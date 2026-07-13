@@ -1,0 +1,33 @@
+[package]
+name = "universallink-server"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["ws"] }
+# `=3.0.0-rc.0`: aligned with the iroh-base 1.0.2 pin (see core/Cargo.toml) —
+# the workspace unifies ed25519-dalek major 3 on this RC.
+ed25519-dalek = "=3.0.0-rc.0"
+futures-util = "0.3"
+hex = "0.4"
+humantime = "2"
+# Version 10 dropped `ring`: a crypto backend must be chosen explicitly,
+# otherwise the crate compiles but panics on the first encode/decode. `rust_crypto`
+# is pure Rust — `aws_lc_rs` would require cmake, a C compiler, and NASM on
+# the Windows runners, which have none of them.
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+rand = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+# Logs directory persistence failures. The library only emits;
+# the collector is installed by the binary (`server-daemon`).
+tracing = "0.1"
+
+[dev-dependencies]
+tokio-tungstenite = "0.29"
+universallink-test-support = { path = "../test-support" }

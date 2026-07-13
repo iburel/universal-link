@@ -1,0 +1,10 @@
+# Terminates TLS for the control plane and relays to the internal server.
+# Caddy obtains and renews the certificate on its own (Let's Encrypt) as soon as
+# a public domain resolves to this machine and ports 80/443 are open.
+#
+# `reverse_proxy` relays the WebSocket (/ws) NATIVELY: nothing to configure for
+# the upgrade, unlike nginx. `/health` goes through the same block.
+
+{$UNIVERSALLINK_DOMAIN} {
+	reverse_proxy server:8080
+}

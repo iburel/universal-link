@@ -1,0 +1,12 @@
+[package]
+name = "universallink-paths"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+# Local deployment contract: where the Core daemon listens and stores its
+# files, hence where the official components find it. No dependencies:
+# everything is derived from the process environment.
+
+[dependencies]

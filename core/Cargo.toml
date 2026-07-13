@@ -1,0 +1,56 @@
+[package]
+name = "universallink-core"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[dependencies]
+anyhow = "1"
+# PKCE: code_verifier and state as base64url, S256 challenge.
+base64 = "0.22"
+# Device identity (= iroh identity): generated on first startup
+# (`rand_core`) and used to sign proofs of possession.
+# Pinned to the exact RC that iroh-base 1.0.2 locks (`=3.0.0-rc.0`): the whole
+# workspace must stay aligned, otherwise resolution fails (ed25519-dalek major 3
+# does not unify between the stable `3.0.0` and the RC). To be bumped once iroh
+# moves to the stable 3.0.0.
+ed25519-dalek = { version = "=3.0.0-rc.0", features = ["rand_core"] }
+# Encoding/decoding of OIDC query strings and form bodies.
+form_urlencoded = "1"
+futures-util = "0.3"
+hex = "0.4"
+rand = "0.10"
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+# Logging: the library only EMITS (100% Rust, cross-compiles). The
+# daemon installs the collector; without it the events are dropped.
+tracing = "0.1"
+# WebSocket handshake ONLY: the stream is opened by the config's `Connector`
+# (`client_async`), never by `connect_async`. Without `connect`, the library
+# has neither `MaybeTlsStream` nor any TLS stack — this is what keeps it
+# cross-checkable from Linux (no C build.rs).
+tokio-tungstenite = { version = "0.29", default-features = false, features = [
+    "handshake",
+] }
+
+[target.'cfg(unix)'.dependencies]
+# Peer verification (uid): compare the socket's uid against our own.
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Named pipe DACL (current user's SID) + client pid.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+universallink-server = { path = "../server" }
+universallink-test-support = { path = "../test-support" }

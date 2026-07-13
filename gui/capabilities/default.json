@@ -1,0 +1,10 @@
+{
+  "identifier": "default",
+  "description": "Main window: core API + opening URLs in the browser (OIDC flow). Deliberately WITHOUT reveal-item-in-dir: nothing in the app opens the file explorer.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "opener:allow-open-url",
+    "opener:allow-default-urls"
+  ]
+}

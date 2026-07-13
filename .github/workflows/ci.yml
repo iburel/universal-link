@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# GITHUB_TOKEN read-only regardless of the repository setting: nothing here
+# writes to the repo.
+permissions:
+  contents: read
+
+# A new push on a PR cancels the previous run; main always runs to completion,
+# so a reference build is never interrupted.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental artifacts are useless for a one-shot compilation and
+  # bloat the cache restored on every run.
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  ci:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    # 45 min: the GUI's webview tree (wry/webkit) adds to the
+    # compilation, and the iroh closure (~146 crates) makes the whole thing heavier still.
+    # Bumping the toolchain to 1.97.0 invalidates all rust-cache caches:
+    # the first run without cache would exceed 30 min on Windows.
+    timeout-minutes: 45
+    strategy:
+      # The status of all three platforms, even if one fails: an OS-specific
+      # bug must not mask the result of the other two.
+      fail-fast: false
+      matrix:
+        # The only deliberately floating versions in the file: GitHub removes
+        # pinned images after notice, whereas a `-latest` migrates without breaking.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      # Actions are pinned to the commit SHA, the only immutable reference:
+      # a tag, however precise, can be redirected by its maintainer.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # This action enables Swatinem/rust-cache by default (itself pinned to a
+      # SHA on its side): do not add a separate cache step. `rustflags: ""`
+      # neutralizes the `-D warnings` it would otherwise set on the whole job: the
+      # deny-on-warnings applies only to the Clippy steps.
+      - name: Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          # Pinned version, identical to the development toolchain. Bumped from
+          # 1.89.0 to 1.97.0 for iroh 1.x (data plane), whose MSRV is
+          # 1.91; we take the latest stable rather than the strict minimum.
+          toolchain: "1.97.0"
+          components: clippy
+          rustflags: ""
+
+      # The GUI (tauri crate) requires the webkit2gtk -dev packages to compile on
+      # Linux — even without the webview engine, tauri-runtime links them.
+      - name: System webview dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libgtk-3-dev
+
+      - name: Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: gui/ui/package-lock.json
+
+      # Type-checking, tests, then build: `ui/dist` is embedded into the webview
+      # binary by generate_context! at the "Build GUI" step.
+      # `npm run check` = `tsc --noEmit`, which covers ONLY the `.ts` files: the
+      # `<script lang="ts">` of `.svelte` files is typed by nothing. svelte-check
+      # would be the tool, but it drives the JS API of the TypeScript compiler,
+      # which TypeScript 7 (native port) no longer exposes — to be retried later.
+      # bash shell enforced: Windows' default pwsh only propagates the
+      # exit code of the LAST command — a `npm test` failure
+      # would be swallowed by the `npm run build` that follows.
+      - name: Frontend
+        working-directory: gui/ui
+        shell: bash
+        run: |
+          npm ci
+          npm run check
+          npm test
+          npm run build
+
+      # `universallink-core` must remain compilable for the three targets WITHOUT
+      # a C compiler: this is what forbids the library from bundling rustls or
+      # keyring, and what justifies the existence of the `daemon` crate. Lib only:
+      # its dev-dependencies (server → reqwest → ring) do not cross-compile,
+      # and do not need to.
+      - name: Core cross-check (lib only)
+        if: runner.os == 'Linux'
+        run: |
+          rustup target add x86_64-pc-windows-msvc aarch64-apple-darwin
+          cargo check -p universallink-core --locked --target x86_64-pc-windows-msvc
+          cargo check -p universallink-core --locked --target aarch64-apple-darwin
+
+      # Production build: lib and binaries ONLY, without dev-dependencies.
+      # Essential, because `--all-targets` and `cargo test` unify the
+      # dev-dependencies' features onto the normal dependencies — an
+      # unbuildable prod binary can therefore pass all the other
+      # steps green (seen: an iroh API gated behind `test-utils` used in the
+      # daemon library).
+      - name: Prod check (lib + bins, no dev-deps)
+        run: cargo check --workspace --lib --bins --locked
+
+      # --locked: fails if Cargo.lock is stale, rather than silently resolving
+      # other dependency versions.
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
+
+      # --all-targets so that Clippy also sees the code in tests/.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # Without --all-targets, which would exclude the doctests. Parallelism capped:
+      # the tests depend on 100-to-300 ms windows that a runner's CPU
+      # contention can overrun.
+      - name: Tests
+        run: cargo test --workspace --locked -- --test-threads=2
+
+      # The real GUI binary is behind `required-features = webview`
+      # (its generate_context! embeds ui/dist): --workspace does not cover
+      # it — neither for the build nor for Clippy, which silently excludes it
+      # from --all-targets. Hence its two dedicated steps: linting main.rs,
+      # then linking against the real webview engine.
+      - name: Clippy GUI (webview)
+        run: cargo clippy -p universallink-gui --features webview --all-targets --locked -- -D warnings
+
+      - name: Build GUI (webview)
+        run: cargo build -p universallink-gui --features webview --locked
+
+  # Dependency policy: security advisories, duplicates, crate provenance,
+  # licenses. A separate job rather than a matrix step — the dependency
+  # graph does not depend on the platform, and the action is a Docker
+  # action, so it only runs on a Linux runner.
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # All four checks, `licenses` included: the allow-list is in deny.toml.
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+        with:
+          command: check
+          command-arguments: advisories bans sources licenses

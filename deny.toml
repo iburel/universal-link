@@ -1,0 +1,99 @@
+# Dependency policy, enforced in CI by cargo-deny.
+#
+# All four checks run: `advisories`, `bans`, `sources` and
+# `licenses`. (The `licenses` check had been disabled on the grounds that `r-efi`,
+# "under LGPL", would block — that was wrong: r-efi is tri-licensed
+# "MIT OR Apache-2.0 OR LGPL-2.1-or-later", and cargo-deny picks the
+# permitted branch of the expression. It would never have blocked.)
+
+[licenses]
+# The workspace crates (publish = false) are not subject to the list.
+private = { ignore = true }
+# Exhaustive allow-list: any missing license fails CI, and is
+# only added after review. Every non-trivial license is commented.
+allow = [
+  # Classic permissive licenses, with no obligation beyond attribution.
+  "MIT",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  # MPL-2.0: weak copyleft, PER FILE. Distributing a binary that links
+  # MPL code is allowed; the only obligation would be to publish our
+  # modifications to the MPL files themselves — we modify none of them.
+  # Pulled in by `attohttpc` (HTTP client of the iroh stack).
+  "MPL-2.0",
+  # CDLA-Permissive-2.0: permissive DATA license (not code), with no
+  # distribution obligation. Covers the `webpki-roots` root store.
+  "CDLA-Permissive-2.0",
+  # Unicode-3.0: permissive (attribution), covers the Unicode data
+  # tables (icu4x, unicode-ident).
+  "Unicode-3.0",
+  # Unlicense: public-domain dedication with a permissive fallback license,
+  # no obligation. Pulled in by pharos/ws_stream_wasm/async_io_stream
+  # (iroh closure, wasm target).
+  "Unlicense",
+  # Apache-2.0 with the LLVM exception, which merely LIFTS the
+  # §4 requirements for binary redistribution: strictly more
+  # permissive than Apache-2.0 alone. Pulled in by target-lexicon (wasmtime).
+  "Apache-2.0 WITH LLVM-exception",
+]
+
+[advisories]
+ignore = [
+  # Marvin attack: timing side channel on RSA **private**-key
+  # operations. The advisory carries `patched = []` — no fix exists, and
+  # none is planned. The `rsa` crate arrives via `jsonwebtoken` (feature
+  # `rust_crypto`), and the server holds no RSA private key: it verifies
+  # signatures with the public keys of the issuer's JWKS. To be revisited if
+  # an RSA private-key operation were ever to appear.
+  { id = "RUSTSEC-2023-0071", reason = "the server only verifies signatures with RSA public keys; no private-key operation is exposed to an attacker" },
+
+  # "unmaintained" advisories (informational, not vulnerabilities) pulled in by
+  # the Tauri v2 tree on Linux, with no alternative until Tauri has
+  # migrated to GTK4 (upstream tracking: tauri-apps/tauri#9662). To be revisited
+  # at each tauri version bump.
+  #
+  # gtk3-rs (GTK3 bindings, archived repository) — via tao/wry/muda:
+  { id = "RUSTSEC-2024-0411", reason = "gtk3-rs archived; imposed by tauri v2 (GTK3 webview) until the upstream GTK4 migration" },
+  { id = "RUSTSEC-2024-0412", reason = "same as RUSTSEC-2024-0411 (gtk3-rs family)" },
+  { id = "RUSTSEC-2024-0413", reason = "same as RUSTSEC-2024-0411 (gtk3-rs family)" },
+  { id = "RUSTSEC-2024-0414", reason = "same as RUSTSEC-2024-0411 (gtk3-rs family)" },
+  { id = "RUSTSEC-2024-0415", reason = "same as RUSTSEC-2024-0411 (gtk3-rs family)" },
+  { id = "RUSTSEC-2024-0416", reason = "same as RUSTSEC-2024-0411 (gtk3-rs family)" },
+  { id = "RUSTSEC-2024-0417", reason = "same as RUSTSEC-2024-0411 (gtk3-rs family)" },
+  { id = "RUSTSEC-2024-0418", reason = "same as RUSTSEC-2024-0411 (gtk3-rs family)" },
+  { id = "RUSTSEC-2024-0419", reason = "same as RUSTSEC-2024-0411 (gtk3-rs family)" },
+  { id = "RUSTSEC-2024-0420", reason = "same as RUSTSEC-2024-0411 (gtk3-rs family)" },
+  # No entry for RUSTSEC-2024-0429 (unsoundness in glib::VariantStrIter,
+  # same gtk3-rs family/blocker) on purpose: it is a function-scoped "unsound"
+  # advisory that cargo-deny does not surface — adding it here would suppress
+  # nothing and would trigger an "advisory-not-detected" warning. Only dependabot
+  # reports it; closed on the dependabot side (risk accepted). The glib 0.20 fix
+  # is unreachable: gtk 0.18 requires glib ^0.18, locked by tauri v2 (GTK3)
+  # until the GTK4 migration.
+  # proc-macro-error, maintainer unreachable — via glib-macros (gtk3-rs):
+  { id = "RUSTSEC-2024-0370", reason = "pulled in by glib-macros, same gtk3-rs chain as above" },
+  # paste (proc macro, archived by its author) — via netlink-packet-core ←
+  # netdev/netwatch ← iroh. Informational "unmaintained" advisory, not a
+  # vulnerability; purely compile-time macro, no runtime surface. To be revisited
+  # at each iroh version bump.
+  { id = "RUSTSEC-2024-0436", reason = "paste pulled in by the iroh closure (netlink); compile-time macro, informational unmaintained advisory" },
+  # unic-* (rust-unic unmaintained) — via urlpattern ← tauri-utils:
+  { id = "RUSTSEC-2025-0075", reason = "unic-* pulled in by urlpattern ← tauri-utils; no alternative on the tauri side" },
+  { id = "RUSTSEC-2025-0080", reason = "same as RUSTSEC-2025-0075 (unic-* family)" },
+  { id = "RUSTSEC-2025-0081", reason = "same as RUSTSEC-2025-0075 (unic-* family)" },
+  { id = "RUSTSEC-2025-0098", reason = "same as RUSTSEC-2025-0075 (unic-* family)" },
+  { id = "RUSTSEC-2025-0100", reason = "same as RUSTSEC-2025-0075 (unic-* family)" },
+]
+
+[bans]
+# Three versions of `rand` and two of `ed25519-dalek` coexist, pulled in by
+# dependencies that have not migrated yet. We want to see it, not suffer it.
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
