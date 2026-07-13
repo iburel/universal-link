@@ -1,0 +1,46 @@
+# Deployment WITHOUT Docker: the bare binary behind YOUR reverse proxy (nginx,
+# Caddy, Traefik…). See doc/server-deployment.md, "Docker-free alternative".
+#
+# Installation:
+#   sudo useradd --system --no-create-home --home-dir /var/lib/universallink universallink
+#   cargo build --release --locked -p universallink-server-daemon --bin universallink-server
+#   sudo install -m 0755 target/release/universallink-server /usr/local/bin/
+#   sudo mkdir -p /etc/universallink
+#   # server.env: see doc/server-deployment.md (loopback BIND + OIDC)
+#   sudo install -m 0640 server.env /etc/universallink/server.env
+#   sudo cp deploy/universallink-server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now universallink-server
+#
+# `systemctl stop` sends SIGTERM: the server exits cleanly (code 0), cf.
+# server-daemon/src/main.rs.
+
+[Unit]
+Description=UniversalLink control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=universallink
+Group=universallink
+EnvironmentFile=/etc/universallink/server.env
+# systemd creates /var/lib/universallink (0700, with the right owner) via
+# StateDirectory and stores the directory there. Do NOT set
+# UNIVERSALLINK_SERVER_STATE in server.env: an EnvironmentFile ALWAYS
+# overrides Environment= (systemd rule, independent of line order).
+StateDirectory=universallink
+Environment=UNIVERSALLINK_SERVER_STATE=/var/lib/universallink/universallink-directory.json
+ExecStart=/usr/local/bin/universallink-server
+Restart=on-failure
+RestartSec=2
+
+# Hardening: the server only listens on a port and writes its directory.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/var/lib/universallink
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,150 @@
+name: Release
+
+# On a `v*` tag: builds the installers and publishes a Release (as a draft, to
+# review before publishing). On `workflow_dispatch`: builds and uploads the
+# installers as run ARTIFACTS, without publishing anything — to test the chain
+# end to end before laying down a real tag.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Write access is needed to create the Release and attach files to it. The
+# build job alone (workflow_dispatch) does not need it, but the scope is set at
+# the workflow level; the publish step is gated on tags.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  bundle:
+    name: ${{ matrix.triple }}
+    runs-on: ${{ matrix.os }}
+    # Cold compile of the tauri + iroh tree plus installing tauri-cli.
+    timeout-minutes: 60
+    strategy:
+      # One OS failing must not cancel the other: we want at least one installer
+      # produced even if the other platform breaks.
+      fail-fast: false
+      matrix:
+        include:
+          # macOS Apple Silicon only (milestone 1 scope). macos-14 = arm64.
+          - os: macos-14
+            triple: aarch64-apple-darwin
+            bin_ext: ""
+            bundle_glob: target/release/bundle/dmg/*.dmg
+          # Windows x64.
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+            bin_ext: ".exe"
+            bundle_glob: target/release/bundle/nsis/*-setup.exe
+    steps:
+      # Actions pinned to a SHA (the only immutable reference), as in ci.yml.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Windows only: Defender's real-time protection scans each of the many
+      # small files rustc/link.exe write, which taxes the build. The runner is
+      # ephemeral and compiles only our own code, so turning the scan off has no
+      # real security impact here.
+      - name: Disable Defender real-time protection (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Set-MpPreference -DisableRealtimeMonitoring $true
+
+      - name: Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          # Same as ci.yml: the project's MSRV (iroh 1.x).
+          toolchain: "1.97.0"
+          rustflags: ""
+
+      - name: Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: gui/ui/package-lock.json
+
+      # `ui/dist` is embedded into the webview binary by generate_context!;
+      # tauri does not rebuild it (no beforeBuildCommand) — we do it here.
+      - name: Frontend
+        working-directory: gui/ui
+        shell: bash
+        run: |
+          npm ci
+          npm run build
+
+      # The CLI that drives the bundling. Built from crates.io (no extra
+      # third-party action to pin).
+      - name: tauri-cli
+        run: cargo install tauri-cli --version "^2.0" --locked
+
+      # The Core, a separate binary, embedded as a sidecar. Release + --locked
+      # like the rest. The production defaults are baked into this binary at
+      # build time (see daemon/src/config.rs): the OIDC client secret and the
+      # default server URL are injected from repository settings (the source
+      # only carries placeholders).
+      - name: Build the Core (sidecar)
+        env:
+          # Google client secret — REQUIRED by Google at the OIDC exchange even
+          # with PKCE; not confidential for a "Desktop app" client (it ships
+          # with the app). Baked from a repository secret. Absent → build with
+          # no baked secret → Google login fails ("client_secret is missing").
+          UNIVERSALLINK_DEFAULT_OIDC_CLIENT_SECRET: ${{ secrets.GOOGLE_OIDC_CLIENT_SECRET }}
+          # Default server URL baked into the client. Not a secret, but kept out
+          # of the source tree: set as a repository variable. Absent → build
+          # falls back to the placeholder in config.rs.
+          UNIVERSALLINK_DEFAULT_SERVER_URL: ${{ vars.DEFAULT_SERVER_URL }}
+          # Default OIDC client_id baked into the client. Public (not a secret),
+          # but kept out of the source tree so a fork doesn't default to the
+          # maintainer's Google project: set as a repository variable.
+          UNIVERSALLINK_DEFAULT_OIDC_CLIENT_ID: ${{ vars.DEFAULT_OIDC_CLIENT_ID }}
+        run: cargo build -p universallink-daemon --bin universallink-core --release --locked
+
+      # Tauri expects the sidecar named with the target triple, next to the GUI.
+      - name: Stage the sidecar
+        shell: bash
+        run: |
+          mkdir -p gui/binaries
+          cp "target/release/universallink-core${{ matrix.bin_ext }}" \
+             "gui/binaries/universallink-core-${{ matrix.triple }}${{ matrix.bin_ext }}"
+
+      # `externalBin` is injected HERE (and not in tauri.conf.json) so that the
+      # `cargo build`/clippy runs in ci.yml don't require the sidecar to be
+      # present: tauri's build script validates its existence at compile time.
+      - name: Build the installer
+        working-directory: gui
+        shell: bash
+        run: |
+          cargo tauri build --features webview \
+            --config '{"bundle":{"externalBin":["binaries/universallink-core"]}}'
+
+      # Always: retrievable from the run (tests the chain without a tag).
+      - name: Run artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: universallink-${{ matrix.triple }}
+          path: ${{ matrix.bundle_glob }}
+          if-no-files-found: error
+
+      # Only on a tag: publishes (as a draft) to the tag's Release. A draft
+      # because the binaries are UNSIGNED (milestone 1) — to review and complete
+      # with Gatekeeper/SmartScreen workaround instructions before publishing.
+      - name: Publish to the Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          draft: true
+          files: ${{ matrix.bundle_glob }}
+          fail_on_unmatched_files: true
+          body: |
+            UniversalLink installers — **unsigned** (milestone 1). The OS will show a warning on first launch:
+
+            - **macOS**: "unverified developer" → System Settings → Privacy & Security → "Open anyway".
+            - **Windows**: SmartScreen "Windows protected your PC" → "More info" → "Run anyway".
+
+            On first launch, the app installs the background service (per-user, no admin) and connects to the configured UniversalLink server.

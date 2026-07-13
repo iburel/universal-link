@@ -1,0 +1,10 @@
+# Docker build context: we only send the sources. Without this, `target/`
+# (gigabytes of binaries, including root-owned files from an in-container build)
+# would be swept into the context — slow and useless: the image recompiles from
+# scratch anyway.
+/target
+/target-docker
+/.git
+/gui/ui/node_modules
+/gui/ui/dist
+/gui/gen

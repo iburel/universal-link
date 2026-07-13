@@ -1,0 +1,53 @@
+[package]
+name = "universallink-gui"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[features]
+default = []
+# Marker for the real binary: `generate_context!` embeds `ui/dist` here, which
+# only exists after an npm build. The library and its tests (MockRuntime) do not
+# depend on it — `cargo test --workspace` stays independent of npm.
+# `common-controls-v6` lives here and not in the library: this feature makes
+# muda import TaskDialogIndirect (comctl32 v6 only), yet only the
+# binary receives the v6 manifest embedded by tauri-build — a Windows
+# TEST executable would link comctl32 v5 and die at load time
+# (STATUS_ENTRYPOINT_NOT_FOUND).
+webview = ["tauri/common-controls-v6"]
+
+[[bin]]
+name = "universallink-gui"
+path = "src/main.rs"
+required-features = ["webview"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# tauri's default features, minus common-controls-v6 (see [features]).
+tauri = { version = "2", default-features = false, features = [
+  "wry",
+  "compression",
+  "dynamic-acl",
+  "x11",
+  "dbus",
+] }
+tauri-plugin-opener = "2"
+tokio = { version = "1", features = ["macros", "rt", "sync"] }
+universallink-ipc-client = { path = "../client" }
+# Deployment contract (socket, config directory) shared with the daemon.
+universallink-paths = { path = "../paths" }
+
+[build-dependencies]
+tauri-build = "2"
+
+[dev-dependencies]
+# default-features = false here too: the feature union would re-enable
+# common-controls-v6 for test builds.
+tauri = { version = "2", default-features = false, features = ["test"] }
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+universallink-core = { path = "../core" }
+universallink-server = { path = "../server" }
+universallink-test-support = { path = "../test-support" }

@@ -1,0 +1,50 @@
+# Turnkey deployment stack: the control plane behind Caddy, which
+# terminates TLS automatically (Let's Encrypt). See doc/server-deployment.md.
+#
+# Prerequisites: a domain name that resolves (A/AAAA) to this machine, and
+# ports 80 + 443 open — Caddy needs them to obtain and renew the
+# certificate.
+#
+# Settings: a `.env` file NEXT TO this file (see .env.example).
+# To launch: from this directory, `docker compose up -d --build`.
+
+services:
+  server:
+    build:
+      # Context = repository root (cargo needs the whole workspace); this
+      # file lives in deploy/, hence the `..`.
+      context: ..
+      dockerfile: docker/server/Dockerfile
+    restart: unless-stopped
+    environment:
+      UNIVERSALLINK_OIDC_ISSUER: ${UNIVERSALLINK_OIDC_ISSUER}
+      UNIVERSALLINK_OIDC_CLIENT_ID: ${UNIVERSALLINK_OIDC_CLIENT_ID}
+      # Optional (defaults baked into the binary) — uncomment as needed:
+      # UNIVERSALLINK_MAX_REQUESTS_PER_MINUTE: "120"
+      # UNIVERSALLINK_LOG: "info"
+    volumes:
+      - directory:/data
+    # No `ports:`: the server is only reachable by Caddy, on the compose
+    # internal network. It listens IN CLEARTEXT — never expose it directly.
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      UNIVERSALLINK_DOMAIN: ${UNIVERSALLINK_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data      # certificates — BACK THESE UP, otherwise re-issuance
+      - caddy_config:/config
+    depends_on:
+      - server
+
+volumes:
+  directory:
+  caddy_data:
+  caddy_config:

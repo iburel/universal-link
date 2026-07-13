@@ -1,0 +1,17 @@
+/target
+/target-docker
+/gui/gen
+/gui/ui/node_modules
+/gui/ui/dist
+# Sidecar staged at release-build time (workflow); never versioned.
+/gui/binaries
+
+# Secrets and local configuration — must never enter the repository.
+.env
+*.env
+!*.env.example
+**/secrets.json
+config.json
+*.pem
+*.key
+!device.key.example

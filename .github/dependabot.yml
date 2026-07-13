@@ -1,0 +1,28 @@
+version: 2
+
+# Versions are pinned (action SHAs, toolchain, Cargo.lock): without this
+# file, nothing would flag that a pinned version has become outdated or
+# vulnerable. Monthly cadence and grouped updates, to receive two pull
+# requests per month rather than one per dependency.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      # Major updates are excluded from the group, hence delivered each in its own
+      # pull request: a major update requires porting the code, and a batch of
+      # four that fails does not tell which one is at fault.
+      cargo:
+        patterns: ["*"]
+        update-types:
+          - minor
+          - patch

@@ -1,0 +1,27 @@
+# Example nginx block for the "binary + systemd" route (the server listens on
+# 127.0.0.1:8080). nginx — unlike Caddy — requires the WebSocket upgrade
+# (/ws) to be forwarded EXPLICITLY, otherwise the Core's connection fails.
+#
+# TLS: obtain the certificate as usual (certbot / Let's Encrypt).
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name your-server.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/your-server.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/your-server.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        # Essential for the /ws WebSocket:
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host       $host;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # WS connections are long-lived (server-side heartbeat):
+        proxy_read_timeout 3600s;
+    }
+}

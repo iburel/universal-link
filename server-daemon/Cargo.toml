@@ -1,0 +1,33 @@
+[package]
+name = "universallink-server-daemon"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+# The DEPLOYABLE control-plane process: this crate produces the
+# server executable (`universallink-server`). It only wires things up — read the
+# configuration from the environment, install the logger, start the
+# `universallink-server` library and shut it down cleanly on signal.
+#
+# Why a separate crate and not a `[[bin]]` in `server/`: the `server` library
+# is a dev-dependency of `core`, `client` and `gui` (their tests instantiate it
+# in memory). Everything a deployment drags along — and above all the upcoming
+# persistence (building block 2) — must stay OUT of this library, otherwise every
+# consumer would pull it into its test builds. The library stays lightweight; the
+# binary carries the rest.
+
+[[bin]]
+name = "universallink-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+universallink-server = { path = "../server" }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,30 @@
+[package]
+name = "universallink-ipc-client"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+# Core IPC client for the official Rust components (GUI, tray,
+# clipboard manager): managed connection (hello, subscriptions, reconnection),
+# multiplexed requests, relayed notifications. The protocol spec lives in
+# doc/core-api.md; the crate's exact contract is frozen by tests/api/.
+
+[dependencies]
+serde_json = "1"
+tokio = { version = "1", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "sync",
+    "time",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+universallink-core = { path = "../core" }
+universallink-server = { path = "../server" }
+universallink-test-support = { path = "../test-support" }

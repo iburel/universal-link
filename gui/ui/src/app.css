@@ -1,0 +1,106 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com> */
+
+/* Global palette and settings. The theme follows the system's. */
+
+:root {
+  color-scheme: light dark;
+  --bg: #f5f6f8;
+  --panel: #ffffff;
+  --nav: #eceef2;
+  --text: #1f2937;
+  --muted: #6b7280;
+  --line: #dfe2e8;
+  --accent: #4f46e5;
+  --accent-text: #ffffff;
+  --ok: #15803d;
+  --warn: #b45309;
+  --danger: #b91c1c;
+  --radius: 8px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16181d;
+    --panel: #1e2128;
+    --nav: #14161b;
+    --text: #e5e7eb;
+    --muted: #9ca3af;
+    --line: #2c313a;
+    --accent: #818cf8;
+    --accent-text: #12141a;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --danger: #f87171;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font:
+    14px/1.5 system-ui,
+    -apple-system,
+    "Segoe UI",
+    sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+h1 {
+  font-size: 1.15rem;
+}
+
+h1,
+h2 {
+  margin: 0;
+  font-weight: 600;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  padding: 0.35rem 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+button.primary {
+  background: var(--accent);
+  color: var(--accent-text);
+  border-color: transparent;
+}
+
+button.danger:hover:not(:disabled) {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+input {
+  font: inherit;
+  color: inherit;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg);
+}
