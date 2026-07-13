@@ -29,5 +29,5 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 
 [dev-dependencies]
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 universallink-test-support = { path = "../test-support" }

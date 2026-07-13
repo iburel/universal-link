@@ -31,7 +31,7 @@ tracing = "0.1"
 # (`client_async`), never by `connect_async`. Without `connect`, the library
 # has neither `MaybeTlsStream` nor any TLS stack — this is what keeps it
 # cross-checkable from Linux (no C build.rs).
-tokio-tungstenite = { version = "0.29", default-features = false, features = [
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
     "handshake",
 ] }
 
