@@ -22,7 +22,7 @@ futures-util = "0.3"
 hex = "0.4"
 rand = "0.10"
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 tokio = { version = "1", features = ["full"] }
 # Logging: the library only EMITS (100% Rust, cross-compiles). The
 # daemon installs the collector; without it the events are dropped.
