@@ -23,7 +23,7 @@ hex = "0.4"
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 rand = "0.10"
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.29"
 # The in-memory transport (`memory_transport`) implements the Core library's
