@@ -49,6 +49,11 @@ async fn two_cores_transfer_a_file_through_the_directory() {
     wait_server_connected(&mut sender, true).await;
     wait_server_connected(&mut watcher, true).await;
     wait_reachable(&mut sender, b.device_id()).await;
+    // Reverse barrier: the receiver must have attested the sender too, or it
+    // refuses the sender's first stream fail-closed and SILENTLY (C7) — the
+    // sender only sees a broken pipe and this watcher would wait forever.
+    // `wait_reachable` above proves only A→B; a transfer also needs B→A.
+    wait_attested(&mut watcher, a.device_id()).await;
 
     let contents = b"hello from A";
     let src = a.write_source("hello.txt", contents);
@@ -126,6 +131,10 @@ async fn a_transfer_of_several_files_lands_intact() {
     wait_server_connected(&mut sender, true).await;
     wait_server_connected(&mut watcher, true).await;
     wait_reachable(&mut sender, b.device_id()).await;
+    // Reverse barrier (see `two_cores_transfer_a_file_through_the_directory`):
+    // the receiver must attest the sender too, else its first stream is refused
+    // fail-closed and silently.
+    wait_attested(&mut watcher, a.device_id()).await;
 
     // Three files, including an EMPTY one (0 bytes) and one bigger than a chunk
     // (streaming boundary): the receiver reads exactly `size` bytes per file.
@@ -184,6 +193,10 @@ async fn a_second_file_with_the_same_name_does_not_overwrite() {
     wait_server_connected(&mut sender, true).await;
     wait_server_connected(&mut watcher, true).await;
     wait_reachable(&mut sender, b.device_id()).await;
+    // Reverse barrier (see `two_cores_transfer_a_file_through_the_directory`):
+    // the receiver must attest the sender too, else its first stream is refused
+    // fail-closed and silently.
+    wait_attested(&mut watcher, a.device_id()).await;
 
     // First "doc.txt".
     let src = a.write_source("doc.txt", b"content A");
@@ -621,6 +634,9 @@ async fn the_peer_is_reachable_again_after_a_reconnection() {
     // On reconnection, B must REPUBLISH its relay — a one-shot publication would
     // leave it mute. Once reachable again, A transfers it a file.
     wait_reachable(&mut sender, b.device_id()).await;
+    // Reverse barrier (see `two_cores_transfer_a_file_through_the_directory`):
+    // B must have attested A too, else it refuses A's stream fail-closed.
+    wait_attested(&mut watcher, a.device_id()).await;
     let src = a.write_source("after.txt", b"still here");
     transfer_and_expect(
         &mut sender,
@@ -662,6 +678,9 @@ async fn a_restarted_core_still_transfers_to_its_peer() {
     wait_server_connected(&mut sa, true).await;
     wait_server_connected(&mut wb, true).await;
     wait_reachable(&mut sa, b.device_id()).await;
+    // Reverse barrier (see `two_cores_transfer_a_file_through_the_directory`):
+    // B must have attested the restarted A too, else it refuses A's stream.
+    wait_attested(&mut wb, a.device_id()).await;
 
     let src = a.write_source("again.txt", b"here again");
     transfer_and_expect(&mut sa, &mut wb, b.device_id(), &src, b"here again").await;
@@ -684,6 +703,8 @@ async fn a_restarted_core_still_transfers_to_its_peer() {
     subscribe_transfers(&mut wa).await;
     wait_server_connected(&mut sb, true).await;
     wait_reachable(&mut sb, a.device_id()).await;
+    // Reverse barrier: A must have attested B too before B's stream.
+    wait_attested(&mut wa, b.device_id()).await;
 
     let src = b.write_source("youtoo.txt", b"you too");
     transfer_and_expect(&mut sb, &mut wa, a.device_id(), &src, b"you too").await;
