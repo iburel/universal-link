@@ -44,6 +44,45 @@ pub fn bundled_core_path() -> Option<PathBuf> {
     Some(exe.parent()?.join(CORE_BIN))
 }
 
+/// The Core to actually spawn and register for autostart. On most platforms
+/// this is just the bundled sidecar (`bundled`) — its location is durable
+/// (macOS `.app` in /Applications, per-user NSIS install dir). On Linux
+/// launched from an AppImage it is NOT: the executable lives in an EPHEMERAL
+/// mount (`/tmp/.mount_*`) that vanishes when the AppImage exits, so an
+/// autostart entry pointing there would be dead at the next login. There we
+/// copy the Core — which has no GTK/webkit dependency and runs standalone —
+/// into a stable per-user location and return that path instead.
+///
+/// Non-fatal: on any error we fall back to `bundled`. This session still runs
+/// (spawned from the mount, which is alive right now); only cross-session
+/// autostart is at risk.
+#[cfg(target_os = "linux")]
+pub fn stabilize_core_path(bundled: &Path) -> PathBuf {
+    // Only INSIDE an AppImage is the bundled path ephemeral. Outside one (dev
+    // run, or a native package installed to a stable prefix) it is already
+    // durable — leave it be.
+    if std::env::var_os("APPIMAGE").is_none() {
+        return bundled.to_path_buf();
+    }
+    match data_home().and_then(|d| stage_core_copy(bundled, &d)) {
+        Ok(stable) => stable,
+        Err(e) => {
+            eprintln!(
+                "[universallink] cannot stage a durable Core copy ({e}); \
+                 autostart may not survive logout — using {}",
+                bundled.display()
+            );
+            bundled.to_path_buf()
+        }
+    }
+}
+
+/// Non-Linux: the bundled path is already durable — nothing to stabilize.
+#[cfg(not(target_os = "linux"))]
+pub fn stabilize_core_path(bundled: &Path) -> PathBuf {
+    bundled.to_path_buf()
+}
+
 /// Launches the Core in the background. Non-blocking and non-fatal: if the
 /// binary is missing (dev build without a bundle) or the spawn fails, the GUI
 /// starts anyway and will display the connection state.
@@ -168,6 +207,57 @@ fn register_autostart_inner(core_path: &Path) -> std::io::Result<()> {
     )
 }
 
+/// `$XDG_DATA_HOME`, else `~/.local/share` — the same precedence the autostart
+/// entry above uses for `$XDG_CONFIG_HOME`. This is where the durable Core copy
+/// lives when we run from an AppImage.
+#[cfg(target_os = "linux")]
+fn data_home() -> std::io::Result<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "neither XDG_DATA_HOME nor HOME")
+        })
+}
+
+/// Where the durable Core copy lives under a given data dir. Pure (tested).
+#[cfg(target_os = "linux")]
+fn staged_core_dest(data_home: &Path) -> PathBuf {
+    data_home.join("universallink").join(CORE_BIN)
+}
+
+/// Copies the Core into `<data_home>/universallink/` and returns its path.
+/// Copy-to-temp-then-`rename`: `rename(2)` is atomic and, unlike copying onto
+/// the destination in place, does NOT fail with `ETXTBSY` when that path is a
+/// Core binary currently running from a previous session — the running process
+/// keeps its old inode, the new file takes over the path. `data_home` is passed
+/// in (not read from the env) so the mechanics are testable deterministically.
+#[cfg(target_os = "linux")]
+fn stage_core_copy(src: &Path, data_home: &Path) -> std::io::Result<PathBuf> {
+    let dest = staged_core_dest(data_home);
+    let dir = dest
+        .parent()
+        .expect("staged destination always has a parent");
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!("{CORE_BIN}.new"));
+    std::fs::copy(src, &tmp)?;
+    set_executable(&tmp)?;
+    std::fs::rename(&tmp, &dest)?;
+    Ok(dest)
+}
+
+/// Marks a freshly written file executable (0o755). `std::fs::copy` already
+/// carries the source mode over, but we set it explicitly so the durable copy
+/// is runnable regardless of the source's bits.
+#[cfg(target_os = "linux")]
+fn set_executable(p: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(p)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(p, perms)
+}
+
 #[cfg(windows)]
 fn register_autostart_inner(core_path: &Path) -> std::io::Result<()> {
     // HKCU Run key (per-user, no privileges). We go through `reg.exe` to avoid
@@ -237,5 +327,57 @@ mod tests {
         } else {
             assert_eq!(CORE_BIN, "universallink-core");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn staged_dest_lives_under_the_data_home_namespace() {
+        let dest = staged_core_dest(Path::new("/home/u/.local/share"));
+        assert_eq!(
+            dest,
+            Path::new("/home/u/.local/share/universallink").join(CORE_BIN)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn staging_copies_the_core_and_marks_it_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("bundled-core");
+        std::fs::write(&src, b"#!/bin/sh\necho core\n").expect("write src");
+
+        let data_home = tmp.path().join("data");
+        let dest = stage_core_copy(&src, &data_home).expect("stage");
+
+        assert_eq!(dest, staged_core_dest(&data_home));
+        assert_eq!(
+            std::fs::read(&dest).expect("read dest"),
+            b"#!/bin/sh\necho core\n"
+        );
+        let mode = std::fs::metadata(&dest).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o111, 0o111, "the durable copy must be executable");
+        // No temp left behind.
+        assert!(!data_home.join("universallink").join(format!("{CORE_BIN}.new")).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn staging_overwrites_a_previous_copy_idempotently() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_home = tmp.path().join("data");
+
+        let old = tmp.path().join("old-core");
+        std::fs::write(&old, b"old").expect("write old");
+        let dest1 = stage_core_copy(&old, &data_home).expect("stage old");
+
+        // A second staging (AppImage updated between launches) replaces it.
+        let new = tmp.path().join("new-core");
+        std::fs::write(&new, b"new-and-longer").expect("write new");
+        let dest2 = stage_core_copy(&new, &data_home).expect("stage new");
+
+        assert_eq!(dest1, dest2);
+        assert_eq!(std::fs::read(&dest2).expect("read"), b"new-and-longer");
     }
 }
