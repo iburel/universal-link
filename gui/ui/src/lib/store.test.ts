@@ -92,6 +92,8 @@ interface Fake {
   calls: { method: string; params: unknown }[];
   /** The URLs passed to `openUrl` (plugin-opener). */
   opened: string[];
+  /** The configs passed to `set_server_config` (the shell's write command). */
+  configWrites: unknown[];
   /** All the raw IPC commands, event subscriptions included. */
   ipc: string[];
   methods: Record<string, Method>;
@@ -116,6 +118,7 @@ function mockCore(options: {
   const fake: Fake = {
     calls: [],
     opened: [],
+    configWrites: [],
     ipc: [],
     methods: {
       "session.status": () => SESSION,
@@ -136,6 +139,13 @@ function mockCore(options: {
       if (cmd === "plugin:opener|open_url") {
         fake.opened.push(args.url);
         return null;
+      }
+      if (cmd === "set_server_config") {
+        fake.configWrites.push((payload as { config: unknown }).config);
+        return null;
+      }
+      if (cmd === "get_server_config") {
+        return { server_url: "", oidc_issuer: "", oidc_client_id: "" };
       }
       if (cmd === "core_request") {
         const { method, params } = payload as {
@@ -1406,4 +1416,75 @@ test("createAccount keeps the code in no store state", async () => {
     transfers: store.transfers,
   });
   expect(dump).not.toContain("riverbed-secret-92");
+});
+
+// -- Server configuration ---------------------------------------------------
+
+test("saveServerConfig writes the config, reloads the Core, then resyncs", async () => {
+  const CONFIGURED: SessionState = {
+    logged_in: false,
+    server_connected: false,
+    configured: true,
+  };
+  const fake = mockCore({
+    status: CONNECTED,
+    methods: {
+      "session.status": () => CONFIGURED,
+      "session.reload": () => CONFIGURED,
+    },
+  });
+  await store.start();
+  await flush();
+
+  const ok = await store.saveServerConfig({
+    server_url: "wss://relay.example/ws",
+    oidc_issuer: "https://idp.example",
+    oidc_client_id: "public-id",
+    oidc_client_secret: null,
+  });
+
+  expect(ok).toBe(true);
+  // The shell wrote config.json (the GUI is the sole writer)...
+  expect(fake.configWrites).toEqual([
+    {
+      server_url: "wss://relay.example/ws",
+      oidc_issuer: "https://idp.example",
+      oidc_client_id: "public-id",
+      oidc_client_secret: null,
+    },
+  ]);
+  // ...the Core re-read it via session.reload...
+  expect(fake.calls.some((c) => c.method === "session.reload")).toBe(true);
+  // ...and the resync picked up the now-configured state.
+  expect(store.session?.configured).toBe(true);
+});
+
+test("saveServerConfig surfaces a config the Core rejects", async () => {
+  const fake = mockCore({
+    status: CONNECTED,
+    methods: {
+      "session.reload": () => {
+        throw appError(
+          "INVALID_CONFIG",
+          "server_url must start with ws:// or wss://",
+        );
+      },
+    },
+  });
+  await store.start();
+  await flush();
+
+  const ok = await store.saveServerConfig({
+    server_url: "https://relay.example/ws",
+    oidc_issuer: "https://idp.example",
+    oidc_client_id: "id",
+    oidc_client_secret: null,
+  });
+
+  expect(ok).toBe(false);
+  // The write still happened; it is the Core that refused on reload.
+  expect(fake.configWrites).toHaveLength(1);
+  expect(store.notice?.kind).toBe("error");
+  // The Core's specific reason is shown (INVALID_CONFIG is not remapped).
+  expect(store.notice?.text).toContain("ws://");
 });

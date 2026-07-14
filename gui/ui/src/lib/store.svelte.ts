@@ -49,10 +49,13 @@ import {
 } from "./api";
 import {
   connectionStatus,
+  getServerConfig,
   onConnectionChanged,
   onCoreNotification,
+  setServerConfig,
   type ConnectionStatus,
   type CoreNotification,
+  type ServerConfigInput,
 } from "./core";
 import { humanize, isCoreError, isInvalidParams } from "./errors";
 
@@ -474,6 +477,40 @@ export class CoreStore {
     return this.#act(async () => {
       await api.sessionLogout();
     });
+  }
+
+  // -- Server configuration -----------------------------------------------
+  //
+  // The GUI writes config.json (shell command), then has the Core re-read it
+  // (`session.reload`) — no baked defaults, no process restart. The Core stays
+  // the validation authority: a bad config comes back as an error.
+
+  /** The server fields currently written, to pre-fill the setup screen. */
+  loadServerConfig(): Promise<ServerConfigInput> {
+    return getServerConfig();
+  }
+
+  /**
+   * Persists the setup screen's fields then applies them live (reload +
+   * resync). Returns `true` on success; on failure a banner carries the reason
+   * (e.g. the Core rejecting an invalid URL) and the config is left as it was.
+   * `busy`-guarded by hand (it returns a value), like the account actions.
+   */
+  async saveServerConfig(input: ServerConfigInput): Promise<boolean> {
+    if (this.busy) return false;
+    this.busy = true;
+    this.notice = null;
+    try {
+      await setServerConfig(input);
+      await api.sessionReload();
+      await this.resync();
+      return true;
+    } catch (e) {
+      this.notice = { kind: "error", text: humanize(e) };
+      return false;
+    } finally {
+      this.busy = false;
+    }
   }
 
   // -- Account (C7 account key) -------------------------------------------

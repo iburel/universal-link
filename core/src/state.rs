@@ -6,8 +6,8 @@
 //! `session` then `registry` (taking the registry while holding the session is
 //! allowed — this is how `session.changed` goes out atomically with its
 //! transition — the reverse never); `login` is never held with another;
-//! `account_root` and `transfers` are LEAVES (never held with another lock:
-//! always cloned/released beforehand). No lock across an await.
+//! `account_root`, `transfers` and `server_config` are LEAVES (never held with
+//! another lock: always cloned/released beforehand). No lock across an await.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -45,7 +45,16 @@ pub struct AppState {
     /// login tasks.
     pub identity: crate::identity::DeviceIdentity,
     /// The deployment's server + OIDC — without it, no login is possible.
-    pub server_config: Option<crate::ServerConfig>,
+    /// Behind a lock because `session.reload` swaps it live: the GUI writes a
+    /// fresh `config.json`, the Core re-reads it — no process restart. LEAF
+    /// lock (cloned/released before any other, never across an await).
+    pub server_config: Mutex<Option<crate::ServerConfig>>,
+    /// Re-reads the persisted config and returns the server it describes (or a
+    /// human reason it is unusable). Injected by the daemon, which owns
+    /// `config.json` parsing; `session.reload` calls it to apply what the GUI
+    /// just wrote. `Ok(None)` = nothing configured.
+    pub reload_server:
+        std::sync::Arc<dyn Fn() -> Result<Option<crate::ServerConfig>, String> + Send + Sync>,
     /// The device's name in the directory, chosen at enrollment.
     pub device_name: String,
     /// Keyring for the durable secrets (OIDC refresh token).

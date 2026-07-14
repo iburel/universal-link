@@ -130,6 +130,10 @@ impl TestCore {
             ipc_path: self.ipc_path.clone(),
             config_dir: self.dir.path().to_path_buf(),
             server: self.server_cfg.clone(),
+            reload_server: {
+                let s = self.server_cfg.clone();
+                Arc::new(move || Ok::<_, String>(s.clone()))
+            },
             device_name: CORE_DEVICE_NAME.into(),
             secret_store: Arc::new(universallink_core::FileSecretStore::new(self.dir.path())),
             // The lib only speaks in the clear: it's the daemon that wires up TLS.
@@ -204,6 +208,9 @@ pub struct Shell {
     pub app: tauri::App<MockRuntime>,
     webview: tauri::WebviewWindow<MockRuntime>,
     events: mpsc::UnboundedReceiver<(String, Value)>,
+    /// The Core's config directory handed to `shell()`: kept alive here, and
+    /// where `set_server_config` writes `config.json` (inspectable by tests).
+    config_dir: tempfile::TempDir,
 }
 
 /// Builds the app (the bridge starts at construction), wires up the listeners
@@ -211,9 +218,14 @@ pub struct Shell {
 /// have been emitted before the listeners: synchronize via `wait_status`, not
 /// via an event, when the Core is already running.
 pub async fn shell_app(config: ClientConfig) -> Shell {
-    let app = universallink_gui::shell(tauri::test::mock_builder(), config)
-        .build(tauri::test::mock_context(tauri::test::noop_assets()))
-        .expect("mock app construction");
+    let config_dir = tempfile::tempdir().expect("config tempdir");
+    let app = universallink_gui::shell(
+        tauri::test::mock_builder(),
+        config,
+        config_dir.path().to_path_buf(),
+    )
+    .build(tauri::test::mock_context(tauri::test::noop_assets()))
+    .expect("mock app construction");
     let (tx, events) = mpsc::unbounded_channel();
     for name in ["core:connection", "core:notification"] {
         let tx = tx.clone();
@@ -230,6 +242,7 @@ pub async fn shell_app(config: ClientConfig) -> Shell {
         app,
         webview,
         events,
+        config_dir,
     }
 }
 
@@ -277,6 +290,24 @@ impl Shell {
         self.invoke("connection_status", json!({}))
             .await
             .expect("connection_status")
+    }
+
+    /// The config directory `set_server_config` writes into.
+    pub fn config_dir(&self) -> &std::path::Path {
+        self.config_dir.path()
+    }
+
+    /// Invokes `set_server_config` (the setup screen's save).
+    pub async fn set_server_config(&self, config: Value) -> Result<Value, Value> {
+        self.invoke("set_server_config", json!({ "config": config }))
+            .await
+    }
+
+    /// Invokes `get_server_config` (the setup screen's pre-fill).
+    pub async fn get_server_config(&self) -> Value {
+        self.invoke("get_server_config", json!({}))
+            .await
+            .expect("get_server_config")
     }
 
     /// Waits (by polling the snapshot) for the connection to reach `status` —

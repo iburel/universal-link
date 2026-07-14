@@ -60,3 +60,28 @@ export function onCoreNotification(
     handler(event.payload),
   );
 }
+
+/**
+ * The server + OIDC fields the setup screen collects, mirroring the shell's
+ * `ServerConfigForm` (gui/src/bridge.rs). The secret is optional (a conformant
+ * PKCE IdP has none); a blank one clears the key on write.
+ */
+export interface ServerConfigInput {
+  server_url: string;
+  oidc_issuer: string;
+  oidc_client_id: string;
+  oidc_client_secret?: string | null;
+}
+
+/**
+ * Writes the fields into `config.json` (the GUI is the sole writer of that
+ * file). The caller then triggers `session.reload` so the Core picks them up.
+ */
+export function setServerConfig(config: ServerConfigInput): Promise<void> {
+  return invoke("set_server_config", { config });
+}
+
+/** The server fields currently in `config.json`, to pre-fill the setup screen. */
+export function getServerConfig(): Promise<ServerConfigInput> {
+  return invoke<ServerConfigInput>("get_server_config");
+}

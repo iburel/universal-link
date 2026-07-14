@@ -27,6 +27,17 @@ impl RpcErr {
         }
     }
 
+    /// Application error carrying a human-facing message beyond the code — used
+    /// when the detail matters to the user (e.g. WHY a config.json was
+    /// rejected, surfaced by `session.reload`).
+    pub fn app_message(code: &str, message: impl Into<String>) -> RpcErr {
+        RpcErr {
+            code: -32000,
+            message: message.into(),
+            app: Some(code.to_string()),
+        }
+    }
+
     /// Reconstructs a JSON-RPC error received from the server, to relay it.
     pub fn from_value(err: &Value) -> RpcErr {
         RpcErr {

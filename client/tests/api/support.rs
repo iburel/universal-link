@@ -140,6 +140,10 @@ impl TestCore {
             ipc_path: self.ipc_path.clone(),
             config_dir: self.dir.path().to_path_buf(),
             server: self.server_cfg.clone(),
+            reload_server: {
+                let s = self.server_cfg.clone();
+                Arc::new(move || Ok::<_, String>(s.clone()))
+            },
             device_name: CORE_DEVICE_NAME.into(),
             secret_store: Arc::new(universallink_core::FileSecretStore::new(self.dir.path())),
             // The lib speaks only in cleartext: it is the daemon that wires up TLS.

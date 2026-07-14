@@ -215,15 +215,11 @@ impl Conn {
         match method {
             "session.status" => {
                 self.require_scope("session.read")?;
-                Ok(self
-                    .state
-                    .session
-                    .lock()
-                    .expect("lock session")
-                    .status_record())
+                Ok(self.session_status_result())
             }
             "session.login" => self.session_login().await,
             "session.logout" => self.session_logout(),
+            "session.reload" => self.session_reload(),
             "account.status" => self.account_status(),
             "account.setup" => self.account_setup().await,
             "account.join" => self.account_join(params).await,
@@ -374,6 +370,44 @@ impl Conn {
         }
         let auth_url = crate::login::start_flow(&self.state, crate::login::Goal::Login).await?;
         Ok(json!({ "auth_url": auth_url }))
+    }
+
+    /// `session.status` plus a `configured` flag — whether a server is set.
+    /// Without it the GUI cannot tell "never configured" (→ show the first-run
+    /// setup screen) from "configured but the server is down" (→ a transient
+    /// error): both otherwise read as `server_connected: false`.
+    fn session_status_result(&self) -> Value {
+        let configured = self
+            .state
+            .server_config
+            .lock()
+            .expect("lock server_config")
+            .is_some();
+        let mut v = self
+            .state
+            .session
+            .lock()
+            .expect("lock session")
+            .status_record();
+        v["configured"] = json!(configured);
+        v
+    }
+
+    /// Re-reads `config.json` (which the GUI has just written) and swaps the
+    /// server config in place — no restart. The daemon-never-writes invariant
+    /// holds: the Core only READS the file. A malformed / half-filled config is
+    /// reported (`INVALID_CONFIG`, message = the reason) rather than silently
+    /// leaving the Core unconfigured. Returns the fresh `session.status`.
+    ///
+    /// Meaningful outside a session: a live session stays pinned to the server
+    /// it enrolled on (`SessionInfo.server_url`), so changing servers means
+    /// logging out first — the GUI enforces that.
+    fn session_reload(&self) -> Result<Value, RpcErr> {
+        self.require_scope("session.manage")?;
+        let server = (self.state.reload_server)()
+            .map_err(|reason| RpcErr::app_message("INVALID_CONFIG", reason))?;
+        *self.state.server_config.lock().expect("lock server_config") = server;
+        Ok(self.session_status_result())
     }
 
     /// Revokes a device of the account. The server demands a fresh ID token:
