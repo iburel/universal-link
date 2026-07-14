@@ -25,8 +25,12 @@ fn main() {
     // pointing at a `target/debug/` binary, nor spawn behind the developer's
     // back.
     if !cfg!(debug_assertions)
-        && let Some(core_path) = universallink_gui::bundled_core_path()
+        && let Some(bundled) = universallink_gui::bundled_core_path()
     {
+        // On Linux/AppImage the bundled path is an ephemeral mount: stabilize
+        // it to a durable per-user copy so autostart survives logout. A no-op
+        // elsewhere (and outside an AppImage).
+        let core_path = universallink_gui::stabilize_core_path(&bundled);
         universallink_gui::register_autostart(&core_path);
         universallink_gui::spawn_core(&core_path);
     }
