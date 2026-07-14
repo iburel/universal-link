@@ -218,6 +218,99 @@ async fn logout_when_logged_out_is_noop() {
 }
 
 #[tokio::test]
+async fn status_reports_whether_a_server_is_configured() {
+    // Unconfigured (fresh install): the flag is false — the GUI shows its
+    // first-run setup screen rather than a connection error (both otherwise
+    // read as `server_connected: false`).
+    let core = TestCore::start().await;
+    let mut c = spawn_component(&core, "gui-lite", "custom", &["session.read"]).await;
+    let r = c
+        .request("session.status", json!({}))
+        .await
+        .expect("session.status");
+    assert_eq!(r["configured"], false, "no server configured yet: {r}");
+
+    // Configured (server + OIDC set): the flag is true.
+    let server = TestServer::start().await;
+    let core = TestCore::start_with_server(&server).await;
+    let mut c = spawn_component(&core, "gui-lite", "custom", &["session.read"]).await;
+    let r = c
+        .request("session.status", json!({}))
+        .await
+        .expect("session.status");
+    assert_eq!(r["configured"], true, "server configured: {r}");
+}
+
+#[tokio::test]
+async fn reload_configures_an_unconfigured_core() {
+    let core = TestCore::start().await;
+    let mut c = spawn_component(
+        &core,
+        "gui-lite",
+        "custom",
+        &["session.read", "session.manage"],
+    )
+    .await;
+    assert_eq!(
+        c.request("session.status", json!({}))
+            .await
+            .expect("status")["configured"],
+        false
+    );
+
+    // The GUI has just written config.json: reload picks it up, no restart.
+    core.stage_config(Some(universallink_core::ServerConfig {
+        url: "wss://relay.example/ws".into(),
+        oidc_issuer: "https://idp.example".into(),
+        oidc_client_id: "public-id".into(),
+        oidc_client_secret: None,
+    }));
+    let r = c
+        .request("session.reload", json!({}))
+        .await
+        .expect("session.reload");
+    assert_eq!(r["configured"], true, "reload must apply the config: {r}");
+    // And it sticks for the next status read.
+    assert_eq!(
+        c.request("session.status", json!({}))
+            .await
+            .expect("status")["configured"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn reload_reports_an_invalid_config() {
+    let core = TestCore::start().await;
+    let mut c = spawn_component(
+        &core,
+        "gui-lite",
+        "custom",
+        &["session.read", "session.manage"],
+    )
+    .await;
+    // A half-filled config.json: the reason is surfaced, and the Core stays
+    // unconfigured rather than silently swallowing it.
+    core.stage_invalid_config("incomplete configuration: only server_url is set");
+    let err = c.request("session.reload", json!({})).await.unwrap_err();
+    assert_eq!(err.app_code(), "INVALID_CONFIG");
+    assert_eq!(
+        c.request("session.status", json!({}))
+            .await
+            .expect("status")["configured"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn reload_requires_session_manage() {
+    let core = TestCore::start().await;
+    let mut c = spawn_component(&core, "tray-official", "tray", &["session.read"]).await;
+    let err = c.request("session.reload", json!({})).await.unwrap_err();
+    assert_eq!(err.app_code(), "SCOPE_DENIED");
+}
+
+#[tokio::test]
 async fn revoked_core_drops_its_session() {
     let server = TestServer::start().await;
     let mut admin = server.online_device("PC-Admin", "macos").await;

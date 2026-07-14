@@ -59,7 +59,12 @@ pub(crate) enum Goal {
 /// authorization URL. Replaces the pending flow if there is one.
 pub(crate) async fn start_flow(state: &Arc<AppState>, goal: Goal) -> Result<String, RpcErr> {
     let unreachable = || RpcErr::app("SERVER_UNREACHABLE");
-    let Some(server) = state.server_config.clone() else {
+    let Some(server) = state
+        .server_config
+        .lock()
+        .expect("lock server_config")
+        .clone()
+    else {
         // Core never configured: there is nowhere to log in.
         return Err(unreachable());
     };
@@ -131,7 +136,12 @@ pub(crate) enum FreshToken {
 }
 
 pub(crate) async fn fresh_id_token(state: &AppState) -> FreshToken {
-    let Some(server) = state.server_config.clone() else {
+    let Some(server) = state
+        .server_config
+        .lock()
+        .expect("lock server_config")
+        .clone()
+    else {
         return FreshToken::Unreachable;
     };
     let Some(refresh) = state.secrets.get(crate::secrets::REFRESH_TOKEN) else {

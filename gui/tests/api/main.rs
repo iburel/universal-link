@@ -5,4 +5,5 @@ mod support;
 
 mod bridge;
 mod commands;
+mod config;
 mod full_stack;

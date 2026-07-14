@@ -50,6 +50,7 @@ impl TestDaemon {
             ipc_path: ipc_path_for(config_dir.path()),
             config_dir: config_dir.path().to_path_buf(),
             server: None,
+            reload_server: Arc::new(|| Ok::<_, String>(None)),
             device_name: "test-daemon".into(),
             secret_store: Arc::new(FileSecretStore::new(config_dir.path())),
             connector: Arc::new(PlainConnector),

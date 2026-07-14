@@ -20,7 +20,13 @@ import type {
   SessionState,
 } from "../lib/api";
 
-const LOGGED_OUT: SessionState = { logged_in: false, server_connected: false };
+// `configured: true` so the dev demo lands on the normal screens; flip it to
+// `false` to preview the first-run server-setup gate.
+const LOGGED_OUT: SessionState = {
+  logged_in: false,
+  server_connected: false,
+  configured: true,
+};
 
 const DEVICES: Device[] = [
   {
@@ -80,6 +86,14 @@ export function installFakeCore(): void {
     },
   ];
 
+  // The server config the setup screen reads/writes (dev only).
+  let serverConfig = {
+    server_url: "wss://demo.example/ws",
+    oidc_issuer: "https://accounts.google.com",
+    oidc_client_id: "demo.apps.googleusercontent.com",
+    oidc_client_secret: null as string | null,
+  };
+
   const changed = () => void emit("core:notification", {
     method: "session.changed",
     params: session,
@@ -95,6 +109,7 @@ export function installFakeCore(): void {
         session = {
           logged_in: true,
           server_connected: true,
+          configured: true,
           account: { email: "account@example.test" },
         };
         devices = DEVICES.map((d) => ({ ...d }));
@@ -108,6 +123,7 @@ export function installFakeCore(): void {
       changed();
       return {};
     },
+    "session.reload": () => session,
     "account.status": () => ({ attested, fingerprint }),
     "account.setup": () => {
       if (attested) throw rpc("ACCOUNT_KEY_SET");
@@ -192,6 +208,11 @@ export function installFakeCore(): void {
         window.open(args.url, "_blank", "noopener");
         return null;
       }
+      if (cmd === "set_server_config") {
+        serverConfig = { ...serverConfig, ...(payload as { config: typeof serverConfig }).config };
+        return null;
+      }
+      if (cmd === "get_server_config") return serverConfig;
       if (cmd === "core_request") {
         const { method, params } = payload as {
           method: string;

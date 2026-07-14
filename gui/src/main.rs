@@ -53,7 +53,7 @@ fn main() {
         request_timeout: Duration::from_secs(30),
     };
 
-    universallink_gui::shell(tauri::Builder::default(), config)
+    universallink_gui::shell(tauri::Builder::default(), config, endpoint.config_dir)
         .plugin(tauri_plugin_opener::init())
         .run(tauri::generate_context!())
         .expect("Tauri app startup");

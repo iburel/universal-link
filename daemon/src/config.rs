@@ -4,24 +4,20 @@
 //! What the daemon needs to know to talk to the deployment: the server URL and
 //! the IdP that authenticates it. Nothing secret (the OIDC client is public).
 //!
-//! Source: `config.json` in the config directory, written by the user — the
-//! daemon NEVER rewrites it. The `UNIVERSALLINK_*` environment variables
-//! override it, for development.
+//! Source: `config.json` in the config directory, written by the GUI's setup
+//! screen — the daemon only ever READS it, never rewrites it. The
+//! `UNIVERSALLINK_*` environment variables override it, for development.
+//! NOTHING is baked into the binary: a fresh install carries no server, and the
+//! GUI walks the user through configuring one, then has the Core re-read this
+//! file live (see `session.reload`). Precedence: env > `config.json`.
 //!
-//! A shipped binary additionally embeds a DEFAULT deployment
-//! (`baked_default_server`, frozen at compile time): with nothing configured,
-//! the Core reaches that server — this is what makes a downloaded installer
-//! "just work" without the user writing a single file. Precedence:
-//! env > `config.json` > baked default. Providing configuration (file OR env)
-//! takes over entirely; a PARTIAL configuration remains a fault — we never
-//! blend a half-setting with the default.
-//!
-//! Three states, and a single behavior: **the Core always starts**. With
-//! neither configuration NOR a baked default (e.g. in tests) it runs unlinked
-//! (`session.login` answers `SERVER_UNREACHABLE`), and that is exactly what is
-//! needed: the IPC is the only channel through which the GUI can tell the user
-//! what is wrong. Refusing to start would leave them staring at an eternal
-//! "Connecting to the Core…" screen.
+//! Two states, one behavior: **the Core always starts**. With nothing
+//! configured it runs unlinked (`session.login` answers `SERVER_UNREACHABLE`,
+//! and `session.status` reports `configured: false`) — exactly what is needed:
+//! the IPC is the only channel through which the GUI can tell the user what to
+//! do. Refusing to start would leave them staring at an eternal "Connecting to
+//! the Core…" screen. A PARTIAL configuration (some fields but not all three)
+//! stays a fault, surfaced as such — never silently ignored.
 
 use std::path::{Path, PathBuf};
 
@@ -62,43 +58,13 @@ pub struct DaemonConfig {
 }
 
 pub fn load(config_dir: &Path) -> DaemonConfig {
-    load_from(
-        config_dir,
-        &|key| std::env::var(key).ok(),
-        hostname,
-        baked_default_server(),
-    )
-}
-
-/// The deployment baked in at compile time, served when nothing is configured.
-/// Overridable at build time via `UNIVERSALLINK_DEFAULT_*` (the release
-/// workflow injects them from repository settings); otherwise, harmless
-/// placeholders — a fork won't reach the maintainer's server or Google project.
-fn baked_default_server() -> Option<ServerConfig> {
-    let url = option_env!("UNIVERSALLINK_DEFAULT_SERVER_URL")
-        .unwrap_or("wss://your-server.example.com/ws");
-    let oidc_issuer =
-        option_env!("UNIVERSALLINK_DEFAULT_OIDC_ISSUER").unwrap_or("https://accounts.google.com");
-    let oidc_client_id = option_env!("UNIVERSALLINK_DEFAULT_OIDC_CLIENT_ID")
-        .unwrap_or("your-client-id.apps.googleusercontent.com");
-    // Google requires the client_secret even in PKCE. No hardcoded fallback (a
-    // secret, even a "distributable" one): injected into the release build via
-    // the env, otherwise absent.
-    let oidc_client_secret =
-        option_env!("UNIVERSALLINK_DEFAULT_OIDC_CLIENT_SECRET").map(str::to_string);
-    Some(ServerConfig {
-        url: url.to_string(),
-        oidc_issuer: oidc_issuer.to_string(),
-        oidc_client_id: oidc_client_id.to_string(),
-        oidc_client_secret,
-    })
+    load_from(config_dir, &|key| std::env::var(key).ok(), hostname)
 }
 
 fn load_from(
     config_dir: &Path,
     env: &dyn Fn(&str) -> Option<String>,
     fallback_name: impl FnOnce() -> String,
-    default_server: Option<ServerConfig>,
 ) -> DaemonConfig {
     // File present but unreadable: the environment does not "repair" a broken
     // file, it overrides values. We give up on the server — but not on the
@@ -143,11 +109,10 @@ fn load_from(
 
     let server = match validate(&fields) {
         Ok(Some(server)) => Some(server),
-        // Nothing configured: we fall back to the baked deployment (None in
-        // tests / if no default was compiled in). A PARTIAL config, on the
-        // other hand, has already been rejected by `validate` as `Err` — so no
-        // blending.
-        Ok(None) => default_server,
+        // Nothing configured: the Core starts unlinked and the GUI offers its
+        // setup screen. A PARTIAL config, by contrast, was already rejected by
+        // `validate` as `Err` below.
+        Ok(None) => None,
         Err(reason) => {
             problem = Some(reason);
             None
@@ -325,19 +290,8 @@ mod tests {
         std::fs::write(dir.path().join("config.json"), text).expect("write config.json");
     }
 
-    // By default, NO baked deployment: the existing tests describe the pure
-    // config.json/env behavior. The default's tests pass it explicitly.
     fn load_with(dir: &tempfile::TempDir, vars: &[(&str, &str)]) -> DaemonConfig {
-        load_from(dir.path(), &env_of(vars), || "fallback-host".to_string(), None)
-    }
-
-    fn a_default() -> ServerConfig {
-        ServerConfig {
-            url: "wss://default.example/ws".to_string(),
-            oidc_issuer: "https://idp.default".to_string(),
-            oidc_client_id: "id-default".to_string(),
-            oidc_client_secret: None,
-        }
+        load_from(dir.path(), &env_of(vars), || "fallback-host".to_string())
     }
 
     const COMPLETE: &str = r#"{
@@ -438,46 +392,6 @@ mod tests {
         assert!(config.server.is_none());
         let problem = config.problem.expect("a half-setting must be visible");
         assert!(problem.contains("incomplete"), "{problem}");
-    }
-
-    #[test]
-    fn a_baked_default_configures_the_core_when_nothing_is_set() {
-        // The heart of "download the installer and it just works": nothing
-        // configured → the baked deployment serves, with no fault.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config = load_from(dir.path(), &env_of(&[]), || "h".into(), Some(a_default()));
-        let server = config.server.expect("the baked default configures the Core");
-        assert_eq!(server.url, "wss://default.example/ws");
-        assert_eq!(server.oidc_client_id, "id-default");
-        assert!(config.problem.is_none());
-    }
-
-    #[test]
-    fn config_json_overrides_the_baked_default() {
-        // The self-hoster takes over: a complete config wins.
-        let dir = tempfile::tempdir().expect("tempdir");
-        write(&dir, COMPLETE);
-        let config = load_from(dir.path(), &env_of(&[]), || "h".into(), Some(a_default()));
-        assert_eq!(config.server.expect("server").url, "wss://relay.example/ws");
-    }
-
-    #[test]
-    fn a_partial_override_does_not_mix_with_the_baked_default() {
-        // Choice: configuring PARTIALLY remains a fault, even with a baked
-        // default — we do not blend. Either the default deployment, or the
-        // three fields. Otherwise an env client_id would stick to the
-        // default's URL without the user intending it.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config = load_from(
-            dir.path(),
-            &env_of(&[("UNIVERSALLINK_OIDC_CLIENT_ID", "x")]),
-            || "h".into(),
-            Some(a_default()),
-        );
-        assert!(config.server.is_none());
-        assert!(
-            config.problem.expect("half config = fault").contains("incomplete")
-        );
     }
 
     #[test]
@@ -588,7 +502,7 @@ mod tests {
     #[test]
     fn the_receive_dir_defaults_to_downloads() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = load_from(dir.path(), &env_of(&[("HOME", "/home/u")]), || "h".into(), None);
+        let config = load_from(dir.path(), &env_of(&[("HOME", "/home/u")]), || "h".into());
         assert_eq!(
             config.receive_dir,
             PathBuf::from("/home/u/Downloads/UniversalLink")
@@ -598,7 +512,6 @@ mod tests {
             dir.path(),
             &env_of(&[("XDG_DOWNLOAD_DIR", "/data/dl"), ("HOME", "/home/u")]),
             || "h".into(),
-            None,
         );
         assert_eq!(config.receive_dir, PathBuf::from("/data/dl/UniversalLink"));
     }
@@ -607,7 +520,10 @@ mod tests {
     fn the_receive_dir_can_be_configured_and_overridden() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir, r#"{ "receive_dir": "/srv/received" }"#);
-        assert_eq!(load_with(&dir, &[]).receive_dir, PathBuf::from("/srv/received"));
+        assert_eq!(
+            load_with(&dir, &[]).receive_dir,
+            PathBuf::from("/srv/received")
+        );
         // The environment overrides, and an empty variable does not erase.
         let config = load_with(&dir, &[("UNIVERSALLINK_RECEIVE_DIR", "/other/received")]);
         assert_eq!(config.receive_dir, PathBuf::from("/other/received"));

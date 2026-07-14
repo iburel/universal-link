@@ -38,6 +38,14 @@ export interface SessionState {
   logged_in: boolean;
   server_connected: boolean;
   account?: Account;
+  /**
+   * Whether a server + OIDC is configured. Distinguishes "never configured"
+   * (→ first-run setup screen) from "configured but the server is down" (both
+   * otherwise read as `server_connected: false`). Present in `session.status`;
+   * ABSENT from `session.changed` deltas (the store resyncs after those, which
+   * re-reads it) — hence optional. See {@link Api.sessionReload}.
+   */
+  configured?: boolean;
 }
 
 /**
@@ -88,6 +96,12 @@ export const api = {
   /** The caller opens `auth_url`; completion arrives via `session.changed`. */
   sessionLogin: () => coreRequest<{ auth_url: string }>("session.login"),
   sessionLogout: () => coreRequest<unknown>("session.logout"),
+  /**
+   * Re-reads `config.json` (which the shell has just written via
+   * `setServerConfig`) and applies it in place — no restart. Returns the fresh
+   * `session.status`. `INVALID_CONFIG` if the file is malformed/half-filled.
+   */
+  sessionReload: () => coreRequest<SessionState>("session.reload"),
 
   /** Whether this device has joined the account vault, and under which fingerprint. */
   accountStatus: () => coreRequest<AccountKey>("account.status"),

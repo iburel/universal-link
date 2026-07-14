@@ -113,25 +113,12 @@ jobs:
         run: cargo install tauri-cli --version "^2.0" --locked
 
       # The Core, a separate binary, embedded as a sidecar. Release + --locked
-      # like the rest. The production defaults are baked into this binary at
-      # build time (see daemon/src/config.rs): the OIDC client secret and the
-      # default server URL are injected from repository settings (the source
-      # only carries placeholders).
+      # like the rest. NOTHING is baked in — no server URL, no OIDC client, no
+      # secret: the installer ships blank, and the user configures their
+      # deployment from the GUI's first-run setup screen (which writes
+      # config.json; the Core only reads it). This is deliberate — the released
+      # binaries must carry no credentials.
       - name: Build the Core (sidecar)
-        env:
-          # Google client secret — REQUIRED by Google at the OIDC exchange even
-          # with PKCE; not confidential for a "Desktop app" client (it ships
-          # with the app). Baked from a repository secret. Absent → build with
-          # no baked secret → Google login fails ("client_secret is missing").
-          UNIVERSALLINK_DEFAULT_OIDC_CLIENT_SECRET: ${{ secrets.GOOGLE_OIDC_CLIENT_SECRET }}
-          # Default server URL baked into the client. Not a secret, but kept out
-          # of the source tree: set as a repository variable. Absent → build
-          # falls back to the placeholder in config.rs.
-          UNIVERSALLINK_DEFAULT_SERVER_URL: ${{ vars.DEFAULT_SERVER_URL }}
-          # Default OIDC client_id baked into the client. Public (not a secret),
-          # but kept out of the source tree so a fork doesn't default to the
-          # maintainer's Google project: set as a repository variable.
-          UNIVERSALLINK_DEFAULT_OIDC_CLIENT_ID: ${{ vars.DEFAULT_OIDC_CLIENT_ID }}
         run: cargo build -p universallink-daemon --bin universallink-core --release --locked
 
       # Tauri expects the sidecar named with the target triple, next to the GUI.
@@ -177,4 +164,4 @@ jobs:
             - **Windows**: SmartScreen "Windows protected your PC" → "More info" → "Run anyway".
             - **Linux** (AppImage): `chmod +x UniversalLink_*.AppImage`, then run it. If it fails to start with a `libfuse.so.2` error, install FUSE 2 (`sudo apt install libfuse2`, or your distro's equivalent).
 
-            On first launch, the app installs the background service (per-user, no admin) and connects to the configured UniversalLink server.
+            On first launch, the app installs the background service (per-user, no admin) and opens a setup screen: enter your UniversalLink server address and its OpenID Connect client (nothing is baked into the build). It then connects.

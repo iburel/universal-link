@@ -65,7 +65,7 @@ async fn run() -> anyhow::Result<Outcome> {
         // can tell the user what is wrong.
         tracing::error!(%problem, "unusable configuration: Core started unconfigured");
     } else if settings.server.is_none() {
-        tracing::warn!("Core not configured: write config.json in the config directory");
+        tracing::info!("Core not configured yet: the GUI's setup screen will write config.json");
     }
 
     let secrets = secrets::build(&endpoint.config_dir);
@@ -84,10 +84,26 @@ async fn run() -> anyhow::Result<Outcome> {
         settings.relay_url,
     ));
 
+    // How the Core re-reads its config on `session.reload` (once the GUI has
+    // written config.json): the SAME parse as startup — env still overrides,
+    // and a half-filled file surfaces its reason rather than reverting to
+    // unconfigured. The daemon owns this parsing; the Core only calls back in.
+    let reload_dir = endpoint.config_dir.clone();
+    let reload_server: Arc<
+        dyn Fn() -> Result<Option<universallink_core::ServerConfig>, String> + Send + Sync,
+    > = Arc::new(move || {
+        let parsed = config::load(&reload_dir);
+        match parsed.problem {
+            Some(problem) => Err(problem),
+            None => Ok(parsed.server),
+        }
+    });
+
     let core = universallink_core::spawn(universallink_core::Config {
         ipc_path: endpoint.ipc_path.clone(),
         config_dir: endpoint.config_dir.clone(),
         server: settings.server,
+        reload_server,
         device_name: settings.device_name,
         secret_store: secrets.store(),
         connector,

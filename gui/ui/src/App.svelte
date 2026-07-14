@@ -10,8 +10,9 @@
   import Approvals from "./views/Approvals.svelte";
   import Devices from "./views/Devices.svelte";
   import Onboarding from "./views/Onboarding.svelte";
+  import ServerSetup from "./views/ServerSetup.svelte";
 
-  type View = "account" | "devices" | "approvals";
+  type View = "account" | "devices" | "approvals" | "settings";
 
   let { store }: { store: CoreStore } = $props();
   let view = $state<View>("account");
@@ -34,6 +35,14 @@
   );
   // The Core was reachable, then no longer is: what is shown is frozen.
   const stale = $derived(store.primed && store.connection.status !== "connected");
+
+  // Fresh install: the Core has no server configured. Block on the setup screen
+  // BEFORE login is possible (you cannot sign in nowhere). `configured === false`
+  // and not merely falsy: an old Core (no such field) must not be pushed into
+  // setup, and a session.changed delta (no field) must not flicker it on.
+  const needsServerSetup = $derived(
+    store.primed && store.session?.configured === false,
+  );
 
   // Blocking portal: once connected to the account, until this device has
   // joined the vault (C7 attestation), nothing else is accessible — a send
@@ -61,6 +70,8 @@
       this interface speaks version 1. Please update UniversalLink.
     </p>
   </div>
+{:else if needsServerSetup}
+  <ServerSetup {store} firstRun />
 {:else if needsOnboarding}
   <Onboarding {store} />
 {:else}
@@ -89,6 +100,11 @@
           <span class="badge">{store.pending.length}</span>
         {/if}
       </button>
+      <button
+        class:active={view === "settings"}
+        aria-current={view === "settings" ? "page" : undefined}
+        onclick={() => (view = "settings")}>Server</button
+      >
     </nav>
 
     <main>
@@ -112,8 +128,10 @@
         <Account {store} />
       {:else if view === "devices"}
         <Devices {store} />
-      {:else}
+      {:else if view === "approvals"}
         <Approvals {store} />
+      {:else}
+        <ServerSetup {store} />
       {/if}
     </main>
   </div>

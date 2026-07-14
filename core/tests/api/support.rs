@@ -407,6 +407,11 @@ pub struct TestCore {
     /// restarted Core keeps its memory switchboard, hence its peers (otherwise a
     /// "reconnection then re-ping" scenario would be inexpressible here).
     transport: Arc<dyn universallink_core::PeerTransport>,
+    /// The config `session.reload` re-reads: a shared slot standing in for
+    /// `config.json`, so a test can reconfigure the Core the way the GUI does
+    /// (see `stage_config` / `stage_invalid_config`). `Err` models a
+    /// malformed/half-filled file.
+    reload_slot: Arc<std::sync::Mutex<Result<Option<universallink_core::ServerConfig>, String>>>,
 }
 
 /// The server+OIDC config of a Core pointed at the test environment.
@@ -475,6 +480,9 @@ impl TestCore {
             enrolled,
             server_cfg,
             transport,
+            // A fresh Core re-seeds its reload slot from `server_cfg`; no test
+            // stages a config across a restart.
+            reload_slot: _,
         } = self;
         drop(handle);
         Self::spawn_in(dir, enrolled, server_cfg, Some(transport)).await
@@ -590,10 +598,20 @@ impl TestCore {
                 MemorySwitchboard::new().endpoint(node_id, None);
             lone
         });
+        // The reload source is a shared slot, seeded with the initial config: a
+        // test can rewrite it (as the GUI rewrites config.json) then trigger
+        // `session.reload` — see `stage_config` / `stage_invalid_config`.
+        // Existing tests never touch it, so a reload just re-serves the same
+        // config.
+        let reload_slot = Arc::new(std::sync::Mutex::new(Ok(server_cfg.clone())));
         let config = Config {
             ipc_path: ipc_path_for(dir.path()),
             config_dir: dir.path().to_path_buf(),
             server: server_cfg.clone(),
+            reload_server: {
+                let slot = reload_slot.clone();
+                Arc::new(move || slot.lock().expect("reload slot").clone())
+            },
             device_name: CORE_DEVICE_NAME.into(),
             // The file fallback — it is also what the harness inspects
             // (`secret`).
@@ -617,7 +635,20 @@ impl TestCore {
             enrolled,
             server_cfg,
             transport,
+            reload_slot,
         }
+    }
+
+    /// Rewrites the config that `session.reload` will pick up — the harness
+    /// equivalent of the GUI writing a fresh `config.json`.
+    pub fn stage_config(&self, cfg: Option<universallink_core::ServerConfig>) {
+        *self.reload_slot.lock().expect("reload slot") = Ok(cfg);
+    }
+
+    /// Models a malformed / half-filled `config.json`: `session.reload` will
+    /// surface `reason` as `INVALID_CONFIG` rather than reconfigure.
+    pub fn stage_invalid_config(&self, reason: &str) {
+        *self.reload_slot.lock().expect("reload slot") = Err(reason.to_string());
     }
 
     /// device_id of the Core in the directory (panics outside `start_enrolled`).
@@ -681,6 +712,10 @@ impl TestCore {
             ipc_path: self.handle.ipc_path().to_path_buf(),
             config_dir: self.dir.path().to_path_buf(),
             server: self.server_cfg.clone(),
+            reload_server: {
+                let s = self.server_cfg.clone();
+                Arc::new(move || Ok::<_, String>(s.clone()))
+            },
             device_name: CORE_DEVICE_NAME.into(),
             secret_store: Arc::new(universallink_core::FileSecretStore::new(self.dir.path())),
             connector: Arc::new(universallink_core::PlainConnector),

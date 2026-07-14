@@ -67,7 +67,7 @@ only through these two paths, never via the prompt.
 | Scope | Grants access to |
 |---|---|
 | `session.read` | `session.status`, `account.status`, the `session` topic |
-| `session.manage` | `session.login`, `session.logout`, `account.setup`, `account.join` |
+| `session.manage` | `session.login`, `session.logout`, `session.reload`, `account.setup`, `account.join` |
 | `devices.read` | `devices.list`, the `devices` topic |
 | `devices.manage` | `devices.rename`, `devices.revoke` |
 | `files.send` | `files.send`, `files.cancel` (any transfer, outgoing or incoming — components are the user's trusted agents; the `transfer_id` is random, non-enumerable) |
@@ -95,11 +95,12 @@ Topics filtered by scopes. Notifications are named (below, by namespace). After 
 
 | Method | Description |
 |---|---|
-| `session.status {}` | → `{ logged_in, server_connected, account? }` |
+| `session.status {}` | → `{ logged_in, server_connected, account?, configured }`. `configured`: whether a server + OIDC is set — distinguishes "never configured" (→ first-run setup) from "configured but the server is down" |
 | `session.login {}` | starts the OIDC flow (PKCE + loopback) → `{ auth_url }`. **The caller** opens the browser — the Core does not touch the UI. Completion signaled by `session.changed` |
 | `session.logout {}` | closes the server session |
+| `session.reload {}` | re-reads `config.json` (which the GUI's setup screen has just written) and swaps the server config in place — no restart. → the fresh `session.status`. `INVALID_CONFIG` if the file is malformed / half-filled. The Core only READS the file; the GUI is its sole writer |
 
-Notification: `session.changed { logged_in, server_connected, account? }`.
+Notification: `session.changed { logged_in, server_connected, account? }` — note it carries NO `configured` (a caller that needs it re-reads `session.status`, which a session change prompts anyway).
 
 ## `account.*` (account key, C7)
 
@@ -256,6 +257,7 @@ Standard JSON-RPC codes + application codes in `error.data.code`:
 | `SCOPE_DENIED` | scope missing for the method or the topic |
 | `ROLE_CONFLICT` | exclusive role already taken (`clipboard-backend`) |
 | `ALREADY_LOGGED_IN` | `session.login` while a session is open (re-logging in starts with `session.logout`) |
+| `INVALID_CONFIG` | `session.reload` on a malformed / half-filled `config.json` (the message carries the reason) |
 | `SERVER_UNREACHABLE` | operation requiring the server, offline |
 | `DEVICE_UNKNOWN` / `DEVICE_OFFLINE` | target unknown / unreachable |
 | `TRANSFER_UNKNOWN` | unknown `transfer_id` |

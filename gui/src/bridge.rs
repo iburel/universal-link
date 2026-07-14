@@ -4,6 +4,7 @@
 //! The bridge: a task that lives with the app, consumes events from the IPC
 //! client and pushes them to the webview; two commands, one snapshot.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use serde_json::{Value, json};
@@ -18,19 +19,33 @@ struct CoreState {
     /// Latest connection snapshot, updated BEFORE the event is emitted:
     /// subscribing then reading the snapshot never misses a state.
     connection: Mutex<Value>,
+    /// The Core's config directory: where the setup screen writes `config.json`
+    /// (`set_server_config`). The Core only ever READS it — the GUI is the sole
+    /// writer, which is why this lives here and not behind the IPC.
+    config_dir: PathBuf,
 }
 
 /// Attaches the Core bridge to a Tauri builder (real or MockRuntime): the
 /// state, the commands, and an internal plugin whose setup starts the bridge
 /// loop. A plugin, because its setup runs at `build()` (MockRuntime included)
 /// — whereas the `Builder`'s own setup only runs at `run()`.
-pub fn shell<R: Runtime>(builder: Builder<R>, config: ClientConfig) -> Builder<R> {
+pub fn shell<R: Runtime>(
+    builder: Builder<R>,
+    config: ClientConfig,
+    config_dir: PathBuf,
+) -> Builder<R> {
     builder
         .manage(CoreState {
             client: OnceLock::new(),
             connection: Mutex::new(json!({ "status": "connecting" })),
+            config_dir,
         })
-        .invoke_handler(tauri::generate_handler![core_request, connection_status])
+        .invoke_handler(tauri::generate_handler![
+            core_request,
+            connection_status,
+            set_server_config,
+            get_server_config
+        ])
         .plugin(
             tauri::plugin::Builder::<R, ()>::new("universallink-bridge")
                 .setup(move |app, _api| {
@@ -146,6 +161,96 @@ fn connection_status(state: State<'_, CoreState>) -> Value {
     state.connection.lock().expect("snapshot lock").clone()
 }
 
+/// The server + OIDC fields the setup screen collects — the subset of the
+/// Core's `ServerConfig` the user provides (the daemon derives the rest). The
+/// Core re-validates on reload; here we only shuttle strings to/from
+/// `config.json`.
+#[derive(serde::Deserialize, serde::Serialize, Default)]
+struct ServerConfigForm {
+    server_url: String,
+    oidc_issuer: String,
+    oidc_client_id: String,
+    /// Optional: only Google (and the like) needs it; a conformant PKCE IdP has
+    /// none. An empty string is treated as "none".
+    #[serde(default)]
+    oidc_client_secret: Option<String>,
+}
+
+/// Writes the setup screen's fields into `config.json`, then the frontend calls
+/// `session.reload` so the Core picks them up. MERGES: the daemon's own keys
+/// (`device_name`, `receive_dir`, `relay_url`) are preserved. The Core never
+/// writes this file — the GUI is the sole writer.
+#[tauri::command]
+fn set_server_config(state: State<'_, CoreState>, config: ServerConfigForm) -> Result<(), String> {
+    write_server_config(&state.config_dir, &config).map_err(|e| e.to_string())
+}
+
+/// The server fields currently in `config.json`, to pre-fill the setup screen
+/// (empty if the file is absent/unreadable). Local app, local file: the secret
+/// round-trips so an edit does not force the user to re-type it.
+#[tauri::command]
+fn get_server_config(state: State<'_, CoreState>) -> ServerConfigForm {
+    read_server_config(&state.config_dir).unwrap_or_default()
+}
+
+fn config_json_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("config.json")
+}
+
+fn read_server_config(config_dir: &Path) -> Option<ServerConfigForm> {
+    let text = std::fs::read_to_string(config_json_path(config_dir)).ok()?;
+    let obj = serde_json::from_str::<serde_json::Map<String, Value>>(&text).ok()?;
+    let get = |key: &str| obj.get(key).and_then(Value::as_str).map(str::to_string);
+    Some(ServerConfigForm {
+        server_url: get("server_url").unwrap_or_default(),
+        oidc_issuer: get("oidc_issuer").unwrap_or_default(),
+        oidc_client_id: get("oidc_client_id").unwrap_or_default(),
+        oidc_client_secret: get("oidc_client_secret"),
+    })
+}
+
+fn write_server_config(config_dir: &Path, form: &ServerConfigForm) -> std::io::Result<()> {
+    let path = config_json_path(config_dir);
+    // Merge into whatever is already there so keys the GUI does not own survive.
+    let mut obj = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Map<String, Value>>(&t).ok())
+        .unwrap_or_default();
+    // A trimmed-empty value clears its key rather than writing `""` (which the
+    // daemon would reject / an empty secret must mean "no secret").
+    let mut set = |key: &str, value: &str| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            obj.remove(key);
+        } else {
+            obj.insert(key.to_string(), Value::from(trimmed));
+        }
+    };
+    set("server_url", &form.server_url);
+    set("oidc_issuer", &form.oidc_issuer);
+    set("oidc_client_id", &form.oidc_client_id);
+    set(
+        "oidc_client_secret",
+        form.oidc_client_secret.as_deref().unwrap_or(""),
+    );
+    // `set` is not used past here, so its borrow of `obj` ends: we can move it.
+    write_private(&path, &Value::Object(obj).to_string())
+}
+
+/// Atomic, private write (0600 on Unix — the file may hold the OIDC secret):
+/// a temporary sibling then a rename over the target, so a crash mid-write
+/// never leaves a truncated `config.json`.
+fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    let tmp = path.with_file_name("config.json.new");
+    std::fs::write(&tmp, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
 #[cfg(test)]
 mod tests {
     use universallink_ipc_client::RpcError;
@@ -228,6 +333,7 @@ mod tests {
             .manage(CoreState {
                 client: OnceLock::new(),
                 connection: Mutex::new(json!({ "status": "connecting" })),
+                config_dir: PathBuf::new(),
             })
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .expect("app mock");

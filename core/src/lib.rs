@@ -53,7 +53,9 @@ pub struct ServerConfig {
     pub oidc_client_secret: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+// No `Debug`: `reload_server` is a closure (not `Debug`), and nothing prints a
+// `Config` — it is an input, built once and handed to `spawn`.
+#[derive(Clone)]
 pub struct Config {
     /// IPC listening point — unix: the UDS socket path; windows: the full name
     /// of the named pipe (`\\.\pipe\…`).
@@ -65,6 +67,10 @@ pub struct Config {
     /// `SERVER_UNREACHABLE` (an existing session, by contrast, carries its own
     /// URL).
     pub server: Option<ServerConfig>,
+    /// Re-reads the persisted config on demand, for `session.reload`: `Ok(None)`
+    /// = nothing configured, `Err` = a human reason it is unusable. The daemon
+    /// supplies it (it owns `config.json` parsing); tests pass a trivial one.
+    pub reload_server: Arc<dyn Fn() -> Result<Option<ServerConfig>, String> + Send + Sync>,
     /// The device's name in the directory, chosen at enrollment (the binary
     /// will pass the hostname).
     pub device_name: String,
@@ -261,7 +267,8 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
         login: Mutex::new(None),
         config_dir: config.config_dir,
         identity: device_identity,
-        server_config: config.server,
+        server_config: Mutex::new(config.server),
+        reload_server: config.reload_server,
         device_name: config.device_name,
         secrets: config.secret_store,
         connector: config.connector,

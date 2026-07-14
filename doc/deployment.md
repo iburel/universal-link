@@ -35,7 +35,8 @@ The Windows pipe name carries the domain **and** the user name: a local account
 
 The config folder houses:
 
-- `config.json` — written by the user, never by the Core (see below);
+- `config.json` — written by the GUI's setup screen (or by hand), never by the
+  Core (see below);
 - `ipc-token` (0600) — the GUI's root of trust, **regenerated at every startup**;
 - `device.key` (0600) — the device's Ed25519 seed, generated at first startup.
   This is the iroh identity, and it precedes the login;
@@ -55,15 +56,23 @@ The config folder houses:
   "server_url": "wss://relais.example/ws",
   "oidc_issuer": "https://accounts.google.com",
   "oidc_client_id": "…apps.googleusercontent.com",
+  "oidc_client_secret": "only-if-your-idp-requires-one",
   "device_name": "Living-room laptop",
   "relay_url": "https://relais-iroh.example",
   "receive_dir": "/home/iwan/Received"
 }
 ```
 
-No secret: the OIDC client is public (PKCE, no client secret). `device_name` is
-optional — without it, the hostname. It is only a display label: the device's
-identity is its public key.
+**Nothing is baked into the binary**: a fresh install carries no server. The GUI's
+first-run setup screen collects `server_url` / `oidc_issuer` / `oidc_client_id`
+(+ the optional secret), writes this file, and calls `session.reload` so the Core
+applies it live — no restart. `config.json` can also be written by hand.
+
+`oidc_client_secret` is optional: a conformant PKCE IdP has none, but Google
+requires it at the token exchange even under PKCE (it is not confidential for a
+"Desktop app" OAuth client — it ships with the app). `device_name` is optional —
+without it, the hostname. It is only a display label: the device's identity is
+its public key.
 
 `relay_url` is optional: the deployment's iroh relay, for whoever also self-hosts
 their relay ([`iroh-relay`]) — without it, the n0 public relays. A sovereign
