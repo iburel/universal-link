@@ -112,6 +112,8 @@ fn classify(event: Option<Event>) -> Step {
             Step::Status(params)
         }
         Some(Event::Notification { .. }) => Step::Idle,
+        // The tray serves no Core→component method (empty served_methods).
+        Some(Event::Request { .. }) => Step::Idle,
         Some(Event::Disconnected) => Step::Exit(Outcome::ConnectionLost),
         Some(Event::Incompatible { .. }) => Step::Exit(Outcome::Incompatible),
         None => Step::Exit(Outcome::ClientEnded),

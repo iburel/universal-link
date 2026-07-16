@@ -192,6 +192,7 @@ pub fn gui_config(core: &TestCore) -> ClientConfig {
             .iter()
             .map(|s| s.to_string())
             .collect(),
+        served_methods: vec![],
         reconnect_base_delay: Duration::from_millis(25),
         request_timeout: RESPONSE_TIMEOUT,
     }

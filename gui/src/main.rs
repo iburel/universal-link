@@ -53,6 +53,7 @@ fn main() {
             .iter()
             .map(|s| s.to_string())
             .collect(),
+        served_methods: vec![],
         reconnect_base_delay: Duration::from_secs(1),
         request_timeout: Duration::from_secs(30),
     };

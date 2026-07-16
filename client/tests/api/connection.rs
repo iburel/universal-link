@@ -238,6 +238,7 @@ pub fn client_config_at(path: std::path::PathBuf) -> universallink_ipc_client::C
         role: "gui".into(),
         scopes: vec!["session.read".into()],
         topics: vec![],
+        served_methods: vec![],
         reconnect_base_delay: std::time::Duration::from_millis(25),
         request_timeout: RESPONSE_TIMEOUT,
     }

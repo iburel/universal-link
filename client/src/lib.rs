@@ -15,8 +15,10 @@
 //! while offline, requests fail immediately, and the state shown by the
 //! consumer must follow the connection events.
 
+mod channel;
 mod conn;
 mod framing;
+mod transport;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -24,6 +26,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+pub use channel::{ChannelError, ConsumerChannel, ErrorCode, ProviderChannel};
 pub use conn::Client;
 
 /// Major version of the IPC API this crate implements. A Core announcing
@@ -56,6 +59,13 @@ pub struct ClientConfig {
     /// `events.subscribe` topics, subscribed on every (re)connection before
     /// `Event::Connected`. Empty: no subscription.
     pub topics: Vec<String>,
+    /// Core→component request methods this component serves (e.g.
+    /// `clipboard.get_data` for the clipboard backend). A served method is
+    /// surfaced as [`Event::Request`], to be answered with [`Client::respond`]
+    /// / [`Client::respond_error`]. Any method NOT in this list is refused with
+    /// `-32601` automatically — so an empty list (the default) is the pure
+    /// client behavior the tray and GUI rely on.
+    pub served_methods: Vec<String>,
     /// Base of the exponential reconnection backoff — doubled on each failure,
     /// capped at 60 s, reset to the base after a successful establishment.
     pub reconnect_base_delay: Duration,
@@ -76,8 +86,29 @@ pub enum Event {
     Disconnected,
     /// Core notification, relayed as-is.
     Notification { method: String, params: Value },
+    /// A Core→component request whose method is in `served_methods`. Answer it
+    /// with [`Client::respond`] / [`Client::respond_error`], passing `id` back
+    /// verbatim. Responding is free-standing (it need not be immediate): the
+    /// clipboard backend replies to `clipboard.get_data` only after streaming
+    /// the blob over a provider channel.
+    Request {
+        id: RequestId,
+        method: String,
+        params: Value,
+    },
     /// The Core speaks a different major version: permanent client shutdown.
     Incompatible { api_version: u64 },
+}
+
+/// Opaque handle to an incoming request, carried from [`Event::Request`] to
+/// [`Client::respond`]. It is bound to the connection that delivered the
+/// request: responding after that connection dropped (and reconnected) fails
+/// with [`RequestError::Disconnected`] rather than sending a stale id onto a
+/// fresh connection.
+#[derive(Clone, Debug)]
+pub struct RequestId {
+    pub(crate) generation: u64,
+    pub(crate) id: Value,
 }
 
 /// JSON-RPC error relayed as-is.

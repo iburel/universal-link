@@ -101,6 +101,8 @@ fn connection_snapshot(event: &Event) -> Option<Value> {
             "api_version": api_version,
         })),
         Event::Notification { .. } => None,
+        // The GUI serves no Core→component method (empty served_methods).
+        Event::Request { .. } => None,
     }
 }
 
