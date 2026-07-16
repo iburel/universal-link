@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
 
-//! The system-tray component: skeleton and contract with the Core.
+//! The system-tray component: the async brain and its testable pieces.
 //!
 //! A supervised component must (see `daemon/src/supervisor.rs`, "Contract of a
 //! supervised component"): find the Core at `UNIVERSALLINK_IPC_PATH`, read its
@@ -10,57 +10,154 @@
 //! the spawn token is single-use, so a reconnection would fail; exiting lets
 //! the supervisor restart us with a fresh token.
 //!
-//! Everything I/O lives in `main`; this module holds only the event loop and
-//! its exit conditions, so the contract is tested deterministically against a
-//! synthetic event stream — no real Core needed.
+//! The platform tray (event loop, icon, menu) lives in `main`; this module
+//! holds the async brain and the pure helpers it uses, so the exit conditions
+//! (the contract) and the status mapping are unit-tested without a real Core.
 
 use std::future::Future;
 
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use universallink_ipc_client::Event;
+use universallink_ipc_client::{Client, Event};
 
-/// Why the tray's event loop ended — and, in `main`, how we exit.
+/// Why the brain's loop ended — mapped by `main` to a process exit code.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     /// Standard input closed: the supervisor asked us to stop. The only
     /// graceful-stop channel that exists on all three OSes. Exit success.
     StdinClosed,
     /// The IPC connection dropped after having been established. The spawn
-    /// token is single-use — we cannot reconnect, so we exit and the supervisor
-    /// restarts us with a fresh one.
+    /// token is single-use — we exit and the supervisor restarts us with a
+    /// fresh one.
     ConnectionLost,
     /// The Core announced an incompatible API version: retrying will not heal
-    /// it. We exit; a version match is a deployment concern.
+    /// it. Exit.
     Incompatible,
-    /// The client task ended on its own (no `Client` left / permanent stop).
+    /// The client task ended on its own (no `Client` left).
     ClientEnded,
 }
 
-/// Drives the tray until it must stop. Consumes the Core's `events` and the
-/// `stdin_closed` signal (standard-input EOF).
+/// A command from the tray UI (a menu click) to the async brain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiCommand {
+    /// "Open UniversalLink" — bring up the GUI (wired in a later block).
+    Open,
+    /// "Quit" — stop the whole Core (its teardown then closes our stdin).
+    Quit,
+}
+
+/// What the icon reflects. Minimal profile: one icon, a tooltip string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayStatus {
+    Connecting,
+    NotConfigured,
+    SignedOut,
+    Offline,
+    Online,
+}
+
+impl TrayStatus {
+    /// Tooltip shown on hover.
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            TrayStatus::Connecting => "UniversalLink — connecting…",
+            TrayStatus::NotConfigured => "UniversalLink — not set up",
+            TrayStatus::SignedOut => "UniversalLink — signed out",
+            TrayStatus::Offline => "UniversalLink — offline",
+            TrayStatus::Online => "UniversalLink — connected",
+        }
+    }
+
+    /// Derives the status from a `session.status` result or a `session.changed`
+    /// payload. `session.changed` omits `configured` — a live session implies a
+    /// configured Core, so its absence means "assume configured".
+    fn from_session(v: &Value) -> TrayStatus {
+        let configured = v["configured"].as_bool().unwrap_or(true);
+        let logged_in = v["logged_in"].as_bool().unwrap_or(false);
+        let server_connected = v["server_connected"].as_bool().unwrap_or(false);
+        if !configured {
+            TrayStatus::NotConfigured
+        } else if server_connected {
+            TrayStatus::Online
+        } else if logged_in {
+            TrayStatus::Offline
+        } else {
+            TrayStatus::SignedOut
+        }
+    }
+}
+
+/// One step of the loop, derived from an IPC event. Pure, so the exit
+/// conditions — the supervised-component contract — are unit-tested.
+enum Step {
+    /// Connection established: fetch the initial `session.status`.
+    Connected,
+    /// A `session.changed` payload to reflect.
+    Status(Value),
+    /// A connected-but-uninteresting notification: nothing to do.
+    Idle,
+    /// The loop must end.
+    Exit(Outcome),
+}
+
+fn classify(event: Option<Event>) -> Step {
+    match event {
+        Some(Event::Connected { .. }) => Step::Connected,
+        Some(Event::Notification { method, params }) if method == "session.changed" => {
+            Step::Status(params)
+        }
+        Some(Event::Notification { .. }) => Step::Idle,
+        Some(Event::Disconnected) => Step::Exit(Outcome::ConnectionLost),
+        Some(Event::Incompatible { .. }) => Step::Exit(Outcome::Incompatible),
+        None => Step::Exit(Outcome::ClientEnded),
+    }
+}
+
+/// The async brain: consumes the Core's `events`, the standard-input EOF signal
+/// and the UI `commands`; reports status through `on_status`. Returns why it
+/// ended.
 ///
-/// Later building blocks react to `Connected` / `Notification` here (draw the
-/// icon, reflect `session.status`); today the skeleton only needs the stop
-/// conditions right.
+/// UI-agnostic on purpose (`on_status` is a plain closure, no windowing type),
+/// so `main` bridges it to the tao event loop while the tests keep the pure
+/// pieces (`classify`, `TrayStatus::from_session`) verifiable without a Core.
 pub async fn run(
+    client: Client,
     mut events: mpsc::Receiver<Event>,
     stdin_closed: impl Future<Output = ()>,
+    mut commands: mpsc::Receiver<UiCommand>,
+    on_status: impl Fn(TrayStatus),
 ) -> Outcome {
     tokio::pin!(stdin_closed);
+    on_status(TrayStatus::Connecting);
     loop {
         tokio::select! {
             _ = &mut stdin_closed => return Outcome::StdinClosed,
-            event = events.recv() => match event {
-                // The connection is up. Brick 3+: (re)draw the icon and read
-                // session.status; the spawn token is now consumed, so any later
-                // loss is terminal.
-                Some(Event::Connected { .. }) => {}
-                // Brick 4+: reflect session / device / transfer changes.
-                Some(Event::Notification { .. }) => {}
-                Some(Event::Disconnected) => return Outcome::ConnectionLost,
-                Some(Event::Incompatible { .. }) => return Outcome::Incompatible,
+            command = commands.recv() => match command {
+                // The UI is gone (its sender dropped): nothing left to serve.
                 None => return Outcome::ClientEnded,
-            }
+                Some(UiCommand::Quit) => {
+                    // Ask the Core to stop the whole service. Its orderly
+                    // teardown closes our standard input, and the StdinClosed
+                    // branch exits us — the supervisor stops us gracefully
+                    // rather than seeing a self-exit it would restart. Offline,
+                    // this is a no-op (there is nothing to talk to).
+                    let _ = client.request("system.shutdown", json!({})).await;
+                }
+                // Later block: launch the GUI.
+                Some(UiCommand::Open) => {}
+            },
+            event = events.recv() => match classify(event) {
+                Step::Connected => {
+                    // session.changed only fires on a CHANGE, so the current
+                    // state is fetched once on connection.
+                    if let Ok(status) = client.request("session.status", json!({})).await {
+                        on_status(TrayStatus::from_session(&status));
+                    }
+                }
+                Step::Status(payload) => on_status(TrayStatus::from_session(&payload)),
+                Step::Idle => {}
+                Step::Exit(outcome) => return outcome,
+            },
         }
     }
 }
@@ -69,55 +166,77 @@ pub async fn run(
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn stdin_eof_stops_gracefully() {
-        // The events channel stays open (`_tx` held) so `recv` pends and the
-        // only ready branch is the closed standard input.
-        let (_tx, rx) = mpsc::channel::<Event>(8);
-        let outcome = run(rx, std::future::ready(())).await;
-        assert_eq!(outcome, Outcome::StdinClosed);
+    #[test]
+    fn classify_maps_events_to_steps() {
+        assert!(matches!(
+            classify(Some(Event::Connected {
+                granted_scopes: vec![],
+                api_version: 1
+            })),
+            Step::Connected
+        ));
+        assert!(matches!(
+            classify(Some(Event::Notification {
+                method: "session.changed".into(),
+                params: json!({ "logged_in": true }),
+            })),
+            Step::Status(_)
+        ));
+        assert!(matches!(
+            classify(Some(Event::Notification {
+                method: "device.online".into(),
+                params: Value::Null,
+            })),
+            Step::Idle
+        ));
+        // The exit conditions of the supervised-component contract.
+        assert!(matches!(
+            classify(Some(Event::Disconnected)),
+            Step::Exit(Outcome::ConnectionLost)
+        ));
+        assert!(matches!(
+            classify(Some(Event::Incompatible { api_version: 2 })),
+            Step::Exit(Outcome::Incompatible)
+        ));
+        assert!(matches!(classify(None), Step::Exit(Outcome::ClientEnded)));
     }
 
-    #[tokio::test]
-    async fn a_lost_connection_makes_us_exit() {
-        let (tx, rx) = mpsc::channel::<Event>(8);
-        tx.send(Event::Connected {
-            granted_scopes: vec!["session.read".into()],
-            api_version: 1,
-        })
-        .await
-        .unwrap();
-        tx.send(Event::Disconnected).await.unwrap();
-        // Standard input never closes: the loss is what stops us.
-        let outcome = run(rx, std::future::pending::<()>()).await;
-        assert_eq!(outcome, Outcome::ConnectionLost);
+    #[test]
+    fn status_reflects_the_session_fields() {
+        let status = |v| TrayStatus::from_session(&v);
+        assert_eq!(
+            status(json!({ "configured": false, "logged_in": false, "server_connected": false })),
+            TrayStatus::NotConfigured
+        );
+        assert_eq!(
+            status(json!({ "configured": true, "logged_in": false, "server_connected": false })),
+            TrayStatus::SignedOut
+        );
+        assert_eq!(
+            status(json!({ "configured": true, "logged_in": true, "server_connected": false })),
+            TrayStatus::Offline
+        );
+        assert_eq!(
+            status(json!({ "configured": true, "logged_in": true, "server_connected": true })),
+            TrayStatus::Online
+        );
+        // session.changed omits `configured`: a live session implies configured.
+        assert_eq!(
+            status(json!({ "logged_in": true, "server_connected": true })),
+            TrayStatus::Online
+        );
     }
 
-    #[tokio::test]
-    async fn notifications_do_not_stop_us() {
-        let (tx, rx) = mpsc::channel::<Event>(8);
-        tx.send(Event::Connected {
-            granted_scopes: vec![],
-            api_version: 1,
-        })
-        .await
-        .unwrap();
-        tx.send(Event::Notification {
-            method: "session.changed".into(),
-            params: serde_json::Value::Null,
-        })
-        .await
-        .unwrap();
-        tx.send(Event::Disconnected).await.unwrap();
-        let outcome = run(rx, std::future::pending::<()>()).await;
-        assert_eq!(outcome, Outcome::ConnectionLost);
-    }
-
-    #[tokio::test]
-    async fn the_client_ending_stops_us() {
-        let (tx, rx) = mpsc::channel::<Event>(8);
-        drop(tx); // no Client left: the channel closes.
-        let outcome = run(rx, std::future::pending::<()>()).await;
-        assert_eq!(outcome, Outcome::ClientEnded);
+    #[test]
+    fn every_status_has_a_tooltip() {
+        for status in [
+            TrayStatus::Connecting,
+            TrayStatus::NotConfigured,
+            TrayStatus::SignedOut,
+            TrayStatus::Offline,
+            TrayStatus::Online,
+        ] {
+            assert!(status.tooltip().contains("UniversalLink"));
+        }
     }
 }

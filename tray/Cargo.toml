@@ -25,6 +25,15 @@ name = "universallink-tray"
 path = "src/main.rs"
 
 [dependencies]
+# Decodes the embedded tray icon (8-bit RGBA PNG) to the raw RGBA `tray-icon`
+# wants.
+png = "0.17"
+# Request params (`system.shutdown`, `session.status`) and reading the
+# session payloads.
+serde_json = "1"
+# Cross-platform event loop for the tray. On Linux it initializes the gtk main
+# loop that `tray-icon` needs; on macOS it owns the main-thread run loop.
+tao = "0.35.3"
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
@@ -32,8 +41,10 @@ tokio = { version = "1", features = [
     "io-util",
     "sync",
 ] }
+# System tray icon + menu (the Tauri ecosystem's standalone crate). `gtk` gives
+# the Linux backend (libappindicator, dlopened at RUNTIME — no build-time system
+# dep; the AppImage bundles it in a later block). The default `libxdo` feature
+# is dropped: it links `-lxdo` at build time only to power the predefined
+# Copy/Cut/Paste/SelectAll menu items, which we do not use.
+tray-icon = { version = "0.24.1", default-features = false, features = ["gtk"] }
 universallink-ipc-client = { path = "../client" }
-
-[dev-dependencies]
-# Only to build an `Event::Notification { params }` in the lib tests.
-serde_json = "1"
