@@ -7,6 +7,7 @@
 mod support;
 
 mod account;
+mod clipboard;
 mod components;
 mod dataplane;
 mod devices;
