@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
+
+[package]
+name = "universallink-tray"
+version = "0.2.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+# The system-tray component: a small headless process launched and supervised
+# by the Core (role `tray`). It reads a single-use spawn token from the first
+# line of its standard input, connects over the local IPC, and lives until that
+# standard input closes (the supervisor's graceful stop) or the connection is
+# lost — the spawn token is single-use, so losing the IPC means exiting and
+# letting the supervisor restart us with a fresh one.
+#
+# lib + bin, like the daemon and the GUI: the exit conditions (the component
+# contract) live in the lib so they are tested without any real I/O; the binary
+# is only wiring (stdin, environment, IPC client). The icon and menu arrive in
+# later building blocks.
+
+[[bin]]
+name = "universallink-tray"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-std",
+    "io-util",
+    "sync",
+] }
+universallink-ipc-client = { path = "../client" }
+
+[dev-dependencies]
+# Only to build an `Event::Notification { params }` in the lib tests.
+serde_json = "1"
