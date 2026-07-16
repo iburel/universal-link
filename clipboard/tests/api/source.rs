@@ -10,6 +10,7 @@
 //! data-channel connections that must make progress at the same time (as in the
 //! client crate's channel suite).
 
+use serde_json::json;
 use universallink_clipboard::{BackendEvent, Format, LocalClip, run};
 use universallink_ipc_client::{ChannelError, ConsumerChannel, ErrorCode};
 
@@ -73,16 +74,18 @@ async fn a_local_copy_opens_a_transaction() {
     );
 }
 
+/// The orchestrator serves an inline `get_data` over a provider channel and
+/// replies only after EOF. Driven against a scripted Core, so the serve is a
+/// single data-channel connection (the provider). The real-Core end-to-end
+/// relay of a provider blob down to a consumer is covered by the client crate's
+/// `channel` suite; forcing both concurrent data channels through the real Core
+/// is the macOS kqueue-starvation pattern that suite is written to handle.
 #[tokio::test(flavor = "multi_thread")]
-async fn serves_an_inline_paste_through_the_provider_channel() {
-    let core = TestCore::start().await;
-    let backend = Backend::connect(&core).await;
-    let fake_handle = backend.fake.clone();
-    let (_fake, backend_tx, ipc) = spawn_orchestrator(&core, backend);
-    let consumer = Consumer::connect(&core).await;
+async fn serves_get_data_over_a_provider_channel() {
+    let (mut scripted, mut conn, backend_tx, fake) = scripted_orchestrator().await;
 
-    // The backend can vouch for generation 1's `text`.
-    fake_handle.provision(1, "text", b"pull-at-paste");
+    // Announce a local copy the backend can vouch for.
+    fake.provision(1, "text", b"pull-at-paste");
     backend_tx
         .send(BackendEvent::Copied {
             generation: 1,
@@ -90,17 +93,40 @@ async fn serves_an_inline_paste_through_the_provider_channel() {
         })
         .await
         .expect("send Copied");
+    let params = conn
+        .handle_request("clipboard.updated", json!({ "tx_id": "tx-1" }))
+        .await;
+    assert_eq!(params["formats"], json!([{ "format": "text", "size": 13 }]));
 
-    let tx_id = consumer.await_current_tx(&["text"]).await;
-    let channel_token = consumer.open(&tx_id).await.expect("open");
-    let mut channel = ConsumerChannel::open(&ipc, &channel_token)
-        .await
-        .expect("open consumer channel");
+    // A remote device pastes an inline format: the Core asks the backend for it.
+    conn.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 100,
+        "method": "clipboard.get_data",
+        "params": { "tx_id": "tx-1", "format": "text", "channel_token": "pt-1" },
+    }))
+    .await;
 
-    // The FETCH routes to the orchestrator as `clipboard.get_data`; it serves
-    // the blob over a provider channel and replies after EOF.
-    let fetched = channel.fetch("text").await.expect("fetch");
-    assert_eq!(fetched, b"pull-at-paste");
+    // The orchestrator opens a provider channel and streams DATA then EOF.
+    let mut provider = scripted.accept().await;
+    assert_eq!(provider.recv_attach().await, "pt-1");
+    let (data_tag, payload) = provider.recv_binary().await;
+    assert_eq!(data_tag, 0x10, "DATA frame");
+    assert_eq!(
+        &payload[8..],
+        b"pull-at-paste",
+        "DATA payload after the u64 offset"
+    );
+    let (eof_tag, _) = provider.recv_binary().await;
+    assert_eq!(eof_tag, 0x11, "EOF frame");
+
+    // Only after EOF does the reply come back — it is the completion signal.
+    let reply = conn.recv().await;
+    assert_eq!(reply["id"], 100);
+    assert!(
+        reply.get("result").is_some(),
+        "get_data replies a result after EOF, got {reply}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -14,41 +14,6 @@ use universallink_clipboard::{BackendEvent, run};
 
 use crate::support::*;
 
-/// Boots the orchestrator against a fresh scripted Core, walks the connect
-/// handshake, and answers the resync `clipboard.current` with "no live clip".
-/// Returns the live control connection, the backend-event sender, the fake
-/// backend, and the scripted Core (for the consumer-channel connection).
-async fn scripted_orchestrator() -> (
-    ScriptedCore,
-    ScriptedConn,
-    mpsc::Sender<BackendEvent>,
-    FakeBackend,
-) {
-    let mut scripted = ScriptedCore::start().await;
-    let fake = FakeBackend::default();
-    let (backend_tx, backend_rx) = mpsc::channel(16);
-    let (client, events) = spawn_client(
-        &scripted.path(),
-        "spawn-token".into(),
-        "clipboard-backend",
-        &BACKEND_SCOPES,
-        &["clipboard.get_data"],
-    );
-    tokio::spawn(run(
-        client,
-        events,
-        fake.clone(),
-        scripted.path(),
-        backend_rx,
-        never(),
-    ));
-    let mut conn = scripted.accept().await;
-    conn.handle_hello().await;
-    // Resync fires on connect; no live clip here.
-    conn.handle_request("clipboard.current", json!({})).await;
-    (scripted, conn, backend_tx, fake)
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn a_remote_copy_is_offered_to_the_os() {
     let (_scripted, mut conn, _backend_tx, fake) = scripted_orchestrator().await;
