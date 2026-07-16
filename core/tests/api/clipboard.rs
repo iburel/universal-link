@@ -390,7 +390,13 @@ async fn open_requires_the_read_scope() {
 // streamed over a provider channel the Core relays to the consumer.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+// The FETCH tests that open a provider channel run on the multi-threaded
+// runtime: the fetch and the provider are two data-channel connections that must
+// make progress at the same time — the production Core is multi-threaded, and on
+// a single-threaded runtime macOS's kqueue readiness ordering can starve one of
+// them (Linux's epoll happens not to). The consumer-only FETCH tests below
+// (CLIP_STALE without a provider) don't need it.
+#[tokio::test(flavor = "multi_thread")]
 async fn fetch_pulls_an_inline_blob_from_the_backend() {
     let core = TestCore::start().await;
     let mut clip = backend(&core).await;
@@ -430,7 +436,7 @@ async fn fetch_pulls_an_inline_blob_from_the_backend() {
     assert_eq!(fetched.unwrap(), b"pull-at-paste");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn fetch_of_an_absent_format_is_request_scoped() {
     let core = TestCore::start().await;
     let mut clip = backend(&core).await;
@@ -536,7 +542,7 @@ async fn fetch_when_the_announcer_is_gone_is_clip_stale() {
     assert_eq!(ch.read("f0", 0, 8).await.unwrap(), b"filedata");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_provider_that_closes_without_eof_yields_clip_stale() {
     let core = TestCore::start().await;
     let mut clip = backend(&core).await;
