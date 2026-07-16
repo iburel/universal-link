@@ -10,6 +10,7 @@
 
 use serde_json::{Value, json};
 
+#[derive(Debug)]
 pub struct RpcErr {
     pub code: i64,
     pub message: String,
@@ -105,6 +106,13 @@ pub fn notification(method: &str, params: &Value) -> String {
     json!({ "jsonrpc": "2.0", "method": method, "params": params }).to_string()
 }
 
+/// A request the Core issues TO a component (`clipboard.get_data`): the Core is
+/// also a JSON-RPC client on the full-duplex connection. The component's reply
+/// carries this `id` and no `method`.
+pub fn request(method: &str, id: u64, params: &Value) -> String {
+    json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string()
+}
+
 /// A required string param, otherwise -32602.
 pub fn required_str(params: &Value, key: &str) -> Result<String, RpcErr> {
     params
@@ -120,6 +128,24 @@ pub fn optional_str(params: &Value, key: &str) -> Result<Option<String>, RpcErr>
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s.clone())),
         Some(_) => Err(RpcErr::invalid_params(key)),
+    }
+}
+
+/// An optional boolean: absent or null → None; present but non-bool → -32602.
+pub fn optional_bool(params: &Value, key: &str) -> Result<Option<bool>, RpcErr> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(RpcErr::invalid_params(key)),
+    }
+}
+
+/// An optional array of strings: absent or null → None; present but not an
+/// array of strings → -32602.
+pub fn optional_str_array(params: &Value, key: &str) -> Result<Option<Vec<String>>, RpcErr> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(_) => required_str_array(params, key).map(Some),
     }
 }
 

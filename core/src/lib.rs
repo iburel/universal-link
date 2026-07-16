@@ -8,8 +8,11 @@
 //! integration test suite (`tests/api/`).
 
 pub mod account_key;
+mod clipboard;
+mod clipnet;
 mod conn;
 mod connector;
+mod datachannel;
 mod dataplane;
 mod framing;
 mod http;
@@ -211,6 +214,15 @@ impl Drop for CoreHandle {
             }
         }
         drop(reg);
+        // Drop every clipboard transaction and cut the open consumer channels
+        // (data-channel connections are not in `conns`, so the sweep above does
+        // not reach them): the right to read ends when the Core stops.
+        self.state
+            .clipboard
+            .lock()
+            .expect("lock clipboard")
+            .clear_all();
+        self.state.clipboard_reset.notify_waiters();
         // The session and login tasks are held by the state (logout and flow
         // replacement go through it): stopped via their handles.
         if let Some(abort) = self
@@ -283,6 +295,8 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
         transport: config.transport,
         receive_dir: config.receive_dir,
         transfers: Mutex::new(Transfers::new()),
+        clipboard: Mutex::new(crate::clipboard::ClipboardState::new()),
+        clipboard_reset: tokio::sync::Notify::new(),
         reconnect_base_delay: config.reconnect_base_delay,
         shutdown_request: tokio::sync::Notify::new(),
     });

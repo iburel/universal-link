@@ -68,6 +68,39 @@ fn topic_scope(topic: &str) -> Option<&'static str> {
     }
 }
 
+/// Parses `transactions.fill`'s `entries`: a non-empty array of
+/// `{ file_id, dest_path }` into pairs of strings; `-32602` otherwise.
+fn parse_fill_entries(params: &Value) -> Result<Vec<(String, String)>, RpcErr> {
+    let items = params
+        .get("entries")
+        .and_then(Value::as_array)
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| RpcErr::invalid_params("entries"))?;
+    items
+        .iter()
+        .map(|e| {
+            let file_id = e
+                .get("file_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RpcErr::invalid_params("file_id"))?;
+            let dest_path = e
+                .get("dest_path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RpcErr::invalid_params("dest_path"))?;
+            Ok((file_id.to_string(), dest_path.to_string()))
+        })
+        .collect()
+}
+
+/// Best-effort millisecond wall-clock: the ordering base for the clipboard's
+/// global last-copier-wins. A clock skew only shifts the tie-break; local
+/// monotonicity is guaranteed by the floor in `announce_local`.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
 struct Conn {
     state: Arc<AppState>,
     conn_id: ConnId,
@@ -81,6 +114,24 @@ struct Conn {
 }
 
 pub async fn run(state: Arc<AppState>, stream: crate::transport::Stream, peer: PeerInfo) {
+    let (read, write) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read);
+
+    // The first frame routes the connection. An attach frame (a lone
+    // `{ "channel_token": "…" }`, no `method`) turns it into a data channel;
+    // anything else is the control plane. Reading it here keeps the two kinds
+    // out of each other's way — a data channel is never registered as a control
+    // connection, and carries no `hello`.
+    let first = match framing::read_frame(&mut reader).await {
+        Ok(Some(text)) => text,
+        // Clean EOF or a framing violation before anything was said: nothing owed.
+        Ok(None) | Err(_) => return,
+    };
+    if let Some(token) = channel_attach(&first) {
+        crate::datachannel::run(state, reader, write, peer, token).await;
+        return;
+    }
+
     let (tx, out_rx) = mpsc::channel(OUT_QUEUE_DEPTH);
     let conn_id = {
         let mut reg = state.registry.lock().expect("lock registry");
@@ -96,13 +147,13 @@ pub async fn run(state: Arc<AppState>, stream: crate::transport::Stream, peer: P
             crate::state::ConnEntry {
                 tx: tx.clone(),
                 phase: Phase::Fresh,
+                pid: peer.pid,
+                pending: std::collections::HashMap::new(),
             },
         );
         id
     };
 
-    let (read, write) = tokio::io::split(stream);
-    let mut reader = BufReader::new(read);
     let mut writer = tokio::spawn(write_loop(write, out_rx));
     let mut conn = Conn {
         state: state.clone(),
@@ -113,32 +164,29 @@ pub async fn run(state: Arc<AppState>, stream: crate::transport::Stream, peer: P
     };
     let mut writer_done = false;
 
-    loop {
-        tokio::select! {
-            // The write task stops on a requested close (deny, revoke —
-            // including one decided by ANOTHER connection) or a dead peer.
-            _ = &mut writer => {
-                writer_done = true;
-                break;
-            }
-            frame = framing::read_frame(&mut reader) => match frame {
-                Ok(Some(text)) => {
-                    if let Some(reply) = conn.handle_text(&text).await
-                        && conn.tx.try_send(OutMsg::Frame(reply)).is_err()
-                    {
-                        break;
+    // Process the first frame (already read), then loop over the rest.
+    if !conn.feed(&first).await {
+        loop {
+            tokio::select! {
+                // The write task stops on a requested close (deny, revoke —
+                // including one decided by ANOTHER connection) or a dead peer.
+                _ = &mut writer => {
+                    writer_done = true;
+                    break;
+                }
+                frame = framing::read_frame(&mut reader) => match frame {
+                    Ok(Some(text)) => {
+                        if conn.feed(&text).await {
+                            break;
+                        }
                     }
-                    if conn.pending_close {
+                    // Clean EOF from the peer, or a framing violation:
+                    // fail-closed, no interpretable reply is owed.
+                    Ok(None) => break,
+                    Err(_) => {
                         let _ = conn.tx.try_send(OutMsg::Close);
                         break;
                     }
-                }
-                // Clean EOF from the peer, or a framing violation: fail-closed,
-                // no interpretable reply is owed.
-                Ok(None) => break,
-                Err(_) => {
-                    let _ = conn.tx.try_send(OutMsg::Close);
-                    break;
                 }
             }
         }
@@ -153,6 +201,19 @@ pub async fn run(state: Arc<AppState>, stream: crate::transport::Stream, peer: P
         let _ = tokio::time::timeout(WRITE_TIMEOUT, &mut writer).await;
         writer.abort();
     }
+}
+
+/// A data-channel attach carries a `channel_token` and no `method`; the control
+/// plane's first frame is always a `hello` (a `method`). Returns the token when
+/// the frame is an attach.
+fn channel_attach(first: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(first).ok()?;
+    if v.get("method").is_some() {
+        return None;
+    }
+    v.get("channel_token")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// Drains the write queue. Any write that makes no progress within the allotted
@@ -179,6 +240,22 @@ async fn write_loop<W: AsyncWrite + Unpin>(mut sink: W, mut out_rx: mpsc::Receiv
 }
 
 impl Conn {
+    /// Processes one control-plane frame: dispatches it, enqueues the reply, and
+    /// honors a self-revocation close. Returns `true` when the loop must end
+    /// (the queue is dead, or a self-close is pending).
+    async fn feed(&mut self, text: &str) -> bool {
+        if let Some(reply) = self.handle_text(text).await
+            && self.tx.try_send(OutMsg::Frame(reply)).is_err()
+        {
+            return true;
+        }
+        if self.pending_close {
+            let _ = self.tx.try_send(OutMsg::Close);
+            return true;
+        }
+        false
+    }
+
     /// Handles a frame; returns the reply to send, if there is one. The `await`
     /// (proxy toward the server) serializes the requests of THIS connection —
     /// never a wait on the socket itself, so the write invariant holds.
@@ -193,6 +270,24 @@ impl Conn {
             .and_then(Value::as_str)
             .map(str::to_string)
         else {
+            // No method: a RESPONSE to a request the Core issued to this
+            // component (`clipboard.get_data`) carries `result` or `error` —
+            // delivered to its waiter, no reply owed. Anything else with no
+            // method is a malformed request (`-32600`, echoing the id).
+            if msg.get("result").is_some() || msg.get("error").is_some() {
+                if let Some(id) = msg.get("id").and_then(Value::as_u64) {
+                    let outcome = match msg.get("error") {
+                        Some(err) => Err(RpcErr::from_value(err)),
+                        None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
+                    };
+                    self.state
+                        .registry
+                        .lock()
+                        .expect("lock registry")
+                        .deliver_response(self.conn_id, id, outcome);
+                }
+                return None;
+            }
             return Some(rpc::response_err(
                 &id.unwrap_or(Value::Null),
                 &RpcErr::invalid_request(),
@@ -244,6 +339,10 @@ impl Conn {
             "components.approve" => self.components_approve(params),
             "components.deny" => self.components_deny(params),
             "components.revoke" => self.components_revoke(params),
+            "clipboard.updated" => self.clipboard_updated(params),
+            "clipboard.current" => self.clipboard_current(),
+            "transactions.open" => self.transactions_open(params),
+            "transactions.fill" => self.transactions_fill(params),
             "system.shutdown" => self.system_shutdown(),
             _ => {
                 // Phase first: an unenrolled component learns nothing about
@@ -494,6 +593,16 @@ impl Conn {
         if let Some(slot) = self.state.login.lock().expect("lock login").take() {
             slot.abort.abort();
         }
+        // Logging out drops every clipboard transaction and cuts the open
+        // consumer channels (`TX_STALE`): the account's read grants do not
+        // outlive its session. (Reached only on a real logout — the not-logged-in
+        // case returned above.)
+        self.state
+            .clipboard
+            .lock()
+            .expect("lock clipboard")
+            .clear_all();
+        self.state.clipboard_reset.notify_waiters();
         Ok(json!({}))
     }
 
@@ -843,6 +952,142 @@ impl Conn {
         Ok(json!({}))
     }
 
+    // -- Clipboard (transactions) -------------------------------------------
+
+    /// Announces a local copy: opens the transaction that supersedes the
+    /// previous clip (last copier wins). Only metadata travels — for files, the
+    /// manifest is frozen from `paths` (canonicalized + `stat`ed, no byte read).
+    /// An empty `formats` means the clipboard was cleared (a contentless
+    /// transaction, which supersedes like any other).
+    fn clipboard_updated(&self, params: &Value) -> Result<Value, RpcErr> {
+        // Announcing is the exclusive backend's privilege (role + scope), not a
+        // right any `clipboard.write` holder gets.
+        self.require_clipboard_backend()?;
+        let formats = crate::clipboard::parse_formats(params)?;
+        let sensitive = rpc::optional_bool(params, "sensitive")?.unwrap_or(false);
+        let paths = rpc::optional_str_array(params, "paths")?;
+        let has_files = formats.iter().any(|f| f.format == "files");
+        // `paths` present iff a `files` format is offered — no silent mismatch.
+        let files = match (has_files, paths) {
+            (true, Some(paths)) if !paths.is_empty() => crate::clipboard::freeze_manifest(&paths)?,
+            (false, None) => Vec::new(),
+            _ => return Err(RpcErr::invalid_params("paths")),
+        };
+        let device_id = self
+            .state
+            .session
+            .lock()
+            .expect("lock session")
+            .own_device_id
+            .clone();
+        let tx = crate::clipboard::Transaction {
+            tx_id: format!("tx_{}", random_hex(16)),
+            device_id,
+            seq: 0, // assigned by `announce_local` (floored above the current clip)
+            formats,
+            files,
+            sensitive,
+            origin: crate::clipboard::Origin::Local {
+                announcer: self.conn_id,
+            },
+            superseded: false,
+            sessions: 0,
+        };
+        // Announce locally (last copier wins here), then broadcast the metadata
+        // to the account's other devices so they converge on this copy.
+        let (tx_id, net) = {
+            let mut cb = self.state.clipboard.lock().expect("lock clipboard");
+            let tx_id = cb.announce_local(tx, now_millis());
+            let net = cb.network_announce_of(&tx_id);
+            (tx_id, net)
+        };
+        if let Some(net) = net {
+            crate::clipnet::propagate(&self.state, net);
+        }
+        Ok(json!({ "tx_id": tx_id }))
+    }
+
+    /// The `clipboard` topic's snapshot method: the current global clip (or `{}`
+    /// if none). A backend that (re)connects re-learns the live promise here
+    /// before subscribing — the resync rule of `events.subscribe`.
+    fn clipboard_current(&self) -> Result<Value, RpcErr> {
+        self.require_scope("clipboard.read")?;
+        Ok(self
+            .state
+            .clipboard
+            .lock()
+            .expect("lock clipboard")
+            .current_record())
+    }
+
+    /// Opens a consumer channel for `tx_id`: mints an unguessable `channel_token`
+    /// bound to this component (peer credentials). The transaction must be
+    /// openable — a superseded clip accepts no NEW session (`TX_STALE`). The
+    /// session itself begins when the data channel attaches with the token.
+    fn transactions_open(&self, params: &Value) -> Result<Value, RpcErr> {
+        self.require_scope("clipboard.read")?;
+        let tx_id = rpc::required_str(params, "tx_id")?;
+        let origin = {
+            let cb = self.state.clipboard.lock().expect("lock clipboard");
+            if !cb.is_openable(&tx_id) {
+                return Err(RpcErr::app("TX_STALE"));
+            }
+            cb.origin_of(&tx_id)
+        };
+        // A remote clip whose source is no longer reachable (re-enrolled under a
+        // new node_id, or with no published relay) fails fast here — the
+        // control-plane twin of the data channel's `PEER_GONE`.
+        if let Some(crate::clipboard::Origin::Remote { node_id, device_id }) = origin {
+            let reachable = crate::dataplane::resolve_peer(&self.state, &device_id)
+                .is_some_and(|p| p.node_id == node_id && p.relay_url.is_some());
+            if !reachable {
+                return Err(RpcErr::app("DEVICE_OFFLINE"));
+            }
+        }
+        let token = self
+            .state
+            .registry
+            .lock()
+            .expect("lock registry")
+            .mint_channel_token(crate::state::ChannelGrant {
+                tx_id,
+                kind: crate::state::ChannelKind::Consumer,
+                pid: self.peer.pid,
+                conn_id: self.conn_id,
+                sink: None,
+            });
+        Ok(json!({ "channel_token": token }))
+    }
+
+    /// Designates target files for the Core to fill from a transaction (the
+    /// paste surface's skeleton paths). Fire-and-forget like `files.send`: the
+    /// `transfer_id` comes back at once, progress and completion arrive over the
+    /// `transfers` topic, cancellation via `files.cancel`. The `dest_path`s come
+    /// from the enrolled backend (the `files.send` trust model — the remote
+    /// manifest never chooses where bytes land); the Core creates their missing
+    /// parents and writes them directly (an OS-watched skeleton admits no
+    /// temp+rename). The `file_id`s must be non-`dir` manifest entries.
+    fn transactions_fill(&self, params: &Value) -> Result<Value, RpcErr> {
+        self.require_scope("clipboard.read")?;
+        let tx_id = rpc::required_str(params, "tx_id")?;
+        let entries = parse_fill_entries(params)?;
+        let plan = self
+            .state
+            .clipboard
+            .lock()
+            .expect("lock clipboard")
+            .fill_plan(&tx_id, &entries)?;
+        let (transfer_id, cancel) = self.state.transfers.lock().expect("lock transfers").register();
+        tokio::spawn(crate::clipnet::run_fill(
+            self.state.clone(),
+            transfer_id.clone(),
+            tx_id,
+            plan,
+            cancel,
+        ));
+        Ok(json!({ "transfer_id": transfer_id }))
+    }
+
     // -- Lifecycle ----------------------------------------------------------
 
     /// Stops the whole Core — the tray's Quit. The library only SIGNALS; the
@@ -882,6 +1127,25 @@ impl Conn {
         }
     }
 
+    /// Announcing (and answering `clipboard.get_data`) is bound to the exclusive
+    /// `clipboard-backend` role AND the `clipboard.write` scope: a component
+    /// with the scope but another role cannot mint clipboard transactions.
+    /// Phase before scope (an unenrolled connection learns nothing).
+    fn require_clipboard_backend(&self) -> Result<(), RpcErr> {
+        let reg = self.state.registry.lock().expect("lock registry");
+        match &reg
+            .conns
+            .get(&self.conn_id)
+            .expect("live connection")
+            .phase
+        {
+            Phase::Fresh => Err(RpcErr::app("NOT_ENROLLED")),
+            Phase::Pending(_) => Err(RpcErr::app("PENDING_APPROVAL")),
+            Phase::Active(a) if a.role == EXCLUSIVE_ROLE && a.has_scope("clipboard.write") => Ok(()),
+            Phase::Active(_) => Err(RpcErr::app("SCOPE_DENIED")),
+        }
+    }
+
     /// Removes the connection from the registry, and its pending enrollment
     /// request if any (a requester that has left has nothing left to approve).
     fn teardown(&mut self) {
@@ -891,5 +1155,8 @@ impl Conn {
         {
             reg.pending.remove(&request_id);
         }
+        // Reclaim any data-channel token this connection minted but that never
+        // attached (an abandoned paste): otherwise the grant would linger.
+        reg.drop_channel_tokens_of(self.conn_id);
     }
 }

@@ -7,6 +7,8 @@
 mod support;
 
 mod account;
+mod clipboard;
+mod clipboard_net;
 mod components;
 mod dataplane;
 mod devices;

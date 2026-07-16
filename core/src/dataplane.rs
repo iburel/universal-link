@@ -119,13 +119,13 @@ pub trait PeerTransport: Send + Sync + std::fmt::Debug {
 /// like the rest — an incompatible change will bump it.
 pub const ALPN: &[u8] = b"ul/data/1";
 
-/// Maximum size of a framed CONTROL frame (offer, acknowledgment). Bounds the
-/// memory a peer can make us allocate at once. The file bodies, by contrast,
-/// are never framed: they are streamed in `CHUNK` buffers — a file of several
-/// GiB goes through without ever exceeding this bound. The manifest is
-/// therefore bounded as well (a transfer of tens of thousands of files would
-/// exceed it; out of v1 scope, the offer would then fail).
-const MAX_FRAME: u32 = 1024 * 1024;
+/// Maximum size of a framed CONTROL frame (offer, acknowledgment, clip
+/// announce). Bounds the memory a peer can make us allocate at once. The file
+/// bodies, by contrast, are never framed: they are streamed in `CHUNK` buffers —
+/// a file of several GiB goes through without ever exceeding this bound. The
+/// manifest is therefore bounded as well (a transfer of tens of thousands of
+/// files would exceed it; out of v1 scope, the offer would then fail).
+pub(crate) const MAX_FRAME: u32 = 1024 * 1024;
 
 /// Size of the body-streaming buffer. Neither memory nor throughput depends on
 /// a value announced by the peer.
@@ -264,7 +264,7 @@ fn device_id_for(state: &AppState, node_id: &str) -> Option<String> {
 /// `node_id` carries no valid attestation under our account key: the check
 /// happens BEFORE any opening, so a server cannot redirect our files toward a
 /// `node_id` it would have injected.
-fn resolve_peer(state: &AppState, device_id: &str) -> Option<PeerAddr> {
+pub(crate) fn resolve_peer(state: &AppState, device_id: &str) -> Option<PeerAddr> {
     let ak_pub = {
         let root = state.account_root.lock().expect("lock account_root");
         root.as_ref()?.ak_pub.clone()
@@ -281,6 +281,43 @@ fn resolve_peer(state: &AppState, device_id: &str) -> Option<PeerAddr> {
         .and_then(Value::as_str)
         .map(str::to_string);
     Some(PeerAddr { node_id, relay_url })
+}
+
+/// Every reachable device of the account, EXCEPT this one: attested under our
+/// key (C7) and with a published relay. The recipients of a clipboard
+/// `clip_announce` broadcast (`clipnet::propagate`). Empty when we have no trust
+/// root or no directory snapshot (not joined / never connected) — fail-closed.
+pub(crate) fn account_peers(state: &AppState) -> Vec<PeerAddr> {
+    let ak_pub = {
+        let root = state.account_root.lock().expect("lock account_root");
+        match root.as_ref() {
+            Some(root) => root.ak_pub.clone(),
+            None => return Vec::new(),
+        }
+    };
+    let own = state.identity.node_id();
+    let s = state.session.lock().expect("lock session");
+    let Some(devices) = s.devices.as_ref() else {
+        return Vec::new();
+    };
+    devices
+        .values()
+        .filter_map(|record| {
+            let node_id = record.get("node_id").and_then(Value::as_str)?.to_string();
+            if node_id == own {
+                return None;
+            }
+            let att = record.get("attestation").and_then(Value::as_str)?;
+            if !crate::account_key::verify(&ak_pub, &node_id, att) {
+                return None;
+            }
+            let relay_url = record.get("relay_url").and_then(Value::as_str)?.to_string();
+            Some(PeerAddr {
+                node_id,
+                relay_url: Some(relay_url),
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +418,11 @@ pub async fn read_offer(stream: &mut Box<dyn IoStream>) -> std::io::Result<Vec<F
             "first frame is not an offer",
         ));
     }
+    parse_manifest(&value)
+}
+
+/// Extracts the file manifest from an already-read `offer` control frame.
+fn parse_manifest(value: &Value) -> std::io::Result<Vec<FileHeader>> {
     let files = value
         .get("files")
         .and_then(Value::as_array)
@@ -508,17 +550,39 @@ async fn write_ack(stream: &mut Box<dyn IoStream>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Serves an incoming stream: reads the offer, announces `transfer.incoming`,
-/// receives the bodies, announces the result. `files.cancel` acts only during
-/// RECEPTION: as soon as all the bytes are there, validation (rename +
-/// acknowledgment) is a point of no return — a transfer whose bytes are all
-/// durable is never reported "cancelled" nor left half-committed on disk. The
-/// terminal outcome is emitted ONCE, by the task.
+/// Serves an incoming stream: reads the first control frame and dispatches on
+/// its `type`. `offer` is a file transfer (below); `clip_announce` /
+/// `clip_session` are the clipboard network plane (`clipnet`). The peer is
+/// already vouched for by `peer_in_directory` (C7) at the accept loop.
 async fn serve_incoming(state: Arc<AppState>, peer: String, mut stream: Box<dyn IoStream>) {
-    let manifest = match read_offer(&mut stream).await {
+    let first = match bounded(STALL_TIMEOUT, read_control(&mut stream), "first frame").await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(peer = %peer, error = %e, "unreadable incoming frame: abandoned");
+            return;
+        }
+    };
+    match first.get("type").and_then(Value::as_str) {
+        Some("offer") => serve_transfer(state, peer, first, stream).await,
+        Some("clip_announce") => crate::clipnet::recv_announce(state, peer, first, stream).await,
+        Some("clip_session") => crate::clipnet::serve_session(state, first, stream).await,
+        other => {
+            tracing::debug!(peer = %peer, kind = ?other, "unknown incoming frame type: abandoned");
+        }
+    }
+}
+
+/// A file transfer (`offer`): announces `transfer.incoming`, receives the
+/// bodies, announces the result. `files.cancel` acts only during RECEPTION: as
+/// soon as all the bytes are there, validation (rename + acknowledgment) is a
+/// point of no return — a transfer whose bytes are all durable is never
+/// reported "cancelled" nor left half-committed on disk. The terminal outcome
+/// is emitted ONCE, by the task.
+async fn serve_transfer(state: Arc<AppState>, peer: String, offer: Value, mut stream: Box<dyn IoStream>) {
+    let manifest = match parse_manifest(&offer) {
         Ok(m) => m,
         Err(e) => {
-            tracing::debug!(peer = %peer, error = %e, "unreadable incoming offer: abandoned");
+            tracing::debug!(peer = %peer, error = %e, "malformed incoming offer: abandoned");
             return;
         }
     };
@@ -738,7 +802,7 @@ pub(crate) fn cancel(state: &AppState, transfer_id: &str) -> bool {
 /// Pushes a notification on the `transfers` topic (scope `transfers.read`,
 /// verified at subscription). The registry lock is taken and released here —
 /// never held across a transfer await.
-fn notify_transfers(state: &AppState, method: &str, params: &Value) {
+pub(crate) fn notify_transfers(state: &AppState, method: &str, params: &Value) {
     state
         .registry
         .lock()
@@ -749,16 +813,16 @@ fn notify_transfers(state: &AppState, method: &str, params: &Value) {
 /// Emits `transfer.progress`, but at most once per `PROGRESS_INTERVAL` — except
 /// the very first point and the last (`done == total`), always emitted for a
 /// clean display (0% at the start, 100% on arrival).
-struct Throttle {
+pub(crate) struct Throttle {
     last: Option<Instant>,
 }
 
 impl Throttle {
-    fn new() -> Throttle {
+    pub(crate) fn new() -> Throttle {
         Throttle { last: None }
     }
 
-    fn tick(&mut self, state: &AppState, transfer_id: &str, done: u64, total: u64) {
+    pub(crate) fn tick(&mut self, state: &AppState, transfer_id: &str, done: u64, total: u64) {
         let now = Instant::now();
         let due = self
             .last
@@ -912,7 +976,7 @@ async fn bounded<T>(
 }
 
 /// Writes a framed message: u32 big-endian length, then the payload.
-async fn write_frame<S>(stream: &mut S, payload: &[u8]) -> std::io::Result<()>
+pub(crate) async fn write_frame<S>(stream: &mut S, payload: &[u8]) -> std::io::Result<()>
 where
     S: AsyncWrite + Unpin + ?Sized,
 {
@@ -935,7 +999,7 @@ where
 
 /// Reads a framed message. The announced length is bounded by `MAX_FRAME`
 /// BEFORE any allocation: a peer does not choose our memory footprint.
-async fn read_frame<S>(stream: &mut S) -> std::io::Result<Vec<u8>>
+pub(crate) async fn read_frame<S>(stream: &mut S) -> std::io::Result<Vec<u8>>
 where
     S: AsyncRead + Unpin + ?Sized,
 {
@@ -954,7 +1018,7 @@ where
 }
 
 /// Consumes the stream until EOF or error (connection end included).
-async fn drain<S>(stream: &mut S)
+pub(crate) async fn drain<S>(stream: &mut S)
 where
     S: AsyncRead + Unpin + ?Sized,
 {

@@ -6,8 +6,9 @@
 //! `session` then `registry` (taking the registry while holding the session is
 //! allowed — this is how `session.changed` goes out atomically with its
 //! transition — the reverse never); `login` is never held with another;
-//! `account_root`, `transfers` and `server_config` are LEAVES (never held with
-//! another lock: always cloned/released beforehand). No lock across an await.
+//! `account_root`, `transfers`, `server_config` and `clipboard` are LEAVES
+//! (never held with another lock: always cloned/released beforehand). No lock
+//! across an await.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -70,6 +71,14 @@ pub struct AppState {
     pub receive_dir: PathBuf,
     /// Transfers in progress (T2), cancelable in both directions. LEAF lock.
     pub transfers: Mutex<Transfers>,
+    /// The clipboard's transactions (the pull-at-paste capability table). LEAF
+    /// lock: taken alone, never across an await.
+    pub clipboard: Mutex<crate::clipboard::ClipboardState>,
+    /// Fired when every transaction is dropped (Core stop, logout): the open
+    /// consumer channels wake, push `TX_STALE`, and close — a revocation that
+    /// takes effect at once rather than at the next request. `notify_waiters`
+    /// (not `notify_one`): all sessions must be cut.
+    pub clipboard_reset: tokio::sync::Notify,
     pub reconnect_base_delay: std::time::Duration,
     /// Fired by `system.shutdown` (the tray's Quit): a component asked the Core
     /// to stop. The library only signals — the binary awaits it next to the OS
@@ -211,6 +220,30 @@ pub struct SpawnGrant {
     pub scopes: Vec<String>,
 }
 
+/// Which end of the data channel a `channel_token` opens.
+pub enum ChannelKind {
+    /// Destination side: the component pulls (`transactions.open`).
+    Consumer,
+    /// Source side: the backend pushes an inline blob (`clipboard.get_data`).
+    Provider,
+}
+
+/// Rights carried by a `channel_token`: the transaction it opens, the direction,
+/// and the pid of the component it was minted for (peer-credential binding — the
+/// data connection carries no `hello`). Single-use, taken at the attach.
+pub struct ChannelGrant {
+    pub tx_id: String,
+    pub kind: ChannelKind,
+    pub pid: Option<u32>,
+    /// The connection that owns this grant (the opener for a consumer, the
+    /// announcer for a provider): reclaimed when it tears down, so a token that
+    /// is never attached does not linger.
+    pub conn_id: ConnId,
+    /// Where a provider channel forwards the backend's blob (the consumer's
+    /// `FETCH` holds the other end). `None` for a consumer grant.
+    pub sink: Option<mpsc::Sender<crate::datachannel::ProviderMsg>>,
+}
+
 /// An enrolled third-party component: the token persists beyond the connection.
 /// (v1: in memory only — a Core restart forgets the enrollment.)
 pub struct Enrolled {
@@ -273,6 +306,14 @@ pub enum Phase {
 pub struct ConnEntry {
     pub tx: mpsc::Sender<OutMsg>,
     pub phase: Phase,
+    /// The peer's pid (best-effort per platform): a data channel this connection
+    /// mints (`clipboard.get_data`'s provider token) is bound to it.
+    pub pid: Option<u32>,
+    /// Core→component requests awaiting their reply (`clipboard.get_data`):
+    /// `id` → the waiter to resolve when the response frame comes back. Dropped
+    /// at teardown, which unblocks any waiter (the caller then treats it as the
+    /// component being gone).
+    pub pending: HashMap<u64, tokio::sync::oneshot::Sender<Result<Value, RpcErr>>>,
 }
 
 pub struct Registry {
@@ -284,12 +325,19 @@ pub struct Registry {
     pub spawn_tokens: HashMap<String, SpawnGrant>,
     /// persistent token → component_id.
     pub enrolled_tokens: HashMap<String, String>,
+    /// Live data-channel tokens (`transactions.open`, `clipboard.get_data`),
+    /// consumed at the attach.
+    pub channel_tokens: HashMap<String, ChannelGrant>,
     /// component_id → enrolled third-party component. BTreeMap: stable
     /// inventory.
     pub enrolled: BTreeMap<String, Enrolled>,
     /// request_id → request. BTreeMap: stable `components.pending`.
     pub pending: BTreeMap<String, PendingRequest>,
     pub conns: HashMap<ConnId, ConnEntry>,
+    /// Counter for the ids of Core→component requests (`issue_request`). Its own
+    /// namespace: a response frame (no `method`) is matched here, a component's
+    /// request (a `method`) is dispatched — no collision even on equal numbers.
+    next_request_id: u64,
     /// The Core is shutting down (drop of the `CoreHandle`). Set and read under
     /// this lock: a connection that registers sees either `false` (it will
     /// receive the Close from the sweep) or `true` (it gives up on its own) —
@@ -304,9 +352,11 @@ impl Registry {
             file_token,
             spawn_tokens: HashMap::new(),
             enrolled_tokens: HashMap::new(),
+            channel_tokens: HashMap::new(),
             enrolled: BTreeMap::new(),
             pending: BTreeMap::new(),
             conns: HashMap::new(),
+            next_request_id: 0,
             shutdown: false,
         }
     }
@@ -314,6 +364,71 @@ impl Registry {
     pub fn new_conn_id(&mut self) -> ConnId {
         self.next_conn_id += 1;
         self.next_conn_id
+    }
+
+    /// Mints a data-channel token bound to `grant`. Unguessable (32 random
+    /// bytes) — possession is the authorization, like `tx_id`.
+    pub fn mint_channel_token(&mut self, grant: ChannelGrant) -> String {
+        let token = random_hex(32);
+        self.channel_tokens.insert(token.clone(), grant);
+        token
+    }
+
+    /// Consumes a data-channel token (single-use).
+    pub fn take_channel_token(&mut self, token: &str) -> Option<ChannelGrant> {
+        self.channel_tokens.remove(token)
+    }
+
+    /// Issues a request TO an active component and returns the receiver for its
+    /// reply. `None` if the connection is gone or not active (the caller then
+    /// treats it as "the component cannot answer"). The waiter is dropped at the
+    /// connection's teardown, which unblocks the receiver.
+    pub fn issue_request(
+        &mut self,
+        conn_id: ConnId,
+        method: &str,
+        params: Value,
+    ) -> Option<(u64, tokio::sync::oneshot::Receiver<Result<Value, RpcErr>>)> {
+        let entry = self.conns.get_mut(&conn_id)?;
+        if !matches!(entry.phase, Phase::Active(_)) {
+            return None;
+        }
+        self.next_request_id += 1;
+        let id = self.next_request_id;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let frame = rpc::request(method, id, &params);
+        if entry.tx.try_send(OutMsg::Frame(frame)).is_err() {
+            return None;
+        }
+        entry.pending.insert(id, reply_tx);
+        Some((id, reply_rx))
+    }
+
+    /// Drops a still-outstanding request waiter — the caller no longer needs the
+    /// reply (it settled on the data-channel outcome). Without it, a reply the
+    /// backend never sends would leave the waiter until the connection closes.
+    pub fn cancel_request(&mut self, conn_id: ConnId, id: u64) {
+        if let Some(entry) = self.conns.get_mut(&conn_id) {
+            entry.pending.remove(&id);
+        }
+    }
+
+    /// Reclaims every data-channel token owned by a connection — called at its
+    /// teardown, so a token minted but never attached (a paste abandoned before
+    /// the second connection) does not linger.
+    pub fn drop_channel_tokens_of(&mut self, conn_id: ConnId) {
+        self.channel_tokens.retain(|_, g| g.conn_id != conn_id);
+    }
+
+    /// Delivers a component's reply to the waiter that issued the request (a
+    /// response frame: an `id` we minted, no `method`). No-op if the id is
+    /// unknown (a stray or late reply).
+    pub fn deliver_response(&mut self, conn_id: ConnId, id: u64, outcome: Result<Value, RpcErr>) {
+        if let Some(entry) = self.conns.get_mut(&conn_id)
+            && let Some(waiter) = entry.pending.remove(&id)
+        {
+            let _ = waiter.send(outcome);
+        }
     }
 
     /// Is the exclusive role already held by an active connection?

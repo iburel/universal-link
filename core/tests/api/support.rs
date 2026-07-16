@@ -739,6 +739,15 @@ impl TestCore {
             notifications: VecDeque::new(),
         }
     }
+
+    /// Opens a data-channel connection and presents `channel_token` (the LSP
+    /// attach frame). The connection then speaks the binary protocol.
+    pub async fn open_channel(&self, channel_token: &str) -> DataChannel {
+        let mut stream = connect_stream(self.handle.ipc_path()).await;
+        let attach = frame(&json!({ "channel_token": channel_token }).to_string());
+        stream.write_all(&attach).await.expect("attach frame");
+        DataChannel { stream }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -815,6 +824,46 @@ impl TestComponent {
             params["token"] = json!(token);
         }
         self.request("hello", params).await
+    }
+
+    /// Waits for an incoming REQUEST from the Core (`clipboard.get_data`):
+    /// a frame with a `method` AND an `id`. Notifications in the meantime are
+    /// buffered. Returns `(id, params)`.
+    pub async fn expect_request(&mut self, method: &str) -> (u64, Value) {
+        timeout(RESPONSE_TIMEOUT, async {
+            loop {
+                let v = self.recv_json().await;
+                match (v.get("method").and_then(Value::as_str), v.get("id").and_then(Value::as_u64)) {
+                    (Some(m), Some(id)) => {
+                        assert_eq!(m, method, "unexpected incoming request");
+                        return (id, v.get("params").cloned().unwrap_or(Value::Null));
+                    }
+                    (Some(_), None) => self.buffer_notification(v),
+                    _ => panic!("unexpected frame while waiting for request {method}: {v}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timeout waiting for the incoming request {method}"))
+    }
+
+    /// Replies to a Core-issued request with a result.
+    pub async fn respond(&mut self, id: u64, result: Value) {
+        self.send_frame(&json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string())
+            .await;
+    }
+
+    /// Replies to a Core-issued request with an application error code.
+    pub async fn respond_error(&mut self, id: u64, code: &str) {
+        self.send_frame(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32000, "message": code, "data": { "code": code } },
+            })
+            .to_string(),
+        )
+        .await;
     }
 
     /// Next notification (buffered or upcoming) → `(method, params)`.
@@ -973,6 +1022,140 @@ impl TestComponent {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Data-channel client: the binary protocol mirror (u32 length + tag byte +
+// payload), independent of the Core's implementation. DATA carries an 8-byte
+// big-endian offset before the bytes; a request is answered by DATA* then EOF,
+// or a single ERROR.
+// ---------------------------------------------------------------------------
+
+const TAG_READ: u8 = 0x01;
+const TAG_FETCH: u8 = 0x02;
+const TAG_ABORT: u8 = 0x03;
+const TAG_DATA: u8 = 0x10;
+const TAG_EOF: u8 = 0x11;
+const TAG_ERROR: u8 = 0x12;
+
+pub struct DataChannel {
+    stream: ClientStream,
+}
+
+impl DataChannel {
+    /// A `READ` of `[offset, offset+len)` of a manifest file → the assembled
+    /// bytes (in offset order), or the `ERROR` code on failure.
+    pub async fn read(&mut self, file_id: &str, offset: u64, len: u64) -> Result<Vec<u8>, String> {
+        let req = json!({ "file_id": file_id, "offset": offset, "len": len });
+        self.send(TAG_READ, &serde_json::to_vec(&req).unwrap()).await;
+        self.collect().await
+    }
+
+    /// A `FETCH` of an inline format → the assembled blob, or the `ERROR` code.
+    pub async fn fetch(&mut self, format: &str) -> Result<Vec<u8>, String> {
+        let req = json!({ "format": format });
+        self.send(TAG_FETCH, &serde_json::to_vec(&req).unwrap()).await;
+        self.collect().await
+    }
+
+    /// Sends an `ABORT` (cancels the in-flight request; the channel survives).
+    pub async fn abort(&mut self) {
+        self.send(TAG_ABORT, &[]).await;
+    }
+
+    /// Reads the next response WITHOUT issuing a request — for a terminal ERROR
+    /// the Core pushes on its own when a reset cuts the session (`TX_STALE`,
+    /// `PEER_GONE`): `Err(code)`, or `Err("closed")` if the channel closes first.
+    pub async fn next_response(&mut self) -> Result<Vec<u8>, String> {
+        self.collect().await
+    }
+
+    // Provider side (the source backend pushing an inline blob).
+
+    /// Streams a `DATA` chunk (`offset` + bytes).
+    pub async fn send_data(&mut self, offset: u64, bytes: &[u8]) {
+        let mut payload = offset.to_be_bytes().to_vec();
+        payload.extend_from_slice(bytes);
+        self.send(TAG_DATA, &payload).await;
+    }
+
+    /// Ends the blob.
+    pub async fn send_eof(&mut self) {
+        self.send(TAG_EOF, &[]).await;
+    }
+
+    /// Fails the blob with an error code.
+    pub async fn send_error(&mut self, code: &str) {
+        self.send(TAG_ERROR, &serde_json::to_vec(&json!({ "code": code })).unwrap())
+            .await;
+    }
+
+    async fn send(&mut self, tag: u8, payload: &[u8]) {
+        let len = (1 + payload.len()) as u32;
+        let mut frame = len.to_be_bytes().to_vec();
+        frame.push(tag);
+        frame.extend_from_slice(payload);
+        // The Core may have closed the channel already (e.g. a proactive
+        // TX_STALE on a reset): a failed send is not the assertion — the pending
+        // ERROR frame, read by `collect`, is.
+        match self.stream.write_all(&frame).await {
+            Ok(()) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ) => {}
+            Err(e) => panic!("data-channel send: {e}"),
+        }
+    }
+
+    /// Collects one response: DATA* then EOF (→ the bytes), or ERROR (→ its
+    /// code), or a closed channel (→ "closed").
+    async fn collect(&mut self) -> Result<Vec<u8>, String> {
+        let mut out = Vec::new();
+        loop {
+            match timeout(RESPONSE_TIMEOUT, self.recv())
+                .await
+                .expect("timeout on the data channel")
+            {
+                None => return Err("closed".to_string()),
+                Some((TAG_DATA, payload)) => {
+                    assert!(payload.len() >= 8, "DATA without an offset header");
+                    out.extend_from_slice(&payload[8..]);
+                }
+                Some((TAG_EOF, _)) => return Ok(out),
+                Some((TAG_ERROR, payload)) => {
+                    let v: Value = serde_json::from_slice(&payload).expect("ERROR payload");
+                    return Err(v["code"].as_str().expect("error code").to_string());
+                }
+                Some((tag, _)) => panic!("unexpected data-channel tag: {tag:#x}"),
+            }
+        }
+    }
+
+    /// Reads one message; `None` on a clean EOF.
+    async fn recv(&mut self) -> Option<(u8, Vec<u8>)> {
+        let mut len = [0u8; 4];
+        match self.stream.read_exact(&mut len).await {
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                return None;
+            }
+            Err(e) => panic!("data-channel read: {e}"),
+        }
+        let len = u32::from_be_bytes(len) as usize;
+        let mut buf = vec![0u8; len];
+        self.stream.read_exact(&mut buf).await.expect("data-channel payload");
+        let tag = buf.remove(0);
+        Some((tag, buf))
+    }
+}
+
 /// Encodes `text` into an LSP frame.
 pub fn frame(text: &str) -> Vec<u8> {
     let mut bytes = format!("Content-Length: {}\r\n\r\n", text.len()).into_bytes();
@@ -1120,6 +1303,57 @@ pub async fn wait_server_connected(c: &mut TestComponent, want: bool) {
             r["server_connected"] == json!(want)
         },
         "convergence of server_connected",
+    )
+    .await;
+}
+
+/// Waits for the directory as seen by `c` to carry both the attestation AND the
+/// relay of `device_id` (so a data-plane stream can resolve and open it).
+pub async fn wait_reachable(c: &mut TestComponent, device_id: &str) {
+    wait_directory(
+        c,
+        device_id,
+        |d| {
+            d.get("attestation").and_then(Value::as_str).is_some()
+                && d.get("relay_url").and_then(Value::as_str).is_some()
+        },
+        "reachable peer (attestation + relay)",
+    )
+    .await;
+}
+
+/// Waits for the directory as seen by `c` to carry the attestation of
+/// `device_id`.
+pub async fn wait_attested(c: &mut TestComponent, device_id: &str) {
+    wait_directory(
+        c,
+        device_id,
+        |d| d.get("attestation").and_then(Value::as_str).is_some(),
+        "attestation visible",
+    )
+    .await;
+}
+
+/// Waits for a device in the directory as seen by `c` to satisfy `pred`. Robust
+/// to the transient absence of the record and to a directory not yet
+/// snapshotted.
+pub async fn wait_directory(
+    c: &mut TestComponent,
+    device_id: &str,
+    pred: impl Fn(&Value) -> bool,
+    what: &str,
+) {
+    eventually(
+        async || {
+            let Ok(list) = c.request("devices.list", json!({})).await else {
+                return false;
+            };
+            list.as_array()
+                .into_iter()
+                .flatten()
+                .any(|d| d.get("device_id").and_then(Value::as_str) == Some(device_id) && pred(d))
+        },
+        what,
     )
     .await;
 }

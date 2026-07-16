@@ -11,8 +11,10 @@
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 
-/// The control plane carries short JSON-RPC, and later the clipboard's inline
-/// payloads (text, base64 image): a large but finite cap.
+/// The control plane carries JSON-RPC only — payloads (clipboard blobs, file
+/// ranges) ride the data channel (doc/core-api.md). The cap bounds metadata;
+/// its heaviest legitimate frame is a full clipboard manifest, itself capped
+/// well below this.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// The header section has no reason to exceed a few lines.
 pub const MAX_HEADER_BYTES: usize = 8 * 1024;

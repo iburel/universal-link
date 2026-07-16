@@ -23,7 +23,7 @@ async fn incoming_request_gets_method_not_found() {
         "jsonrpc": "2.0",
         "id": 42,
         "method": "clipboard.get_data",
-        "params": { "clip_id": "x", "format": "text" },
+        "params": { "tx_id": "x", "format": "text", "channel_token": "t" },
     }))
     .await;
     let v = conn.recv().await;

@@ -58,11 +58,12 @@ On each PC:
    integrations impose their own form (in-process COM DLL for the Windows 11
    menu, signed appex for Finder, in-process plugin for Nautilus).
 
-2. **Files never travel over the local IPC.** Components exchange *paths* and
-   control; the Core reads/writes the disk itself (same machine) and streams via
-   iroh. Only the clipboard's content travels over the IPC (small payloads). The
-   IPC is a control plane: simple, reliable, secure — no need for high
-   performance.
+2. **Files never travel over the local IPC's control plane.** Components
+   exchange *paths* and control; the Core reads/writes the disk itself (same
+   machine) and streams via iroh. Payloads that must cross the IPC (the
+   clipboard's inline content, consumer-driven reads) go through a dedicated
+   **data channel** on the same socket. The control plane stays control only:
+   simple, reliable, secure — no need for high performance.
 
 3. **End-to-end encryption, blind server.** Each device has its own key pair
    (the iroh identity is an Ed25519 key pair). The server and the relays can
@@ -161,7 +162,7 @@ Central daemon, launched automatically at session login.
 | Component | Launch | Role |
 |---|---|---|
 | **Tray / notifier** | spawned by the Core | Minimal always-present surface: status icon, native notifications (session expired, pending approval…), "open the GUI" / "open the browser" actions. It is the Core's doorbell. |
-| **Clipboard manager** | spawned by the Core | Per-OS backends to read/write the clipboard and be notified of changes. Handles the "blocking paste" for the duration of the download. **Detailed design in phase 2.** |
+| **Clipboard manager** | spawned by the Core | Per-OS backends to read/write the clipboard and be notified of changes. Handles the "blocking paste" for the duration of the download. Protocol specified in [core-api.md](core-api.md) (`clipboard.*`, transactions); the per-OS backend internals are still to design. |
 | **Contextual menu manager** | spawned by the Core | Per-contextual-menu-surface backends. See the dedicated section. |
 | **GUI** | launched by the user (or via the tray) | Displays the PCs and their states, drag and drop, list of transfers, settings, approval of third-party components. Never required for nominal operation. |
 
@@ -204,9 +205,9 @@ Security).
   the same full-duplex connection.
 - Implementable by hand in any language, without a toolchain — chosen to
   maximize the ease of writing third-party components.
-- Inline payloads (clipboard text/image) as base64 on the control plane;
-  consumer-driven file reads (IStream, FUSE…) go through a dedicated **data
-  channel** for range reads.
+- No payload on the control plane: inline clipboard blobs (text/image) and
+  consumer-driven file reads (IStream, FUSE…) both go through a dedicated
+  **data channel** (binary, range reads).
 - The API is defined as a **versioned formal spec** — see
   [core-api.md](core-api.md): it is the project's extensibility product.
 
@@ -253,9 +254,9 @@ component → Core : hello { name, version, role, requested scopes, token? }
 Core → component : { granted scopes, API version }
 ```
 
-The roles (`gui`, `clipboard-backend`, `menu-backend`, `tray`, `custom`) will
-also serve for arbitration (e.g. a single active clipboard backend — to be
-settled in phase 2).
+The roles (`gui`, `clipboard-backend`, `menu-backend`, `tray`, `custom`) also
+serve for arbitration: a single active clipboard backend — the exclusive
+`clipboard-backend` role, see [core-api.md](core-api.md), "Roles".
 
 ## Contextual menu manager
 
@@ -284,7 +285,7 @@ settled in phase 2).
 2. When the menu opens, the user sees the **current list of targets** (target UX:
    `UniversalLink → PC A / PC B / …` submenu).
 3. On click, the backend reports **`(target, paths[])`** to the manager, which
-   calls `send_files` on the Core. Fire-and-forget: progress lives elsewhere
+   calls `files.send` on the Core. Fire-and-forget: progress lives elsewhere
    (tray/GUI).
 
 ### Flow
