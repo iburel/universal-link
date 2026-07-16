@@ -71,6 +71,12 @@ pub struct AppState {
     /// Transfers in progress (T2), cancelable in both directions. LEAF lock.
     pub transfers: Mutex<Transfers>,
     pub reconnect_base_delay: std::time::Duration,
+    /// Fired by `system.shutdown` (the tray's Quit): a component asked the Core
+    /// to stop. The library only signals — the binary awaits it next to the OS
+    /// signals and runs the orderly teardown. `notify_one` memorizes a single
+    /// permit, so a request that lands before the binary waits is not lost (same
+    /// reasoning as a transfer's cancel token).
+    pub shutdown_request: tokio::sync::Notify,
 }
 
 /// The pending OIDC flow: its `state` (anti-CSRF — also the flow's identity)

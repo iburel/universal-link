@@ -75,6 +75,7 @@ only through these two paths, never via the prompt.
 | `clipboard.write` | `clipboard.updated`, answering `clipboard.get_data` |
 | `clipboard.read` | the `clipboard` topic, `clipboard.fetch`, `clipboard.open_file`, `clipboard.fill_files` |
 | `components.approve` | `components.*` — never grantable via the prompt |
+| `system.shutdown` | `system.shutdown` — stops the whole Core (the tray's Quit) |
 
 Verification: per method and per topic. Example profiles — menu manager:
 `devices.read + files.send`; tray: `session.read + devices.read +
@@ -223,6 +224,12 @@ Reserved for the `components.approve` scope.
 
 Notification: `component.pending { request_id, name, role, scopes, peer_info }`
 (binary, pid — derived from the peer credentials).
+
+## `system.*`
+
+| Method | Description |
+|---|---|
+| `system.shutdown {}` | → `{}`. Stops the whole Core — the tray's Quit. The Core replies, then tears down in order (components, then the IPC, then the data plane). Receiving a file with the window closed stops until the GUI is reopened, which respawns the Core. Guarded by the `system.shutdown` scope, strictly stronger than `session.read`: killing the daemon is not something a status reader may do |
 
 ## The data channel
 
