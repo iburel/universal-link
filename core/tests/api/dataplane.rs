@@ -443,10 +443,7 @@ async fn a_crafted_traversal_name_is_refused_and_writes_nothing() {
         .parent()
         .expect("parent directory")
         .join("pown.txt");
-    assert!(
-        !escape.exists(),
-        "no write outside the receive directory"
-    );
+    assert!(!escape.exists(), "no write outside the receive directory");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -476,7 +473,10 @@ async fn a_body_shorter_than_announced_fails_and_writes_nothing() {
 
     let failed = watcher.wait_notification("transfer.failed").await;
     assert!(failed["transfer_id"].is_string());
-    assert!(received_files(&victim).is_empty(), "nothing truncated written");
+    assert!(
+        received_files(&victim).is_empty(),
+        "nothing truncated written"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1048,4 +1048,3 @@ fn victim_peer(core: &TestCore) -> PeerAddr {
         relay_url: Some(format!("iroh+memory://{}", core.key().node_id())),
     }
 }
-

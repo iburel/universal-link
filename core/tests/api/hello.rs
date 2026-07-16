@@ -181,7 +181,12 @@ async fn unknown_scope_is_invalid_params() {
     let mut c = core.connect().await;
 
     let err = c
-        .hello("third-party", "custom", &["devices.read", "coffee.read"], None)
+        .hello(
+            "third-party",
+            "custom",
+            &["devices.read", "coffee.read"],
+            None,
+        )
         .await
         .unwrap_err();
     assert_eq!(err.code, -32602);

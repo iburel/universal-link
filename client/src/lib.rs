@@ -136,7 +136,9 @@ impl std::fmt::Display for RequestError {
         match self {
             RequestError::NotConnected => write!(f, "no connection to the Core"),
             RequestError::Timeout => write!(f, "no response from the Core in time"),
-            RequestError::Disconnected => write!(f, "connection to the Core lost during the request"),
+            RequestError::Disconnected => {
+                write!(f, "connection to the Core lost during the request")
+            }
             RequestError::Rpc(e) => match &e.data_code {
                 Some(code) => write!(f, "{code}: {}", e.message),
                 None => write!(f, "error {}: {}", e.code, e.message),

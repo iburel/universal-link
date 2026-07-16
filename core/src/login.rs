@@ -235,12 +235,7 @@ impl Flow {
                 .into_owned()
                 .collect();
             if params.get("state") != Some(&self.state_param) {
-                respond(
-                    &mut conn,
-                    400,
-                    "This link matches no login in progress.",
-                )
-                .await;
+                respond(&mut conn, 400, "This link matches no login in progress.").await;
                 continue;
             }
             if let Some(error) = params.get("error") {
@@ -435,7 +430,9 @@ impl Flow {
 async fn enroll(state: &AppState, server_url: &str, id_token: &str) -> Result<String, String> {
     let mut ws = crate::session::open_ws(state, server_url).await?;
     let challenge = ws_request(&mut ws, 1, "auth.challenge", json!({})).await?;
-    let nonce = challenge["nonce"].as_str().ok_or("challenge without a nonce")?;
+    let nonce = challenge["nonce"]
+        .as_str()
+        .ok_or("challenge without a nonce")?;
     let result = ws_request(
         &mut ws,
         2,

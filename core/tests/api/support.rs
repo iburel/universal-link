@@ -429,8 +429,7 @@ fn server_cfg(server: &TestServer) -> universallink_core::ServerConfig {
 /// exactly what `account.join` would do. Without it, the data plane is
 /// fail-closed: no peer is authorized or reachable.
 fn seed_account_from_code(dir: &Path, node_id: &str, code: &str) {
-    let ak =
-        universallink_core::account_key::account_key_from_code(code).expect("valid test code");
+    let ak = universallink_core::account_key::account_key_from_code(code).expect("valid test code");
     let root = universallink_core::account_key::root_for(&ak, node_id);
     universallink_core::account_key::save(dir, &root).expect("seed account-key.json");
 }
@@ -833,7 +832,10 @@ impl TestComponent {
         timeout(RESPONSE_TIMEOUT, async {
             loop {
                 let v = self.recv_json().await;
-                match (v.get("method").and_then(Value::as_str), v.get("id").and_then(Value::as_u64)) {
+                match (
+                    v.get("method").and_then(Value::as_str),
+                    v.get("id").and_then(Value::as_u64),
+                ) {
                     (Some(m), Some(id)) => {
                         assert_eq!(m, method, "unexpected incoming request");
                         return (id, v.get("params").cloned().unwrap_or(Value::Null));
@@ -1045,14 +1047,16 @@ impl DataChannel {
     /// bytes (in offset order), or the `ERROR` code on failure.
     pub async fn read(&mut self, file_id: &str, offset: u64, len: u64) -> Result<Vec<u8>, String> {
         let req = json!({ "file_id": file_id, "offset": offset, "len": len });
-        self.send(TAG_READ, &serde_json::to_vec(&req).unwrap()).await;
+        self.send(TAG_READ, &serde_json::to_vec(&req).unwrap())
+            .await;
         self.collect().await
     }
 
     /// A `FETCH` of an inline format → the assembled blob, or the `ERROR` code.
     pub async fn fetch(&mut self, format: &str) -> Result<Vec<u8>, String> {
         let req = json!({ "format": format });
-        self.send(TAG_FETCH, &serde_json::to_vec(&req).unwrap()).await;
+        self.send(TAG_FETCH, &serde_json::to_vec(&req).unwrap())
+            .await;
         self.collect().await
     }
 
@@ -1084,8 +1088,11 @@ impl DataChannel {
 
     /// Fails the blob with an error code.
     pub async fn send_error(&mut self, code: &str) {
-        self.send(TAG_ERROR, &serde_json::to_vec(&json!({ "code": code })).unwrap())
-            .await;
+        self.send(
+            TAG_ERROR,
+            &serde_json::to_vec(&json!({ "code": code })).unwrap(),
+        )
+        .await;
     }
 
     async fn send(&mut self, tag: u8, payload: &[u8]) {
@@ -1150,7 +1157,10 @@ impl DataChannel {
         }
         let len = u32::from_be_bytes(len) as usize;
         let mut buf = vec![0u8; len];
-        self.stream.read_exact(&mut buf).await.expect("data-channel payload");
+        self.stream
+            .read_exact(&mut buf)
+            .await
+            .expect("data-channel payload");
         let tag = buf.remove(0);
         Some((tag, buf))
     }

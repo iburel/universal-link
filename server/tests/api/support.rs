@@ -106,7 +106,10 @@ impl TestEnv {
             .await
             .expect("HTTP request");
         let mut buf = String::new();
-        stream.read_to_string(&mut buf).await.expect("HTTP response");
+        stream
+            .read_to_string(&mut buf)
+            .await
+            .expect("HTTP response");
         buf.split_whitespace()
             .nth(1)
             .and_then(|s| s.parse().ok())

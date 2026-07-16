@@ -64,10 +64,9 @@ async fn list_keeps_enrolled_components_when_disconnected() {
                 .request("components.list", json!({}))
                 .await
                 .expect("components.list");
-            list.as_array()
-                .expect("list")
-                .iter()
-                .any(|e| e["name"] == "third-party" && e["connected"] == false && e["enrolled"] == true)
+            list.as_array().expect("list").iter().any(|e| {
+                e["name"] == "third-party" && e["connected"] == false && e["enrolled"] == true
+            })
         },
         "enrolled component listed as disconnected",
     )

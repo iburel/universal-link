@@ -83,7 +83,7 @@ fn app_bundle_path(exe: &Path) -> Option<PathBuf> {
     (macos.file_name()? == "MacOS"
         && contents.file_name()? == "Contents"
         && bundle.extension()? == "app")
-    .then(|| bundle.to_path_buf())
+        .then(|| bundle.to_path_buf())
 }
 
 /// Records the GUI relaunch target (see [`launch_target`]) at `dest` for the
@@ -259,7 +259,10 @@ fn register_autostart_inner(core_path: &Path) -> std::io::Result<()> {
         .filter(|p| p.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "neither XDG_CONFIG_HOME nor HOME")
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "neither XDG_CONFIG_HOME nor HOME",
+            )
         })?;
     let dir = base.join("autostart");
     std::fs::create_dir_all(&dir)?;
@@ -279,7 +282,10 @@ fn data_home() -> std::io::Result<PathBuf> {
         .filter(|p| p.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
         .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "neither XDG_DATA_HOME nor HOME")
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "neither XDG_DATA_HOME nor HOME",
+            )
         })
 }
 
@@ -479,7 +485,12 @@ mod tests {
         let mode = std::fs::metadata(&dest).expect("meta").permissions().mode();
         assert_eq!(mode & 0o111, 0o111, "the durable copy must be executable");
         // No temp left behind.
-        assert!(!data_home.join("universallink").join(format!("{CORE_BIN}.new")).exists());
+        assert!(
+            !data_home
+                .join("universallink")
+                .join(format!("{CORE_BIN}.new"))
+                .exists()
+        );
     }
 
     #[cfg(target_os = "linux")]

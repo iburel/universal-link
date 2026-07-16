@@ -482,7 +482,10 @@ impl Conn {
         // here — it's the PEER that verifies it under its account key. The server
         // only carries it, blind, like the rest of the directory.
         let attestation = rpc::optional_str_max(params, "attestation", ATTESTATION_MAX)?;
-        let device_id = self.device_id.clone().expect("authenticated → device bound");
+        let device_id = self
+            .device_id
+            .clone()
+            .expect("authenticated → device bound");
         // Only the attestation is durable here (status/relay_url are ephemeral):
         // we persist only if it changes.
         let attestation_changed = attestation.is_some();

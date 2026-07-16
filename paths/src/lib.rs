@@ -155,8 +155,11 @@ mod tests {
             dir,
             PathBuf::from("/home/u/.local/state/universallink/logs")
         );
-        let dir = log_dir_from(&env_of(&[("XDG_STATE_HOME", "/state"), ("HOME", "/home/u")]))
-            .expect("logs directory");
+        let dir = log_dir_from(&env_of(&[
+            ("XDG_STATE_HOME", "/state"),
+            ("HOME", "/home/u"),
+        ]))
+        .expect("logs directory");
         assert_eq!(dir, PathBuf::from("/state/universallink/logs"));
         assert!(log_dir_from(&env_of(&[])).is_none());
     }

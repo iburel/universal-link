@@ -129,8 +129,7 @@ async fn malformed_header_closes_connection() {
     let core = TestCore::start().await;
     let mut c = core.connect().await;
 
-    c.send_bytes(b"anything without a colon\r\n\r\n")
-        .await;
+    c.send_bytes(b"anything without a colon\r\n\r\n").await;
     c.expect_close().await;
 }
 

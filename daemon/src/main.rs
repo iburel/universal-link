@@ -154,7 +154,9 @@ async fn run() -> anyhow::Result<Outcome> {
         .await
         .is_err()
     {
-        tracing::warn!("stopping the components is taking too long: leaving without waiting for them");
+        tracing::warn!(
+            "stopping the components is taking too long: leaving without waiting for them"
+        );
     }
     drop(core);
     // The iroh endpoint closes AFTER the Core (nobody opens streams anymore):

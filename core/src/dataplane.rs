@@ -361,8 +361,7 @@ pub async fn send_transfer(
     progress(done, total);
     let mut buf = vec![0u8; CHUNK];
     for f in files {
-        let mut file =
-            bounded(STALL_TIMEOUT, tokio::fs::File::open(&f.source), "open").await?;
+        let mut file = bounded(STALL_TIMEOUT, tokio::fs::File::open(&f.source), "open").await?;
         let mut remaining = f.size;
         while remaining > 0 {
             let want = remaining.min(CHUNK as u64) as usize;
@@ -377,12 +376,7 @@ pub async fn send_transfer(
                     format!("SIZE_CHANGED: {} shrank during send", f.name),
                 ));
             }
-            bounded(
-                STALL_TIMEOUT,
-                stream.write_all(&buf[..n]),
-                "network write",
-            )
-            .await?;
+            bounded(STALL_TIMEOUT, stream.write_all(&buf[..n]), "network write").await?;
             remaining -= n as u64;
             done += n as u64;
             progress(done, total);
@@ -426,7 +420,9 @@ fn parse_manifest(value: &Value) -> std::io::Result<Vec<FileHeader>> {
     let files = value
         .get("files")
         .and_then(Value::as_array)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "offer without files"))?;
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "offer without files")
+        })?;
     files
         .iter()
         .map(|f| {
@@ -578,7 +574,12 @@ async fn serve_incoming(state: Arc<AppState>, peer: String, mut stream: Box<dyn 
 /// point of no return — a transfer whose bytes are all durable is never
 /// reported "cancelled" nor left half-committed on disk. The terminal outcome
 /// is emitted ONCE, by the task.
-async fn serve_transfer(state: Arc<AppState>, peer: String, offer: Value, mut stream: Box<dyn IoStream>) {
+async fn serve_transfer(
+    state: Arc<AppState>,
+    peer: String,
+    offer: Value,
+    mut stream: Box<dyn IoStream>,
+) {
     let manifest = match parse_manifest(&offer) {
         Ok(m) => m,
         Err(e) => {
@@ -986,10 +987,7 @@ where
         .ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!(
-                    "frame too large for the data plane: {}",
-                    payload.len()
-                ),
+                format!("frame too large for the data plane: {}", payload.len()),
             )
         })?;
     stream.write_all(&len.to_be_bytes()).await?;
@@ -1038,10 +1036,7 @@ mod tests {
 
     #[test]
     fn safe_file_name_keeps_a_plain_basename() {
-        assert_eq!(
-            safe_file_name("report.pdf").as_deref(),
-            Some("report.pdf")
-        );
+        assert_eq!(safe_file_name("report.pdf").as_deref(), Some("report.pdf"));
         assert_eq!(
             safe_file_name("my file (1).txt").as_deref(),
             Some("my file (1).txt")

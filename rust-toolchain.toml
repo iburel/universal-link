@@ -1,0 +1,9 @@
+# Pins the development toolchain to the exact version the CI and release
+# workflows use (see .github/workflows/{ci,release}.yml). rustfmt's line
+# wrapping shifts between toolchains, so an unpinned dev machine would
+# reformat the tree on the next `rustup update` and turn the CI `fmt` job
+# red. clippy is listed too: the CI denies warnings, and a newer clippy
+# invents lints the pinned one never emits.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
