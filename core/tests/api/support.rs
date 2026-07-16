@@ -211,7 +211,15 @@ pub use universallink_test_support::{
 /// Name of the Core's device in the directory (chosen at enrollment).
 pub const CORE_DEVICE_NAME: &str = "PC-Core";
 
+/// Control-plane RPC / notification ceiling: those are instant, so a tight
+/// bound catches a genuine hang fast.
 pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Data-channel round-trip ceiling (pull-at-paste). Deliberately ABOVE the
+/// Core's own data-channel deadlines (`FETCH_TIMEOUT` / `STALL`, 30 s): a real
+/// relay hang then surfaces as the Core's `CLIP_STALE`, not an opaque test-side
+/// `Elapsed`, and a slow-but-healthy round trip on a contended runner (macOS is
+/// the slowest) is never misreported as a hang.
+pub const DATA_CHANNEL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Observation window to assert that no notification arrives.
 pub const SILENCE_WINDOW: Duration = Duration::from_millis(300);
 /// Maximum delay for an asynchronous state to converge (propagated
@@ -1119,7 +1127,7 @@ impl DataChannel {
     async fn collect(&mut self) -> Result<Vec<u8>, String> {
         let mut out = Vec::new();
         loop {
-            match timeout(RESPONSE_TIMEOUT, self.recv())
+            match timeout(DATA_CHANNEL_TIMEOUT, self.recv())
                 .await
                 .expect("timeout on the data channel")
             {
