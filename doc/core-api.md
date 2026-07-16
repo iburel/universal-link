@@ -20,9 +20,9 @@
 - **A local file's bytes never travel over the IPC**: components exchange paths,
   the Core reads/writes the disk itself. The *remote* bytes being downloaded are
   either written directly by the Core at the designated locations
-  (`clipboard.fill_files`), or streamed via the data channel when the OS surface
-  demands it. Only the clipboard's inline contents (text, image) travel over the
-  control plane (base64 in v1).
+  (`transactions.fill`), or streamed via the data channel when the OS surface
+  demands it. The clipboard's inline contents (text, image) move over the data
+  channel too: the control plane carries control, never payloads.
 - **Subscription-based notifications**: a component subscribes to topics, the
   Core pushes named notifications. No polling.
 
@@ -72,8 +72,8 @@ only through these two paths, never via the prompt.
 | `devices.manage` | `devices.rename`, `devices.revoke` |
 | `files.send` | `files.send`, `files.cancel` (any transfer, outgoing or incoming — components are the user's trusted agents; the `transfer_id` is random, non-enumerable) |
 | `transfers.read` | the `transfers` topic |
-| `clipboard.write` | `clipboard.updated`, answering `clipboard.get_data` |
-| `clipboard.read` | the `clipboard` topic, `clipboard.fetch`, `clipboard.open_file`, `clipboard.fill_files` |
+| `clipboard.write` | `clipboard.updated`, answering `clipboard.get_data` — both additionally require the `clipboard-backend` role (announcing is the exclusive backend's privilege) |
+| `clipboard.read` | the `clipboard` topic, `clipboard.current`, `transactions.open`, `transactions.fill` |
 | `components.approve` | `components.*` — never grantable via the prompt |
 | `system.shutdown` | `system.shutdown` — stops the whole Core (the tray's Quit) |
 
@@ -175,41 +175,132 @@ Notifications (topic `transfers`):
 | Notification | Emitted when |
 |---|---|
 | `transfer.incoming { transfer_id, device_id, files }` | a device sends us files (`files` = manifest `[{name, size}]`) |
-| `transfer.started { transfer_id, device_id, files, total }` | the actual start of a send (will include `clipboard.fill_files` fills) |
+| `transfer.started { transfer_id, device_id, files, total }` | the actual start of a send (will include `transactions.fill` fills) |
 | `transfer.progress { transfer_id, done, total }` | throttled by the Core (~2/s; the first and last point are always emitted) |
 | `transfer.finished { transfer_id, paths? }` / `transfer.failed { transfer_id, error }` | end (`paths` = files written, on the receiving side; `error: "cancelled"` on cancellation) |
 
+## Transactions
+
+The object at the heart of everything that serves bytes across devices: a
+**transaction** is a capability minted by the source Core that grants the right
+to read a frozen set of resources. The clipboard is its first producer (one
+copy = one transaction); a shared folder will simply be a long-lived
+transaction with an explicit revocation instead of an automatic expiry. The
+`tx_id` is unguessable and never reused: holding it (plus being an
+authenticated device of the account, on the network side) is the
+authorization, and the source verifies that every requested `format` /
+`file_id` belongs to the transaction before serving a byte.
+
+Two kinds of resources, split by who holds the bytes:
+
+- **Inline formats** (`text`, `image/png`): the bytes live in the OS clipboard
+  and only the source backend can read them — the Core pulls them from it at
+  paste time (`clipboard.get_data`). If the OS clipboard changed since the
+  announce, they no longer exist anywhere: `CLIP_STALE`. Deliberate limit of
+  pull-at-paste (nothing is snapshotted — a copied password never sits in the
+  Core's memory), with a negligible window: an inline paste is a single fetch.
+- **Files**: the backend hands over paths; the Core canonicalizes them and
+  freezes the **manifest** at announce time (`stat` only — canonical paths,
+  sizes, and each file's identity: device + inode where the OS gives one, plus
+  mtime; no byte is read). From then on the Core serves the bytes from the disk
+  itself: what the OS clipboard has since become no longer matters. Reads are
+  strictly bounded to the manifest: at open time the Core re-verifies that the
+  canonical path still resolves to the frozen identity — a swapped symlink, a
+  replaced file, or a same-size rewrite fails with `FILE_CHANGED`, never a
+  silent truncation and never silently different bytes.
+
+### Lifecycle
+
+1. **Born** at the announce (`clipboard.updated` → `tx_id`).
+2. **Consumed** through sessions: an open consumer channel, or an in-flight
+   `transactions.fill`. Closing the channel (or the fill ending) ends the
+   session — there is no explicit "paste done" call: a crashed consumer is just
+   a dead connection swept by the stall timeout. A live session's rights last
+   exactly as long as its activity — deliberate: consumers are the account's
+   own devices, and cutting a half-done folder paste would be worse than
+   letting it finish.
+3. **Superseded** by the next announce — its own device's, or a newer one
+   learned from another device (last copier wins **globally**: Cores converge
+   on the most recent announce, ordered by announce timestamp then `device_id`;
+   best-effort clocks are fine — what matters is that every device elects the
+   same winner). A superseded transaction refuses NEW sessions (`TX_STALE`) but
+   the active ones run to completion — copying something else never cancels an
+   in-flight paste, which keeps reading its frozen manifest, exactly as a local
+   paste survives the next copy.
+4. **Deleted** once superseded with zero active sessions. Until superseded, it
+   serves any number of pastes (copy once, paste N times, from several
+   devices).
+
+Supersession is the graceful exit; the source Core stopping or logging out is
+not — both **cut** active sessions (`ERROR { TX_STALE }` on open channels) and
+drop every transaction. The shared folders' future explicit revocation will
+take the same cutting path: revoking must mean *now*. Consuming a transaction
+requires the scope of its producer — `clipboard.read` for a clipboard
+transaction.
+
+Very large trees: v1 freezes the full manifest at the announce and **caps it**
+(65,536 entries; beyond, the announce fails with `MANIFEST_TOO_LARGE` — a
+runaway copy is refused up front instead of killing connections with an
+oversized frame). Lazy enumeration (which shared folders will need) is an
+additive extension: `file_id` is opaque and the manifest can become pageable
+without breaking consumers.
+
 ## `clipboard.*`
 
-**Pull-at-paste** model: on copy, only the metadata circulates; the bytes move
-only at paste time. v1 normalized formats: `text`, `image/png`, `files` — the
-conversion from/to the OS formats is the backend's responsibility, the Core only
-transports normalized content. Last copier wins, across all machines. The
-anti-echo (not re-announcing one's own writes) is a contract of the backend.
+**Pull-at-paste** model: on copy, only the metadata circulates (as a
+transaction); the bytes move only at paste time. v1 normalized formats: `text`,
+`image/png`, `files` — the conversion from/to the OS formats is the backend's
+responsibility, the Core only transports normalized content. Last copier wins,
+across all machines. The anti-echo (not re-announcing one's own writes) is a
+contract of the backend.
 
 ### Source side (the PC where you copy)
 
 | Direction | Call | Description |
 |---|---|---|
-| component → Core | `clipboard.updated { clip_id, formats: [{format, size?}], paths?, sensitive? }` | announces the local copy. `clip_id`: generated by the backend, locally unique (the Core prefixes it with the device). `paths` mandatory if `files`: the Core builds the **manifest** (`stat` only, instant announcement — names, sizes, tree). `sensitive`: set if the OS confidentiality markers are detected |
-| Core → component | `clipboard.get_data { clip_id, format }` → `{ data }` | **request** from the Core when a remote device fetches an inline format. The backend reads the OS clipboard. `CLIP_STALE` if the clipboard has changed since |
+| component → Core | `clipboard.updated { formats: [{format, size?}], paths?, sensitive? }` → `{ tx_id }` | announces the local copy: opens the transaction that supersedes the previous one. `paths` mandatory if `files` (the manifest is frozen from them). `formats` may be empty — the clipboard was cleared; it supersedes like any announce (a contentless transaction), and destinations withdraw their promise. Inline `size` is an advisory hint (the content is re-serialized at paste time; the stream up to `EOF` is authoritative, a mismatch is not an error) and is omitted when `sensitive`. `sensitive`: set if the OS confidentiality markers are detected. The backend keeps the returned `tx_id` mapped to that clipboard generation |
+| Core → component | `clipboard.get_data { tx_id, format, channel_token }` → `{}` | **request** from the Core when a device pastes an inline format: the backend re-reads the OS clipboard, streams the blob over the provider channel opened with `channel_token`, and replies `{}` only after `EOF` — the reply is the completion signal. It replies `CLIP_STALE` *without opening the channel* if it cannot vouch for the `tx_id` generation (the OS clipboard moved on — or this backend instance never knew it); a failure detected mid-stream surfaces as `ERROR` on the channel and mirrors in the reply |
 
-The files never pass back through the backend: the Core serves their bytes from
-the disk (manifest paths), validating the size at read time (`SIZE_CHANGED`
-otherwise).
+The files never pass through the backend: the Core serves their bytes from the
+disk (manifest paths). `clipboard.get_data` is only ever addressed to the
+connection that announced the transaction; if it is gone, the Core fails
+inline pulls with `CLIP_STALE` itself — a fresh backend cannot vouch for a
+generation it never saw. After a (re)start the backend resynchronizes with
+`clipboard.current` and announces only on the next observed change: blindly
+re-announcing at startup would wrongly supersede a newer copy from another
+device (the anti-echo contract, extended).
 
 ### Destination side (the PC where you paste)
 
 | Direction | Call | Description |
 |---|---|---|
-| Core → component | notification `clipboard.remote_updated { device_id, clip_id, formats, files?: [{file_id, name, size, dir}], sensitive? }` | a device has copied; `files` is the manifest. The backend takes ownership of the OS clipboard with promised data |
-| component → Core | `clipboard.fetch { clip_id, format }` → `{ data }` | paste of an **inline** format (text, image) |
-| component → Core | `clipboard.open_file { clip_id, file_id }` → `{ channel_token, size }` | opens a manifest entry for range reads on the data channel (consumer-driven surfaces: IStream, FUSE, NFS, FSKit…) |
-| component → Core | `clipboard.fill_files { clip_id, entries: [{file_id, dest_path}] }` | the backend designates target files (NSFilePresenter skeletons, spool…), **the Core fills them** and answers at the end. Tracked via `transfer.*` |
+| Core → component | notification `clipboard.remote_updated { device_id, tx_id, formats, files?: [{file_id, path, size, dir?}], sensitive? }` | a device has copied; `files` is the manifest (`path`: relative, `/`-separated, unique — the announcing Core suffixes collisions with "(n)", as in reception). Empty `formats`: the source cleared its clipboard — the backend withdraws its promise (touching the OS clipboard only if it still owns it). Otherwise the backend takes ownership of the OS clipboard with promised data |
+| component → Core | `clipboard.current {}` → the current global clip (`{ device_id, tx_id, formats, files?, sensitive? }`, or `{}` if none) | the `clipboard` topic's **snapshot method**, per the resync rule: a (re)connecting backend re-learns the live promise before subscribing |
+| component → Core | `transactions.open { tx_id }` → `{ channel_token }` | opens a **consumer channel** — a paste session. One request at a time per channel: open as many channels as the paste needs concurrency |
+| component → Core | `transactions.fill { tx_id, entries: [{file_id, dest_path}] }` → `{ transfer_id }` | the backend designates target files (NSFilePresenter skeletons, spool…), **the Core fills them**. Fire-and-forget like `files.send`: progress and completion arrive via `transfer.*`, cancellation via `files.cancel`. `dest_path` comes from the enrolled backend — the user's agent, the `files.send` trust model; the remote manifest never chooses where bytes land |
 
-All the fetch paths can fail with `CLIP_STALE` (the source no longer recognizes
-this `clip_id`), `SIZE_CHANGED`, or `DEVICE_OFFLINE` — the backend must release
-its promise cleanly (paste refused, never silently truncated content).
+The receiving Core **re-validates every manifest before delivering it** —
+relative `/`-separated paths only, no `..`, no rooted or absolute segment, no
+`:` or control character, no duplicate — and drops the announce otherwise
+(fail-closed, exactly like reception): a naive backend joining `path` onto its
+paste target must not be a confused deputy for a compromised peer.
+
+`transactions.fill` details: `entries` reference non-`dir` entries only (the
+backend creates the directories — it has the manifest); the Core creates each
+`dest_path`'s missing parents. On `transfer.failed` (error or cancellation)
+the backend discards whatever the `transfer.*` events did not confirm — the
+paste surface is its promise, and temp-plus-atomic-rename is not possible on
+OS-watched skeleton paths. A backend that disconnects mid-fill cancels it.
+
+On a consumer channel the backend pulls what the OS asks for, in the order the
+OS asks for it — a whole inline blob, or arbitrary ranges of a manifest file,
+as if the file were local. Every pull can fail — `TX_STALE`, `CLIP_STALE`
+(inline only), `FILE_CHANGED`, `DEVICE_OFFLINE` at `transactions.open`,
+`PEER_GONE` mid-stream — and the backend must release its promise cleanly
+(paste refused, never silently truncated content). `sensitive` is not
+advisory: the destination backend re-applies the OS confidentiality markers
+when it takes ownership, and no component may persist a sensitive clip's
+contents (history, logs).
 
 ## `components.*`
 
@@ -223,7 +314,9 @@ Reserved for the `components.approve` scope.
 | `components.revoke { component_id }` | invalidates the token; any existing connection is closed |
 
 Notification: `component.pending { request_id, name, role, scopes, peer_info }`
-(binary, pid — derived from the peer credentials).
+(binary, pid — derived from the peer credentials). It has no topic and needs
+no subscription: the Core pushes it to every connected `gui`-role component
+holding `components.approve`.
 
 ## `system.*`
 
@@ -233,24 +326,53 @@ Notification: `component.pending { request_id, name, role, scopes, peer_info }`
 
 ## The data channel
 
-For consumers that drive the read themselves (Explorer via IStream, FUSE, NFS,
-FSKit — and later the GUI's drag & drop, which will consume the same primitive).
+Payloads never ride the control plane: file ranges AND inline blobs move over a
+**data channel** — a second connection to the same socket — so a heavy paste
+never delays a `session.status`. Built for consumers that drive the read
+themselves (Explorer via IStream, FUSE, NFS, FSKit — and later the GUI's
+drag & drop, which will consume the same primitive).
 
-1. The component obtains a `channel_token` (`clipboard.open_file`) — single-use,
-   short-lived, bound to the component and to the opened entry.
-2. It opens a **second connection** to the socket and presents the token.
-3. The connection becomes a binary range-read protocol (exact framing to be
-   frozen at implementation time):
-   - component → Core: `READ { offset, len }`, `ABORT`
-   - Core → component: `DATA { offset, bytes }`, `EOF`, `ERROR { code }`
-     (`CLIP_STALE`, `SIZE_CHANGED`, `PEER_GONE`, `TIMEOUT`)
+A `channel_token` is unguessable (CSPRNG — like `tx_id`, possession is the
+authorization), single-use, short-lived, and bound to one transaction, one
+component and one direction: the Core accepts it only from a connection whose
+peer credentials match the component it was minted for, and closes anything
+else. The bearer opens a **second connection** to the socket, presents the
+token, and the connection becomes a binary protocol (exact framing frozen at
+implementation time):
 
-Contractual properties: optimized sequential reads (read-ahead on the Core side),
-`seek` supported (an arbitrary range is valid, at the cost of reopening the network
-stream), **error propagable mid-read** (never a silent truncation), **cancellation
-in both directions** (closing the connection = reset of the iroh stream; paste
-abandoned on the OS side = `ABORT`), stall timeout on the Core side. One channel =
-one opened entry.
+- **Consumer channel** (destination side, token minted by `transactions.open`)
+  — the component drives, one request in flight per channel:
+  - component → Core: `FETCH { format }` (a whole inline blob) · `READ {
+    file_id, offset, len }` (a file range) · `ABORT` (cancels the in-flight
+    request; the channel stays usable)
+  - Core → component: `DATA { offset, bytes }`, `EOF`, `ERROR { code }`
+    (`TX_STALE`, `CLIP_STALE`, `FILE_CHANGED`, `FILE_UNKNOWN`,
+    `FORMAT_UNKNOWN`, `PEER_GONE`, `TIMEOUT`)
+  - Every request is answered by `DATA*` then `EOF` — `EOF` terminates the
+    *response*, not the file: a `READ` crossing the end of the file returns
+    the intersection (possibly zero bytes) then `EOF`. `DATA` arrives in
+    order; `offset` is absolute (file-relative for `READ`, 0-based for
+    `FETCH`). An `ERROR` ends only the request — the channel stays usable —
+    except `TX_STALE` and `PEER_GONE`, which end the session: the Core closes
+    the channel. `READ` on a `dir` entry → `FILE_UNKNOWN` (a directory conveys
+    the tree; it has no bytes).
+- **Provider channel** (source side, token carried by `clipboard.get_data`) —
+  the backend writes the requested blob: `DATA*` then `EOF`, or `ERROR { code }`
+  (`CLIP_STALE`); the `clipboard.get_data` reply follows `EOF` — the RPC
+  response is the completion signal.
+
+Contractual properties: optimized sequential reads (read-ahead on the Core
+side), `seek` supported (an arbitrary range is valid, at the cost of reopening
+the network stream), **error propagable mid-read** (never a silent truncation),
+**cancellation in both directions** (closing the connection = reset of the
+network stream; paste abandoned on the OS side = `ABORT`), stall timeout on the
+Core side. Closing the channel ends the paste session it materialized.
+
+Network mapping (informative): between Cores, one iroh connection per device
+pair and **at least one stream per transaction** — one transaction's traffic
+never queues behind another's (a small copy pastes instantly while a big one is
+still pouring), and a consumer channel's requests relay 1:1 onto such a stream.
+The exact wire protocol is out of scope for this document.
 
 ## Errors
 
@@ -266,11 +388,19 @@ Standard JSON-RPC codes + application codes in `error.data.code`:
 | `ALREADY_LOGGED_IN` | `session.login` while a session is open (re-logging in starts with `session.logout`) |
 | `INVALID_CONFIG` | `session.reload` on a malformed / half-filled `config.json` (the message carries the reason) |
 | `SERVER_UNREACHABLE` | operation requiring the server, offline |
+| `ACCOUNT_KEY_SET` | `account.setup` / `account.join` while an account key already exists (rotation is a follow-up) |
+| `INVALID_CODE` | `account.join`: malformed or wrong recovery code (checksum) |
+| `ACCOUNT_KEY_SAVE_FAILED` | the account root cannot be persisted (folder not writable) — nothing is installed |
 | `DEVICE_UNKNOWN` / `DEVICE_OFFLINE` | target unknown / unreachable |
 | `TRANSFER_UNKNOWN` | unknown `transfer_id` |
-| `FORMAT_UNKNOWN` | format not present in the clip |
-| `CLIP_STALE` | the `clip_id` is no longer the source's current clipboard |
-| `SIZE_CHANGED` | file modified between the copy and the read |
+| `FORMAT_UNKNOWN` | format not present in the transaction |
+| `FILE_UNKNOWN` | `file_id` absent from the manifest — or a `dir` entry, which has no bytes to read |
+| `TX_STALE` | `tx_id` unknown or superseded: no new session. Supersession lets active sessions finish; a Core stop, logout, or (future) explicit revocation cuts them |
+| `CLIP_STALE` | inline formats only: the source backend can no longer vouch for the announce's clipboard generation (the OS clipboard changed, the backend restarted or is gone) |
+| `FILE_CHANGED` | the file behind a manifest entry is no longer the frozen one (size, identity, or mtime): the read is refused rather than serving different bytes |
+| `MANIFEST_TOO_LARGE` | announce refused: the copy exceeds the v1 manifest cap |
+| `PEER_GONE` | data channel: the source device vanished mid-stream (`DEVICE_OFFLINE` is its control-plane twin, at `transactions.open`) |
+| `TIMEOUT` | data channel: stall timeout on the Core side |
 
 ## Versioning
 
