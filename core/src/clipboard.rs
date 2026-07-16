@@ -157,7 +157,8 @@ impl Transaction {
                 .files
                 .iter()
                 .map(|f| {
-                    let mut fv = json!({ "file_id": f.file_id, "path": f.rel_path, "size": f.size });
+                    let mut fv =
+                        json!({ "file_id": f.file_id, "path": f.rel_path, "size": f.size });
                     if f.is_dir {
                         fv["dir"] = json!(true);
                     }
@@ -243,7 +244,10 @@ impl ClipboardState {
         if self.transactions.contains_key(&tx.tx_id) {
             return None;
         }
-        if let Some(cur) = self.current.as_ref().and_then(|id| self.transactions.get(id))
+        if let Some(cur) = self
+            .current
+            .as_ref()
+            .and_then(|id| self.transactions.get(id))
             && (tx.seq, &tx.device_id) <= (cur.seq, &cur.device_id)
         {
             return None;
@@ -281,7 +285,11 @@ impl ClipboardState {
     /// The current clip's metadata, or `{}` if there is none — the
     /// `clipboard.current` snapshot.
     pub fn current_record(&self) -> Value {
-        match self.current.as_ref().and_then(|id| self.transactions.get(id)) {
+        match self
+            .current
+            .as_ref()
+            .and_then(|id| self.transactions.get(id))
+        {
             Some(t) => t.record(),
             None => json!({}),
         }
@@ -309,9 +317,7 @@ impl ClipboardState {
     /// May a NEW session open on `tx_id`? It must exist and not be superseded —
     /// a superseded clip lets its live sessions finish but accepts no new one.
     pub fn is_openable(&self, tx_id: &str) -> bool {
-        self.transactions
-            .get(tx_id)
-            .is_some_and(|t| !t.superseded)
+        self.transactions.get(tx_id).is_some_and(|t| !t.superseded)
     }
 
     /// The origin of `tx_id`, if it exists — to decide, at `transactions.open`,
@@ -565,7 +571,10 @@ fn is_safe_rel_path(raw: &str) -> bool {
     // `\` is never a separator on the wire (paths are `/`-separated); a
     // backslash, colon, or control character is refused outright, as is any
     // `.`/`..`/empty segment.
-    if raw.chars().any(|c| matches!(c, '\\' | ':') || c.is_control()) {
+    if raw
+        .chars()
+        .any(|c| matches!(c, '\\' | ':') || c.is_control())
+    {
         return false;
     }
     raw.split('/')
@@ -593,7 +602,7 @@ fn safe_base_name(raw: &str) -> Option<String> {
     if base.is_empty() || base == "." || base == ".." {
         return None;
     }
-    if base.chars().any(|c| matches!(c, ':' ) || c.is_control()) {
+    if base.chars().any(|c| matches!(c, ':') || c.is_control()) {
         return None;
     }
     Some(base.to_string())

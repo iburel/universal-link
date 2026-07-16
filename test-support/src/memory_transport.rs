@@ -97,7 +97,10 @@ impl PeerTransport for MemoryTransport {
                     None => {
                         return Err(Error::new(
                             ErrorKind::ConnectionRefused,
-                            format!("peer unknown to the in-memory switchboard: {}", peer.node_id),
+                            format!(
+                                "peer unknown to the in-memory switchboard: {}",
+                                peer.node_id
+                            ),
                         ));
                     }
                 }
@@ -127,7 +130,10 @@ impl PeerTransport for MemoryTransport {
             let mut inbox = self.inbox.lock().await;
             match inbox.recv().await {
                 Some((peer_id, stream)) => Ok((peer_id, Box::new(stream) as Box<dyn IoStream>)),
-                None => Err(Error::new(ErrorKind::BrokenPipe, "in-memory switchboard closed")),
+                None => Err(Error::new(
+                    ErrorKind::BrokenPipe,
+                    "in-memory switchboard closed",
+                )),
             }
         })
     }

@@ -34,8 +34,8 @@ use tokio::sync::Notify;
 
 use crate::clipboard::{FillPlan, Origin, Transaction};
 use crate::connector::IoStream;
-use crate::dataplane::{self, PeerAddr};
 use crate::datachannel;
+use crate::dataplane::{self, PeerAddr};
 use crate::state::AppState;
 
 /// Budget for opening a stream to the source (resolution + iroh handshake).
@@ -191,7 +191,11 @@ fn build_remote_tx(state: &AppState, peer_node_id: &str, first: &Value) -> Optio
 /// and pulls its inline blobs from the announcing backend — exactly as for a
 /// local consumer channel.
 pub(crate) async fn serve_session(state: Arc<AppState>, first: Value, stream: Box<dyn IoStream>) {
-    let Some(tx_id) = first.get("tx_id").and_then(Value::as_str).map(str::to_string) else {
+    let Some(tx_id) = first
+        .get("tx_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
         return;
     };
     let (reader, write) = tokio::io::split(stream);
@@ -357,7 +361,8 @@ pub(crate) async fn run_fill(
         .iter()
         .map(|i| json!({ "name": i.name, "size": i.size }))
         .collect();
-    let mut started = json!({ "transfer_id": transfer_id, "files": files_json, "total": plan.total });
+    let mut started =
+        json!({ "transfer_id": transfer_id, "files": files_json, "total": plan.total });
     if let Some(d) = &plan.device_id {
         started["device_id"] = json!(d);
     }
@@ -457,10 +462,15 @@ async fn fill_entries(
             .await
             .map_err(|e| e.to_string())?;
         match &mut session {
-            Some(sess) => sess.read_file(&item.file_id, item.size, &mut dest, &mut progress).await?,
+            Some(sess) => {
+                sess.read_file(&item.file_id, item.size, &mut dest, &mut progress)
+                    .await?
+            }
             None => fill_local(state, tx_id, &item.file_id, &mut dest, &mut progress).await?,
         }
-        datachannel::bounded(dest.flush()).await.map_err(|e| e.to_string())?;
+        datachannel::bounded(dest.flush())
+            .await
+            .map_err(|e| e.to_string())?;
         written.push(json!(item.dest_path.to_string_lossy()));
     }
     Ok(written)

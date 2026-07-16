@@ -441,7 +441,11 @@ mod tests {
     #[test]
     fn load_save_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(load(dir.path()), None, "no root until the account is joined");
+        assert_eq!(
+            load(dir.path()),
+            None,
+            "no root until the account is joined"
+        );
         let root = AccountRoot {
             ak_pub: public_hex(&account_key_from_code(&generate_recovery_code()).unwrap()),
             attestation: "de".repeat(64),

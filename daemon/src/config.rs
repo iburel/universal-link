@@ -104,7 +104,10 @@ fn load_from(
     over("UNIVERSALLINK_SERVER_URL", &mut fields.server_url);
     over("UNIVERSALLINK_OIDC_ISSUER", &mut fields.oidc_issuer);
     over("UNIVERSALLINK_OIDC_CLIENT_ID", &mut fields.oidc_client_id);
-    over("UNIVERSALLINK_OIDC_CLIENT_SECRET", &mut fields.oidc_client_secret);
+    over(
+        "UNIVERSALLINK_OIDC_CLIENT_SECRET",
+        &mut fields.oidc_client_secret,
+    );
     over("UNIVERSALLINK_RELAY_URL", &mut fields.relay_url);
 
     let server = match validate(&fields) {
@@ -124,9 +127,7 @@ fn load_from(
         None => None,
         Some(Ok(url)) => Some(url),
         Some(Err(e)) => {
-            problem.get_or_insert(format!(
-                "relay_url is not a valid relay URL: {e}"
-            ));
+            problem.get_or_insert(format!("relay_url is not a valid relay URL: {e}"));
             None
         }
     };
@@ -208,9 +209,7 @@ fn validate(fields: &Fields) -> Result<Option<ServerConfig>, String> {
     // connection: a typo would otherwise give a `SERVER_UNREACHABLE` with no
     // explanation.
     if !(url.starts_with("ws://") || url.starts_with("wss://")) {
-        return Err(format!(
-            "server_url must start with ws:// or wss://: {url}"
-        ));
+        return Err(format!("server_url must start with ws:// or wss://: {url}"));
     }
     if !(oidc_issuer.starts_with("http://") || oidc_issuer.starts_with("https://")) {
         return Err(format!(
@@ -252,10 +251,7 @@ fn read_file(path: &Path) -> Result<Fields, String> {
             None | Some(serde_json::Value::Null) => {}
             Some(serde_json::Value::String(text)) => *slot = Some(text.clone()),
             Some(_) => {
-                return Err(format!(
-                    "{key} must be a string in {}",
-                    path.display()
-                ));
+                return Err(format!("{key} must be a string in {}", path.display()));
             }
         }
     }

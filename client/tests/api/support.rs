@@ -162,10 +162,7 @@ impl TestCore {
             match universallink_core::spawn(config.clone()).await {
                 Ok(handle) => break handle,
                 Err(e) => {
-                    assert!(
-                        tokio::time::Instant::now() < deadline,
-                        "Core startup: {e}"
-                    );
+                    assert!(tokio::time::Instant::now() < deadline, "Core startup: {e}");
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
             }
@@ -619,17 +616,11 @@ impl ScriptedConn {
 
     pub async fn send(&mut self, v: &Value) {
         let bytes = frame(&v.to_string());
-        self.writer
-            .write_all(&bytes)
-            .await
-            .expect("scripted write");
+        self.writer.write_all(&bytes).await.expect("scripted write");
     }
 
     pub async fn send_raw(&mut self, bytes: &[u8]) {
-        self.writer
-            .write_all(bytes)
-            .await
-            .expect("scripted write");
+        self.writer.write_all(bytes).await.expect("scripted write");
     }
 
     /// Reads the client's hello and accepts it: granted scopes = requested,

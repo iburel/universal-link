@@ -29,10 +29,12 @@ async fn announce_requires_the_backend_role_and_write_scope() {
 
     // Right scope, wrong role: a `custom` component holding `clipboard.write`
     // still cannot mint transactions — announcing is the exclusive backend's.
-    let mut impostor =
-        spawn_component(&core, "impostor", "custom", &["clipboard.write"]).await;
+    let mut impostor = spawn_component(&core, "impostor", "custom", &["clipboard.write"]).await;
     let err = impostor
-        .request("clipboard.updated", json!({ "formats": [{ "format": "text" }] }))
+        .request(
+            "clipboard.updated",
+            json!({ "formats": [{ "format": "text" }] }),
+        )
         .await
         .unwrap_err();
     assert_eq!(err.app_code(), "SCOPE_DENIED");
@@ -41,7 +43,10 @@ async fn announce_requires_the_backend_role_and_write_scope() {
     let mut reader =
         spawn_component(&core, "reader", "clipboard-backend", &["clipboard.read"]).await;
     let err = reader
-        .request("clipboard.updated", json!({ "formats": [{ "format": "text" }] }))
+        .request(
+            "clipboard.updated",
+            json!({ "formats": [{ "format": "text" }] }),
+        )
         .await
         .unwrap_err();
     assert_eq!(err.app_code(), "SCOPE_DENIED");
@@ -77,7 +82,10 @@ async fn a_new_announce_supersedes_the_previous_clip() {
     let mut clip = backend(&core).await;
 
     let first = clip
-        .request("clipboard.updated", json!({ "formats": [{ "format": "text" }] }))
+        .request(
+            "clipboard.updated",
+            json!({ "formats": [{ "format": "text" }] }),
+        )
         .await
         .unwrap()["tx_id"]
         .as_str()
@@ -106,9 +114,12 @@ async fn an_empty_announce_clears_the_clipboard() {
     let core = TestCore::start().await;
     let mut clip = backend(&core).await;
 
-    clip.request("clipboard.updated", json!({ "formats": [{ "format": "text" }] }))
-        .await
-        .unwrap();
+    clip.request(
+        "clipboard.updated",
+        json!({ "formats": [{ "format": "text" }] }),
+    )
+    .await
+    .unwrap();
     // Empty formats = the clipboard was cleared: a contentless transaction that
     // supersedes the previous one.
     let cleared = clip
@@ -183,7 +194,10 @@ async fn files_and_paths_must_agree() {
 
     // `files` format but no paths.
     let err = clip
-        .request("clipboard.updated", json!({ "formats": [{ "format": "files" }] }))
+        .request(
+            "clipboard.updated",
+            json!({ "formats": [{ "format": "files" }] }),
+        )
         .await
         .unwrap_err();
     assert_eq!(err.code, -32602);
@@ -205,7 +219,10 @@ async fn current_requires_the_read_scope() {
     let core = TestCore::start().await;
     // A tray with only session.read cannot read the clipboard snapshot.
     let mut tray = spawn_component(&core, "tray", "tray", &["session.read"]).await;
-    let err = tray.request("clipboard.current", json!({})).await.unwrap_err();
+    let err = tray
+        .request("clipboard.current", json!({}))
+        .await
+        .unwrap_err();
     assert_eq!(err.app_code(), "SCOPE_DENIED");
 }
 
@@ -214,7 +231,12 @@ async fn current_requires_the_read_scope() {
 // ---------------------------------------------------------------------------
 
 /// Announces a single file and returns its `tx_id`.
-async fn announce_file(core: &TestCore, clip: &mut TestComponent, name: &str, bytes: &[u8]) -> String {
+async fn announce_file(
+    core: &TestCore,
+    clip: &mut TestComponent,
+    name: &str,
+    bytes: &[u8],
+) -> String {
     let path = core.write_source(name, bytes);
     clip.request(
         "clipboard.updated",
@@ -403,7 +425,10 @@ async fn fetch_pulls_an_inline_blob_from_the_backend() {
 
     // The backend announces text (no bytes travel at the announce).
     let tx = clip
-        .request("clipboard.updated", json!({ "formats": [{ "format": "text" }] }))
+        .request(
+            "clipboard.updated",
+            json!({ "formats": [{ "format": "text" }] }),
+        )
         .await
         .unwrap()["tx_id"]
         .as_str()
@@ -441,7 +466,10 @@ async fn fetch_of_an_absent_format_is_request_scoped() {
     let core = TestCore::start().await;
     let mut clip = backend(&core).await;
     let tx = clip
-        .request("clipboard.updated", json!({ "formats": [{ "format": "text" }] }))
+        .request(
+            "clipboard.updated",
+            json!({ "formats": [{ "format": "text" }] }),
+        )
         .await
         .unwrap()["tx_id"]
         .as_str()
@@ -463,7 +491,9 @@ async fn fetch_of_an_absent_format_is_request_scoped() {
     let fetch = ch.fetch("text");
     let serve = async {
         let (id, params) = clip.expect_request("clipboard.get_data").await;
-        let mut provider = core.open_channel(params["channel_token"].as_str().unwrap()).await;
+        let mut provider = core
+            .open_channel(params["channel_token"].as_str().unwrap())
+            .await;
         provider.send_data(0, b"ok").await;
         provider.send_eof().await;
         clip.respond(id, json!({})).await;
@@ -477,7 +507,10 @@ async fn a_stale_clipboard_fails_the_fetch() {
     let core = TestCore::start().await;
     let mut clip = backend(&core).await;
     let tx = clip
-        .request("clipboard.updated", json!({ "formats": [{ "format": "text" }] }))
+        .request(
+            "clipboard.updated",
+            json!({ "formats": [{ "format": "text" }] }),
+        )
         .await
         .unwrap()["tx_id"]
         .as_str()
@@ -547,7 +580,10 @@ async fn a_provider_that_closes_without_eof_yields_clip_stale() {
     let core = TestCore::start().await;
     let mut clip = backend(&core).await;
     let tx = clip
-        .request("clipboard.updated", json!({ "formats": [{ "format": "text" }] }))
+        .request(
+            "clipboard.updated",
+            json!({ "formats": [{ "format": "text" }] }),
+        )
         .await
         .unwrap()["tx_id"]
         .as_str()
@@ -569,7 +605,9 @@ async fn a_provider_that_closes_without_eof_yields_clip_stale() {
     let fetch = ch.fetch("text");
     let serve = async {
         let (id, params) = clip.expect_request("clipboard.get_data").await;
-        let mut provider = core.open_channel(params["channel_token"].as_str().unwrap()).await;
+        let mut provider = core
+            .open_channel(params["channel_token"].as_str().unwrap())
+            .await;
         provider.send_data(0, b"partial").await;
         drop(provider); // close without EOF
         clip.respond(id, json!({})).await;

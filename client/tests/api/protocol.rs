@@ -97,7 +97,10 @@ async fn respond_error_carries_the_application_code() {
         Event::Request { id, .. } => id,
         other => panic!("expected an incoming request, got {other:?}"),
     };
-    client.respond_error(id, "CLIP_STALE").await.expect("respond");
+    client
+        .respond_error(id, "CLIP_STALE")
+        .await
+        .expect("respond");
     let resp = conn.recv().await;
     assert_eq!(resp["id"], 7);
     assert_eq!(resp["error"]["data"]["code"], "CLIP_STALE");

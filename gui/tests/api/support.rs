@@ -151,10 +151,7 @@ impl TestCore {
             match universallink_core::spawn(config.clone()).await {
                 Ok(handle) => break handle,
                 Err(e) => {
-                    assert!(
-                        tokio::time::Instant::now() < deadline,
-                        "Core startup: {e}"
-                    );
+                    assert!(tokio::time::Instant::now() < deadline, "Core startup: {e}");
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
             }

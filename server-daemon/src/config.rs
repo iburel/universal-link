@@ -207,7 +207,10 @@ mod tests {
     const REQUIRED: &[(&str, &str)] = &[
         ("UNIVERSALLINK_SERVER_BIND", "0.0.0.0:8080"),
         ("UNIVERSALLINK_OIDC_ISSUER", "https://accounts.google.com"),
-        ("UNIVERSALLINK_OIDC_CLIENT_ID", "abc.apps.googleusercontent.com"),
+        (
+            "UNIVERSALLINK_OIDC_CLIENT_ID",
+            "abc.apps.googleusercontent.com",
+        ),
     ];
 
     #[test]

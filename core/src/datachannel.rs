@@ -75,8 +75,13 @@ pub(crate) const STALL: Duration = Duration::from_secs(30);
 /// Serves a data-channel connection: validates the token, binds it to the peer,
 /// then serves according to the channel kind. Anything unexpected closes the
 /// connection (fail-closed — the data channel owes no interpretable reply).
-pub(crate) async fn run<R, W>(state: Arc<AppState>, reader: R, write: W, peer: PeerInfo, token: String)
-where
+pub(crate) async fn run<R, W>(
+    state: Arc<AppState>,
+    reader: R,
+    write: W,
+    peer: PeerInfo,
+    token: String,
+) where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
@@ -120,7 +125,11 @@ where
     loop {
         match bounded(read_msg(&mut reader)).await {
             Ok(Some((TAG_DATA, payload))) if payload.len() >= 8 => {
-                if sink.send(ProviderMsg::Data(payload[8..].to_vec())).await.is_err() {
+                if sink
+                    .send(ProviderMsg::Data(payload[8..].to_vec()))
+                    .await
+                    .is_err()
+                {
                     break; // the consumer gave up
                 }
             }
@@ -235,8 +244,12 @@ where
     W: AsyncWrite + Unpin,
 {
     let req: Value = serde_json::from_slice(payload).map_err(|_| unexpected("bad READ"))?;
-    let file_id = req["file_id"].as_str().ok_or_else(|| unexpected("READ file_id"))?;
-    let offset = req["offset"].as_u64().ok_or_else(|| unexpected("READ offset"))?;
+    let file_id = req["file_id"]
+        .as_str()
+        .ok_or_else(|| unexpected("READ file_id"))?;
+    let offset = req["offset"]
+        .as_u64()
+        .ok_or_else(|| unexpected("READ offset"))?;
     let len = req["len"].as_u64().ok_or_else(|| unexpected("READ len"))?;
 
     let lookup = state
@@ -294,7 +307,9 @@ where
     W: AsyncWrite + Unpin,
 {
     let req: Value = serde_json::from_slice(payload).map_err(|_| unexpected("bad FETCH"))?;
-    let format = req["format"].as_str().ok_or_else(|| unexpected("FETCH format"))?;
+    let format = req["format"]
+        .as_str()
+        .ok_or_else(|| unexpected("FETCH format"))?;
 
     // Resolve then release the lock — the branches below await.
     let source = state
@@ -338,7 +353,11 @@ where
     };
     let Some((req_id, mut reply_rx)) = issued else {
         // The announcer is gone: no one can vouch for this generation.
-        state.registry.lock().expect("lock registry").take_channel_token(&token);
+        state
+            .registry
+            .lock()
+            .expect("lock registry")
+            .take_channel_token(&token);
         write_error(write, "CLIP_STALE").await?;
         return Ok(false);
     };
@@ -542,7 +561,9 @@ pub(crate) async fn read_msg<R: AsyncRead + Unpin>(
 }
 
 /// Applies the no-progress budget to an I/O future.
-pub(crate) async fn bounded<T>(fut: impl Future<Output = std::io::Result<T>>) -> std::io::Result<T> {
+pub(crate) async fn bounded<T>(
+    fut: impl Future<Output = std::io::Result<T>>,
+) -> std::io::Result<T> {
     match tokio::time::timeout(STALL, fut).await {
         Ok(result) => result,
         Err(_) => Err(std::io::Error::new(

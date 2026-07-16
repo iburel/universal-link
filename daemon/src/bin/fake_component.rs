@@ -196,9 +196,7 @@ fn read_frame(stream: &mut impl Read) -> Result<String, String> {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
-        let n = stream
-            .read(&mut byte)
-            .map_err(|e| format!("read: {e}"))?;
+        let n = stream.read(&mut byte).map_err(|e| format!("read: {e}"))?;
         if n == 0 {
             return Err("connection closed".to_string());
         }

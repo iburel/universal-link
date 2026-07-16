@@ -46,9 +46,12 @@ async fn backend(core: &TestCore) -> TestComponent {
 }
 
 async fn subscribe(c: &mut TestComponent) {
-    c.request("events.subscribe", json!({ "topics": ["clipboard", "transfers"] }))
-        .await
-        .expect("events.subscribe");
+    c.request(
+        "events.subscribe",
+        json!({ "topics": ["clipboard", "transfers"] }),
+    )
+    .await
+    .expect("events.subscribe");
 }
 
 /// Two Cores of the same account, each with a subscribed backend, connected and
@@ -82,7 +85,10 @@ async fn announce_text(c: &mut TestComponent, text: &str) -> String {
 
 /// Announces a `files` clip from `paths` and returns the `tx_id`.
 async fn announce_files(c: &mut TestComponent, paths: &[std::path::PathBuf]) -> String {
-    let paths: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    let paths: Vec<String> = paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
     c.request(
         "clipboard.updated",
         json!({ "formats": [{ "format": "files" }], "paths": paths }),
@@ -231,7 +237,10 @@ async fn a_malicious_manifest_is_dropped_fail_closed() {
     .await;
 
     cb.assert_silent().await;
-    assert_eq!(cb.request("clipboard.current", json!({})).await.unwrap(), json!({}));
+    assert_eq!(
+        cb.request("clipboard.current", json!({})).await.unwrap(),
+        json!({})
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -581,7 +590,11 @@ impl RawPeer {
             node_id: target.key().node_id(),
             relay_url: Some(format!("iroh+memory://{}", target.key().node_id())),
         };
-        let mut stream = self.transport.open(&peer).await.expect("the switchboard routes");
+        let mut stream = self
+            .transport
+            .open(&peer)
+            .await
+            .expect("the switchboard routes");
         announce["type"] = json!("clip_announce");
         let bytes = serde_json::to_vec(&announce).unwrap();
         stream

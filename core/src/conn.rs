@@ -369,12 +369,7 @@ impl Conn {
         }
 
         let mut reg = self.state.registry.lock().expect("lock registry");
-        match &reg
-            .conns
-            .get(&self.conn_id)
-            .expect("live connection")
-            .phase
-        {
+        match &reg.conns.get(&self.conn_id).expect("live connection").phase {
             Phase::Fresh => {}
             Phase::Pending(_) => return Err(RpcErr::app("PENDING_APPROVAL")),
             Phase::Active(_) => return Err(RpcErr::invalid_request()),
@@ -1077,7 +1072,12 @@ impl Conn {
             .lock()
             .expect("lock clipboard")
             .fill_plan(&tx_id, &entries)?;
-        let (transfer_id, cancel) = self.state.transfers.lock().expect("lock transfers").register();
+        let (transfer_id, cancel) = self
+            .state
+            .transfers
+            .lock()
+            .expect("lock transfers")
+            .register();
         tokio::spawn(crate::clipnet::run_fill(
             self.state.clone(),
             transfer_id.clone(),
@@ -1107,12 +1107,7 @@ impl Conn {
     /// The connection is active → its scopes; otherwise the phase error.
     fn require_enrolled(&self) -> Result<Vec<String>, RpcErr> {
         let reg = self.state.registry.lock().expect("lock registry");
-        match &reg
-            .conns
-            .get(&self.conn_id)
-            .expect("live connection")
-            .phase
-        {
+        match &reg.conns.get(&self.conn_id).expect("live connection").phase {
             Phase::Fresh => Err(RpcErr::app("NOT_ENROLLED")),
             Phase::Pending(_) => Err(RpcErr::app("PENDING_APPROVAL")),
             Phase::Active(a) => Ok(a.scopes.clone()),
@@ -1133,15 +1128,12 @@ impl Conn {
     /// Phase before scope (an unenrolled connection learns nothing).
     fn require_clipboard_backend(&self) -> Result<(), RpcErr> {
         let reg = self.state.registry.lock().expect("lock registry");
-        match &reg
-            .conns
-            .get(&self.conn_id)
-            .expect("live connection")
-            .phase
-        {
+        match &reg.conns.get(&self.conn_id).expect("live connection").phase {
             Phase::Fresh => Err(RpcErr::app("NOT_ENROLLED")),
             Phase::Pending(_) => Err(RpcErr::app("PENDING_APPROVAL")),
-            Phase::Active(a) if a.role == EXCLUSIVE_ROLE && a.has_scope("clipboard.write") => Ok(()),
+            Phase::Active(a) if a.role == EXCLUSIVE_ROLE && a.has_scope("clipboard.write") => {
+                Ok(())
+            }
             Phase::Active(_) => Err(RpcErr::app("SCOPE_DENIED")),
         }
     }

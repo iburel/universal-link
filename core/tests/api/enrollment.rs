@@ -22,7 +22,13 @@ async fn tokenless_hello_is_pending_and_methods_blocked() {
 async fn gui_receives_component_pending() {
     let core = TestCore::start().await;
     let mut g = gui(&core).await;
-    let _c = pending_component(&core, "third-party", "custom", &["devices.read", "files.send"]).await;
+    let _c = pending_component(
+        &core,
+        "third-party",
+        "custom",
+        &["devices.read", "files.send"],
+    )
+    .await;
 
     // Pushed without a subscription: it is the duty of the holder of the
     // approve scope.
@@ -80,7 +86,13 @@ async fn pending_requests_are_listed_for_late_gui() {
 async fn approve_activates_with_granted_subset() {
     let core = TestCore::start().await;
     let mut g = gui(&core).await;
-    let mut c = pending_component(&core, "third-party", "custom", &["devices.read", "files.send"]).await;
+    let mut c = pending_component(
+        &core,
+        "third-party",
+        "custom",
+        &["devices.read", "files.send"],
+    )
+    .await;
     let p = g.expect_notification("component.pending").await;
     let request_id = p["request_id"].as_str().expect("request_id");
 
@@ -243,7 +255,12 @@ async fn enrolled_token_scopes_are_bounded() {
     assert_eq!(err.app_code(), "SCOPE_DENIED");
 
     let err = again
-        .hello("third-party", "menu-backend", &["devices.read"], Some(&token))
+        .hello(
+            "third-party",
+            "menu-backend",
+            &["devices.read"],
+            Some(&token),
+        )
         .await
         .unwrap_err();
     assert_eq!(err.app_code(), "INVALID_TOKEN");

@@ -99,7 +99,10 @@ async fn a_cancelled_read_resynchronizes_on_the_next_request() {
         let read = ch.read("f0", 0, 200_000);
         tokio::pin!(read);
         poll_fn(|cx| {
-            assert!(read.as_mut().poll(cx).is_pending(), "read completed in one poll");
+            assert!(
+                read.as_mut().poll(cx).is_pending(),
+                "read completed in one poll"
+            );
             Poll::Ready(())
         })
         .await;
@@ -107,7 +110,10 @@ async fn a_cancelled_read_resynchronizes_on_the_next_request() {
 
     // The abandoned response is drained transparently: the next reads return
     // the right bytes, never the leftover frames.
-    assert_eq!(ch.read("f0", 0, 4).await.expect("read"), content[0..4].to_vec());
+    assert_eq!(
+        ch.read("f0", 0, 4).await.expect("read"),
+        content[0..4].to_vec()
+    );
     assert_eq!(
         ch.read("f0", 100, 4).await.expect("read"),
         content[100..104].to_vec()
