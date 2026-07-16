@@ -204,11 +204,19 @@ async fn run_once(
 }
 
 /// The deployment's official components, looked up next to the Core binary.
-/// None exist yet: the tray, the clipboard manager, and the contextual menu
-/// will come and register here. A missing executable is ignored (with a word
-/// in the log) — a Core without a tray is still a working Core.
+/// The tray is registered; the clipboard manager and the contextual menu will
+/// come and register here too. A missing executable is ignored (with a word in
+/// the log) — a Core without a tray is still a working Core.
+///
+/// The tray is granted `system.shutdown` (its Quit stops the whole Core) on top
+/// of `session.read` (its status icon); it requests only what each of its
+/// building blocks actually uses.
 pub fn official_components() -> Vec<ChildSpec> {
-    const OFFICIAL: [(&str, &str, &[&str]); 0] = [];
+    const OFFICIAL: [(&str, &str, &[&str]); 1] = [(
+        "universallink-tray",
+        "tray",
+        &["session.read", "system.shutdown"],
+    )];
 
     let Some(dir) = std::env::current_exe()
         .ok()

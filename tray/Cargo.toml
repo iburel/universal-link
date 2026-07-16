@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
+
+[package]
+name = "universallink-tray"
+version = "0.2.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+# The system-tray component: a small headless process launched and supervised
+# by the Core (role `tray`). It reads a single-use spawn token from the first
+# line of its standard input, connects over the local IPC, and lives until that
+# standard input closes (the supervisor's graceful stop) or the connection is
+# lost — the spawn token is single-use, so losing the IPC means exiting and
+# letting the supervisor restart us with a fresh one.
+#
+# lib + bin, like the daemon and the GUI: the exit conditions (the component
+# contract) live in the lib so they are tested without any real I/O; the binary
+# is only wiring (stdin, environment, IPC client). The icon and menu arrive in
+# later building blocks.
+
+[[bin]]
+name = "universallink-tray"
+path = "src/main.rs"
+
+[dependencies]
+# Decodes the embedded tray icon (8-bit RGBA PNG) to the raw RGBA `tray-icon`
+# wants.
+png = "0.17"
+# Request params (`system.shutdown`, `session.status`) and reading the
+# session payloads.
+serde_json = "1"
+# Cross-platform event loop for the tray. On Linux it initializes the gtk main
+# loop that `tray-icon` needs; on macOS it owns the main-thread run loop.
+tao = "0.35.3"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-std",
+    "io-util",
+    "sync",
+] }
+# System tray icon + menu (the Tauri ecosystem's standalone crate). `gtk` gives
+# the Linux backend (libappindicator, dlopened at RUNTIME — no build-time system
+# dep; the AppImage bundles it in a later block). The default `libxdo` feature
+# is dropped: it links `-lxdo` at build time only to power the predefined
+# Copy/Cut/Paste/SelectAll menu items, which we do not use.
+tray-icon = { version = "0.24.1", default-features = false, features = ["gtk"] }
+universallink-ipc-client = { path = "../client" }
+# Resolves the config directory to read the GUI's recorded relaunch path.
+universallink-paths = { path = "../paths" }

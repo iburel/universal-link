@@ -44,6 +44,59 @@ pub fn bundled_core_path() -> Option<PathBuf> {
     Some(exe.parent()?.join(CORE_BIN))
 }
 
+/// What the tray should run to bring the GUI up. The tray runs from the Core's
+/// durable copy and cannot otherwise find the GUI, so the GUI records this at
+/// startup. `None` if we cannot resolve our own path.
+///
+/// - Linux: `$APPIMAGE` when launched from one (the loose file to re-run),
+///   otherwise the executable (dev / native install).
+/// - macOS: the `.app` bundle — opened with `open`, which activates an existing
+///   instance instead of duplicating it — otherwise the executable.
+/// - Windows: the executable.
+pub fn launch_target() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(appimage) = std::env::var_os("APPIMAGE") {
+            return Some(PathBuf::from(appimage));
+        }
+        Some(exe)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Some(app_bundle_path(&exe).unwrap_or(exe))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Some(exe)
+    }
+}
+
+/// The enclosing `.app` bundle of a macOS executable at
+/// `Foo.app/Contents/MacOS/Foo`; `None` if the path is not shaped like that.
+/// Pure function (tested on every platform).
+#[cfg(any(test, target_os = "macos"))]
+fn app_bundle_path(exe: &Path) -> Option<PathBuf> {
+    let macos = exe.parent()?; // Contents/MacOS
+    let contents = macos.parent()?; // Contents
+    let bundle = contents.parent()?; // Foo.app
+    (macos.file_name()? == "MacOS"
+        && contents.file_name()? == "Contents"
+        && bundle.extension()? == "app")
+    .then(|| bundle.to_path_buf())
+}
+
+/// Records the GUI relaunch target (see [`launch_target`]) at `dest` for the
+/// tray to read. Best-effort: on failure the tray's "Open" is simply a no-op.
+pub fn record_launch_target(dest: &Path) {
+    let Some(target) = launch_target() else {
+        return;
+    };
+    if let Err(e) = std::fs::write(dest, target.to_string_lossy().as_bytes()) {
+        eprintln!("[universallink] cannot record the GUI launch path: {e}");
+    }
+}
+
 /// The Core to actually spawn and register for autostart. On most platforms
 /// this is just the bundled sidecar (`bundled`) — its location is durable
 /// (macOS `.app` in /Applications, per-user NSIS install dir). On Linux
@@ -64,7 +117,16 @@ pub fn stabilize_core_path(bundled: &Path) -> PathBuf {
     if std::env::var_os("APPIMAGE").is_none() {
         return bundled.to_path_buf();
     }
-    match data_home().and_then(|d| stage_core_copy(bundled, &d)) {
+    let staged = data_home().and_then(|data| {
+        let core = stage_core_copy(bundled, &data)?;
+        // Bring the tray sidecar alongside the durable Core: the Core's
+        // supervisor looks for it next to its OWN executable, which is now this
+        // copy — not the AppImage mount. Best-effort — a Core without a tray
+        // still works.
+        stage_tray_copy(bundled, &data);
+        Ok(core)
+    });
+    match staged {
         Ok(stable) => stable,
         Err(e) => {
             eprintln!(
@@ -228,23 +290,55 @@ fn staged_core_dest(data_home: &Path) -> PathBuf {
 }
 
 /// Copies the Core into `<data_home>/universallink/` and returns its path.
-/// Copy-to-temp-then-`rename`: `rename(2)` is atomic and, unlike copying onto
-/// the destination in place, does NOT fail with `ETXTBSY` when that path is a
-/// Core binary currently running from a previous session — the running process
-/// keeps its old inode, the new file takes over the path. `data_home` is passed
-/// in (not read from the env) so the mechanics are testable deterministically.
+/// `data_home` is passed in (not read from the env) so the mechanics are
+/// testable deterministically.
 #[cfg(target_os = "linux")]
 fn stage_core_copy(src: &Path, data_home: &Path) -> std::io::Result<PathBuf> {
     let dest = staged_core_dest(data_home);
+    stage_copy(src, &dest)?;
+    Ok(dest)
+}
+
+/// The tray sidecar's name, next to the Core.
+#[cfg(target_os = "linux")]
+const TRAY_BIN: &str = "universallink-tray";
+
+/// Copies the tray sidecar next to the durable Core (best-effort). It lives
+/// next to the bundled Core inside the AppImage mount; the durable copy must
+/// carry it too, or the supervisor won't find it once we run from the copy.
+#[cfg(target_os = "linux")]
+fn stage_tray_copy(bundled_core: &Path, data_home: &Path) {
+    let Some(src) = bundled_core.parent().map(|d| d.join(TRAY_BIN)) else {
+        return;
+    };
+    if !src.exists() {
+        return; // no tray in this build
+    }
+    let dest = data_home.join("universallink").join(TRAY_BIN);
+    if let Err(e) = stage_copy(&src, &dest) {
+        eprintln!("[universallink] cannot stage the tray copy ({e})");
+    }
+}
+
+/// Copies `src` onto `dest` via a temp file then an atomic `rename(2)`: unlike
+/// copying in place, this does NOT fail with `ETXTBSY` when `dest` is a binary
+/// currently running from a previous session — the running process keeps its
+/// old inode, the new file takes over the path. Creates `dest`'s parent.
+#[cfg(target_os = "linux")]
+fn stage_copy(src: &Path, dest: &Path) -> std::io::Result<()> {
     let dir = dest
         .parent()
         .expect("staged destination always has a parent");
     std::fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!("{CORE_BIN}.new"));
+    let name = dest
+        .file_name()
+        .expect("staged destination has a file name")
+        .to_string_lossy();
+    let tmp = dir.join(format!("{name}.new"));
     std::fs::copy(src, &tmp)?;
     set_executable(&tmp)?;
-    std::fs::rename(&tmp, &dest)?;
-    Ok(dest)
+    std::fs::rename(&tmp, dest)?;
+    Ok(())
 }
 
 /// Marks a freshly written file executable (0o755). `std::fs::copy` already
@@ -313,6 +407,32 @@ mod tests {
     }
 
     #[test]
+    fn recording_writes_a_non_empty_launch_target() {
+        // In the test process `launch_target` resolves the current executable,
+        // so a non-empty path is written for the tray to read back.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dest = tmp.path().join("gui-launch");
+        record_launch_target(&dest);
+        let recorded = std::fs::read_to_string(&dest).expect("recorded launch target");
+        assert!(!recorded.trim().is_empty());
+    }
+
+    #[test]
+    fn app_bundle_path_ascends_to_the_dot_app() {
+        let exe = Path::new("/Applications/UniversalLink.app/Contents/MacOS/UniversalLink");
+        assert_eq!(
+            app_bundle_path(exe),
+            Some(PathBuf::from("/Applications/UniversalLink.app"))
+        );
+        // Not inside a bundle (a bare executable): None, so the caller falls
+        // back to the executable itself.
+        assert_eq!(
+            app_bundle_path(Path::new("/usr/local/bin/universallink-gui")),
+            None
+        );
+    }
+
+    #[test]
     fn the_desktop_entry_points_at_the_program() {
         let entry = autostart_desktop_entry(Path::new("/opt/ul/core"));
         assert!(entry.contains("Exec=/opt/ul/core"));
@@ -360,6 +480,23 @@ mod tests {
         assert_eq!(mode & 0o111, 0o111, "the durable copy must be executable");
         // No temp left behind.
         assert!(!data_home.join("universallink").join(format!("{CORE_BIN}.new")).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn staging_a_sibling_copies_it_and_marks_it_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join(TRAY_BIN);
+        std::fs::write(&src, b"tray").expect("write src");
+
+        let dest = tmp.path().join("data").join("universallink").join(TRAY_BIN);
+        stage_copy(&src, &dest).expect("stage");
+
+        assert_eq!(std::fs::read(&dest).expect("read"), b"tray");
+        let mode = std::fs::metadata(&dest).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o111, 0o111, "the sibling copy must be executable");
     }
 
     #[cfg(target_os = "linux")]

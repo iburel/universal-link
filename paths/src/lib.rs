@@ -34,6 +34,13 @@ impl Endpoint {
     pub fn token_path(&self) -> PathBuf {
         self.config_dir.join("ipc-token")
     }
+
+    /// Where the GUI records how the tray should relaunch it. The tray runs
+    /// from the Core's durable copy and cannot otherwise find the GUI — a loose
+    /// AppImage on Linux especially. Written by the GUI, read by the tray.
+    pub fn gui_launch_path(&self) -> PathBuf {
+        self.config_dir.join("gui-launch")
+    }
 }
 
 /// Production paths, resolved from the process's environment.

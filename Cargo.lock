@@ -7221,6 +7221,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "universallink-tray"
+version = "0.2.0"
+dependencies = [
+ "png 0.17.16",
+ "serde_json",
+ "tao",
+ "tokio",
+ "tray-icon",
+ "universallink-ipc-client",
+ "universallink-paths",
+]
+
+[[package]]
 name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
