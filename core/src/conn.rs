@@ -41,7 +41,7 @@ const ROLES: [&str; 5] = ["gui", "clipboard-backend", "menu-backend", "tray", "c
 /// A single clipboard backend active at a time (doc/core-api.md, "Roles").
 const EXCLUSIVE_ROLE: &str = "clipboard-backend";
 
-const SCOPES: [&str; 9] = [
+const SCOPES: [&str; 10] = [
     "session.read",
     "session.manage",
     "devices.read",
@@ -51,6 +51,7 @@ const SCOPES: [&str; 9] = [
     "clipboard.read",
     "clipboard.write",
     "components.approve",
+    "system.shutdown",
 ];
 
 /// Never grantable through the approval prompt — only by the bootstrap trust
@@ -243,6 +244,7 @@ impl Conn {
             "components.approve" => self.components_approve(params),
             "components.deny" => self.components_deny(params),
             "components.revoke" => self.components_revoke(params),
+            "system.shutdown" => self.system_shutdown(),
             _ => {
                 // Phase first: an unenrolled component learns nothing about
                 // the surface, not even which methods exist.
@@ -838,6 +840,20 @@ impl Conn {
         if !known {
             return Err(RpcErr::invalid_params("component_id"));
         }
+        Ok(json!({}))
+    }
+
+    // -- Lifecycle ----------------------------------------------------------
+
+    /// Stops the whole Core — the tray's Quit. The library only SIGNALS; the
+    /// binary owns the orderly teardown and awaits this next to the OS signals.
+    /// The reply leaves before that teardown reaches this connection: the binary
+    /// stops the components first, ample time for this connection's queue to
+    /// drain (the same reply-before-close guarantee as a self-revocation).
+    /// Relaunching means opening the GUI, which respawns the Core.
+    fn system_shutdown(&self) -> Result<Value, RpcErr> {
+        self.require_scope("system.shutdown")?;
+        self.state.shutdown_request.notify_one();
         Ok(json!({}))
     }
 

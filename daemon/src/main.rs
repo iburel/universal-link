@@ -133,8 +133,13 @@ async fn run() -> anyhow::Result<Outcome> {
         Policy::default(),
     );
 
-    shutdown_signal().await;
-    tracing::info!("shutdown requested");
+    // Two ways out: an OS signal (service stop, session end) or a component
+    // over the IPC (the tray's Quit → `system.shutdown`). The teardown below is
+    // the same for both.
+    tokio::select! {
+        _ = shutdown_signal() => tracing::info!("shutdown requested (signal)"),
+        _ = core.shutdown_requested() => tracing::info!("shutdown requested (component)"),
+    }
     // A second signal during shutdown: the user insists.
     tokio::spawn(async {
         shutdown_signal().await;

@@ -173,6 +173,14 @@ impl CoreHandle {
             .spawn_tokens
             .remove(token);
     }
+
+    /// Resolves when a component asked the Core to stop (`system.shutdown` — the
+    /// tray's Quit). The binary awaits this alongside the OS signals, then runs
+    /// its usual teardown (components, then IPC, then the data plane). The Core
+    /// is relaunched by opening the GUI, which respawns it.
+    pub async fn shutdown_requested(&self) {
+        self.state.shutdown_request.notified().await;
+    }
 }
 
 impl Drop for CoreHandle {
@@ -276,6 +284,7 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
         receive_dir: config.receive_dir,
         transfers: Mutex::new(Transfers::new()),
         reconnect_base_delay: config.reconnect_base_delay,
+        shutdown_request: tokio::sync::Notify::new(),
     });
 
     if let Some(info) = session_info {
