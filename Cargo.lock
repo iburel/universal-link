@@ -7085,6 +7085,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "universallink-clipboard"
+version = "0.2.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "universallink-core",
+ "universallink-ipc-client",
+ "universallink-test-support",
+]
+
+[[package]]
 name = "universallink-core"
 version = "0.2.0"
 dependencies = [

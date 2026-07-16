@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[package]
+name = "universallink-clipboard"
+version = "0.2.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+# The OS clipboard backend: the exclusive `clipboard-backend` component. It
+# observes local copies and announces them (`clipboard.updated`), serves inline
+# pastes from the OS clipboard over a provider channel (`clipboard.get_data`),
+# and — for a remote copy — takes ownership of the OS clipboard and pulls the
+# bytes at paste time (`transactions.open` + a consumer channel). The
+# OS-agnostic orchestrator (the announce/promise/session state machine) lives in
+# the lib and is frozen by tests/api/ against a real Core; the per-OS backends
+# land in later bricks (X11, Windows, macOS).
+
+[[bin]]
+name = "universallink-clipboard"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-std",
+    "io-util",
+    "sync",
+] }
+universallink-ipc-client = { path = "../client" }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+universallink-core = { path = "../core" }
+universallink-test-support = { path = "../test-support" }
