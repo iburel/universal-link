@@ -143,8 +143,7 @@ pub async fn run(
                     // this is a no-op (there is nothing to talk to).
                     let _ = client.request("system.shutdown", json!({})).await;
                 }
-                // Later block: launch the GUI.
-                Some(UiCommand::Open) => {}
+                Some(UiCommand::Open) => open_gui(),
             },
             event = events.recv() => match classify(event) {
                 Step::Connected => {
@@ -159,6 +158,41 @@ pub async fn run(
                 Step::Exit(outcome) => return outcome,
             },
         }
+    }
+}
+
+/// Launches the GUI from the target it recorded at startup (the tray runs from
+/// the Core's durable copy and cannot otherwise find it). Best-effort and
+/// fire-and-forget; a missing or stale record just means nothing opens.
+fn open_gui() {
+    let Some(endpoint) = universallink_paths::production_endpoint() else {
+        eprintln!("[universallink-tray] cannot resolve the config directory");
+        return;
+    };
+    let record = endpoint.gui_launch_path();
+    let target = match std::fs::read_to_string(&record) {
+        Ok(target) if !target.trim().is_empty() => target.trim().to_string(),
+        _ => {
+            eprintln!(
+                "[universallink-tray] no recorded GUI launch path ({})",
+                record.display()
+            );
+            return;
+        }
+    };
+    // macOS: `open` activates an existing instance rather than duplicating it.
+    // Elsewhere: run the recorded target directly. Detached from our standard
+    // input (the supervisor's token pipe) so the GUI does not inherit it.
+    let mut command = if cfg!(target_os = "macos") {
+        let mut open = std::process::Command::new("open");
+        open.arg(&target);
+        open
+    } else {
+        std::process::Command::new(&target)
+    };
+    command.stdin(std::process::Stdio::null());
+    if let Err(e) = command.spawn() {
+        eprintln!("[universallink-tray] cannot launch the GUI ({target}): {e}");
     }
 }
 

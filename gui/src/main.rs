@@ -33,6 +33,10 @@ fn main() {
         let core_path = universallink_gui::stabilize_core_path(&bundled);
         universallink_gui::register_autostart(&core_path);
         universallink_gui::spawn_core(&core_path);
+        // Record how the tray should relaunch us: it runs from the Core's
+        // durable copy and cannot otherwise find the GUI (a loose AppImage on
+        // Linux).
+        universallink_gui::record_launch_target(&endpoint.gui_launch_path());
     }
 
     let config = ClientConfig {

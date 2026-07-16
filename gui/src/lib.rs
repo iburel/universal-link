@@ -16,7 +16,9 @@ mod bridge;
 mod supervise;
 
 pub use bridge::shell;
-pub use supervise::{bundled_core_path, register_autostart, spawn_core, stabilize_core_path};
+pub use supervise::{
+    bundled_core_path, record_launch_target, register_autostart, spawn_core, stabilize_core_path,
+};
 
 /// Scopes requested by the official GUI (production binary).
 /// `files.send`: the user sends files by dropping them onto a device;

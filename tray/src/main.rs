@@ -145,9 +145,9 @@ async fn brain(cmd_rx: mpsc::Receiver<UiCommand>, proxy: EventLoopProxy<UserEven
         name: "universallink-tray".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         role: "tray".into(),
-        // session.read now (status icon); the grant also carries system.shutdown
-        // for the Quit, requested when the Core call is wired in.
-        scopes: vec!["session.read".into()],
+        // session.read for the status icon, system.shutdown for the Quit — both
+        // within the supervisor's grant.
+        scopes: vec!["session.read".into(), "system.shutdown".into()],
         topics: vec!["session".into()],
         reconnect_base_delay: RECONNECT_BASE_DELAY,
         request_timeout: REQUEST_TIMEOUT,

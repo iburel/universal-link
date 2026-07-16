@@ -44,6 +44,59 @@ pub fn bundled_core_path() -> Option<PathBuf> {
     Some(exe.parent()?.join(CORE_BIN))
 }
 
+/// What the tray should run to bring the GUI up. The tray runs from the Core's
+/// durable copy and cannot otherwise find the GUI, so the GUI records this at
+/// startup. `None` if we cannot resolve our own path.
+///
+/// - Linux: `$APPIMAGE` when launched from one (the loose file to re-run),
+///   otherwise the executable (dev / native install).
+/// - macOS: the `.app` bundle — opened with `open`, which activates an existing
+///   instance instead of duplicating it — otherwise the executable.
+/// - Windows: the executable.
+pub fn launch_target() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(appimage) = std::env::var_os("APPIMAGE") {
+            return Some(PathBuf::from(appimage));
+        }
+        Some(exe)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Some(app_bundle_path(&exe).unwrap_or(exe))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Some(exe)
+    }
+}
+
+/// The enclosing `.app` bundle of a macOS executable at
+/// `Foo.app/Contents/MacOS/Foo`; `None` if the path is not shaped like that.
+/// Pure function (tested on every platform).
+#[cfg(any(test, target_os = "macos"))]
+fn app_bundle_path(exe: &Path) -> Option<PathBuf> {
+    let macos = exe.parent()?; // Contents/MacOS
+    let contents = macos.parent()?; // Contents
+    let bundle = contents.parent()?; // Foo.app
+    (macos.file_name()? == "MacOS"
+        && contents.file_name()? == "Contents"
+        && bundle.extension()? == "app")
+    .then(|| bundle.to_path_buf())
+}
+
+/// Records the GUI relaunch target (see [`launch_target`]) at `dest` for the
+/// tray to read. Best-effort: on failure the tray's "Open" is simply a no-op.
+pub fn record_launch_target(dest: &Path) {
+    let Some(target) = launch_target() else {
+        return;
+    };
+    if let Err(e) = std::fs::write(dest, target.to_string_lossy().as_bytes()) {
+        eprintln!("[universallink] cannot record the GUI launch path: {e}");
+    }
+}
+
 /// The Core to actually spawn and register for autostart. On most platforms
 /// this is just the bundled sidecar (`bundled`) — its location is durable
 /// (macOS `.app` in /Applications, per-user NSIS install dir). On Linux
@@ -310,6 +363,32 @@ mod tests {
         let plist = launch_agent_plist("l", Path::new("/a & b/<core>"));
         assert!(plist.contains("/a &amp; b/&lt;core&gt;"));
         assert!(!plist.contains("/a & b/<core>"));
+    }
+
+    #[test]
+    fn recording_writes_a_non_empty_launch_target() {
+        // In the test process `launch_target` resolves the current executable,
+        // so a non-empty path is written for the tray to read back.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dest = tmp.path().join("gui-launch");
+        record_launch_target(&dest);
+        let recorded = std::fs::read_to_string(&dest).expect("recorded launch target");
+        assert!(!recorded.trim().is_empty());
+    }
+
+    #[test]
+    fn app_bundle_path_ascends_to_the_dot_app() {
+        let exe = Path::new("/Applications/UniversalLink.app/Contents/MacOS/UniversalLink");
+        assert_eq!(
+            app_bundle_path(exe),
+            Some(PathBuf::from("/Applications/UniversalLink.app"))
+        );
+        // Not inside a bundle (a bare executable): None, so the caller falls
+        // back to the executable itself.
+        assert_eq!(
+            app_bundle_path(Path::new("/usr/local/bin/universallink-gui")),
+            None
+        );
     }
 
     #[test]

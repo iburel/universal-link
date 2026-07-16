@@ -48,3 +48,5 @@ tokio = { version = "1", features = [
 # Copy/Cut/Paste/SelectAll menu items, which we do not use.
 tray-icon = { version = "0.24.1", default-features = false, features = ["gtk"] }
 universallink-ipc-client = { path = "../client" }
+# Resolves the config directory to read the GUI's recorded relaunch path.
+universallink-paths = { path = "../paths" }
