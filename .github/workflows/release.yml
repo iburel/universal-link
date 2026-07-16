@@ -121,13 +121,21 @@ jobs:
       - name: Build the Core (sidecar)
         run: cargo build -p universallink-daemon --bin universallink-core --release --locked
 
-      # Tauri expects the sidecar named with the target triple, next to the GUI.
-      - name: Stage the sidecar
+      # The tray, a second sidecar next to the Core. Same flags; on Linux it
+      # dlopens libappindicator at runtime, so there is no extra build-time
+      # system dependency here.
+      - name: Build the tray (sidecar)
+        run: cargo build -p universallink-tray --bin universallink-tray --release --locked
+
+      # Tauri expects each sidecar named with the target triple, next to the GUI.
+      - name: Stage the sidecars
         shell: bash
         run: |
           mkdir -p gui/binaries
           cp "target/release/universallink-core${{ matrix.bin_ext }}" \
              "gui/binaries/universallink-core-${{ matrix.triple }}${{ matrix.bin_ext }}"
+          cp "target/release/universallink-tray${{ matrix.bin_ext }}" \
+             "gui/binaries/universallink-tray-${{ matrix.triple }}${{ matrix.bin_ext }}"
 
       # `externalBin` is injected HERE (and not in tauri.conf.json) so that the
       # `cargo build`/clippy runs in ci.yml don't require the sidecar to be
@@ -137,7 +145,7 @@ jobs:
         shell: bash
         run: |
           cargo tauri build --features webview --bundles ${{ matrix.bundles }} \
-            --config '{"bundle":{"externalBin":["binaries/universallink-core"]}}'
+            --config '{"bundle":{"externalBin":["binaries/universallink-core","binaries/universallink-tray"]}}'
 
       # Always: retrievable from the run (tests the chain without a tag).
       - name: Run artifact
@@ -162,6 +170,6 @@ jobs:
 
             - **macOS**: "unverified developer" → System Settings → Privacy & Security → "Open anyway".
             - **Windows**: SmartScreen "Windows protected your PC" → "More info" → "Run anyway".
-            - **Linux** (AppImage): `chmod +x UniversalLink_*.AppImage`, then run it. If it fails to start with a `libfuse.so.2` error, install FUSE 2 (`sudo apt install libfuse2`, or your distro's equivalent).
+            - **Linux** (AppImage): `chmod +x UniversalLink_*.AppImage`, then run it. If it fails to start with a `libfuse.so.2` error, install FUSE 2 (`sudo apt install libfuse2`, or your distro's equivalent). The tray icon additionally needs `libayatana-appindicator3` (`sudo apt install libayatana-appindicator3-1`) and a StatusNotifierItem host — on GNOME, the AppIndicator extension.
 
             On first launch, the app installs the background service (per-user, no admin) and opens a setup screen: enter your UniversalLink server address and its OpenID Connect client (nothing is baked into the build). It then connects.

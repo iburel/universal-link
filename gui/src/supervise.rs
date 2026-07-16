@@ -117,7 +117,16 @@ pub fn stabilize_core_path(bundled: &Path) -> PathBuf {
     if std::env::var_os("APPIMAGE").is_none() {
         return bundled.to_path_buf();
     }
-    match data_home().and_then(|d| stage_core_copy(bundled, &d)) {
+    let staged = data_home().and_then(|data| {
+        let core = stage_core_copy(bundled, &data)?;
+        // Bring the tray sidecar alongside the durable Core: the Core's
+        // supervisor looks for it next to its OWN executable, which is now this
+        // copy — not the AppImage mount. Best-effort — a Core without a tray
+        // still works.
+        stage_tray_copy(bundled, &data);
+        Ok(core)
+    });
+    match staged {
         Ok(stable) => stable,
         Err(e) => {
             eprintln!(
@@ -281,23 +290,55 @@ fn staged_core_dest(data_home: &Path) -> PathBuf {
 }
 
 /// Copies the Core into `<data_home>/universallink/` and returns its path.
-/// Copy-to-temp-then-`rename`: `rename(2)` is atomic and, unlike copying onto
-/// the destination in place, does NOT fail with `ETXTBSY` when that path is a
-/// Core binary currently running from a previous session — the running process
-/// keeps its old inode, the new file takes over the path. `data_home` is passed
-/// in (not read from the env) so the mechanics are testable deterministically.
+/// `data_home` is passed in (not read from the env) so the mechanics are
+/// testable deterministically.
 #[cfg(target_os = "linux")]
 fn stage_core_copy(src: &Path, data_home: &Path) -> std::io::Result<PathBuf> {
     let dest = staged_core_dest(data_home);
+    stage_copy(src, &dest)?;
+    Ok(dest)
+}
+
+/// The tray sidecar's name, next to the Core.
+#[cfg(target_os = "linux")]
+const TRAY_BIN: &str = "universallink-tray";
+
+/// Copies the tray sidecar next to the durable Core (best-effort). It lives
+/// next to the bundled Core inside the AppImage mount; the durable copy must
+/// carry it too, or the supervisor won't find it once we run from the copy.
+#[cfg(target_os = "linux")]
+fn stage_tray_copy(bundled_core: &Path, data_home: &Path) {
+    let Some(src) = bundled_core.parent().map(|d| d.join(TRAY_BIN)) else {
+        return;
+    };
+    if !src.exists() {
+        return; // no tray in this build
+    }
+    let dest = data_home.join("universallink").join(TRAY_BIN);
+    if let Err(e) = stage_copy(&src, &dest) {
+        eprintln!("[universallink] cannot stage the tray copy ({e})");
+    }
+}
+
+/// Copies `src` onto `dest` via a temp file then an atomic `rename(2)`: unlike
+/// copying in place, this does NOT fail with `ETXTBSY` when `dest` is a binary
+/// currently running from a previous session — the running process keeps its
+/// old inode, the new file takes over the path. Creates `dest`'s parent.
+#[cfg(target_os = "linux")]
+fn stage_copy(src: &Path, dest: &Path) -> std::io::Result<()> {
     let dir = dest
         .parent()
         .expect("staged destination always has a parent");
     std::fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!("{CORE_BIN}.new"));
+    let name = dest
+        .file_name()
+        .expect("staged destination has a file name")
+        .to_string_lossy();
+    let tmp = dir.join(format!("{name}.new"));
     std::fs::copy(src, &tmp)?;
     set_executable(&tmp)?;
-    std::fs::rename(&tmp, &dest)?;
-    Ok(dest)
+    std::fs::rename(&tmp, dest)?;
+    Ok(())
 }
 
 /// Marks a freshly written file executable (0o755). `std::fs::copy` already
@@ -439,6 +480,23 @@ mod tests {
         assert_eq!(mode & 0o111, 0o111, "the durable copy must be executable");
         // No temp left behind.
         assert!(!data_home.join("universallink").join(format!("{CORE_BIN}.new")).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn staging_a_sibling_copies_it_and_marks_it_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join(TRAY_BIN);
+        std::fs::write(&src, b"tray").expect("write src");
+
+        let dest = tmp.path().join("data").join("universallink").join(TRAY_BIN);
+        stage_copy(&src, &dest).expect("stage");
+
+        assert_eq!(std::fs::read(&dest).expect("read"), b"tray");
+        let mode = std::fs::metadata(&dest).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o111, 0o111, "the sibling copy must be executable");
     }
 
     #[cfg(target_os = "linux")]
