@@ -3,6 +3,7 @@
 
 mod support;
 
+mod channel;
 mod connection;
 mod events;
 mod full_stack;

@@ -222,6 +222,7 @@ pub fn client_config(
         role: role.into(),
         scopes: scopes.iter().map(|s| s.to_string()).collect(),
         topics: topics.iter().map(|s| s.to_string()).collect(),
+        served_methods: vec![],
         reconnect_base_delay: Duration::from_millis(25),
         request_timeout: RESPONSE_TIMEOUT,
     }
@@ -604,6 +605,16 @@ impl ScriptedConn {
             .await
             .expect("timeout waiting for the client to close");
         assert!(r.is_none(), "unexpected frame before close: {r:?}");
+    }
+
+    /// Checks that no frame arrives during `SILENCE_WINDOW` and the connection
+    /// stays open (used to assert a stale response is never written).
+    pub async fn assert_no_frame(&mut self) {
+        match timeout(SILENCE_WINDOW, recv_frame(&mut self.reader)).await {
+            Err(_) => {}
+            Ok(None) => panic!("connection closed during the silence window"),
+            Ok(Some(f)) => panic!("unexpected frame during the silence window: {f}"),
+        }
     }
 
     pub async fn send(&mut self, v: &Value) {

@@ -12,7 +12,6 @@
 //! connection, not a client hang.
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -20,7 +19,8 @@ use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
-use crate::{ClientConfig, Event, RequestError, RpcError, TokenSource, framing};
+use crate::transport::{self, Stream};
+use crate::{ClientConfig, Event, RequestError, RequestId, RpcError, TokenSource, framing};
 
 /// A full establishment attempt (connection + hello + subscribe)
 /// beyond this: failure. Generous — the Core replies in milliseconds.
@@ -37,17 +37,27 @@ const CMD_CAPACITY: usize = 64;
 /// Parsed messages between the reader task and the manager.
 const READ_CAPACITY: usize = 64;
 
-#[cfg(unix)]
-type Stream = tokio::net::UnixStream;
-#[cfg(windows)]
-type Stream = tokio::net::windows::named_pipe::NamedPipeClient;
-
 enum Cmd {
     Request {
         method: String,
         params: Value,
         reply: oneshot::Sender<Result<Value, RequestError>>,
     },
+    Respond {
+        /// The connection generation the request was delivered on — a response
+        /// is only written if it still matches the live connection.
+        generation: u64,
+        id: Value,
+        payload: RespondPayload,
+        reply: oneshot::Sender<Result<(), RequestError>>,
+    },
+}
+
+enum RespondPayload {
+    /// A successful `result`.
+    Ok(Value),
+    /// An application error code (`error.data.code`, e.g. `CLIP_STALE`).
+    Err(String),
 }
 
 /// Request handle to the Core — clonable, shareable across tasks.
@@ -85,6 +95,45 @@ impl Client {
             Ok(r) => r,
         }
     }
+
+    /// Answers an [`Event::Request`] with a successful result. `id` is the one
+    /// carried by the event. `Disconnected` if the connection that delivered
+    /// the request is gone (a stale id is never sent onto a fresh connection).
+    pub async fn respond(&self, id: RequestId, result: Value) -> Result<(), RequestError> {
+        self.send_response(id, RespondPayload::Ok(result)).await
+    }
+
+    /// Answers an [`Event::Request`] with an application error code (surfaced to
+    /// the Core as `error.data.code`, e.g. `CLIP_STALE`).
+    pub async fn respond_error(&self, id: RequestId, code: &str) -> Result<(), RequestError> {
+        self.send_response(id, RespondPayload::Err(code.to_string()))
+            .await
+    }
+
+    async fn send_response(
+        &self,
+        id: RequestId,
+        payload: RespondPayload,
+    ) -> Result<(), RequestError> {
+        let (tx, rx) = oneshot::channel();
+        match timeout(self.request_timeout, async {
+            self.cmd
+                .send(Cmd::Respond {
+                    generation: id.generation,
+                    id: id.id,
+                    payload,
+                    reply: tx,
+                })
+                .await
+                .map_err(|_| RequestError::NotConnected)?;
+            rx.await.map_err(|_| RequestError::NotConnected)?
+        })
+        .await
+        {
+            Err(_) => Err(RequestError::Timeout),
+            Ok(r) => r,
+        }
+    }
 }
 
 pub(crate) fn spawn(config: ClientConfig) -> (Client, mpsc::Receiver<Event>) {
@@ -107,6 +156,9 @@ async fn run(config: ClientConfig, mut cmd_rx: mpsc::Receiver<Cmd>, event_tx: mp
     // Request ids: monotonically increasing over the client's whole lifetime,
     // never reused (establishment consumes some too).
     let mut next_id: u64 = 0;
+    // Connection generation: bumped on every established connection so a
+    // response to an incoming request cannot leak onto a later connection.
+    let mut generation: u64 = 0;
     loop {
         // Establishment is NOT the connection yet: requests issued during
         // the attempt fail with immediate NotConnected, just as during
@@ -120,9 +172,7 @@ async fn run(config: ClientConfig, mut cmd_rx: mpsc::Receiver<Cmd>, event_tx: mp
                     r = &mut attempt => break Some(r),
                     cmd = cmd_rx.recv() => match cmd {
                         None => break None,
-                        Some(Cmd::Request { reply, .. }) => {
-                            let _ = reply.send(Err(RequestError::NotConnected));
-                        }
+                        Some(cmd) => fail_offline(cmd),
                     },
                 }
             }
@@ -133,6 +183,7 @@ async fn run(config: ClientConfig, mut cmd_rx: mpsc::Receiver<Cmd>, event_tx: mp
         match outcome {
             Ok(Ok(link)) => {
                 delay = config.reconnect_base_delay;
+                generation += 1;
                 let _ = event_tx
                     .send(Event::Connected {
                         granted_scopes: link.granted_scopes.clone(),
@@ -149,7 +200,15 @@ async fn run(config: ClientConfig, mut cmd_rx: mpsc::Receiver<Cmd>, event_tx: mp
                         })
                         .await;
                 }
-                let served = serve(link, &mut cmd_rx, &event_tx, &mut next_id).await;
+                let served = serve(
+                    link,
+                    &mut cmd_rx,
+                    &event_tx,
+                    &mut next_id,
+                    generation,
+                    &config.served_methods,
+                )
+                .await;
                 let _ = event_tx.send(Event::Disconnected).await;
                 if matches!(served, Served::ClientDropped) {
                     return;
@@ -160,8 +219,8 @@ async fn run(config: ClientConfig, mut cmd_rx: mpsc::Receiver<Cmd>, event_tx: mp
                 // shutdown. We keep replying NotConnected so that
                 // in-flight requests do not hang.
                 let _ = event_tx.send(Event::Incompatible { api_version }).await;
-                while let Some(Cmd::Request { reply, .. }) = cmd_rx.recv().await {
-                    let _ = reply.send(Err(RequestError::NotConnected));
+                while let Some(cmd) = cmd_rx.recv().await {
+                    fail_offline(cmd);
                 }
                 return;
             }
@@ -185,10 +244,22 @@ async fn wait_backoff(cmd_rx: &mut mpsc::Receiver<Cmd>, delay: Duration) -> bool
             _ = &mut deadline => return true,
             cmd = cmd_rx.recv() => match cmd {
                 None => return false,
-                Some(Cmd::Request { reply, .. }) => {
-                    let _ = reply.send(Err(RequestError::NotConnected));
-                }
+                Some(cmd) => fail_offline(cmd),
             },
+        }
+    }
+}
+
+/// Fail-closed reply to a command received while offline (establishment,
+/// backoff, permanent shutdown): a request has nothing to send it on, and a
+/// response's connection is gone.
+fn fail_offline(cmd: Cmd) {
+    match cmd {
+        Cmd::Request { reply, .. } => {
+            let _ = reply.send(Err(RequestError::NotConnected));
+        }
+        Cmd::Respond { reply, .. } => {
+            let _ = reply.send(Err(RequestError::Disconnected));
         }
     }
 }
@@ -225,7 +296,7 @@ async fn establish(config: &ClientConfig, next_id: &mut u64) -> Result<Link, Est
         TokenSource::Spawn(token) => token.clone(),
     };
 
-    let stream = connect(&config.ipc_path)
+    let stream = transport::connect(&config.ipc_path)
         .await
         .map_err(|_| EstablishError::Failed)?;
     let (read, write) = tokio::io::split(stream);
@@ -342,6 +413,8 @@ async fn serve(
     cmd_rx: &mut mpsc::Receiver<Cmd>,
     event_tx: &mpsc::Sender<Event>,
     next_id: &mut u64,
+    generation: u64,
+    served_methods: &[String],
 ) -> Served {
     let Link {
         mut reader,
@@ -392,6 +465,33 @@ async fn serve(
                         }
                     }
                 }
+                Some(Cmd::Respond { generation: g, id, payload, reply }) => {
+                    // The request's connection is gone: never write its id onto
+                    // this (later) connection.
+                    if g != generation {
+                        let _ = reply.send(Err(RequestError::Disconnected));
+                        continue;
+                    }
+                    let msg = match payload {
+                        RespondPayload::Ok(result) => {
+                            json!({ "jsonrpc": "2.0", "id": id, "result": result })
+                        }
+                        RespondPayload::Err(code) => json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": { "code": -32000, "message": code, "data": { "code": code } },
+                        }),
+                    };
+                    match write_frame(&mut writer, &msg.to_string()).await {
+                        Ok(()) => {
+                            let _ = reply.send(Ok(()));
+                        }
+                        Err(_) => {
+                            let _ = reply.send(Err(RequestError::Disconnected));
+                            break Served::ConnectionLost;
+                        }
+                    }
+                }
             },
             msg = msg_rx.recv() => match msg {
                 None => break Served::ConnectionLost,
@@ -407,6 +507,22 @@ async fn serve(
                             // intended backpressure. Consumer gone:
                             // events dropped, the client stays usable.
                             let _ = event_tx.send(Event::Notification { method, params }).await;
+                        } else if let Some(method) = v["method"].as_str()
+                            && served_methods.iter().any(|m| m == method)
+                        {
+                            // A served Core→component request: surface it; the
+                            // consumer answers via Client::respond. Same
+                            // backpressure as a notification.
+                            let method = method.to_string();
+                            let params = v.get("params").cloned().unwrap_or(Value::Null);
+                            let id = v.get("id").cloned().unwrap_or(Value::Null);
+                            let _ = event_tx
+                                .send(Event::Request {
+                                    id: RequestId { generation, id },
+                                    method,
+                                    params,
+                                })
+                                .await;
                         } else if write_frame(&mut writer, &method_not_found(&v)).await.is_err() {
                             break Served::ConnectionLost;
                         }
@@ -464,21 +580,4 @@ async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, text: &str) -> std::
     timeout(WRITE_TIMEOUT, writer.write_all(&bytes))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "IPC write blocked"))?
-}
-
-#[cfg(unix)]
-async fn connect(path: &Path) -> std::io::Result<Stream> {
-    tokio::net::UnixStream::connect(path).await
-}
-
-#[cfg(windows)]
-async fn connect(path: &Path) -> std::io::Result<Stream> {
-    use tokio::net::windows::named_pipe::ClientOptions;
-    let name = path
-        .to_str()
-        .ok_or_else(|| std::io::Error::other("pipe name not UTF-8"))?;
-    // All instances busy (ERROR_PIPE_BUSY): a failure like any
-    // other — the cycle's backoff retries, the next instance arrives as soon
-    // as the Core accepts.
-    ClientOptions::new().open(name)
 }
