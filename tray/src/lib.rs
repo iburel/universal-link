@@ -75,14 +75,19 @@ impl TrayStatus {
         let configured = v["configured"].as_bool().unwrap_or(true);
         let logged_in = v["logged_in"].as_bool().unwrap_or(false);
         let server_connected = v["server_connected"].as_bool().unwrap_or(false);
-        if !configured {
-            TrayStatus::NotConfigured
-        } else if server_connected {
+        // Connection first: a live session means "connected" even when
+        // `configured` is false. A session carries its own server URL and
+        // reconnects without a config.json (only a NEW login needs one), so
+        // `configured` only distinguishes "never set up" from "signed out" when
+        // there is no session at all.
+        if server_connected {
             TrayStatus::Online
         } else if logged_in {
             TrayStatus::Offline
-        } else {
+        } else if configured {
             TrayStatus::SignedOut
+        } else {
+            TrayStatus::NotConfigured
         }
     }
 }
@@ -258,6 +263,17 @@ mod tests {
         assert_eq!(
             status(json!({ "logged_in": true, "server_connected": true })),
             TrayStatus::Online
+        );
+        // A live session with no config.json (a new login isn't possible, but
+        // the session reconnects on its own URL): still "connected", never
+        // "not set up".
+        assert_eq!(
+            status(json!({ "configured": false, "logged_in": true, "server_connected": true })),
+            TrayStatus::Online
+        );
+        assert_eq!(
+            status(json!({ "configured": false, "logged_in": true, "server_connected": false })),
+            TrayStatus::Offline
         );
     }
 
