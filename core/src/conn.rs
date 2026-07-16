@@ -68,6 +68,39 @@ fn topic_scope(topic: &str) -> Option<&'static str> {
     }
 }
 
+/// Parses `transactions.fill`'s `entries`: a non-empty array of
+/// `{ file_id, dest_path }` into pairs of strings; `-32602` otherwise.
+fn parse_fill_entries(params: &Value) -> Result<Vec<(String, String)>, RpcErr> {
+    let items = params
+        .get("entries")
+        .and_then(Value::as_array)
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| RpcErr::invalid_params("entries"))?;
+    items
+        .iter()
+        .map(|e| {
+            let file_id = e
+                .get("file_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RpcErr::invalid_params("file_id"))?;
+            let dest_path = e
+                .get("dest_path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RpcErr::invalid_params("dest_path"))?;
+            Ok((file_id.to_string(), dest_path.to_string()))
+        })
+        .collect()
+}
+
+/// Best-effort millisecond wall-clock: the ordering base for the clipboard's
+/// global last-copier-wins. A clock skew only shifts the tie-break; local
+/// monotonicity is guaranteed by the floor in `announce_local`.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
 struct Conn {
     state: Arc<AppState>,
     conn_id: ConnId,
@@ -309,6 +342,7 @@ impl Conn {
             "clipboard.updated" => self.clipboard_updated(params),
             "clipboard.current" => self.clipboard_current(),
             "transactions.open" => self.transactions_open(params),
+            "transactions.fill" => self.transactions_fill(params),
             "system.shutdown" => self.system_shutdown(),
             _ => {
                 // Phase first: an unenrolled component learns nothing about
@@ -949,14 +983,27 @@ impl Conn {
         let tx = crate::clipboard::Transaction {
             tx_id: format!("tx_{}", random_hex(16)),
             device_id,
+            seq: 0, // assigned by `announce_local` (floored above the current clip)
             formats,
             files,
             sensitive,
-            announcer: self.conn_id,
+            origin: crate::clipboard::Origin::Local {
+                announcer: self.conn_id,
+            },
             superseded: false,
             sessions: 0,
         };
-        let tx_id = self.state.clipboard.lock().expect("lock clipboard").announce(tx);
+        // Announce locally (last copier wins here), then broadcast the metadata
+        // to the account's other devices so they converge on this copy.
+        let (tx_id, net) = {
+            let mut cb = self.state.clipboard.lock().expect("lock clipboard");
+            let tx_id = cb.announce_local(tx, now_millis());
+            let net = cb.network_announce_of(&tx_id);
+            (tx_id, net)
+        };
+        if let Some(net) = net {
+            crate::clipnet::propagate(&self.state, net);
+        }
         Ok(json!({ "tx_id": tx_id }))
     }
 
@@ -980,14 +1027,22 @@ impl Conn {
     fn transactions_open(&self, params: &Value) -> Result<Value, RpcErr> {
         self.require_scope("clipboard.read")?;
         let tx_id = rpc::required_str(params, "tx_id")?;
-        if !self
-            .state
-            .clipboard
-            .lock()
-            .expect("lock clipboard")
-            .is_openable(&tx_id)
-        {
-            return Err(RpcErr::app("TX_STALE"));
+        let origin = {
+            let cb = self.state.clipboard.lock().expect("lock clipboard");
+            if !cb.is_openable(&tx_id) {
+                return Err(RpcErr::app("TX_STALE"));
+            }
+            cb.origin_of(&tx_id)
+        };
+        // A remote clip whose source is no longer reachable (re-enrolled under a
+        // new node_id, or with no published relay) fails fast here — the
+        // control-plane twin of the data channel's `PEER_GONE`.
+        if let Some(crate::clipboard::Origin::Remote { node_id, device_id }) = origin {
+            let reachable = crate::dataplane::resolve_peer(&self.state, &device_id)
+                .is_some_and(|p| p.node_id == node_id && p.relay_url.is_some());
+            if !reachable {
+                return Err(RpcErr::app("DEVICE_OFFLINE"));
+            }
         }
         let token = self
             .state
@@ -1002,6 +1057,35 @@ impl Conn {
                 sink: None,
             });
         Ok(json!({ "channel_token": token }))
+    }
+
+    /// Designates target files for the Core to fill from a transaction (the
+    /// paste surface's skeleton paths). Fire-and-forget like `files.send`: the
+    /// `transfer_id` comes back at once, progress and completion arrive over the
+    /// `transfers` topic, cancellation via `files.cancel`. The `dest_path`s come
+    /// from the enrolled backend (the `files.send` trust model — the remote
+    /// manifest never chooses where bytes land); the Core creates their missing
+    /// parents and writes them directly (an OS-watched skeleton admits no
+    /// temp+rename). The `file_id`s must be non-`dir` manifest entries.
+    fn transactions_fill(&self, params: &Value) -> Result<Value, RpcErr> {
+        self.require_scope("clipboard.read")?;
+        let tx_id = rpc::required_str(params, "tx_id")?;
+        let entries = parse_fill_entries(params)?;
+        let plan = self
+            .state
+            .clipboard
+            .lock()
+            .expect("lock clipboard")
+            .fill_plan(&tx_id, &entries)?;
+        let (transfer_id, cancel) = self.state.transfers.lock().expect("lock transfers").register();
+        tokio::spawn(crate::clipnet::run_fill(
+            self.state.clone(),
+            transfer_id.clone(),
+            tx_id,
+            plan,
+            cancel,
+        ));
+        Ok(json!({ "transfer_id": transfer_id }))
     }
 
     // -- Lifecycle ----------------------------------------------------------

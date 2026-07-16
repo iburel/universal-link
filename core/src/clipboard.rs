@@ -15,6 +15,12 @@
 //! manifest of paths + sizes + identity). No byte is read here. Inline formats
 //! (text, image/png) are re-read from the backend at paste time; files are
 //! served by the Core from the disk, bounded to the frozen manifest.
+//!
+//! A transaction is either **local** (announced by a backend on this device —
+//! inline pulled from it, files read from this disk) or **remote** (learned
+//! from a peer's `clip_announce` — everything relayed to the source device over
+//! the data plane, see `clipnet`). Which one is the transaction's `origin`; a
+//! remote manifest carries no local backing, only the metadata a paste needs.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -30,8 +36,12 @@ use crate::state::ConnId;
 const FORMATS: [&str; 3] = ["text", "image/png", "files"];
 
 /// Upper bound on a v1 manifest: a runaway copy is refused at the announce
-/// (`MANIFEST_TOO_LARGE`) rather than later killing a connection with an
-/// oversized notification frame. Lazy enumeration (shared folders) will lift it.
+/// (`MANIFEST_TOO_LARGE`) rather than freezing an unbounded manifest in memory.
+/// It bounds the LOCAL offer and the IPC notification (16 MiB); it does NOT by
+/// itself fit the network `clip_announce` frame (`dataplane::MAX_FRAME`, 1 MiB —
+/// a few tens of thousands of entries), so a very large clip still serves
+/// locally and to a local paste but fails to PROPAGATE (best-effort, logged) —
+/// a known v1 limit that lazy enumeration (shared folders) will lift.
 const MANIFEST_MAX: usize = 65_536;
 
 /// An offered format and its advisory size (bytes). For inline formats the size
@@ -56,9 +66,20 @@ pub struct Identity {
     pub ino: u64,
 }
 
+/// What a source Core needs to serve a manifest file's bytes from its own disk:
+/// the canonical path and the frozen identity. Absent on a remote transaction
+/// (the bytes live on the source device; reads are relayed to it, never served
+/// from here) — its presence is exactly "this file is local".
+#[derive(Clone, Debug)]
+pub struct LocalBacking {
+    /// Canonical absolute path on the local disk. Resolved once at the announce
+    /// (symlinks followed); reads are bounded to it.
+    pub source: PathBuf,
+    pub identity: Identity,
+}
+
 /// A manifest entry: what the destination sees (`file_id`, relative `path`,
-/// size, `dir`) plus what the source Core needs to serve it (the canonical
-/// on-disk `source` and the frozen `identity`).
+/// size, `dir`) plus, for a local file, the `backing` the Core reads from.
 #[derive(Clone, Debug)]
 pub struct FileEntry {
     pub file_id: String,
@@ -66,33 +87,48 @@ pub struct FileEntry {
     /// `clipboard.remote_updated` carries and a destination joins onto its
     /// paste target.
     pub rel_path: String,
-    /// Canonical absolute path on the local disk. Resolved once at the announce
-    /// (symlinks followed); reads are bounded to it.
-    pub source: PathBuf,
     pub size: u64,
     pub is_dir: bool,
-    pub identity: Identity,
+    /// `Some` on the source device (bytes served from disk), `None` on a
+    /// destination that learned the manifest over the network.
+    pub backing: Option<LocalBacking>,
+}
+
+/// Where a transaction's bytes come from — and therefore how the Core serves a
+/// paste of it.
+#[derive(Clone, Debug)]
+pub enum Origin {
+    /// Announced by a backend on this device: inline formats are pulled from
+    /// `announcer` (`clipboard.get_data`), files are read from the local disk.
+    Local { announcer: ConnId },
+    /// Learned from a peer's `clip_announce`: every paste is relayed to the
+    /// source device over the data plane (a `clip_session` stream). `node_id`
+    /// authenticates the source (iroh identity); `device_id` reaches it through
+    /// the directory (`resolve_peer`).
+    Remote { node_id: String, device_id: String },
 }
 
 /// A transaction: a frozen offer, addressable by its unguessable `tx_id`.
 pub struct Transaction {
     pub tx_id: String,
-    /// The source device (own device on the announcing side); omitted when the
-    /// Core is not logged in.
+    /// The source device (own device on the announcing side, the peer's on a
+    /// remote clip); omitted when a local Core is not logged in.
     pub device_id: Option<String>,
+    /// Ordering key for the global last-copier-wins: a best-effort millisecond
+    /// timestamp, floored above the current clip's so a fresh local copy always
+    /// wins locally. Every Core elects the highest `(seq, device_id)`.
+    pub seq: u64,
     pub formats: Vec<Format>,
     /// The file manifest (empty unless a `files` format was announced).
     pub files: Vec<FileEntry>,
     pub sensitive: bool,
-    /// The control connection that announced it — where `clipboard.get_data` is
-    /// addressed for inline formats. If it is gone, inline pulls fail
-    /// `CLIP_STALE`; files keep being served from the disk regardless.
-    pub announcer: ConnId,
+    /// Where the bytes live and how a paste reaches them.
+    pub origin: Origin,
     /// Superseded by a newer announce: refuses new sessions (`TX_STALE`), but a
     /// session already open runs to completion.
     pub superseded: bool,
-    /// Open consumer channels reading it. A superseded transaction is deleted
-    /// once this reaches zero.
+    /// Open consumer channels / fills reading it. A superseded transaction is
+    /// deleted once this reaches zero.
     pub sessions: u32,
 }
 
@@ -141,12 +177,22 @@ impl FileEntry {
     /// Re-`stat`s the source and confirms it is still the frozen file: same
     /// size AND same identity (mtime, and dev+inode on unix). Any change — a
     /// swap, a same-size rewrite, a vanished file, or an unreadable stat —
-    /// fails: we never serve bytes we cannot vouch for (`FILE_CHANGED`).
+    /// fails: we never serve bytes we cannot vouch for (`FILE_CHANGED`). A
+    /// remote entry (no backing) never matches: its bytes are not served from
+    /// here.
     pub fn still_matches(&self) -> bool {
-        let Ok(meta) = std::fs::metadata(&self.source) else {
+        let Some(backing) = &self.backing else {
             return false;
         };
-        !meta.is_dir() && meta.len() == self.size && identity_of(&meta) == self.identity
+        let Ok(meta) = std::fs::metadata(&backing.source) else {
+            return false;
+        };
+        !meta.is_dir() && meta.len() == self.size && identity_of(&meta) == backing.identity
+    }
+
+    /// The on-disk path to read this file's bytes from, if it is local.
+    pub fn source(&self) -> Option<&std::path::Path> {
+        self.backing.as_ref().map(|b| b.source.as_path())
     }
 }
 
@@ -169,14 +215,53 @@ impl ClipboardState {
         }
     }
 
-    /// Opens `tx` and makes it the current clip, superseding the previous one
-    /// (last copier wins). Returns the `tx_id`.
-    pub fn announce(&mut self, tx: Transaction) -> String {
+    /// Opens a LOCAL `tx` and makes it the current clip, superseding the
+    /// previous one — a fresh local copy always wins on its own device. Assigns
+    /// its ordering `seq`: `now_ms`, floored above the current clip's so it also
+    /// wins the global election even against a peer with a fast clock. Returns
+    /// the `tx_id`.
+    pub fn announce_local(&mut self, mut tx: Transaction, now_ms: u64) -> String {
+        tx.seq = now_ms.max(self.current_seq().saturating_add(1));
         let tx_id = tx.tx_id.clone();
         self.supersede_current();
         self.transactions.insert(tx_id.clone(), tx);
         self.current = Some(tx_id.clone());
         tx_id
+    }
+
+    /// Adopts a REMOTE `tx` learned from a peer, but ONLY if it is strictly
+    /// newer than the current clip by `(seq, device_id)` — the global
+    /// last-copier-wins. Returns `Some(tx_id)` when adopted (the caller then
+    /// notifies the local backend), `None` when the announce is stale or a
+    /// duplicate (ignored, never made current). Every Core applying the same
+    /// total order converges on the same winner.
+    pub fn announce_remote(&mut self, tx: Transaction) -> Option<String> {
+        // Every announce mints a FRESH unguessable `tx_id`; a remote one reusing
+        // an id already in the table is a duplicate delivery or a collision from
+        // a misbehaving account device — refuse it rather than overwrite a live
+        // transaction (which could be draining a paste of its own).
+        if self.transactions.contains_key(&tx.tx_id) {
+            return None;
+        }
+        if let Some(cur) = self.current.as_ref().and_then(|id| self.transactions.get(id))
+            && (tx.seq, &tx.device_id) <= (cur.seq, &cur.device_id)
+        {
+            return None;
+        }
+        let tx_id = tx.tx_id.clone();
+        self.supersede_current();
+        self.transactions.insert(tx_id.clone(), tx);
+        self.current = Some(tx_id.clone());
+        Some(tx_id)
+    }
+
+    /// The `seq` of the current clip (0 if none) — the floor for the next local
+    /// announce.
+    fn current_seq(&self) -> u64 {
+        self.current
+            .as_ref()
+            .and_then(|id| self.transactions.get(id))
+            .map_or(0, |t| t.seq)
     }
 
     /// Marks the current transaction superseded; drops it at once if no session
@@ -202,6 +287,16 @@ impl ClipboardState {
         }
     }
 
+    /// The `clip_announce` payload for a transaction: its metadata record plus
+    /// the ordering `seq` (the network-internal field peers converge on). Used
+    /// right after `announce_local` to broadcast the copy.
+    pub fn network_announce_of(&self, tx_id: &str) -> Option<Value> {
+        let t = self.transactions.get(tx_id)?;
+        let mut v = t.record();
+        v["seq"] = json!(t.seq);
+        Some(v)
+    }
+
     /// Drops every transaction — the non-graceful exit (Core stop, logout, and
     /// later an explicit revocation): the right to read ends *now*. Active
     /// sessions are cut separately (a `TX_STALE` pushed on their channels); once
@@ -219,18 +314,21 @@ impl ClipboardState {
             .is_some_and(|t| !t.superseded)
     }
 
-    /// Opens a session on `tx_id`, reserving it against deletion. `false` if the
-    /// transaction is already gone (deleted between `transactions.open` and the
-    /// channel attach). Accepts a superseded-but-alive transaction: the grant
-    /// was minted while it was openable.
-    pub fn start_session(&mut self, tx_id: &str) -> bool {
-        match self.transactions.get_mut(tx_id) {
-            Some(t) => {
-                t.sessions += 1;
-                true
-            }
-            None => false,
-        }
+    /// The origin of `tx_id`, if it exists — to decide, at `transactions.open`,
+    /// whether reaching the source device is even possible (`DEVICE_OFFLINE`).
+    pub fn origin_of(&self, tx_id: &str) -> Option<Origin> {
+        self.transactions.get(tx_id).map(|t| t.origin.clone())
+    }
+
+    /// Opens a session on `tx_id`, reserving it against deletion, and returns
+    /// its `origin` (how to serve the paste). `None` if the transaction is
+    /// already gone (deleted between `transactions.open` and the channel
+    /// attach). Accepts a superseded-but-alive transaction: the grant was minted
+    /// while it was openable, and an in-flight paste runs to completion.
+    pub fn begin_session(&mut self, tx_id: &str) -> Option<Origin> {
+        let t = self.transactions.get_mut(tx_id)?;
+        t.sessions += 1;
+        Some(t.origin.clone())
     }
 
     /// Closes a session; deletes the transaction if it was superseded and this
@@ -258,6 +356,62 @@ impl ClipboardState {
     }
 }
 
+/// A resolved `transactions.fill`: the files to write, checked against the
+/// frozen manifest, plus the total and the source device (for `transfer.*`).
+pub struct FillPlan {
+    pub items: Vec<FillItem>,
+    pub total: u64,
+    pub device_id: Option<String>,
+}
+
+/// One target of a fill: the manifest `file_id` to read, its `name` (relative
+/// manifest path, for the `transfer.started` event), `size`, and the
+/// backend-chosen `dest_path` the Core writes to.
+pub struct FillItem {
+    pub file_id: String,
+    pub name: String,
+    pub size: u64,
+    pub dest_path: PathBuf,
+}
+
+impl ClipboardState {
+    /// Validates a `transactions.fill` against the current manifest: the
+    /// transaction must be openable (a superseded clip accepts no new session,
+    /// `TX_STALE`), and every `file_id` must be a non-`dir` manifest entry
+    /// (`-32602` otherwise — a directory has no bytes to fill). Returns the plan
+    /// to run; the background task then reserves the session with
+    /// `begin_session`.
+    pub fn fill_plan(&self, tx_id: &str, entries: &[(String, String)]) -> Result<FillPlan, RpcErr> {
+        let t = self
+            .transactions
+            .get(tx_id)
+            .filter(|t| !t.superseded)
+            .ok_or_else(|| RpcErr::app("TX_STALE"))?;
+        let mut items = Vec::with_capacity(entries.len());
+        let mut total = 0u64;
+        for (file_id, dest_path) in entries {
+            let fe = t
+                .files
+                .iter()
+                .find(|f| &f.file_id == file_id)
+                .filter(|f| !f.is_dir)
+                .ok_or_else(|| RpcErr::invalid_params(&format!("file_id: {file_id}")))?;
+            total = total.saturating_add(fe.size);
+            items.push(FillItem {
+                file_id: fe.file_id.clone(),
+                name: fe.rel_path.clone(),
+                size: fe.size,
+                dest_path: PathBuf::from(dest_path),
+            });
+        }
+        Ok(FillPlan {
+            items,
+            total,
+            device_id: t.device_id.clone(),
+        })
+    }
+}
+
 /// The outcome of resolving a manifest file for a data-channel `READ`.
 pub enum Lookup {
     /// The transaction is gone — `TX_STALE`.
@@ -280,14 +434,18 @@ pub enum InlineSource {
 
 impl ClipboardState {
     /// Resolves an inline `FETCH`: the announcer to ask for `format`,
-    /// distinguishing a vanished transaction from an absent format.
+    /// distinguishing a vanished transaction from an absent format. Only
+    /// meaningful for a LOCAL transaction — a remote clip's inline pulls are
+    /// relayed to the source device by the consumer pipe, never resolved here
+    /// (a remote origin therefore reads as `Gone`, defensively).
     pub fn inline_source(&self, tx_id: &str, format: &str) -> InlineSource {
         match self.transactions.get(tx_id) {
             None => InlineSource::Gone,
-            Some(t) if t.formats.iter().any(|f| f.format == format) => {
-                InlineSource::Announcer(t.announcer)
-            }
-            Some(_) => InlineSource::NoFormat,
+            Some(t) if !t.formats.iter().any(|f| f.format == format) => InlineSource::NoFormat,
+            Some(t) => match &t.origin {
+                Origin::Local { announcer } => InlineSource::Announcer(*announcer),
+                Origin::Remote { .. } => InlineSource::Gone,
+            },
         }
     }
 }
@@ -349,13 +507,69 @@ pub fn freeze_manifest(paths: &[String]) -> Result<Vec<FileEntry>, RpcErr> {
         files.push(FileEntry {
             file_id: format!("f{index}"),
             rel_path: unique_rel(&mut used, &base),
-            source,
             size: meta.len(),
             is_dir: false,
-            identity: identity_of(&meta),
+            backing: Some(LocalBacking {
+                identity: identity_of(&meta),
+                source,
+            }),
         });
     }
     Ok(files)
+}
+
+/// Re-validates a manifest received over the network (`clip_announce`) and
+/// rebuilds it as a set of backing-less entries. Fail-closed, exactly like the
+/// transfer receiver: a relative `/`-separated `path` only — no `..`, no rooted
+/// or absolute segment, no `\`, no `:` or control character, no duplicate — so
+/// a backend that naively joins `path` onto its paste target cannot be turned
+/// into a confused deputy by a compromised peer. Returns `None` (drop the
+/// announce) on any violation. `MANIFEST_MAX` bounds the count here too.
+pub fn validate_remote_manifest(files: &[Value]) -> Option<Vec<FileEntry>> {
+    if files.len() > MANIFEST_MAX {
+        return None;
+    }
+    let mut used = HashSet::new();
+    let mut out = Vec::with_capacity(files.len());
+    for f in files {
+        let file_id = f.get("file_id").and_then(Value::as_str)?;
+        let rel_path = f.get("path").and_then(Value::as_str)?;
+        let size = f.get("size").and_then(Value::as_u64)?;
+        let is_dir = match f.get("dir") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return None,
+        };
+        if !is_safe_rel_path(rel_path) || !used.insert(rel_path.to_string()) {
+            return None;
+        }
+        out.push(FileEntry {
+            file_id: file_id.to_string(),
+            rel_path: rel_path.to_string(),
+            size,
+            is_dir,
+            backing: None,
+        });
+    }
+    Some(out)
+}
+
+/// A manifest `path` a destination may safely join onto its paste target:
+/// relative, `/`-separated, no traversal. Reasoning on the raw string (never
+/// `Path`, whose splitting diverges across platforms) — the same OS-independent
+/// discipline as `safe_base_name` and the transfer receiver.
+fn is_safe_rel_path(raw: &str) -> bool {
+    if raw.is_empty() || raw.starts_with('/') {
+        return false;
+    }
+    // `\` is never a separator on the wire (paths are `/`-separated); a
+    // backslash, colon, or control character is refused outright, as is any
+    // `.`/`..`/empty segment.
+    if raw.chars().any(|c| matches!(c, '\\' | ':') || c.is_control()) {
+        return false;
+    }
+    raw.split('/')
+        .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
 }
 
 /// The identity to freeze: modification time everywhere, plus the (device,
@@ -483,5 +697,51 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = freeze_manifest(&[dir.path().to_string_lossy().into_owned()]).unwrap_err();
         assert_eq!(err.code, -32602);
+    }
+
+    #[test]
+    fn validate_remote_manifest_accepts_relative_paths() {
+        let files = json!([
+            { "file_id": "f0", "path": "a.txt", "size": 3 },
+            { "file_id": "f1", "path": "sub/b.txt", "size": 5, "dir": false },
+            { "file_id": "f2", "path": "sub", "size": 0, "dir": true },
+        ]);
+        let out = validate_remote_manifest(files.as_array().unwrap()).expect("valid manifest");
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[1].rel_path, "sub/b.txt");
+        assert!(out[2].is_dir);
+        // A remote manifest carries no local backing.
+        assert!(out.iter().all(|f| f.backing.is_none()));
+    }
+
+    #[test]
+    fn validate_remote_manifest_refuses_traversal_and_duplicates() {
+        // Absolute, `..`, backslash, colon, control char, empty segment.
+        for bad in [
+            "/etc/passwd",
+            "../escape",
+            "a/../b",
+            "a/./b",
+            r"a\b",
+            "c:evil",
+            "with\nnewline",
+            "a//b",
+            "",
+        ] {
+            let files = json!([{ "file_id": "f0", "path": bad, "size": 1 }]);
+            assert!(
+                validate_remote_manifest(files.as_array().unwrap()).is_none(),
+                "must refuse {bad:?}"
+            );
+        }
+        // Duplicate relative paths.
+        let dup = json!([
+            { "file_id": "f0", "path": "same.txt", "size": 1 },
+            { "file_id": "f1", "path": "same.txt", "size": 1 },
+        ]);
+        assert!(validate_remote_manifest(dup.as_array().unwrap()).is_none());
+        // A missing field.
+        let missing = json!([{ "file_id": "f0", "size": 1 }]);
+        assert!(validate_remote_manifest(missing.as_array().unwrap()).is_none());
     }
 }

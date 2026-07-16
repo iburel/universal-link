@@ -1061,6 +1061,13 @@ impl DataChannel {
         self.send(TAG_ABORT, &[]).await;
     }
 
+    /// Reads the next response WITHOUT issuing a request — for a terminal ERROR
+    /// the Core pushes on its own when a reset cuts the session (`TX_STALE`,
+    /// `PEER_GONE`): `Err(code)`, or `Err("closed")` if the channel closes first.
+    pub async fn next_response(&mut self) -> Result<Vec<u8>, String> {
+        self.collect().await
+    }
+
     // Provider side (the source backend pushing an inline blob).
 
     /// Streams a `DATA` chunk (`offset` + bytes).
@@ -1296,6 +1303,57 @@ pub async fn wait_server_connected(c: &mut TestComponent, want: bool) {
             r["server_connected"] == json!(want)
         },
         "convergence of server_connected",
+    )
+    .await;
+}
+
+/// Waits for the directory as seen by `c` to carry both the attestation AND the
+/// relay of `device_id` (so a data-plane stream can resolve and open it).
+pub async fn wait_reachable(c: &mut TestComponent, device_id: &str) {
+    wait_directory(
+        c,
+        device_id,
+        |d| {
+            d.get("attestation").and_then(Value::as_str).is_some()
+                && d.get("relay_url").and_then(Value::as_str).is_some()
+        },
+        "reachable peer (attestation + relay)",
+    )
+    .await;
+}
+
+/// Waits for the directory as seen by `c` to carry the attestation of
+/// `device_id`.
+pub async fn wait_attested(c: &mut TestComponent, device_id: &str) {
+    wait_directory(
+        c,
+        device_id,
+        |d| d.get("attestation").and_then(Value::as_str).is_some(),
+        "attestation visible",
+    )
+    .await;
+}
+
+/// Waits for a device in the directory as seen by `c` to satisfy `pred`. Robust
+/// to the transient absence of the record and to a directory not yet
+/// snapshotted.
+pub async fn wait_directory(
+    c: &mut TestComponent,
+    device_id: &str,
+    pred: impl Fn(&Value) -> bool,
+    what: &str,
+) {
+    eventually(
+        async || {
+            let Ok(list) = c.request("devices.list", json!({})).await else {
+                return false;
+            };
+            list.as_array()
+                .into_iter()
+                .flatten()
+                .any(|d| d.get("device_id").and_then(Value::as_str) == Some(device_id) && pred(d))
+        },
+        what,
     )
     .await;
 }

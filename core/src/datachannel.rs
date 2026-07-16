@@ -51,14 +51,15 @@ pub(crate) enum ProviderMsg {
 /// backend that acknowledges but never delivers.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
-// Consumer → Core.
-const TAG_READ: u8 = 0x01;
-const TAG_FETCH: u8 = 0x02;
+// Consumer → Core. (`pub(crate)`: the network relay in `clipnet` speaks the
+// very same binary protocol over a `clip_session` stream.)
+pub(crate) const TAG_READ: u8 = 0x01;
+pub(crate) const TAG_FETCH: u8 = 0x02;
 const TAG_ABORT: u8 = 0x03;
 // Core → consumer, and provider → Core.
-const TAG_DATA: u8 = 0x10;
-const TAG_EOF: u8 = 0x11;
-const TAG_ERROR: u8 = 0x12;
+pub(crate) const TAG_DATA: u8 = 0x10;
+pub(crate) const TAG_EOF: u8 = 0x11;
+pub(crate) const TAG_ERROR: u8 = 0x12;
 
 /// Bounds a single message: control messages are tiny, and a provider's `DATA`
 /// chunk is bounded by the sender — a peer never chooses our allocation.
@@ -69,7 +70,7 @@ const CHUNK: usize = 64 * 1024;
 /// No-progress budget on a read or write. Not a cap on total duration: a large
 /// range takes as long as the bytes keep flowing, but a peer that stops driving
 /// is swept rather than pinning the connection forever.
-const STALL: Duration = Duration::from_secs(30);
+pub(crate) const STALL: Duration = Duration::from_secs(30);
 
 /// Serves a data-channel connection: validates the token, binds it to the peer,
 /// then serves according to the channel kind. Anything unexpected closes the
@@ -98,7 +99,7 @@ where
         return;
     }
     match grant.kind {
-        ChannelKind::Consumer => serve_consumer(state, reader, write, grant.tx_id).await,
+        ChannelKind::Consumer => serve_consumer(&state, reader, write, grant.tx_id).await,
         // Provider: the backend pushes the inline blob it was asked for; we
         // forward it to the consumer that is waiting on the sink.
         ChannelKind::Provider => {
@@ -142,25 +143,53 @@ where
     }
 }
 
-/// A paste session: the consumer drives (`READ`/`FETCH`), one request at a time.
-/// The session reserves the transaction (it cannot be deleted while read) and
-/// releases it at the end, whatever the reason.
-async fn serve_consumer<R, W>(state: Arc<AppState>, mut reader: R, mut write: W, tx_id: String)
-where
+/// A paste session: reserves the transaction (it cannot be deleted while read),
+/// serves it according to its origin, and releases it at the end whatever the
+/// reason. A LOCAL clip is served here (disk ranges + inline pulls from the
+/// announcer); a REMOTE clip is relayed to its source device (`clipnet`) — the
+/// same entry point on both the destination Core (a local component's channel)
+/// and the source Core (an incoming `clip_session` stream, always local there).
+pub(crate) async fn serve_consumer<R, W>(
+    state: &Arc<AppState>,
+    reader: R,
+    mut write: W,
+    tx_id: String,
+) where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     // The transaction may have been deleted between `transactions.open` and
     // this attach: no session to serve.
-    if !state
+    let origin = state
         .clipboard
         .lock()
         .expect("lock clipboard")
-        .start_session(&tx_id)
-    {
+        .begin_session(&tx_id);
+    let Some(origin) = origin else {
         let _ = write_error(&mut write, "TX_STALE").await;
         return;
+    };
+    match origin {
+        crate::clipboard::Origin::Local { .. } => serve_local(state, reader, write, &tx_id).await,
+        crate::clipboard::Origin::Remote { node_id, device_id } => {
+            crate::clipnet::pipe_consumer(state, reader, write, &tx_id, &node_id, &device_id).await;
+        }
     }
+    state
+        .clipboard
+        .lock()
+        .expect("lock clipboard")
+        .end_session(&tx_id);
+}
+
+/// Serves a LOCAL clip: the consumer drives (`READ`/`FETCH`), one request at a
+/// time, reading file ranges from this disk and pulling inline blobs from the
+/// announcing backend.
+async fn serve_local<R, W>(state: &Arc<AppState>, mut reader: R, mut write: W, tx_id: &str)
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     loop {
         let (tag, payload) = tokio::select! {
             // A clipboard-wide reset (Core stop, logout): the transaction is
@@ -177,8 +206,8 @@ where
             },
         };
         let ended = match tag {
-            TAG_READ => handle_read(&state, &tx_id, &payload, &mut write).await,
-            TAG_FETCH => handle_fetch(&state, &tx_id, &payload, &mut write).await,
+            TAG_READ => handle_read(state, tx_id, &payload, &mut write).await,
+            TAG_FETCH => handle_fetch(state, tx_id, &payload, &mut write).await,
             // Nothing is ever in flight between two requests (the consumer waits
             // for our EOF): an ABORT here has nothing to cancel.
             TAG_ABORT => Ok(false),
@@ -191,11 +220,6 @@ where
             Ok(true) | Err(_) => break,
         }
     }
-    state
-        .clipboard
-        .lock()
-        .expect("lock clipboard")
-        .end_session(&tx_id);
 }
 
 /// Serves a `READ`: a byte range of a manifest file, from the disk. Returns
@@ -240,11 +264,16 @@ where
         Lookup::File(entry) => {
             // The frozen file must still be itself: a swap, a same-size rewrite,
             // or a vanished file fails the read rather than serving other bytes.
+            // `still_matches` also fails a remote entry (no local backing) — this
+            // path only ever runs for a local clip, so `source()` is then `Some`.
             if !entry.still_matches() {
                 write_error(write, "FILE_CHANGED").await?;
                 return Ok(false);
             }
-            stream_range(write, &entry.source, offset, len).await?;
+            match entry.source() {
+                Some(source) => stream_range(write, source, offset, len).await?,
+                None => write_error(write, "FILE_CHANGED").await?,
+            }
             Ok(false)
         }
     }
@@ -448,7 +477,7 @@ where
 // Wire helpers.
 // ---------------------------------------------------------------------------
 
-async fn write_data<W: AsyncWrite + Unpin>(
+pub(crate) async fn write_data<W: AsyncWrite + Unpin>(
     write: &mut W,
     offset: u64,
     bytes: &[u8],
@@ -459,13 +488,26 @@ async fn write_data<W: AsyncWrite + Unpin>(
     write_msg(write, TAG_DATA, &payload).await
 }
 
-async fn write_error<W: AsyncWrite + Unpin>(write: &mut W, code: &str) -> std::io::Result<()> {
+pub(crate) async fn write_error<W: AsyncWrite + Unpin>(
+    write: &mut W,
+    code: &str,
+) -> std::io::Result<()> {
     let payload = serde_json::to_vec(&json!({ "code": code })).expect("serialize error code");
     write_msg(write, TAG_ERROR, &payload).await
 }
 
+/// Does an `ERROR` payload's code end the whole session (`TX_STALE` /
+/// `PEER_GONE`), as opposed to just the request? The network relay forwards
+/// every `ERROR` verbatim but must stop the pipe on a session-ending one.
+pub(crate) fn error_ends_session(payload: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(payload)
+        .ok()
+        .and_then(|v| v["code"].as_str().map(str::to_string))
+        .is_some_and(|code| code == "TX_STALE" || code == "PEER_GONE")
+}
+
 /// Writes a message: `u32` length (tag + payload), the tag, the payload, flush.
-async fn write_msg<W: AsyncWrite + Unpin>(
+pub(crate) async fn write_msg<W: AsyncWrite + Unpin>(
     write: &mut W,
     tag: u8,
     payload: &[u8],
@@ -479,7 +521,9 @@ async fn write_msg<W: AsyncWrite + Unpin>(
 
 /// Reads a message: `Ok(None)` on a clean EOF between messages. The announced
 /// length is bounded BEFORE any allocation — a peer does not choose our memory.
-async fn read_msg<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<Option<(u8, Vec<u8>)>> {
+pub(crate) async fn read_msg<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Option<(u8, Vec<u8>)>> {
     let mut len = [0u8; 4];
     match reader.read_exact(&mut len).await {
         Ok(_) => {}
@@ -498,7 +542,7 @@ async fn read_msg<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<Optio
 }
 
 /// Applies the no-progress budget to an I/O future.
-async fn bounded<T>(fut: impl Future<Output = std::io::Result<T>>) -> std::io::Result<T> {
+pub(crate) async fn bounded<T>(fut: impl Future<Output = std::io::Result<T>>) -> std::io::Result<T> {
     match tokio::time::timeout(STALL, fut).await {
         Ok(result) => result,
         Err(_) => Err(std::io::Error::new(
@@ -508,6 +552,6 @@ async fn bounded<T>(fut: impl Future<Output = std::io::Result<T>>) -> std::io::R
     }
 }
 
-fn unexpected(what: &str) -> std::io::Error {
+pub(crate) fn unexpected(what: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, what.to_string())
 }

@@ -9,6 +9,7 @@
 
 pub mod account_key;
 mod clipboard;
+mod clipnet;
 mod conn;
 mod connector;
 mod datachannel;
