@@ -26,6 +26,10 @@
 //! real Core (`tests/api/`) through a test double rather than a live desktop.
 
 pub mod backend;
+#[cfg(target_os = "linux")]
+mod files;
+#[cfg(target_os = "linux")]
+mod fuse;
 #[cfg(target_os = "macos")]
 mod macos;
 mod orchestrator;
@@ -35,5 +39,12 @@ mod windows;
 #[cfg(target_os = "linux")]
 mod x11;
 
-pub use backend::{BackendEvent, ClipboardBackend, Format, LocalClip, RemoteClip, RemoteFile};
+pub use backend::{
+    BackendEvent, ClipboardBackend, FileFetcher, Format, LocalClip, RemoteClip, RemoteFile,
+};
+// The FUSE mount is a private module, but its mount + probe are re-exported on
+// Linux so the native-only files integration test (tests/linux_files.rs, all
+// `#[ignore]`d) can drive a real mount without the private module path.
+#[cfg(target_os = "linux")]
+pub use fuse::{FuseMount, fuse_available};
 pub use orchestrator::{Outcome, run};

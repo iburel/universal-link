@@ -12,9 +12,14 @@
 //! `CLIP_STALE` if the backend can no longer vouch for the generation.
 //!
 //! Destination side (a remote device copied): a `clipboard.remote_updated`
-//! notification → the backend takes ownership of the OS clipboard with a promise;
-//! a `Paste` upcall → `transactions.open` → a consumer channel → `FETCH` → the
-//! bytes go to the backend; any error refuses the paste cleanly.
+//! notification → the backend takes ownership of the OS clipboard with a promise.
+//! An inline clip (`text`, `image/png`) then renders lazily: a `Paste` upcall →
+//! `transactions.open` → a consumer channel → `FETCH` → the bytes go to the
+//! backend; any error refuses the paste cleanly. A files clip takes a different
+//! path — there is no paste event to fetch on. It is promised through
+//! `offer_files` with a [`CoreFetcher`]: the files backend serves byte ranges on
+//! demand (`transactions.open` → a consumer channel → `READ`), one pull per OS
+//! `read`, so bytes are still fetched at paste time, not at offer.
 //!
 //! Lifecycle: born at the announce, superseded by the next announce (own or a
 //! newer remote — the Core converges globally and only notifies the winner),
@@ -25,14 +30,25 @@
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use universallink_ipc_client::{
-    Client, ConsumerChannel, Event, ProviderChannel, RequestError, RequestId,
+    ChannelError, Client, ConsumerChannel, Event, ProviderChannel, RequestError, RequestId,
 };
 
-use crate::backend::{BackendEvent, ClipboardBackend, Format, RemoteClip, RemoteFile};
+use crate::backend::{BackendEvent, ClipboardBackend, FileFetcher, Format, RemoteClip, RemoteFile};
+
+/// Core-normalized id of the files format.
+const FORMAT_FILES: &str = "files";
+
+/// Whether a remote clip is a FILES clip (its formats include `files`), which
+/// the destination side promises through the on-demand [`CoreFetcher`] path
+/// rather than the inline `Paste`/`deliver` path.
+fn is_files_clip(clip: &RemoteClip) -> bool {
+    clip.formats.iter().any(|f| f.id == FORMAT_FILES)
+}
 
 /// Why the orchestrator loop ended — mapped by `main` to a process exit code.
 #[derive(Debug, PartialEq, Eq)]
@@ -270,10 +286,27 @@ impl<B: ClipboardBackend> State<B> {
             tx_id: clip.tx_id.clone(),
             formats: clip.formats.iter().map(|f| f.id.clone()).collect(),
         });
-        self.backend.offer(clip);
+        self.offer_clip(clip);
         // A remote copy that reaches us has won the global convergence: it
         // supersedes our own announce, which we can no longer serve.
         self.announced = None;
+    }
+
+    /// Hands a remote clip to the backend on the right seam. A files clip is
+    /// promised through `offer_files` with a [`CoreFetcher`] bound to its
+    /// transaction (on-demand `READ` at paste time); any other clip is promised
+    /// inline through `offer` (bytes pulled on the eventual `Paste`).
+    fn offer_clip(&self, clip: RemoteClip) {
+        if is_files_clip(&clip) {
+            let fetcher = CoreFetcher::new(
+                clip.tx_id.clone(),
+                self.ipc_path.clone(),
+                self.client.clone(),
+            );
+            self.backend.offer_files(clip, Arc::new(fetcher));
+        } else {
+            self.backend.offer(clip);
+        }
     }
 
     /// Dispatches a local paste onto its own task: `transactions.open` then a
@@ -327,7 +360,7 @@ impl<B: ClipboardBackend> State<B> {
             tx_id: clip.tx_id.clone(),
             formats: clip.formats.iter().map(|f| f.id.clone()).collect(),
         });
-        self.backend.offer(clip);
+        self.offer_clip(clip);
     }
 
     /// Whether `device_id` is this device. Resolves our own id once via
@@ -453,6 +486,85 @@ async fn consume_paste<B: ClipboardBackend>(
             warn(&format!("paste fetch failed: {e}"));
             backend.paste_failed(token, format);
         }
+    }
+}
+
+// --- Files fetcher (destination side, on-demand READ) ---------------------
+
+/// The [`FileFetcher`] the files backend calls to pull byte ranges of a promised
+/// remote FILES clip. Bound to one transaction; opens its consumer channel
+/// lazily on the first `read` and reuses it (FUSE reads are serial, and one
+/// channel serves any `file_id` sequentially). A terminal channel error drops
+/// the channel so a later read reopens (and fails again → clean `EIO`).
+struct CoreFetcher {
+    tx_id: String,
+    ipc_path: PathBuf,
+    client: Client,
+    /// The runtime the orchestrator runs on; the fetcher's `read` is invoked
+    /// from the FUSE session thread (a plain OS thread), so it bridges back here
+    /// with `block_on`.
+    handle: tokio::runtime::Handle,
+    /// The reusable consumer channel, opened on demand.
+    channel: tokio::sync::Mutex<Option<ConsumerChannel>>,
+}
+
+impl CoreFetcher {
+    /// Captures the current runtime handle — the orchestrator runs inside it.
+    fn new(tx_id: String, ipc_path: PathBuf, client: Client) -> CoreFetcher {
+        CoreFetcher {
+            tx_id,
+            ipc_path,
+            client,
+            handle: tokio::runtime::Handle::current(),
+            channel: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    async fn read_async(&self, file_id: &str, offset: u64, len: u64) -> std::io::Result<Vec<u8>> {
+        let mut guard = self.channel.lock().await;
+        if guard.is_none() {
+            let result = self
+                .client
+                .request("transactions.open", json!({ "tx_id": &self.tx_id }))
+                .await
+                .map_err(|e| std::io::Error::other(format!("transactions.open failed: {e}")))?;
+            let Some(channel_token) = result["channel_token"].as_str() else {
+                return Err(std::io::Error::other(
+                    "transactions.open returned no channel_token",
+                ));
+            };
+            let channel = ConsumerChannel::open(&self.ipc_path, channel_token)
+                .await
+                .map_err(|e| std::io::Error::other(format!("open consumer channel: {e}")))?;
+            *guard = Some(channel);
+        }
+        let channel = guard.as_mut().expect("consumer channel present after open");
+        match channel.read(file_id, offset, len).await {
+            Ok(bytes) => Ok(bytes),
+            Err(e) => {
+                // A terminal error (TX_STALE / PEER_GONE) or a dead channel ends
+                // the session: drop it so a later read reopens. A request-scoped
+                // error (FILE_CHANGED / FILE_UNKNOWN / TIMEOUT / …) keeps the
+                // channel usable for the next read.
+                let session_over = match &e {
+                    ChannelError::Code(code) => code.is_terminal(),
+                    ChannelError::Closed | ChannelError::Io(_) => true,
+                };
+                if session_over {
+                    *guard = None;
+                }
+                Err(std::io::Error::other(format!("data channel read: {e}")))
+            }
+        }
+    }
+}
+
+impl FileFetcher for CoreFetcher {
+    fn read(&self, file_id: &str, offset: u64, len: u64) -> std::io::Result<Vec<u8>> {
+        // Called from the FUSE session thread (a plain OS thread, not a runtime
+        // worker), so `block_on` is valid here.
+        self.handle
+            .block_on(async { self.read_async(file_id, offset, len).await })
     }
 }
 
@@ -605,6 +717,36 @@ mod tests {
         assert_eq!(clip.files[0].size, 7);
         assert!(!clip.files[0].dir);
         assert!(clip.files[1].dir);
+    }
+
+    #[test]
+    fn is_files_clip_detects_the_files_format() {
+        let files = RemoteClip {
+            tx_id: "t".into(),
+            formats: vec![Format {
+                id: "files".into(),
+                size: None,
+            }],
+            files: Vec::new(),
+            sensitive: false,
+        };
+        assert!(is_files_clip(&files));
+        let text = RemoteClip {
+            tx_id: "t".into(),
+            formats: vec![Format {
+                id: "text".into(),
+                size: Some(3),
+            }],
+            files: Vec::new(),
+            sensitive: false,
+        };
+        assert!(!is_files_clip(&text));
+        assert!(!is_files_clip(&RemoteClip {
+            tx_id: "t".into(),
+            formats: Vec::new(),
+            files: Vec::new(),
+            sensitive: false,
+        }));
     }
 
     #[test]

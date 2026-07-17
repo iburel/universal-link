@@ -4,9 +4,14 @@
 //! The X11 / XWayland clipboard backend: an owner-driven, deferred-render
 //! selection state machine that plugs into the frozen [`crate::backend`] seam.
 //!
-//! Ported from a private POC (the kynput/clipnet selection loop) and adapted
-//! onto this crate's seam. Scope of this brick: `text` and `image/png` only, no
-//! INCR (large transfers are refused cleanly, marked `TODO(INCR)`).
+//! Ported from a private POC and adapted onto this crate's seam. Inline formats
+//! (`text`, `image/png`) render deferred: the offer takes ownership, a paste
+//! emits `Paste`, and `deliver` writes the bytes. `files` clips are different —
+//! X11 has no paste event, so a promised files clip is exposed through a FUSE
+//! mount (see [`crate::fuse`]) and the clipboard advertises `file://` URIs into
+//! it; the file manager then reads those files, each kernel `read` pulling one
+//! byte range on demand. No INCR for inline formats (large transfers are refused
+//! cleanly, marked `TODO(INCR)`).
 //!
 //! Two threads meet here. The non-`Send` [`xcb::Connection`] is pinned to the
 //! MAIN thread inside [`Backend`], pumped by [`X11Loop::run`] (a `mio::Poll`
@@ -23,6 +28,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::os::unix::io::AsRawFd;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -31,7 +37,8 @@ use mio::{Events, Interest, Poll, Token, Waker};
 use tokio::sync::{mpsc, oneshot};
 use xcb::{Xid, x, xfixes};
 
-use crate::backend::{BackendEvent, ClipboardBackend, Format, LocalClip, RemoteClip};
+use crate::backend::{BackendEvent, ClipboardBackend, FileFetcher, Format, LocalClip, RemoteClip};
+use crate::{files, fuse};
 
 const XCB_TOKEN: Token = Token(0);
 const CMD_TOKEN: Token = Token(1);
@@ -60,6 +67,7 @@ const BACKEND_EVENT_CAPACITY: usize = 256;
 /// Core v1 format strings.
 const FORMAT_TEXT: &str = "text";
 const FORMAT_PNG: &str = "image/png";
+const FORMAT_FILES: &str = "files";
 
 /// A downcall from the orchestrator, queued for the main-thread loop.
 enum Cmd {
@@ -71,6 +79,12 @@ enum Cmd {
     },
     /// Take ownership of CLIPBOARD, promising a remote clip (bytes come later).
     Offer(RemoteClip),
+    /// Take ownership of CLIPBOARD for a remote FILES clip: mount a FUSE tree
+    /// serving `fetcher`'s bytes on demand and advertise `file://` URIs into it.
+    OfferFiles {
+        clip: RemoteClip,
+        fetcher: Arc<dyn FileFetcher>,
+    },
     /// Fetched bytes for the pending paste `token`: complete the request.
     Deliver {
         token: u64,
@@ -136,6 +150,10 @@ impl ClipboardBackend for X11Backend {
         self.push(Cmd::Offer(clip));
     }
 
+    fn offer_files(&self, clip: RemoteClip, fetcher: Arc<dyn FileFetcher>) {
+        self.push(Cmd::OfferFiles { clip, fetcher });
+    }
+
     fn deliver(&self, token: u64, format: &str, bytes: Vec<u8>) {
         self.push(Cmd::Deliver {
             token,
@@ -187,6 +205,11 @@ struct Atoms {
     /// KDE confidentiality hint: advertised for a sensitive offer, and answered
     /// with `"secret"` so Klipper/KWallet keep it out of history.
     kde_password_hint: x::Atom,
+    /// File-manager copy targets. `uri_list` is the RFC 2483 `text/uri-list`;
+    /// `gnome_copied`/`kde_copied` are the `copy\n…` variants GNOME/KDE prefer.
+    uri_list: x::Atom,
+    gnome_copied: x::Atom,
+    kde_copied: x::Atom,
 }
 
 fn intern(conn: &xcb::Connection, name: &[u8]) -> Result<x::Atom, String> {
@@ -211,6 +234,9 @@ impl Atoms {
             image_png: intern(conn, b"image/png")?,
             prop: intern(conn, b"UNIVERSALLINK_SELECTION")?,
             kde_password_hint: intern(conn, b"x-kde-passwordManagerHint")?,
+            uri_list: intern(conn, b"text/uri-list")?,
+            gnome_copied: intern(conn, b"x-special/gnome-copied-files")?,
+            kde_copied: intern(conn, b"x-special/KDE-copied-files")?,
         })
     }
 
@@ -221,6 +247,11 @@ impl Atoms {
             Some(FORMAT_TEXT)
         } else if target == self.image_png {
             Some(FORMAT_PNG)
+        } else if target == self.uri_list
+            || target == self.gnome_copied
+            || target == self.kde_copied
+        {
+            Some(FORMAT_FILES)
         } else {
             None
         }
@@ -232,6 +263,7 @@ impl Atoms {
         match format {
             FORMAT_TEXT => vec![self.utf8_string, self.string, self.text],
             FORMAT_PNG => vec![self.image_png],
+            FORMAT_FILES => vec![self.uri_list, self.gnome_copied, self.kde_copied],
             _ => vec![],
         }
     }
@@ -312,6 +344,11 @@ struct Backend {
     events_tx: mpsc::Sender<BackendEvent>,
     /// Content targets currently published (derived from the last offer).
     advertised: Vec<x::Atom>,
+    /// The live FUSE mount of a promised remote FILES clip (if any). Held for the
+    /// offer's lifetime; dropping it unmounts. `file_uris` are the `file://` URIs
+    /// (mount roots) served for the file-manager targets.
+    current_files: Option<fuse::FuseMount>,
+    file_uris: Vec<String>,
     pending: Option<PendingPaste>,
     /// Whether we own CLIPBOARD (an offer is live).
     owned: bool,
@@ -441,9 +478,11 @@ impl Backend {
             xcb::Event::X(x::Event::SelectionClear(e))
                 if e.selection() == self.atoms.clipboard && self.owned =>
             {
-                // Another app took the selection (or an echo of our release).
+                // Another app took the selection (or an echo of our release):
+                // supersede — drop ownership state and any live files offer.
                 self.owned = false;
                 self.advertised.clear();
+                self.drop_files_offer();
             }
             _ => {}
         }
@@ -480,6 +519,34 @@ impl Backend {
             return;
         };
         let sensitive = targets.contains(&self.atoms.kde_password_hint);
+
+        // Files take priority: a files copy often ALSO offers text (the dropped
+        // paths) that must not be mistaken for content. Read the URIs, and if any
+        // parse, announce a files copy and stop — the Core reads the paths, so no
+        // inline bytes are cached (a sentinel keeps the local capture "live" so a
+        // later unsupported foreign copy still supersedes it).
+        if (targets.contains(&self.atoms.uri_list) || targets.contains(&self.atoms.gnome_copied))
+            && let Some(paths) = self.read_file_uris(&targets)
+        {
+            let generation = self.next_generation;
+            self.next_generation += 1;
+            let mut sentinel: HashMap<String, Vec<u8>> = HashMap::new();
+            sentinel.insert(FORMAT_FILES.to_string(), Vec::new());
+            self.cache.store(generation, sentinel);
+            self.emit(BackendEvent::Copied {
+                generation,
+                clip: LocalClip {
+                    formats: vec![Format {
+                        id: FORMAT_FILES.to_string(),
+                        size: None,
+                    }],
+                    paths,
+                    sensitive,
+                },
+            });
+            return;
+        }
+
         let mut bytes_by_format: HashMap<String, Vec<u8>> = HashMap::new();
         let mut formats: Vec<Format> = Vec::new();
 
@@ -552,6 +619,21 @@ impl Backend {
             }
         }
         None
+    }
+
+    /// Read the copied `file://` URIs as a files copy: convert `text/uri-list`
+    /// (preferred) else `x-special/gnome-copied-files`, parse the URIs into
+    /// absolute local paths. `None` if the list is empty or unreadable (the
+    /// caller then falls through to text/image). The Core enumerates and reads
+    /// the paths itself; only the top-level paths are announced.
+    fn read_file_uris(&mut self, targets: &[x::Atom]) -> Option<Vec<PathBuf>> {
+        let raw = if targets.contains(&self.atoms.uri_list) {
+            self.convert_and_read(self.atoms.uri_list)
+        } else {
+            self.convert_and_read(self.atoms.gnome_copied)
+        }?;
+        let paths = files::parse_uri_list(&raw);
+        if paths.is_empty() { None } else { Some(paths) }
     }
 
     fn query_targets(&mut self) -> Option<Vec<x::Atom>> {
@@ -692,11 +774,40 @@ impl Backend {
             self.respond_timestamp(e);
         } else if target == self.atoms.kde_password_hint && self.advertised.contains(&target) {
             self.respond_secret(e);
+        } else if self.advertised.contains(&target)
+            && self.current_files.is_some()
+            && (target == self.atoms.uri_list
+                || target == self.atoms.gnome_copied
+                || target == self.atoms.kde_copied)
+        {
+            // A files offer: the URIs are known at offer time (they point into
+            // the FUSE mount), so answer synchronously — no deferred render.
+            self.respond_files(e, target);
         } else if self.advertised.contains(&target) {
             self.start_deferred(e, target);
         } else {
             self.notify(e.requestor(), e.target(), x::ATOM_NONE, e.time());
         }
+    }
+
+    /// Answer a files paste synchronously. The property TYPE is the REQUESTED
+    /// target atom itself (not UTF8_STRING): `text/uri-list` bytes for the
+    /// uri-list target, `copy\n…` bytes for the GNOME/KDE variants.
+    fn respond_files(&self, e: &x::SelectionRequestEvent, target: x::Atom) {
+        let bytes = if target == self.atoms.uri_list {
+            files::uri_list_bytes(&self.file_uris)
+        } else {
+            files::copied_files_bytes(&self.file_uris)
+        };
+        let property = property_or_target(e);
+        self.conn.send_request(&x::ChangeProperty {
+            mode: x::PropMode::Replace,
+            window: e.requestor(),
+            property,
+            r#type: target,
+            data: &bytes,
+        });
+        self.notify(e.requestor(), e.target(), property, e.time());
     }
 
     fn respond_targets(&self, e: &x::SelectionRequestEvent) {
@@ -747,6 +858,14 @@ impl Backend {
             self.notify(e.requestor(), e.target(), x::ATOM_NONE, e.time());
             return;
         };
+        // Files never render deferred: they are answered synchronously from a
+        // live FUSE mount (`respond_files`). Reaching here for a file target
+        // means the mount is gone (a torn-down offer whose atoms still linger in
+        // `advertised`) — refuse cleanly rather than emit a spurious `Paste`.
+        if format == FORMAT_FILES {
+            self.notify(e.requestor(), e.target(), x::ATOM_NONE, e.time());
+            return;
+        }
         // ICCCM: at most one paste in flight — refuse and replace the previous.
         if let Some(prev) = self.pending.take() {
             self.refuse(&prev);
@@ -867,6 +986,7 @@ impl Backend {
                     let _ = reply.send(self.cache.get(generation, &format));
                 }
                 Cmd::Offer(clip) => self.on_offer(clip),
+                Cmd::OfferFiles { clip, fetcher } => self.on_offer_files(clip, fetcher),
                 Cmd::Deliver {
                     token,
                     format,
@@ -884,11 +1004,13 @@ impl Backend {
 
     fn on_offer(&mut self, clip: RemoteClip) {
         // A new offer refuses any in-flight paste and supersedes the local
-        // capture (a remote promise wins convergence).
+        // capture (a remote promise wins convergence). It also tears down any
+        // prior files offer (unmounts the FUSE tree).
         if let Some(p) = self.pending.take() {
             self.refuse(&p);
         }
         self.cache.invalidate();
+        self.drop_files_offer();
         let mut advertised: Vec<x::Atom> = clip
             .formats
             .iter()
@@ -899,6 +1021,50 @@ impl Backend {
         }
         self.advertised = advertised;
         self.take_ownership();
+    }
+
+    /// Promise a remote FILES clip: mount a FUSE tree and advertise `file://`
+    /// URIs into it, taking CLIPBOARD ownership. Any prior offer is torn down
+    /// first. If FUSE is unavailable or the mount fails, refuse cleanly — make no
+    /// promise, leave the OS clipboard untouched (a paste finds nothing from us).
+    fn on_offer_files(&mut self, clip: RemoteClip, fetcher: Arc<dyn FileFetcher>) {
+        if let Some(p) = self.pending.take() {
+            self.refuse(&p);
+        }
+        self.cache.invalidate();
+        self.drop_files_offer();
+
+        if !fuse::fuse_available() {
+            warn("FUSE unavailable (no /dev/fuse or fusermount); refusing files paste");
+            self.release_ownership();
+            return;
+        }
+        let mount = match fuse::FuseMount::mount(&clip.files, fetcher) {
+            Ok(mount) => mount,
+            Err(e) => {
+                warn(&format!("FUSE mount failed ({e}); refusing files paste"));
+                self.release_ownership();
+                return;
+            }
+        };
+        self.file_uris = mount
+            .root_paths()
+            .iter()
+            .map(|p| files::file_uri(p))
+            .collect();
+        let mut advertised = self.atoms.targets_for_format(FORMAT_FILES);
+        if clip.sensitive {
+            advertised.push(self.atoms.kde_password_hint);
+        }
+        self.advertised = advertised;
+        self.current_files = Some(mount);
+        self.take_ownership();
+    }
+
+    /// Tear down any live files offer: unmount the FUSE tree and forget its URIs.
+    fn drop_files_offer(&mut self) {
+        self.current_files = None;
+        self.file_uris.clear();
     }
 
     /// Take CLIPBOARD ownership for the already-set `advertised` targets, and
@@ -924,10 +1090,11 @@ impl Backend {
         }
     }
 
-    fn on_release(&mut self) {
-        if let Some(p) = self.pending.take() {
-            self.refuse(&p);
-        }
+    /// Relinquish CLIPBOARD ownership if held, and forget the advertised
+    /// targets. Used both on a full release and on a clean files refusal: once we
+    /// can no longer honor a promise, we must not keep owning the selection while
+    /// advertising a superseded one (a paste of it would only be refused later).
+    fn release_ownership(&mut self) {
         if self.owned {
             self.conn.send_request(&x::SetSelectionOwner {
                 owner: x::Window::none(),
@@ -938,6 +1105,14 @@ impl Backend {
             self.owned = false;
         }
         self.advertised.clear();
+    }
+
+    fn on_release(&mut self) {
+        if let Some(p) = self.pending.take() {
+            self.refuse(&p);
+        }
+        self.drop_files_offer();
+        self.release_ownership();
     }
 }
 
@@ -1036,6 +1211,8 @@ pub fn create() -> Result<crate::os::Created, String> {
         cmds: cmds.clone(),
         events_tx,
         advertised: Vec::new(),
+        current_files: None,
+        file_uris: Vec::new(),
         pending: None,
         owned: false,
         last_owner_foreign: false,
@@ -1075,6 +1252,9 @@ mod tests {
             image_png: x::ATOM_BITMAP,
             prop: x::ATOM_DRAWABLE,
             kde_password_hint: x::ATOM_FONT,
+            uri_list: x::ATOM_POINT,
+            gnome_copied: x::ATOM_RECTANGLE,
+            kde_copied: x::ATOM_COLORMAP,
         }
     }
 
@@ -1086,8 +1266,22 @@ mod tests {
             vec![a.utf8_string, a.string, a.text]
         );
         assert_eq!(a.targets_for_format(FORMAT_PNG), vec![a.image_png]);
-        assert!(a.targets_for_format("files").is_empty());
+        assert_eq!(
+            a.targets_for_format(FORMAT_FILES),
+            vec![a.uri_list, a.gnome_copied, a.kde_copied]
+        );
         assert!(a.targets_for_format("bogus").is_empty());
+    }
+
+    #[test]
+    fn detect_maps_the_file_target_atoms() {
+        let a = test_atoms();
+        assert_eq!(a.format_for_target(a.uri_list), Some(FORMAT_FILES));
+        assert_eq!(a.format_for_target(a.gnome_copied), Some(FORMAT_FILES));
+        assert_eq!(a.format_for_target(a.kde_copied), Some(FORMAT_FILES));
+        for target in a.targets_for_format(FORMAT_FILES) {
+            assert_eq!(a.format_for_target(target), Some(FORMAT_FILES));
+        }
     }
 
     #[test]

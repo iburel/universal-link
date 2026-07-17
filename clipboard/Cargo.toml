@@ -35,10 +35,16 @@ universallink-ipc-client = { path = "../client" }
 # selection loop. Same stack the private POC uses — `xcb` (an FFI binding to the
 # system libxcb) with the XFixes extension for selection-owner notifications, and
 # `mio` (os-poll + os-ext for the eventfd-backed `Waker`) to pump the X socket fd
-# and the command queue on the main thread. Non-Linux targets never pull these.
+# and the command queue on the main thread. `fuser` (default-features = false, so
+# NO libfuse C dependency — it mounts via the setuid `fusermount3`/`fusermount`
+# binary at runtime, keeping the CI build free of libfuse-dev) serves a remote
+# files clip as an on-demand FUSE tree; `libc` supplies the errno/uid constants
+# the FUSE callbacks need. Non-Linux targets never pull these.
 [target.'cfg(target_os = "linux")'.dependencies]
 xcb = { version = "1", features = ["xfixes"] }
 mio = { version = "1", features = ["os-poll", "os-ext"] }
+fuser = { version = "0.16", default-features = false }
+libc = "0.2"
 
 # Windows clipboard backend (Windows only): the synchronous delayed-render
 # message loop. `windows-sys` is the raw FFI surface (MIT/Apache, no system libs

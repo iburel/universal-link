@@ -56,6 +56,18 @@ pub struct RemoteClip {
     pub sensitive: bool,
 }
 
+/// Serves on-demand byte ranges of a promised remote FILES clip. A files
+/// backend (FUSE) calls this from a synchronous OS filesystem thread, so it is
+/// BLOCKING and must be safe to call off any thread; the implementor bridges to
+/// the IPC runtime internally.
+pub trait FileFetcher: Send + Sync {
+    /// Bytes [offset, offset+len) of manifest file `file_id`. Returns the
+    /// intersection with the file (fewer than `len`, or empty, only at/after
+    /// EOF). `Err` on a failed pull (TX_STALE / FILE_CHANGED / PEER_GONE / …):
+    /// the OS read then fails cleanly, never a silent truncation.
+    fn read(&self, file_id: &str, offset: u64, len: u64) -> std::io::Result<Vec<u8>>;
+}
+
 /// What a platform backend reports to the orchestrator.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BackendEvent {
@@ -89,6 +101,12 @@ pub trait ClipboardBackend: Clone + Send + Sync + 'static {
     /// Take ownership of the OS clipboard, promising `clip` (a remote copy). If
     /// `clip.sensitive`, re-apply the OS confidentiality markers.
     fn offer(&self, clip: RemoteClip);
+
+    /// Take ownership of the OS clipboard for a remote FILES clip, serving its
+    /// bytes on demand through `fetcher`. DEFAULT: the platform has no files
+    /// backend yet → make NO promise (clean refusal), leaving the OS clipboard
+    /// untouched.
+    fn offer_files(&self, _clip: RemoteClip, _fetcher: std::sync::Arc<dyn FileFetcher>) {}
 
     /// Deliver fetched bytes to the OS for the pending paste `token`.
     fn deliver(&self, token: u64, format: &str, bytes: Vec<u8>);
