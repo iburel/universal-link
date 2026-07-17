@@ -31,8 +31,23 @@ tokio = { version = "1", features = [
 ] }
 universallink-ipc-client = { path = "../client" }
 
+# X11/XWayland clipboard backend (Linux only): the owner-driven deferred-render
+# selection loop. Same stack the private POC uses — `xcb` (an FFI binding to the
+# system libxcb) with the XFixes extension for selection-owner notifications, and
+# `mio` (os-poll + os-ext for the eventfd-backed `Waker`) to pump the X socket fd
+# and the command queue on the main thread. Non-Linux targets never pull these.
+[target.'cfg(target_os = "linux")'.dependencies]
+xcb = { version = "1", features = ["xfixes"] }
+mio = { version = "1", features = ["os-poll", "os-ext"] }
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 universallink-core = { path = "../core" }
 universallink-test-support = { path = "../test-support" }
+
+# Live-X round-trip tests (tests/x11.rs) drive a SECOND X client (a requestor
+# and a selection owner) against the real backend under Xvfb. Linux-only, and
+# only the core `x` protocol is needed on the test side.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+xcb = { version = "1", features = ["xfixes"] }

@@ -28,6 +28,8 @@
 pub mod backend;
 mod orchestrator;
 pub mod os;
+#[cfg(target_os = "linux")]
+mod x11;
 
 pub use backend::{BackendEvent, ClipboardBackend, Format, LocalClip, RemoteClip, RemoteFile};
 pub use orchestrator::{Outcome, run};

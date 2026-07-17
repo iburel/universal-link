@@ -86,6 +86,16 @@ ignore = [
   { id = "RUSTSEC-2025-0081", reason = "same as RUSTSEC-2025-0075 (unic-* family)" },
   { id = "RUSTSEC-2025-0098", reason = "same as RUSTSEC-2025-0075 (unic-* family)" },
   { id = "RUSTSEC-2025-0100", reason = "same as RUSTSEC-2025-0075 (unic-* family)" },
+
+  # quick-xml 0.30 is a BUILD-only dependency of the `xcb` crate (the X11
+  # clipboard backend): xcb's build.rs parses the X11 protocol descriptions —
+  # XML vendored inside the crate, trusted and static, never attacker-controlled.
+  # Both advisories are DoS via parsing UNTRUSTED XML, so there is no runtime
+  # surface here, and no fix exists in the 0.30 line (fixed in >=0.41, a breaking
+  # bump that xcb 1.7.0 — the latest release — pins away from). To be revisited if
+  # xcb bumps its quick-xml build-dep.
+  { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.30 is a build-only dep of xcb (build.rs parses vendored, trusted X-protocol XML); no runtime surface; no fix in the 0.30 line" },
+  { id = "RUSTSEC-2026-0195", reason = "same as RUSTSEC-2026-0194 (quick-xml 0.30, build-only via xcb)" },
 ]
 
 [bans]

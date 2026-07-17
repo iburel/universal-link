@@ -92,6 +92,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libgtk-3-dev
 
+      # The X11 clipboard backend (universallink-clipboard) links libxcb + the
+      # XFIXES extension through the `xcb` crate's FFI, so the -dev headers are
+      # needed to BUILD/link it on Linux; its live-X integration tests need a
+      # server, provided headless by Xvfb. DISPLAY is exported into the job env
+      # so the later Build/Clippy/Tests steps inherit it. apt-get update already
+      # ran in the step above (same runner), so it is not repeated here.
+      - name: System X11 dependencies + headless display (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y --no-install-recommends libxcb1-dev libxcb-xfixes0-dev xvfb
+          Xvfb :99 -screen 0 1280x1024x24 >/dev/null 2>&1 &
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+
       - name: Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
