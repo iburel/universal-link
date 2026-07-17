@@ -7,11 +7,13 @@
 //! Ported from a private POC and adapted onto this crate's seam. Inline formats
 //! (`text`, `image/png`) render deferred: the offer takes ownership, a paste
 //! emits `Paste`, and `deliver` writes the bytes. `files` clips are different —
-//! X11 has no paste event, so a promised files clip is exposed through a FUSE
-//! mount (see [`crate::fuse`]) and the clipboard advertises `file://` URIs into
-//! it; the file manager then reads those files, each kernel `read` pulling one
-//! byte range on demand. No INCR for inline formats (large transfers are refused
-//! cleanly, marked `TODO(INCR)`).
+//! X11 has no paste event, so a promised files clip is exposed on demand and the
+//! clipboard advertises URIs into it; the file manager then reads those files,
+//! each read pulling one byte range on demand. The preferred backend is a FUSE
+//! mount (see [`crate::fuse`]) advertising `file://` URIs; when FUSE is
+//! unavailable, a non-sensitive clip falls back to a loopback WebDAV server (see
+//! [`crate::webdav`]) advertising `dav://`/`webdav://` URIs. No INCR for inline
+//! formats (large transfers are refused cleanly, marked `TODO(INCR)`).
 //!
 //! Two threads meet here. The non-`Send` [`xcb::Connection`] is pinned to the
 //! MAIN thread inside [`Backend`], pumped by [`X11Loop::run`] (a `mio::Poll`
@@ -38,7 +40,7 @@ use tokio::sync::{mpsc, oneshot};
 use xcb::{Xid, x, xfixes};
 
 use crate::backend::{BackendEvent, ClipboardBackend, FileFetcher, Format, LocalClip, RemoteClip};
-use crate::{files, fuse};
+use crate::{files, fuse, webdav};
 
 const XCB_TOKEN: Token = Token(0);
 const CMD_TOKEN: Token = Token(1);
@@ -79,8 +81,9 @@ enum Cmd {
     },
     /// Take ownership of CLIPBOARD, promising a remote clip (bytes come later).
     Offer(RemoteClip),
-    /// Take ownership of CLIPBOARD for a remote FILES clip: mount a FUSE tree
-    /// serving `fetcher`'s bytes on demand and advertise `file://` URIs into it.
+    /// Take ownership of CLIPBOARD for a remote FILES clip: expose the tree on
+    /// demand (FUSE, else the WebDAV fallback) serving `fetcher`'s bytes and
+    /// advertise the corresponding URIs.
     OfferFiles {
         clip: RemoteClip,
         fetcher: Arc<dyn FileFetcher>,
@@ -332,6 +335,18 @@ impl Cache {
     }
 }
 
+/// The live on-demand backend serving a promised remote FILES clip. FUSE is
+/// preferred (a real `file://` path any app can read); WebDAV is the fallback
+/// when FUSE is unavailable. Dropping either variant tears the backend down, so
+/// `Backend` needs no explicit teardown beyond clearing this field. The payload
+/// is a pure RAII guard — its bytes are served through the URIs captured at offer
+/// time, so it is only ever "read" by its own `Drop`.
+#[allow(dead_code)]
+enum FilesMount {
+    Fuse(fuse::FuseMount),
+    WebDav(webdav::WebDavMount),
+}
+
 /// Backend state, living on the X11 (main) thread. Owns the non-`Send`
 /// connection.
 struct Backend {
@@ -344,11 +359,17 @@ struct Backend {
     events_tx: mpsc::Sender<BackendEvent>,
     /// Content targets currently published (derived from the last offer).
     advertised: Vec<x::Atom>,
-    /// The live FUSE mount of a promised remote FILES clip (if any). Held for the
-    /// offer's lifetime; dropping it unmounts. `file_uris` are the `file://` URIs
-    /// (mount roots) served for the file-manager targets.
-    current_files: Option<fuse::FuseMount>,
-    file_uris: Vec<String>,
+    /// The live on-demand backend of a promised remote FILES clip (if any): a
+    /// FUSE mount, or the WebDAV fallback. Held for the offer's lifetime; dropping
+    /// it unmounts / stops the server.
+    current_files: Option<FilesMount>,
+    /// URIs advertised for the GNOME / `text/uri-list` file-manager targets: a
+    /// `file://` list for FUSE, a `dav://` list for WebDAV.
+    offer_uris: Vec<String>,
+    /// URIs advertised for the KDE (`x-special/KDE-copied-files`) target:
+    /// identical to `offer_uris` for FUSE, a `webdav://` list for WebDAV (Dolphin
+    /// rejects `dav://`, KDE bug 365356).
+    offer_uris_kde: Vec<String>,
     pending: Option<PendingPaste>,
     /// Whether we own CLIPBOARD (an offer is live).
     owned: bool,
@@ -792,12 +813,19 @@ impl Backend {
 
     /// Answer a files paste synchronously. The property TYPE is the REQUESTED
     /// target atom itself (not UTF8_STRING): `text/uri-list` bytes for the
-    /// uri-list target, `copy\n…` bytes for the GNOME/KDE variants.
+    /// uri-list target, `copy\n…` bytes for the GNOME/KDE variants. The KDE
+    /// variant draws on the KDE URI list (a `webdav://` scheme for a WebDAV
+    /// offer), every other target on the default list.
     fn respond_files(&self, e: &x::SelectionRequestEvent, target: x::Atom) {
-        let bytes = if target == self.atoms.uri_list {
-            files::uri_list_bytes(&self.file_uris)
+        let uris = if target == self.atoms.kde_copied {
+            &self.offer_uris_kde
         } else {
-            files::copied_files_bytes(&self.file_uris)
+            &self.offer_uris
+        };
+        let bytes = if target == self.atoms.uri_list {
+            files::uri_list_bytes(uris)
+        } else {
+            files::copied_files_bytes(uris)
         };
         let property = property_or_target(e);
         self.conn.send_request(&x::ChangeProperty {
@@ -1023,10 +1051,14 @@ impl Backend {
         self.take_ownership();
     }
 
-    /// Promise a remote FILES clip: mount a FUSE tree and advertise `file://`
-    /// URIs into it, taking CLIPBOARD ownership. Any prior offer is torn down
-    /// first. If FUSE is unavailable or the mount fails, refuse cleanly — make no
-    /// promise, leave the OS clipboard untouched (a paste finds nothing from us).
+    /// Promise a remote FILES clip: expose the tree on demand and advertise its
+    /// URIs, taking CLIPBOARD ownership. Any prior offer is torn down first. The
+    /// backend cascade is FUSE first (universal `file://` path), then the WebDAV
+    /// fallback for a NON-sensitive clip on a GVfs/KIO desktop. A sensitive clip
+    /// is FUSE-only: a loopback DAV server is weaker than the uid-private mount,
+    /// so it is never used for confidential content. Every refusal path releases
+    /// ownership so we never keep owning the selection while advertising a promise
+    /// we cannot honor.
     fn on_offer_files(&mut self, clip: RemoteClip, fetcher: Arc<dyn FileFetcher>) {
         if let Some(p) = self.pending.take() {
             self.refuse(&p);
@@ -1034,37 +1066,71 @@ impl Backend {
         self.cache.invalidate();
         self.drop_files_offer();
 
-        if !fuse::fuse_available() {
-            warn("FUSE unavailable (no /dev/fuse or fusermount); refusing files paste");
-            self.release_ownership();
-            return;
-        }
-        let mount = match fuse::FuseMount::mount(&clip.files, fetcher) {
-            Ok(mount) => mount,
-            Err(e) => {
-                warn(&format!("FUSE mount failed ({e}); refusing files paste"));
-                self.release_ownership();
-                return;
+        // 1. FUSE (preferred). Clone the `Arc` so the fetcher survives a FUSE
+        //    failure and can still be handed to the WebDAV fallback.
+        if fuse::fuse_available() {
+            match fuse::FuseMount::mount(&clip.files, fetcher.clone()) {
+                Ok(mount) => {
+                    let uris: Vec<String> = mount
+                        .root_paths()
+                        .iter()
+                        .map(|p| files::file_uri(p))
+                        .collect();
+                    self.offer_uris = uris.clone();
+                    self.offer_uris_kde = uris;
+                    self.current_files = Some(FilesMount::Fuse(mount));
+                    self.advertise_files(clip.sensitive);
+                    self.take_ownership();
+                    return;
+                }
+                Err(e) => warn(&format!("FUSE mount failed ({e}); trying WebDAV fallback")),
             }
-        };
-        self.file_uris = mount
-            .root_paths()
-            .iter()
-            .map(|p| files::file_uri(p))
-            .collect();
-        let mut advertised = self.atoms.targets_for_format(FORMAT_FILES);
+        }
+
+        // 2. WebDAV fallback — only for a non-sensitive clip on a GVfs/KIO desktop.
+        if !clip.sensitive && webdav::webdav_available() {
+            match webdav::WebDavMount::mount(&clip.files, fetcher) {
+                Ok(mount) => {
+                    self.offer_uris = mount.uris(false);
+                    self.offer_uris_kde = mount.uris(true);
+                    self.current_files = Some(FilesMount::WebDav(mount));
+                    self.advertise_files(clip.sensitive);
+                    self.take_ownership();
+                    return;
+                }
+                Err(e) => {
+                    warn(&format!("WebDAV mount failed ({e}); refusing files paste"));
+                    self.release_ownership();
+                    return;
+                }
+            }
+        }
+
+        // 3. No backend: refuse cleanly (release ownership, make no promise).
         if clip.sensitive {
+            warn("no FUSE and a sensitive files clip stays FUSE-only; refusing files paste");
+        } else {
+            warn("no FUSE and no WebDAV files backend; refusing files paste");
+        }
+        self.release_ownership();
+    }
+
+    /// Publish the files targets, plus the KDE confidentiality hint for a
+    /// sensitive clip (only ever reached via FUSE now).
+    fn advertise_files(&mut self, sensitive: bool) {
+        let mut advertised = self.atoms.targets_for_format(FORMAT_FILES);
+        if sensitive {
             advertised.push(self.atoms.kde_password_hint);
         }
         self.advertised = advertised;
-        self.current_files = Some(mount);
-        self.take_ownership();
     }
 
-    /// Tear down any live files offer: unmount the FUSE tree and forget its URIs.
+    /// Tear down any live files offer: unmount/stop the backend and forget its
+    /// URIs (both the default and the KDE list).
     fn drop_files_offer(&mut self) {
         self.current_files = None;
-        self.file_uris.clear();
+        self.offer_uris.clear();
+        self.offer_uris_kde.clear();
     }
 
     /// Take CLIPBOARD ownership for the already-set `advertised` targets, and
@@ -1212,7 +1278,8 @@ pub fn create() -> Result<crate::os::Created, String> {
         events_tx,
         advertised: Vec::new(),
         current_files: None,
-        file_uris: Vec::new(),
+        offer_uris: Vec::new(),
+        offer_uris_kde: Vec::new(),
         pending: None,
         owned: false,
         last_owner_foreign: false,

@@ -34,6 +34,8 @@ mod fuse;
 mod macos;
 mod orchestrator;
 pub mod os;
+#[cfg(target_os = "linux")]
+mod webdav;
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "linux")]
@@ -48,3 +50,8 @@ pub use backend::{
 #[cfg(target_os = "linux")]
 pub use fuse::{FuseMount, fuse_available};
 pub use orchestrator::{Outcome, run};
+// The WebDAV fallback is likewise private, but its bare server + probe are
+// re-exported on Linux so the loopback integration test (tests/linux_webdav.rs)
+// can drive the HTTP surface with no gio/GVFS.
+#[cfg(target_os = "linux")]
+pub use webdav::{WebDavMount, WebDavServer, webdav_available};
