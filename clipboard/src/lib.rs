@@ -38,6 +38,11 @@ pub mod os;
 mod webdav;
 #[cfg(target_os = "windows")]
 mod windows;
+// The OLE data object (destination side of the Windows files brick). Private:
+// its only public entry, `build_files_data_object`, is used from `windows`, and
+// its COM behavior is covered by the `#[cfg(test)]` unit tests inside the module.
+#[cfg(target_os = "windows")]
+mod windows_ole;
 #[cfg(target_os = "linux")]
 mod x11;
 

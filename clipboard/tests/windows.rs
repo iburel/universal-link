@@ -18,17 +18,20 @@
 
 #![cfg(target_os = "windows")]
 
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use universallink_clipboard::os;
-use universallink_clipboard::{BackendEvent, ClipboardBackend, Format, RemoteClip};
+use universallink_clipboard::{
+    BackendEvent, ClipboardBackend, FileFetcher, Format, LocalClip, RemoteClip, RemoteFile,
+};
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
-    SetClipboardData,
+    RegisterClipboardFormatW, SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
@@ -36,6 +39,8 @@ use windows_sys::Win32::System::Memory::{
 
 /// UTF-16LE text.
 const CF_UNICODETEXT: u32 = 13;
+/// A dropped-files list (a `DROPFILES` blob + the paths).
+const CF_HDROP: u32 = 15;
 
 /// Serializes the process-global clipboard (`OpenClipboard` is per-process).
 static CLIPBOARD_LOCK: Mutex<()> = Mutex::const_new(());
@@ -277,6 +282,152 @@ async fn a_foreign_text_copy_is_detected_and_provided() {
             .await
             .is_none(),
         "a stale generation must not be served"
+    );
+
+    handle.request_exit(0);
+    loop_thread.join().unwrap();
+}
+
+// ----- Files brick (OLE destination + CF_HDROP source) -----
+
+/// A `&str` → a `NUL`-terminated wide string for the `…W` APIs.
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// A trivial fetcher for the destination test: it never has to serve real bytes
+/// (the test only checks the offer is installed), so every read is immediate EOF.
+struct ZeroFetcher;
+
+impl FileFetcher for ZeroFetcher {
+    fn read(&self, _file_id: &str, _offset: u64, _len: u64) -> std::io::Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+}
+
+fn files_offer() -> RemoteClip {
+    RemoteClip {
+        tx_id: "tx-files".into(),
+        formats: vec![Format {
+            id: "files".into(),
+            size: None,
+        }],
+        files: vec![RemoteFile {
+            file_id: "id-a".into(),
+            path: "a.txt".into(),
+            size: 3,
+            dir: false,
+        }],
+        sensitive: false,
+    }
+}
+
+/// Waits (bounded) for the next `Copied` upcall and returns the whole clip
+/// (paths included), ignoring any other event.
+async fn recv_copied_clip(events: &mut mpsc::Receiver<BackendEvent>) -> Option<(u64, LocalClip)> {
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        match tokio::time::timeout_at(deadline, events.recv()).await {
+            Ok(Some(BackendEvent::Copied { generation, clip })) => return Some((generation, clip)),
+            Ok(Some(_)) => continue,
+            _ => return None,
+        }
+    }
+}
+
+/// Plays a foreign app copying files: takes the clipboard with a NULL owner and
+/// sets a WIDE `CF_HDROP` (`DROPFILES` header + the paths, double-`NUL` ended).
+fn set_clipboard_hdrop(paths: &[&str]) {
+    let mut blob: Vec<u8> = Vec::new();
+    blob.extend_from_slice(&20u32.to_le_bytes()); // pFiles: list right after header
+    blob.extend_from_slice(&[0u8; 8]); // pt (unused)
+    blob.extend_from_slice(&0u32.to_le_bytes()); // fNC (unused)
+    blob.extend_from_slice(&1u32.to_le_bytes()); // fWide = true
+    for p in paths {
+        for u in p.encode_utf16() {
+            blob.extend_from_slice(&u.to_le_bytes());
+        }
+        blob.extend_from_slice(&0u16.to_le_bytes());
+    }
+    blob.extend_from_slice(&0u16.to_le_bytes()); // final empty string
+    unsafe {
+        assert!(
+            OpenClipboard(std::ptr::null_mut()) != 0,
+            "OpenClipboard (hdrop)"
+        );
+        EmptyClipboard();
+        let h = GlobalAlloc(GMEM_MOVEABLE, blob.len());
+        assert!(!h.is_null(), "GlobalAlloc");
+        let dst = GlobalLock(h) as *mut u8;
+        std::ptr::copy_nonoverlapping(blob.as_ptr(), dst, blob.len());
+        GlobalUnlock(h);
+        assert!(
+            !SetClipboardData(CF_HDROP, h as HWND).is_null(),
+            "SetClipboardData(CF_HDROP)"
+        );
+        CloseClipboard();
+    }
+}
+
+/// Blocks (bounded) until clipboard format `cf` is available.
+fn wait_until_format_available(cf: u32) -> bool {
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline {
+        if unsafe { IsClipboardFormatAvailable(cf) } != 0 {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+/// Source side: a foreign app copies files (`CF_HDROP`); the backend detects it,
+/// parses the `DROPFILES` paths, and announces a `files` `Copied` with them (no
+/// inline formats), mirroring the X11 files-source path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real Windows clipboard; run manually with --ignored --test-threads=1"]
+async fn a_foreign_files_copy_is_detected_and_announced() {
+    let _guard = CLIPBOARD_LOCK.lock().await;
+    let (handle, mut events, loop_thread) = skip_if_unsupported!(spawn_backend!());
+
+    let paths = ["C:\\Temp\\ul-a.txt", "C:\\Temp\\ul-dir\\b.bin"];
+    set_clipboard_hdrop(&paths);
+
+    let (_generation, clip) = recv_copied_clip(&mut events).await.expect("Copied upcall");
+    assert!(
+        clip.formats.iter().any(|f| f.id == "files"),
+        "a files copy must announce the `files` format, got {:?}",
+        clip.formats
+    );
+    assert_eq!(
+        clip.paths,
+        paths
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect::<Vec<_>>(),
+        "the announced paths must be the parsed DROPFILES paths"
+    );
+
+    handle.request_exit(0);
+    loop_thread.join().unwrap();
+}
+
+/// Destination side (best-effort): an `offer_files` puts an OLE `IDataObject` on
+/// the clipboard, so `FileGroupDescriptorW` becomes available (the anti-echo's
+/// `OleIsCurrentClipboard` would then recognize our own object). The full paste
+/// marshaling to Explorer is untestable in CI — validated manually.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real Windows clipboard + OLE; run manually with --ignored --test-threads=1"]
+async fn an_offer_files_installs_the_descriptor_format() {
+    let _guard = CLIPBOARD_LOCK.lock().await;
+    let (handle, _events, loop_thread) = skip_if_unsupported!(spawn_backend!());
+
+    handle.offer_files(files_offer(), Arc::new(ZeroFetcher));
+
+    let cf = unsafe { RegisterClipboardFormatW(wide("FileGroupDescriptorW").as_ptr()) };
+    assert!(
+        wait_until_format_available(cf),
+        "the OLE files offer must publish FileGroupDescriptorW"
     );
 
     handle.request_exit(0);

@@ -49,11 +49,19 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
+// The OLE (COM) surface for the virtual-files DESTINATION path lives on the
+// typed `windows` crate (see `windows_ole`); the classic clipboard path stays on
+// `windows-sys`. `Interface::as_raw` hands the raw vtable pointer to the raw
+// `OleIsCurrentClipboard` import (declared below) for the files anti-echo.
+use windows::Win32::System::Com::IDataObject;
+use windows::Win32::System::Ole::{OleInitialize, OleSetClipboard, OleUninitialize};
+use windows::core::Interface;
 use windows_sys::Win32::Foundation::{GlobalFree, HGLOBAL, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
@@ -72,7 +80,24 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_RENDERFORMAT, WNDCLASSW,
 };
 
-use crate::backend::{BackendEvent, ClipboardBackend, Format, LocalClip, RemoteClip};
+use crate::backend::{BackendEvent, ClipboardBackend, FileFetcher, Format, LocalClip, RemoteClip};
+
+// The `windows` crate's safe `OleIsCurrentClipboard` maps EVERY success HRESULT
+// — S_OK *and* S_FALSE — to `Ok(())`, collapsing the exact bit the files
+// anti-echo needs: S_OK ("our data object still owns the clipboard", our own
+// update to ignore) vs S_FALSE ("it was replaced", a foreign clip to read). So
+// bind the raw ole32 entry point and compare the HRESULT ourselves. The
+// `#[link]` attributes mirror the raw-dylib import the `windows` crate uses for
+// ole32 (via `windows-link`), so there is no import-library dependency and no
+// clash with the crate's own ole32 import. `import_name_type` is x86-only, so it
+// is omitted (x86_64 imports are already undecorated).
+#[link(name = "ole32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
+unsafe extern "system" {
+    fn OleIsCurrentClipboard(pdataobj: *mut core::ffi::c_void) -> i32;
+}
+
+/// `S_OK` as a raw `HRESULT` value, for the raw `OleIsCurrentClipboard` above.
+const S_OK: i32 = 0;
 
 /// Deadline of a pending paste: past it, refuse cleanly (the app never freezes).
 /// A safety net independent of `release()` when a disconnection is silent.
@@ -96,6 +121,7 @@ const BACKEND_EVENT_CAPACITY: usize = 256;
 /// Core v1 format strings.
 const FORMAT_TEXT: &str = "text";
 const FORMAT_PNG: &str = "image/png";
+const FORMAT_FILES: &str = "files";
 
 // --- Stable Win32 clipboard-format ids, hard-coded (documented by the API).
 // The typed `CLIPBOARD_FORMAT` constants live behind the `Win32_System_Ole`
@@ -108,6 +134,9 @@ const CF_UNICODETEXT: u32 = 13;
 const CF_DIB: u32 = 8;
 /// Device-independent bitmap, `BITMAPV5HEADER` (carries an explicit alpha mask).
 const CF_DIBV5: u32 = 17;
+/// A dropped-files list (a `DROPFILES` blob followed by the file paths). The
+/// SOURCE side reads this to detect a foreign files copy.
+const CF_HDROP: u32 = 15;
 
 /// Private wake message (in the `WM_APP` range): the orchestrator posted a
 /// [`Cmd`] onto the queue.
@@ -134,6 +163,12 @@ enum Cmd {
     },
     /// Take ownership of the clipboard, promising a remote clip (bytes later).
     Offer(RemoteClip),
+    /// Take ownership of the clipboard for a remote FILES clip: promise an OLE
+    /// `IDataObject` whose contents are pulled through `fetcher` on demand.
+    OfferFiles {
+        clip: RemoteClip,
+        fetcher: Arc<dyn FileFetcher>,
+    },
     /// Drop OS ownership (promise withdrawn / superseded / shutting down).
     Release,
     /// Stop the loop with this process exit code (dropping ownership first).
@@ -270,6 +305,10 @@ impl ClipboardBackend for WindowsBackend {
         self.push(Cmd::Offer(clip));
     }
 
+    fn offer_files(&self, clip: RemoteClip, fetcher: Arc<dyn FileFetcher>) {
+        self.push(Cmd::OfferFiles { clip, fetcher });
+    }
+
     fn deliver(&self, token: u64, _format: &str, bytes: Vec<u8>) {
         // Straight to the blocked render handler (never the command queue). The
         // handler already knows the exact clipboard format requested, so the
@@ -298,8 +337,32 @@ impl WindowsLoop {
     /// Pumps the Windows message loop on the calling (main) thread until a
     /// [`Cmd::Exit`] (or a vanished orchestrator) stops it, dropping clipboard
     /// ownership on the way out. Returns the requested exit code.
-    pub fn run(mut self) -> i32 {
-        self.backend.run()
+    ///
+    /// OLE apartment: `OleSetClipboard`/`IDataObject` require an initialized OLE
+    /// apartment on THIS thread, and `OleInitialize` implies an STA with a
+    /// message pump — which is exactly what this thread already is. So init here,
+    /// NOT in [`Backend::new`] (which may run on a different thread). A failure is
+    /// non-fatal: files offers then refuse cleanly (no OLE), while text/image (the
+    /// classic Win32 path) keep working. `Backend` is dropped BEFORE
+    /// `OleUninitialize` so its files-offer withdrawal (in `Drop`) still runs with
+    /// a live apartment; we never `OleFlush` (we cannot serve files after exit —
+    /// the fetcher's runtime is gone).
+    pub fn run(self) -> i32 {
+        let ole = unsafe { OleInitialize(None) };
+        let ole_ok = ole.is_ok();
+        if !ole_ok {
+            warn(&format!(
+                "OleInitialize failed ({ole:?}); files offers will refuse cleanly"
+            ));
+        }
+        let WindowsLoop { mut backend } = self;
+        backend.ole_available = ole_ok;
+        let code = backend.run();
+        drop(backend); // withdraw the files offer + relinquish while OLE is live
+        if ole_ok {
+            unsafe { OleUninitialize() };
+        }
+        code
     }
 }
 
@@ -394,6 +457,14 @@ struct Backend {
     /// Bounded upcall channel to the orchestrator (never blocks the loop).
     events_tx: mpsc::Sender<BackendEvent>,
     cache: Cache,
+    /// The live OLE data object of a promised remote FILES clip, if any. Held so
+    /// the files anti-echo can ask OLE whether it is still the clipboard, and so
+    /// it can be withdrawn on the next offer / release / exit. `IDataObject` is
+    /// `!Send`, but `Backend` never leaves the pump thread, so this is fine.
+    current_ole: Option<IDataObject>,
+    /// Whether the OLE apartment initialized (set by [`WindowsLoop::run`]). When
+    /// false, files offers refuse cleanly and the classic path is unaffected.
+    ole_available: bool,
     /// Monotonic id per local copy (announce generation).
     next_generation: u64,
     /// Monotonic id per deferred paste (correlation token). SEPARATE from
@@ -471,6 +542,8 @@ impl Backend {
                 paste,
                 events_tx,
                 cache: Cache::default(),
+                current_ole: None,
+                ole_available: false,
                 next_generation: 0,
                 next_paste_token: 0,
                 shutdown: false,
@@ -562,6 +635,7 @@ impl Backend {
                     let _ = reply.send(self.cache.get(generation, &format));
                 }
                 Cmd::Offer(clip) => self.on_offer(clip),
+                Cmd::OfferFiles { clip, fetcher } => self.on_offer_files(clip, fetcher),
                 Cmd::Release => self.relinquish(),
                 Cmd::Exit(code) => {
                     self.exit_code = Some(code);
@@ -577,6 +651,10 @@ impl Backend {
     /// `provide` for the old generation must stop vouching — invalidate the cache.
     fn on_offer(&mut self, clip: RemoteClip) {
         self.cache.invalidate();
+        // A prior files offer, if any, was placed with OLE (its owner is the
+        // hidden OLE window, not us): withdraw it first, so the classic
+        // EmptyClipboard below cleanly takes over rather than racing OLE.
+        self.withdraw_ole();
         let clipformats = self.formats.offer_clipformats(&clip.formats);
         if clipformats.is_empty() {
             // Nothing we can promise: relinquish rather than hold a stale offer.
@@ -597,10 +675,77 @@ impl Backend {
         }
     }
 
-    /// Relinquish ownership if we still hold it (drop the delayed-render
-    /// promises). Live-queried via `GetClipboardOwner` — no mutable "owned" flag.
-    /// Shared by `Cmd::Release`, the shutdown path, and `Drop`.
-    fn relinquish(&self) {
+    /// Promise a remote FILES clip by putting an OLE `IDataObject` on the
+    /// clipboard (`OleSetClipboard`); its contents are pulled through `fetcher`
+    /// one range at a time at paste/copy-out. A remote promise supersedes any
+    /// local inline capture (convergence), so the cache is invalidated exactly
+    /// like [`on_offer`](Self::on_offer). Without an OLE apartment, or with no
+    /// non-directory file to promise, this refuses cleanly (withdraw + return).
+    fn on_offer_files(&mut self, clip: RemoteClip, fetcher: Arc<dyn FileFetcher>) {
+        self.cache.invalidate();
+        if !self.ole_available {
+            // No OLE apartment: we cannot serve an IDataObject. Clean refusal.
+            self.relinquish();
+            return;
+        }
+        // `build_files_data_object` filters `!dir`; if that leaves nothing, there
+        // is nothing to promise.
+        if !clip.files.iter().any(|f| !f.dir) {
+            self.relinquish();
+            return;
+        }
+        // Withdraw any existing offer (a classic inline promise or a prior OLE
+        // object) before installing the new one.
+        self.relinquish();
+        match crate::windows_ole::build_files_data_object(&clip.files, fetcher) {
+            Ok(obj) => {
+                // OleSetClipboard makes a hidden OLE window the clipboard owner
+                // and AddRefs `obj`; we keep our own reference in `current_ole`
+                // for the anti-echo and the eventual withdrawal.
+                match unsafe { OleSetClipboard(Some(&obj)) } {
+                    Ok(()) => self.current_ole = Some(obj),
+                    Err(e) => {
+                        warn(&format!(
+                            "OleSetClipboard failed ({e:?}) — files offer dropped"
+                        ));
+                        self.relinquish();
+                    }
+                }
+            }
+            Err(e) => {
+                warn(&format!(
+                    "building the files data object failed ({e:?}) — files offer dropped"
+                ));
+                self.relinquish();
+            }
+        }
+    }
+
+    /// Withdraw a live OLE files offer, if any: clear it from the clipboard
+    /// (`OleSetClipboard(None)`) and drop our `IDataObject` reference. We CANNOT
+    /// serve files once this component exits (the fetcher's IPC runtime is gone),
+    /// so exit / `Drop` MUST withdraw — never `OleFlush` (that would try to leave
+    /// a durable copy we cannot back). Best-effort: if the apartment is already
+    /// gone the clear fails harmlessly.
+    fn withdraw_ole(&mut self) {
+        let held = self.current_ole.take();
+        if held.is_some()
+            && let Err(e) = unsafe { OleSetClipboard(None) }
+        {
+            warn(&format!("OleSetClipboard(None) (withdraw) failed: {e:?}"));
+        }
+        // `held` drops here, releasing our reference; OLE released its own in
+        // `OleSetClipboard(None)`.
+    }
+
+    /// Relinquish ownership if we still hold it. Two independent promises can be
+    /// live: an OLE files offer (owned by the hidden OLE window, withdrawn via
+    /// `OleSetClipboard(None)`) and a classic inline offer (owned by our window,
+    /// dropped with `EmptyClipboard`). The classic branch is live-queried via
+    /// `GetClipboardOwner` — no mutable "owned" flag. Shared by `Cmd::Release`,
+    /// the shutdown path, and `Drop`.
+    fn relinquish(&mut self) {
+        self.withdraw_ole();
         unsafe {
             if GetClipboardOwner() == self.hwnd && self.open_clipboard() {
                 EmptyClipboard();
@@ -612,8 +757,23 @@ impl Backend {
     // ----- Source side: a foreign copy → eager read → Copied/Cleared -----
 
     fn on_clipboard_update(&mut self) {
-        // Anti-echo: our own offers set us as the owner — never re-read them.
-        // Stateless on purpose (always query live), so it cannot desynchronize.
+        // Files anti-echo FIRST: `OleSetClipboard` made a hidden OLE window (NOT
+        // our hwnd) the clipboard owner, so the `GetClipboardOwner == hwnd` test
+        // below would NOT recognize our own files offer. Ask OLE directly whether
+        // our stored data object is still the clipboard. S_OK → it is → our own
+        // update → ignore. Anything else (S_FALSE = replaced, or an error) →
+        // someone else owns it now → forget our stale object (do NOT withdraw
+        // from the clipboard — the foreign owner already replaced it) and fall
+        // through to read the new clip.
+        if let Some(obj) = self.current_ole.as_ref() {
+            let hr = unsafe { OleIsCurrentClipboard(obj.as_raw()) };
+            if hr == S_OK {
+                return;
+            }
+            self.current_ole = None;
+        }
+        // Classic anti-echo: our own `EmptyClipboard` set us as the owner —
+        // never re-read that. Stateless on purpose (always query live).
         if unsafe { GetClipboardOwner() } == self.hwnd {
             return;
         }
@@ -624,6 +784,33 @@ impl Backend {
     /// under a fresh generation, and announce the metadata. If nothing usable is
     /// there, supersede the stale capture instead of continuing to vouch for it.
     fn read_and_announce_copy(&mut self) {
+        // Files take priority over inline formats, mirroring the X11 backend: a
+        // files copy often ALSO offers text (the dropped paths) that must not be
+        // mistaken for content. If CF_HDROP parses to any path, announce a files
+        // copy and stop — the Core reads the paths, so no inline bytes are cached.
+        // A `{files: []}` sentinel keeps the local capture "live" so a later
+        // foreign non-files copy still supersedes it (fires `Cleared`), exactly
+        // like the X11 sentinel.
+        if let Some(paths) = self.read_files() {
+            let generation = self.next_generation;
+            self.next_generation += 1;
+            let mut sentinel: HashMap<String, Vec<u8>> = HashMap::new();
+            sentinel.insert(FORMAT_FILES.to_string(), Vec::new());
+            self.cache.store(generation, sentinel);
+            self.emit(BackendEvent::Copied {
+                generation,
+                clip: LocalClip {
+                    formats: vec![Format {
+                        id: FORMAT_FILES.to_string(),
+                        size: None,
+                    }],
+                    paths,
+                    sensitive: false,
+                },
+            });
+            return;
+        }
+
         let Some((bytes_by_format, formats)) = self.read_clipboard() else {
             self.supersede_local();
             return;
@@ -645,6 +832,30 @@ impl Backend {
                 sensitive: false,
             },
         });
+    }
+
+    /// Detect and read a `CF_HDROP` files copy into absolute paths. `None` if
+    /// there is no `CF_HDROP`, it is unreadable, or it parses to no paths (the
+    /// caller then falls through to the inline formats). Opens/closes the
+    /// clipboard itself; `provide("files")` is never called (the Core reads the
+    /// paths), consistent with X11.
+    fn read_files(&self) -> Option<Vec<PathBuf>> {
+        if !is_format_available(CF_HDROP) {
+            return None;
+        }
+        // SAFETY: bounded open, then a single read of the clipboard-owned handle,
+        // then close. `read_bytes` copies out under GlobalLock/Unlock.
+        let bytes = unsafe {
+            if !self.open_clipboard() {
+                warn("OpenClipboard (files read) failed");
+                return None;
+            }
+            let bytes = read_bytes(CF_HDROP);
+            CloseClipboard();
+            bytes?
+        };
+        let paths = parse_dropfiles(&bytes);
+        if paths.is_empty() { None } else { Some(paths) }
     }
 
     /// A foreign owner took the clipboard but we could not capture a usable clip
@@ -814,6 +1025,53 @@ fn read_bytes(fmt: u32) -> Option<Vec<u8>> {
         GlobalUnlock(h);
         Some(bytes)
     }
+}
+
+/// Parse a `CF_HDROP` `DROPFILES` blob into absolute paths. PURE (no OS calls, so
+/// it is unit-tested in CI) — decoded by hand rather than via `DragQueryFileW`,
+/// which would drag `Win32_UI_Shell` into the `windows-sys` module for one call.
+///
+/// Layout: a 20-byte `DROPFILES` header, then the NUL-terminated file paths at
+/// byte offset `pFiles`:
+/// - `pFiles: u32`  @ 0  — offset of the file list
+/// - `pt: POINT`    @ 4  — 8 bytes (unused here)
+/// - `fNC: BOOL`    @ 12 — 4 bytes (unused here)
+/// - `fWide: BOOL`  @ 16 — 4 bytes
+///
+/// When `fWide != 0` (Explorer always does), the list is UTF-16LE `NUL`-
+/// terminated strings ended by an extra empty string (a double-`NUL`); when
+/// `fWide == 0`, ANSI C-strings similarly (decoded lossily as UTF-8, best-effort).
+fn parse_dropfiles(bytes: &[u8]) -> Vec<PathBuf> {
+    if bytes.len() < 20 {
+        return Vec::new(); // truncated / empty: no header
+    }
+    let p_files = read_u32(bytes, 0) as usize;
+    let f_wide = read_u32(bytes, 16) != 0;
+    if p_files < 20 || p_files > bytes.len() {
+        return Vec::new(); // a nonsensical offset: refuse to read out of bounds
+    }
+    let list = &bytes[p_files..];
+    let mut out = Vec::new();
+    if f_wide {
+        let units: Vec<u16> = list
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        for part in units.split(|&u| u == 0) {
+            if part.is_empty() {
+                break; // the terminating empty string
+            }
+            out.push(PathBuf::from(String::from_utf16_lossy(part)));
+        }
+    } else {
+        for part in list.split(|&b| b == 0) {
+            if part.is_empty() {
+                break;
+            }
+            out.push(PathBuf::from(String::from_utf8_lossy(part).into_owned()));
+        }
+    }
+    out
 }
 
 /// Render the delivered bytes for the EXACT clipboard format the requestor asked
@@ -1273,5 +1531,46 @@ mod tests {
         dib.extend_from_slice(&[7, 8, 9, 0]); // one pixel B,G,R,A with A=0
         let (_, _, rgba) = dib_to_rgba(&dib).expect("decode BI_RGB 32bpp");
         assert_eq!(rgba, vec![9, 8, 7, 255], "R,G,B and forced-opaque alpha");
+    }
+
+    /// Build a synthetic WIDE `DROPFILES` blob for `paths`: a 20-byte header
+    /// (`pFiles = 20`, `fWide = 1`) then UTF-16LE `NUL`-terminated paths ended by
+    /// an extra empty string (the double-`NUL`).
+    fn make_dropfiles_wide(paths: &[&str]) -> Vec<u8> {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&20u32.to_le_bytes()); // pFiles: list right after header
+        blob.extend_from_slice(&[0u8; 8]); // pt (unused)
+        blob.extend_from_slice(&0u32.to_le_bytes()); // fNC (unused)
+        blob.extend_from_slice(&1u32.to_le_bytes()); // fWide = true
+        for p in paths {
+            for u in p.encode_utf16() {
+                blob.extend_from_slice(&u.to_le_bytes());
+            }
+            blob.extend_from_slice(&0u16.to_le_bytes()); // per-string NUL
+        }
+        blob.extend_from_slice(&0u16.to_le_bytes()); // final empty string
+        blob
+    }
+
+    #[test]
+    fn parse_dropfiles_reads_two_wide_paths() {
+        let blob = make_dropfiles_wide(&["C:\\a.txt", "C:\\dir\\b.bin"]);
+        assert_eq!(
+            parse_dropfiles(&blob),
+            vec![PathBuf::from("C:\\a.txt"), PathBuf::from("C:\\dir\\b.bin")]
+        );
+    }
+
+    #[test]
+    fn parse_dropfiles_rejects_truncated_empty_and_bad_offset() {
+        // Shorter than the 20-byte header, and outright empty.
+        assert!(parse_dropfiles(&[]).is_empty());
+        assert!(parse_dropfiles(&[0u8; 10]).is_empty());
+        // A well-formed header whose file list is immediately empty.
+        assert!(parse_dropfiles(&make_dropfiles_wide(&[])).is_empty());
+        // A valid header but a `pFiles` offset past the blob → no OOB read.
+        let mut blob = make_dropfiles_wide(&["C:\\a.txt"]);
+        blob[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse_dropfiles(&blob).is_empty());
     }
 }
