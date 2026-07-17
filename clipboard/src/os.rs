@@ -33,9 +33,28 @@ pub fn create() -> Result<Created, Unsupported> {
     crate::x11::create().map_err(|_| Unsupported)
 }
 
+/// The pieces the Windows backend hands back: the `Clone` handle the
+/// orchestrator drives, the upcall stream it consumes, and the main-thread
+/// message loop `main` pumps.
+#[cfg(target_os = "windows")]
+pub struct Created {
+    pub handle: crate::windows::WindowsBackend,
+    pub backend_events: tokio::sync::mpsc::Receiver<crate::backend::BackendEvent>,
+    pub event_loop: crate::windows::WindowsLoop,
+}
+
+/// Builds the platform clipboard backend (Windows). A failure to set up the
+/// message-only window / clipboard listener — e.g. a headless session-0 window
+/// station with no usable clipboard — is reported as [`Unsupported`] so `main`
+/// exits cleanly (never a panic).
+#[cfg(target_os = "windows")]
+pub fn create() -> Result<Created, Unsupported> {
+    crate::windows::create().map_err(|_| Unsupported)
+}
+
 /// No backend on this platform yet: the `Ok` type is uninhabited on purpose, so
 /// callers only need to handle the error until a backend lands.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn create() -> Result<std::convert::Infallible, Unsupported> {
     Err(Unsupported)
 }

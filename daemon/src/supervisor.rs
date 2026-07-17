@@ -205,8 +205,8 @@ async fn run_once(
 
 /// The deployment's official components, looked up next to the Core binary.
 /// The tray is registered on every platform; the clipboard backend is
-/// registered on Linux (X11) for now — the Windows and macOS backends land in
-/// later bricks. The contextual menu will come and register here too. A missing
+/// registered on Linux (X11) and Windows for now — the macOS backend lands in a
+/// later brick. The contextual menu will come and register here too. A missing
 /// executable is ignored (with a word in the log) — a Core without a tray is
 /// still a working Core.
 ///
@@ -215,14 +215,24 @@ async fn run_once(
 /// building blocks actually uses.
 pub fn official_components() -> Vec<ChildSpec> {
     // (name, role, scopes). The tray is cross-platform; the clipboard backend
-    // is X11-only for now (brick 2), so it is registered on Linux alone.
-    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    // has a Linux/X11 (brick 2) and a Windows (brick 3) backend, so it is
+    // registered on those two — not yet on macOS.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "windows")),
+        allow(unused_mut)
+    )]
     let mut official: Vec<(&str, &str, &[&str])> = vec![(
         "universallink-tray",
         "tray",
         &["session.read", "system.shutdown"],
     )];
     #[cfg(target_os = "linux")]
+    official.push((
+        "universallink-clipboard",
+        "clipboard-backend",
+        &["devices.read", "clipboard.read", "clipboard.write"],
+    ));
+    #[cfg(target_os = "windows")]
     official.push((
         "universallink-clipboard",
         "clipboard-backend",

@@ -40,6 +40,22 @@ universallink-ipc-client = { path = "../client" }
 xcb = { version = "1", features = ["xfixes"] }
 mio = { version = "1", features = ["os-poll", "os-ext"] }
 
+# Windows clipboard backend (Windows only): the synchronous delayed-render
+# message loop. `windows-sys` is the raw FFI surface (MIT/Apache, no system libs
+# to install) — only the modules we call are enabled. `image` (png feature only)
+# decodes/encodes PNG so DIB-only sources (Snipping Tool, Paint) round-trip via
+# `CF_DIBV5`. Non-Windows targets never pull these.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_UI_WindowsAndMessaging",
+] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
@@ -51,3 +67,14 @@ universallink-test-support = { path = "../test-support" }
 # only the core `x` protocol is needed on the test side.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 xcb = { version = "1", features = ["xfixes"] }
+
+# Live Windows-clipboard round-trip tests (tests/windows.rs) play the copying /
+# pasting application against the real backend, driving the OS clipboard directly
+# — so the test side needs the same raw Win32 surface. All `#[ignore]`d and
+# skip-if-`Unsupported`, validated manually on a real desktop.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+] }

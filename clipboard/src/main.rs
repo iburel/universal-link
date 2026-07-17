@@ -2,11 +2,12 @@
 // Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
 
 //! The `universallink-clipboard` binary: the platform clipboard OS loop on the
-//! main thread (X11 requires the non-`Send` connection pinned there), plus the
-//! async IPC brain (a tokio runtime on a side thread) running the OS-agnostic
-//! orchestrator. The two are bridged by the `Clone` backend handle (downcalls +
-//! `request_exit`) and a `BackendEvent` channel (upcalls). Mirrors the
-//! `universallink-tray` shape; all the testable logic lives in the lib.
+//! main thread (X11 pins its non-`Send` connection there; Windows pins its
+//! message-only window and pump there), plus the async IPC brain (a tokio
+//! runtime on a side thread) running the OS-agnostic orchestrator. The two are
+//! bridged by the `Clone` backend handle (downcalls + `request_exit`) and a
+//! `BackendEvent` channel (upcalls). Mirrors the `universallink-tray` shape; all
+//! the testable logic lives in the lib.
 //!
 //! Supervised-component contract (see `daemon/src/supervisor.rs`): find the
 //! Core at `UNIVERSALLINK_IPC_PATH`, read the single-use spawn token from the
@@ -27,7 +28,7 @@ fn main() -> ExitCode {
             );
             ExitCode::SUCCESS
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         Ok(created) => {
             let handle = created.handle;
             let backend_events = created.backend_events;
@@ -47,14 +48,14 @@ fn main() -> ExitCode {
                 handle.request_exit(code);
             });
 
-            // The X11 event loop pumps on THIS (main) thread until the brain
+            // The OS event loop pumps on THIS (main) thread until the brain
             // requests an exit; its return value is the process exit code.
             let code = event_loop.run();
             std::process::exit(code);
         }
-        // Non-Linux `create()` returns `Result<Infallible, _>`: the `Ok` arm is
-        // uninhabited.
-        #[cfg(not(target_os = "linux"))]
+        // Platforms without a backend yet: `create()` returns
+        // `Result<Infallible, _>`, so the `Ok` arm is uninhabited.
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         Ok(never) => match never {},
     }
 }
@@ -62,7 +63,7 @@ fn main() -> ExitCode {
 /// Reads the token and environment, connects, and runs the orchestrator.
 /// Returns the process exit code. Generic over the backend so it never has to
 /// name the platform handle type (which lives in a private module).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 async fn brain<B: universallink_clipboard::ClipboardBackend>(
     backend: B,
     backend_events: tokio::sync::mpsc::Receiver<universallink_clipboard::BackendEvent>,
