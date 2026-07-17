@@ -3,8 +3,9 @@
 
 //! The `universallink-clipboard` binary: the platform clipboard OS loop on the
 //! main thread (X11 pins its non-`Send` connection there; Windows pins its
-//! message-only window and pump there), plus the async IPC brain (a tokio
-//! runtime on a side thread) running the OS-agnostic orchestrator. The two are
+//! message-only window and pump there; macOS pins its `NSPasteboard` + run-loop
+//! pump there), plus the async IPC brain (a tokio runtime on a side thread)
+//! running the OS-agnostic orchestrator. The two are
 //! bridged by the `Clone` backend handle (downcalls + `request_exit`) and a
 //! `BackendEvent` channel (upcalls). Mirrors the `universallink-tray` shape; all
 //! the testable logic lives in the lib.
@@ -28,7 +29,7 @@ fn main() -> ExitCode {
             );
             ExitCode::SUCCESS
         }
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         Ok(created) => {
             let handle = created.handle;
             let backend_events = created.backend_events;
@@ -55,7 +56,7 @@ fn main() -> ExitCode {
         }
         // Platforms without a backend yet: `create()` returns
         // `Result<Infallible, _>`, so the `Ok` arm is uninhabited.
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
         Ok(never) => match never {},
     }
 }
@@ -63,7 +64,7 @@ fn main() -> ExitCode {
 /// Reads the token and environment, connects, and runs the orchestrator.
 /// Returns the process exit code. Generic over the backend so it never has to
 /// name the platform handle type (which lives in a private module).
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 async fn brain<B: universallink_clipboard::ClipboardBackend>(
     backend: B,
     backend_events: tokio::sync::mpsc::Receiver<universallink_clipboard::BackendEvent>,

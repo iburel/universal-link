@@ -52,9 +52,27 @@ pub fn create() -> Result<Created, Unsupported> {
     crate::windows::create().map_err(|_| Unsupported)
 }
 
+/// The pieces the macOS backend hands back: the `Clone` handle the orchestrator
+/// drives, the upcall stream it consumes, and the main-thread run loop `main`
+/// pumps.
+#[cfg(target_os = "macos")]
+pub struct Created {
+    pub handle: crate::macos::MacBackend,
+    pub backend_events: tokio::sync::mpsc::Receiver<crate::backend::BackendEvent>,
+    pub event_loop: crate::macos::MacLoop,
+}
+
+/// Builds the platform clipboard backend (macOS). A failure to reach the general
+/// pasteboard is reported as [`Unsupported`] so `main` exits cleanly (never a
+/// panic); in practice the general pasteboard is always available.
+#[cfg(target_os = "macos")]
+pub fn create() -> Result<Created, Unsupported> {
+    crate::macos::create().map_err(|_| Unsupported)
+}
+
 /// No backend on this platform yet: the `Ok` type is uninhabited on purpose, so
 /// callers only need to handle the error until a backend lands.
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 pub fn create() -> Result<std::convert::Infallible, Unsupported> {
     Err(Unsupported)
 }

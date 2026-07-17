@@ -56,6 +56,31 @@ windows-sys = { version = "0.61", features = [
 ] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
+# macOS clipboard backend (macOS only): the synchronous delayed-render run loop
+# on `NSPasteboard`, through the typed `objc2` Objective-C bindings (the same
+# 0.6/0.3 stack the tray already pulls via tao/tauri — no version bump). The
+# `NSPasteboard` feature exposes the pasteboard, its type constants, and the
+# `NSPasteboardTypeOwner` protocol; `NSImageRep` + `NSBitmapImageRep` give the
+# native, in-memory `NSBitmapImageRep` TIFF↔PNG conversion (headless-safe via
+# ImageIO), so no image codec crate is needed. `NSDate`/`NSRunLoop` drive the
+# main-thread run-loop pump; `NSString`/`NSData`/`NSArray`/`NSDictionary` are the
+# value types we pass. Non-macOS targets never pull these.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSString",
+    "NSData",
+    "NSArray",
+    "NSDictionary",
+    "NSDate",
+    "NSRunLoop",
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSPasteboard",
+    "NSImageRep",
+    "NSBitmapImageRep",
+] }
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
@@ -78,3 +103,12 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_DataExchange",
     "Win32_System_Memory",
 ] }
+
+# Live macOS-pasteboard round-trip tests (tests/macos.rs) play the copying /
+# pasting application against the real backend, driving `NSPasteboard` directly —
+# so the test side needs the same `objc2` surface. All `#[ignore]`d, validated
+# manually on a real Mac desktop (a logged-in GUI session, where `pbs` runs).
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSData", "NSArray"] }
+objc2-app-kit = { version = "0.3", features = ["NSPasteboard"] }

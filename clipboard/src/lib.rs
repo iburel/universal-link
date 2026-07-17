@@ -26,6 +26,8 @@
 //! real Core (`tests/api/`) through a test double rather than a live desktop.
 
 pub mod backend;
+#[cfg(target_os = "macos")]
+mod macos;
 mod orchestrator;
 pub mod os;
 #[cfg(target_os = "windows")]
