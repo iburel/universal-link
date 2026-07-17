@@ -163,8 +163,19 @@ jobs:
       # Without --all-targets, which would exclude the doctests. Parallelism capped:
       # the tests depend on 100-to-300 ms windows that a runner's CPU
       # contention can overrun.
+      #
+      # macOS runs single-threaded (=1), the others =2. The cross-Core relay
+      # tests (e.g. clipboard_net::a_remote_inline_blob_relays_from_the_source_backend)
+      # co-locate two full Cores + their data channels in one process's tokio
+      # reactor; when two such tests overlap on the 3-core macOS runner, macOS's
+      # kqueue readiness ordering can starve one connection past the Core's 30 s
+      # FETCH_TIMEOUT, surfacing as an ~30 s CLIP_STALE/"closed"/PEER_GONE (Linux
+      # epoll does not; reproduced natively — a single relay never stalls, only
+      # co-located concurrent ones do). Serializing macOS keeps at most one such
+      # test in flight, the configuration that is 100% green. Not a product bug:
+      # in production each Core is its own process with its own reactor.
       - name: Tests
-        run: cargo test --workspace --locked -- --test-threads=2
+        run: cargo test --workspace --locked -- --test-threads=${{ runner.os == 'macOS' && '1' || '2' }}
 
       # The real GUI binary is behind `required-features = webview`
       # (its generate_context! embeds ui/dist): --workspace does not cover
