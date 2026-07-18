@@ -1,0 +1,165 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[package]
+name = "universallink-clipboard"
+version = "0.2.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+# The OS clipboard backend: the exclusive `clipboard-backend` component. It
+# observes local copies and announces them (`clipboard.updated`), serves inline
+# pastes from the OS clipboard over a provider channel (`clipboard.get_data`),
+# and — for a remote copy — takes ownership of the OS clipboard and pulls the
+# bytes at paste time (`transactions.open` + a consumer channel). The
+# OS-agnostic orchestrator (the announce/promise/session state machine) lives in
+# the lib and is frozen by tests/api/ against a real Core; the per-OS backends
+# land in later bricks (X11, Windows, macOS).
+
+[[bin]]
+name = "universallink-clipboard"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-std",
+    "io-util",
+    "sync",
+] }
+universallink-ipc-client = { path = "../client" }
+
+# X11/XWayland clipboard backend (Linux only): the owner-driven deferred-render
+# selection loop. Same stack the private POC uses — `xcb` (an FFI binding to the
+# system libxcb) with the XFixes extension for selection-owner notifications, and
+# `mio` (os-poll + os-ext for the eventfd-backed `Waker`) to pump the X socket fd
+# and the command queue on the main thread. `fuser` (default-features = false, so
+# NO libfuse C dependency — it mounts via the setuid `fusermount3`/`fusermount`
+# binary at runtime, keeping the CI build free of libfuse-dev) serves a remote
+# files clip as an on-demand FUSE tree; `libc` supplies the errno/uid constants
+# the FUSE callbacks need. Non-Linux targets never pull these.
+[target.'cfg(target_os = "linux")'.dependencies]
+xcb = { version = "1", features = ["xfixes"] }
+mio = { version = "1", features = ["os-poll", "os-ext"] }
+fuser = { version = "0.16", default-features = false }
+libc = "0.2"
+
+# Windows clipboard backend (Windows only): the synchronous delayed-render
+# message loop. Two Win32 crates, complementary:
+# - `windows-sys` (raw FFI, MIT/Apache, no system libs to install) drives the
+#   CLASSIC clipboard path: the message-only window, the clipboard listener, and
+#   the delayed render of text/image (`SetClipboardData` / `WM_RENDERFORMAT`).
+# - `windows` (typed, COM) drives the OLE VIRTUAL-FILES path (brick 6): a remote
+#   files clip is promised as an `IDataObject` whose `FileContents` are pulled on
+#   demand through one `IStream` per file. Implementing COM interfaces needs
+#   vtables (`#[implement]`), which `windows-sys` does not generate — hence the
+#   typed crate here. `windows-core` MUST be a DIRECT dependency: the
+#   `#[implement]` macro expands to `::windows_core::…` paths (same 0.61.2 the
+#   `windows` crate resolves). Pinned 0.61 to reuse the 0.61.3 already in the
+#   workspace lock (via tao/tauri on Windows) — no version bump, no new package.
+# `image` (png feature only) decodes/encodes PNG so DIB-only sources (Snipping
+# Tool, Paint) round-trip via `CF_DIBV5`. Non-Windows targets never pull these.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-core = "0.61"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",                 # IDataObject_Impl vtable references GDI types
+    "Win32_System_Com",                   # IDataObject/IEnumFORMATETC/IStream, FORMATETC, STGMEDIUM, TYMED…
+    "Win32_System_Com_StructuredStorage", # STATSTG/STREAM_SEEK/STGTY (IStream) + IDataObject_Impl gate
+    "Win32_System_Ole",                   # OleInitialize/OleSetClipboard/OleIsCurrentClipboard/ReleaseStgMedium
+    "Win32_System_Memory",                # GlobalAlloc/Lock/Unlock for the FILEGROUPDESCRIPTORW
+    "Win32_System_DataExchange",          # RegisterClipboardFormatW
+    "Win32_UI_Shell",                     # FILEGROUPDESCRIPTORW / FILEDESCRIPTORW / FD_*
+] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# macOS clipboard backend (macOS only): the synchronous delayed-render run loop
+# on `NSPasteboard`, through the typed `objc2` Objective-C bindings (the same
+# 0.6/0.3 stack the tray already pulls via tao/tauri — no version bump). The
+# `NSPasteboard` feature exposes the pasteboard, its type constants, and the
+# `NSPasteboardTypeOwner` protocol; `NSImageRep` + `NSBitmapImageRep` give the
+# native, in-memory `NSBitmapImageRep` TIFF↔PNG conversion (headless-safe via
+# ImageIO), so no image codec crate is needed. `NSDate`/`NSRunLoop` drive the
+# main-thread run-loop pump; `NSString`/`NSData`/`NSArray`/`NSDictionary` are the
+# value types we pass. The files brick (7) adds `NSURL`/`NSOperation`/
+# `NSFilePresenter`/`NSFileCoordinator` (the fill-on-paste skeleton) and the
+# `block2` feature — the `relinquishPresentedItemToReader:` callback takes an
+# Objective-C block, so its trait method is gated behind `block2` and its argument
+# type is `block2::DynBlock`. `block2` is already in the workspace lock as a
+# transitive dep of `objc2-app-kit` (0.6.2), so naming it directly adds no new
+# package. Non-macOS targets never pull these.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSString",
+    "NSData",
+    "NSArray",
+    "NSDictionary",
+    "NSDate",
+    "NSRunLoop",
+    "NSURL",
+    "NSOperation",
+    "NSFilePresenter",
+    "NSFileCoordinator",
+    "block2",
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSPasteboard",
+    "NSImageRep",
+    "NSBitmapImageRep",
+] }
+block2 = "0.6"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+universallink-core = { path = "../core" }
+universallink-test-support = { path = "../test-support" }
+
+# Live-X round-trip tests (tests/x11.rs) drive a SECOND X client (a requestor
+# and a selection owner) against the real backend under Xvfb. Linux-only, and
+# only the core `x` protocol is needed on the test side.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+xcb = { version = "1", features = ["xfixes"] }
+
+# Live Windows-clipboard round-trip tests (tests/windows.rs) play the copying /
+# pasting application against the real backend, driving the OS clipboard directly
+# — so the test side needs the same raw Win32 surface. All `#[ignore]`d and
+# skip-if-`Unsupported`, validated manually on a real desktop.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+] }
+
+# Live macOS-pasteboard round-trip tests (tests/macos.rs) play the copying /
+# pasting application against the real backend, driving `NSPasteboard` directly —
+# so the test side needs the same `objc2` surface. The files brick (7) also drives
+# a real coordinated read (`NSFileCoordinator`) to trigger the presenter fill, so
+# the test side pulls `NSFileCoordinator`/`NSURL`/`NSError` and `block2` (the
+# accessor is an Objective-C block). All `#[ignore]`d, validated manually on a
+# real Mac desktop (a logged-in GUI session, where `pbs` runs).
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSString",
+    "NSData",
+    "NSArray",
+    "NSURL",
+    "NSError",
+    "NSFileCoordinator",
+    "block2",
+] }
+objc2-app-kit = { version = "0.3", features = ["NSPasteboard"] }
+block2 = "0.6"

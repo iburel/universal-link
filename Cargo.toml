@@ -1,3 +1,3 @@
 [workspace]
 resolver = "3"
-members = ["client", "core", "daemon", "gui", "paths", "server", "server-daemon", "test-support", "tray"]
+members = ["client", "clipboard", "core", "daemon", "gui", "paths", "server", "server-daemon", "test-support", "tray"]

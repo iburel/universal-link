@@ -204,19 +204,53 @@ async fn run_once(
 }
 
 /// The deployment's official components, looked up next to the Core binary.
-/// The tray is registered; the clipboard manager and the contextual menu will
-/// come and register here too. A missing executable is ignored (with a word in
-/// the log) — a Core without a tray is still a working Core.
+/// The tray is registered on every platform; the clipboard backend is registered
+/// on Linux (X11), Windows, and macOS. The contextual menu will come and register
+/// here too. A missing executable is ignored (with a word in the log) — a Core
+/// without a tray is still a working Core.
 ///
 /// The tray is granted `system.shutdown` (its Quit stops the whole Core) on top
 /// of `session.read` (its status icon); it requests only what each of its
 /// building blocks actually uses.
 pub fn official_components() -> Vec<ChildSpec> {
-    const OFFICIAL: [(&str, &str, &[&str]); 1] = [(
+    // (name, role, scopes). The tray is cross-platform; the clipboard backend
+    // has a Linux/X11 (brick 2), a Windows (brick 3), and a macOS (brick 4)
+    // backend, so it is registered on all three.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "windows", target_os = "macos")),
+        allow(unused_mut)
+    )]
+    let mut official: Vec<(&str, &str, &[&str])> = vec![(
         "universallink-tray",
         "tray",
         &["session.read", "system.shutdown"],
     )];
+    #[cfg(target_os = "linux")]
+    official.push((
+        "universallink-clipboard",
+        "clipboard-backend",
+        &["devices.read", "clipboard.read", "clipboard.write"],
+    ));
+    #[cfg(target_os = "windows")]
+    official.push((
+        "universallink-clipboard",
+        "clipboard-backend",
+        &["devices.read", "clipboard.read", "clipboard.write"],
+    ));
+    // macOS pastes files via `transactions.fill`, whose completion is reported
+    // out-of-band on the `transfers` topic — hence the extra `transfers.read`
+    // (brick 7). The pull-at-paste platforms above do not need it.
+    #[cfg(target_os = "macos")]
+    official.push((
+        "universallink-clipboard",
+        "clipboard-backend",
+        &[
+            "devices.read",
+            "clipboard.read",
+            "clipboard.write",
+            "transfers.read",
+        ],
+    ));
 
     let Some(dir) = std::env::current_exe()
         .ok()
@@ -226,7 +260,7 @@ pub fn official_components() -> Vec<ChildSpec> {
         return Vec::new();
     };
 
-    OFFICIAL
+    official
         .iter()
         .filter_map(|(name, role, scopes)| {
             let program = dir.join(executable_name(name));
