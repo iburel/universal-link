@@ -19,7 +19,12 @@
 //! path — there is no paste event to fetch on. It is promised through
 //! `offer_files` with a [`CoreFetcher`]: the files backend serves byte ranges on
 //! demand (`transactions.open` → a consumer channel → `READ`), one pull per OS
-//! `read`, so bytes are still fetched at paste time, not at offer.
+//! `read`, so bytes are still fetched at paste time, not at offer. A backend
+//! whose paste surface is on-disk destinations rather than a demand-read
+//! filesystem (macOS) instead calls [`FileFetcher::fill`] on that same handle:
+//! the Core writes the files itself (`transactions.fill`, fire-and-forget) and
+//! the orchestrator routes the out-of-band `transfer.finished`/`transfer.failed`
+//! back to the blocked paste so it can complete or refuse cleanly.
 //!
 //! Lifecycle: born at the announce, superseded by the next announce (own or a
 //! newer remote — the Core converges globally and only notifies the winner),
@@ -31,9 +36,10 @@ use std::future::Future;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use universallink_ipc_client::{
     ChannelError, Client, ConsumerChannel, Event, ProviderChannel, RequestError, RequestId,
 };
@@ -80,6 +86,9 @@ enum Action {
     RemoteUpdated(Value),
     /// A `clipboard.get_data` request to serve over a provider channel.
     GetData(RequestId, Value),
+    /// A terminal `transfer.*` notification (fill completion) to route to a
+    /// blocked [`CoreFetcher::fill`].
+    Transfer(TransferOutcome),
     /// A connected-but-uninteresting event: nothing to do.
     Idle,
     /// The loop must end.
@@ -91,6 +100,11 @@ fn classify(event: Option<Event>) -> Action {
         Some(Event::Connected { .. }) => Action::Resync,
         Some(Event::Notification { method, params }) if method == "clipboard.remote_updated" => {
             Action::RemoteUpdated(params)
+        }
+        Some(Event::Notification { method, params })
+            if method == "transfer.finished" || method == "transfer.failed" =>
+        {
+            Action::Transfer(parse_transfer_outcome(&method, &params))
         }
         Some(Event::Notification { .. }) => Action::Idle,
         Some(Event::Request { id, method, params }) if method == "clipboard.get_data" => {
@@ -118,6 +132,17 @@ struct Promise {
     formats: Vec<String>,
 }
 
+/// A terminal `transfer.*` outcome, broadcast to whichever [`CoreFetcher::fill`]
+/// is awaiting that `transfer_id`. Only `transfer.finished`/`transfer.failed`
+/// are published (started/progress are ignored), so the channel carries at most
+/// one item per fill and can never lag it out.
+#[derive(Clone, Debug)]
+struct TransferOutcome {
+    transfer_id: String,
+    /// The written paths on success, or the Core's error string on failure.
+    result: Result<Vec<PathBuf>, String>,
+}
+
 struct State<B: ClipboardBackend> {
     client: Client,
     ipc_path: PathBuf,
@@ -127,6 +152,9 @@ struct State<B: ClipboardBackend> {
     self_device_id: Option<String>,
     announced: Option<Announced>,
     promise: Option<Promise>,
+    /// Publishes terminal `transfer.*` outcomes; each [`CoreFetcher`] subscribes
+    /// to await its own fill's completion (macOS files paste).
+    transfers: broadcast::Sender<TransferOutcome>,
 }
 
 /// Runs the orchestrator until a terminal condition. Consumes the Core `events`
@@ -148,6 +176,9 @@ pub async fn run<B: ClipboardBackend>(
         self_device_id: None,
         announced: None,
         promise: None,
+        // Only terminal fill outcomes flow here (one per fill), so a small buffer
+        // never lags; kept alive in `State` so `CoreFetcher`s can subscribe.
+        transfers: broadcast::channel(64).0,
     };
     tokio::pin!(stdin_closed);
 
@@ -179,6 +210,11 @@ impl<B: ClipboardBackend> State<B> {
             Action::Resync => self.resync().await,
             Action::RemoteUpdated(params) => self.on_remote_updated(params),
             Action::GetData(id, params) => self.dispatch_get_data(id, params),
+            // Route to the blocked fill; `Err` means no fill is waiting (the
+            // transfer belongs to another component) — nothing to do.
+            Action::Transfer(outcome) => {
+                let _ = self.transfers.send(outcome);
+            }
             Action::Idle => {}
             Action::Exit(outcome) => return ControlFlow::Break(outcome),
         }
@@ -302,6 +338,7 @@ impl<B: ClipboardBackend> State<B> {
                 clip.tx_id.clone(),
                 self.ipc_path.clone(),
                 self.client.clone(),
+                self.transfers.clone(),
             );
             self.backend.offer_files(clip, Arc::new(fetcher));
         } else {
@@ -500,23 +537,82 @@ struct CoreFetcher {
     tx_id: String,
     ipc_path: PathBuf,
     client: Client,
-    /// The runtime the orchestrator runs on; the fetcher's `read` is invoked
-    /// from the FUSE session thread (a plain OS thread), so it bridges back here
-    /// with `block_on`.
+    /// The runtime the orchestrator runs on; the fetcher's `read`/`fill` is
+    /// invoked from an OS paste thread (FUSE session / macOS presenter queue, a
+    /// plain OS thread), so it bridges back here with `block_on`.
     handle: tokio::runtime::Handle,
-    /// The reusable consumer channel, opened on demand.
+    /// The reusable consumer channel, opened on demand (`read` path only).
     channel: tokio::sync::Mutex<Option<ConsumerChannel>>,
+    /// Terminal fill outcomes, subscribed to in `fill` (macOS push path).
+    transfers: broadcast::Sender<TransferOutcome>,
 }
+
+/// A backstop bounding a `fill` wait so the OS paste thread can never hang
+/// forever on a lost broadcast item. The Core is the real deadline authority
+/// (it always emits exactly one terminal `transfer.*`), so this is deliberately
+/// generous — it must never truncate a legitimately slow large transfer.
+const FILL_BACKSTOP: Duration = Duration::from_secs(3600);
 
 impl CoreFetcher {
     /// Captures the current runtime handle — the orchestrator runs inside it.
-    fn new(tx_id: String, ipc_path: PathBuf, client: Client) -> CoreFetcher {
+    fn new(
+        tx_id: String,
+        ipc_path: PathBuf,
+        client: Client,
+        transfers: broadcast::Sender<TransferOutcome>,
+    ) -> CoreFetcher {
         CoreFetcher {
             tx_id,
             ipc_path,
             client,
             handle: tokio::runtime::Handle::current(),
             channel: tokio::sync::Mutex::new(None),
+            transfers,
+        }
+    }
+
+    /// Issues one `transactions.fill` for `entries` and blocks (async) until its
+    /// terminal `transfer.*` arrives. Subscribes to the outcome broadcast BEFORE
+    /// issuing, so a fast completion cannot be missed between the reply and the
+    /// subscription.
+    async fn fill_async(&self, entries: &[(String, PathBuf)]) -> std::io::Result<Vec<PathBuf>> {
+        let mut rx = self.transfers.subscribe();
+        let entries_json: Vec<Value> = entries
+            .iter()
+            .map(|(file_id, dest)| {
+                json!({ "file_id": file_id, "dest_path": dest.to_string_lossy() })
+            })
+            .collect();
+        let reply = self
+            .client
+            .request(
+                "transactions.fill",
+                json!({ "tx_id": &self.tx_id, "entries": entries_json }),
+            )
+            .await
+            .map_err(|e| std::io::Error::other(format!("transactions.fill failed: {e}")))?;
+        let Some(transfer_id) = reply["transfer_id"].as_str().map(str::to_string) else {
+            return Err(std::io::Error::other(
+                "transactions.fill returned no transfer_id",
+            ));
+        };
+        let wait = async {
+            loop {
+                match rx.recv().await {
+                    Ok(o) if o.transfer_id == transfer_id => return o.result,
+                    // A different component's transfer, or a benign lag on
+                    // unrelated outcomes: keep waiting for ours.
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return Err("transfers stream closed (Core gone)".to_string());
+                    }
+                }
+            }
+        };
+        match tokio::time::timeout(FILL_BACKSTOP, wait).await {
+            Ok(Ok(paths)) => Ok(paths),
+            Ok(Err(e)) => Err(std::io::Error::other(format!("fill failed: {e}"))),
+            Err(_) => Err(std::io::Error::other("fill timed out awaiting completion")),
         }
     }
 
@@ -565,6 +661,41 @@ impl FileFetcher for CoreFetcher {
         // worker), so `block_on` is valid here.
         self.handle
             .block_on(async { self.read_async(file_id, offset, len).await })
+    }
+
+    fn fill(&self, entries: &[(String, PathBuf)]) -> std::io::Result<Vec<PathBuf>> {
+        // Called from the macOS presenter queue (a plain OS thread), so
+        // `block_on` is valid here — same discipline as `read`.
+        self.handle
+            .block_on(async { self.fill_async(entries).await })
+    }
+}
+
+/// Parses a terminal `transfer.*` notification into a [`TransferOutcome`].
+/// `transfer.finished` carries the written `paths`; `transfer.failed` carries an
+/// `error` string (defaulted if absent).
+fn parse_transfer_outcome(method: &str, params: &Value) -> TransferOutcome {
+    let transfer_id = params["transfer_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let result = if method == "transfer.finished" {
+        Ok(params["paths"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.as_str())
+            .map(PathBuf::from)
+            .collect())
+    } else {
+        Err(params["error"]
+            .as_str()
+            .unwrap_or("transfer failed")
+            .to_string())
+    };
+    TransferOutcome {
+        transfer_id,
+        result,
     }
 }
 
@@ -756,5 +887,55 @@ mod tests {
                 .formats
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn classify_routes_terminal_transfer_events_and_ignores_progress() {
+        assert!(matches!(
+            classify(Some(Event::Notification {
+                method: "transfer.finished".into(),
+                params: json!({ "transfer_id": "x", "paths": [] }),
+            })),
+            Action::Transfer(_)
+        ));
+        assert!(matches!(
+            classify(Some(Event::Notification {
+                method: "transfer.failed".into(),
+                params: json!({ "transfer_id": "x", "error": "PEER_GONE" }),
+            })),
+            Action::Transfer(_)
+        ));
+        // Non-terminal transfer events carry no fill outcome: nothing to route.
+        assert!(matches!(
+            classify(Some(Event::Notification {
+                method: "transfer.progress".into(),
+                params: json!({ "transfer_id": "x" }),
+            })),
+            Action::Idle
+        ));
+    }
+
+    #[test]
+    fn parse_transfer_outcome_reads_both_terminal_shapes() {
+        let ok = parse_transfer_outcome(
+            "transfer.finished",
+            &json!({ "transfer_id": "t1", "paths": ["/a/b.txt", "/a/c.txt"] }),
+        );
+        assert_eq!(ok.transfer_id, "t1");
+        assert_eq!(
+            ok.result.unwrap(),
+            vec![PathBuf::from("/a/b.txt"), PathBuf::from("/a/c.txt")]
+        );
+
+        let failed = parse_transfer_outcome(
+            "transfer.failed",
+            &json!({ "transfer_id": "t2", "error": "TX_STALE" }),
+        );
+        assert_eq!(failed.transfer_id, "t2");
+        assert_eq!(failed.result.unwrap_err(), "TX_STALE");
+
+        // A failed transfer without an explicit error still fails (defaulted).
+        let bare = parse_transfer_outcome("transfer.failed", &json!({ "transfer_id": "t3" }));
+        assert!(bare.result.is_err());
     }
 }

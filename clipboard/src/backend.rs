@@ -66,6 +66,22 @@ pub trait FileFetcher: Send + Sync {
     /// EOF). `Err` on a failed pull (TX_STALE / FILE_CHANGED / PEER_GONE / …):
     /// the OS read then fails cleanly, never a silent truncation.
     fn read(&self, file_id: &str, offset: u64, len: u64) -> std::io::Result<Vec<u8>>;
+
+    /// Push-materialize `entries` — each `(file_id, dest_path)` — by having the
+    /// Core write the files itself (`transactions.fill`). This is the alternative
+    /// to [`read`](Self::read) for a backend whose OS paste surface is a set of
+    /// on-disk destinations rather than a demand-read filesystem: the macOS
+    /// `NSFilePresenter` skeleton, where the Core fills the watched leaf paths
+    /// directly. BLOCKS from the OS paste thread until the whole transfer
+    /// finishes (like `read`), returning the written paths, or `Err` on
+    /// failure/cancellation — the paste is then left incomplete, never a
+    /// silently-truncated file passed off as whole. DEFAULT: pull backends
+    /// (X11 / Windows / FUSE) never call this.
+    fn fill(&self, _entries: &[(String, PathBuf)]) -> std::io::Result<Vec<PathBuf>> {
+        Err(std::io::Error::other(
+            "fill is not supported by this fetcher",
+        ))
+    }
 }
 
 /// What a platform backend reports to the orchestrator.

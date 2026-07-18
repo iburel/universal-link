@@ -97,18 +97,32 @@ async fn brain<B: universallink_clipboard::ClipboardBackend>(
     }
     let token = token.trim().to_string();
 
+    // macOS pastes files via `transactions.fill` (fire-and-forget): completion
+    // arrives out-of-band on the `transfers` topic, so the macOS backend must
+    // subscribe to it and hold `transfers.read`. Other platforms pull at paste
+    // and never need it — keep them at least privilege.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut scopes: Vec<String> = vec![
+        "devices.read".into(),
+        "clipboard.read".into(),
+        "clipboard.write".into(),
+    ];
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut topics: Vec<String> = vec!["clipboard".into()];
+    #[cfg(target_os = "macos")]
+    {
+        scopes.push("transfers.read".into());
+        topics.push("transfers".into());
+    }
+
     let (client, events) = universallink_ipc_client::spawn(ClientConfig {
         ipc_path: PathBuf::from(&ipc_path),
         token: TokenSource::Spawn(token),
         name: "universallink-clipboard".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         role: "clipboard-backend".into(),
-        scopes: vec![
-            "devices.read".into(),
-            "clipboard.read".into(),
-            "clipboard.write".into(),
-        ],
-        topics: vec!["clipboard".into()],
+        scopes,
+        topics,
         served_methods: vec!["clipboard.get_data".into()],
         reconnect_base_delay: Duration::from_millis(500),
         request_timeout: Duration::from_secs(10),

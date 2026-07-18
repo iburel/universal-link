@@ -3,8 +3,8 @@
 
 //! The macOS clipboard backend: an owner-driven, delayed-render state machine
 //! that plugs into the frozen [`crate::backend`] seam. Built on AppKit's
-//! `NSPasteboard` through the typed `objc2` bindings. Scope of this brick:
-//! `text` and `image/png` only (files land in a later brick).
+//! `NSPasteboard` through the typed `objc2` bindings. Scope: `text`, `image/png`
+//! (brick 4) and `files` (brick 7 — see the files section below).
 //!
 //! One thread does everything here, and it MUST be the main thread. Our
 //! `main.rs` already pins [`MacLoop::run`] to the main thread and runs the async
@@ -73,27 +73,74 @@
 //! the delivered PNG to TIFF when TIFF is asked for. The conversions use AppKit's
 //! `NSBitmapImageRep` (native, in-memory, headless-safe via ImageIO — no image
 //! codec crate).
+//!
+//! # Files: fill-on-paste through `NSFilePresenter` (both directions)
+//!
+//! A files clip does NOT ride the delayed-render `provideDataForType:` path above
+//! (macOS file promises — `NSFilePromiseProvider` — are dead at Cmd-V: the paste
+//! yields 0 bytes). Instead, on an `offer_files` we materialize a **skeleton** on
+//! disk in a uid-private (0700) temp dir: real subdirectories plus one EMPTY file
+//! per manifest leaf. We register **one `NSFilePresenter` per leaf file** (never a
+//! single presenter on a directory — that pastes an empty folder) and publish only
+//! the top-level `file://` URLs (`writeObjects:` of `NSURL`s, which are concrete —
+//! not a lazy promise). When an app pastes (Cmd-V), the Finder performs a
+//! coordinated read of each leaf; the system then calls
+//! `relinquishPresentedItemToReader:` on that leaf's presenter, on the presenter's
+//! serial `NSOperationQueue` — a BACKGROUND thread, NOT the main run loop, so it
+//! does not block the run-loop pump and needs no `PasteSync`. On the FIRST such
+//! relinquish we run ONE whole-clip [`FileFetcher::fill`] (every non-`dir` leaf →
+//! its skeleton path); the Core writes those files itself (push). Concurrent and
+//! later leaf relinquishes block on the SAME shared result through a
+//! [`FillCoordinator`] (`Mutex<FillProgress>` + `Condvar`) until it is `Done`, then
+//! release immediately. The reader is ALWAYS released — even on fill failure: the
+//! Finder has no refusal channel, so a failed leaf simply stays empty (an
+//! "incomplete paste", logged), never a partially-written file passed off as whole.
+//!
+//! Tear-down obeys the FreeRDP #12355 lesson: a `relinquish` may still be running
+//! on a presenter's queue when its offer is superseded, and destroying the
+//! presenter under its own callback is a use-after-free. So a superseded offer is
+//! RETIRED (`removeFilePresenter:`, stopping new callbacks) into a kept-alive list
+//! rather than dropped, and only freed at the next full release.
+//!
+//! Source side (this Mac copied files): `NSFilenamesPboardType` (a plist array of
+//! POSIX paths) is read FIRST, before text/image — a files copy usually also
+//! carries the paths as text, which must not be mistaken for content. The
+//! top-level paths are announced as a `files` clip (`paths` set, no inline bytes);
+//! the Core enumerates them. A `{files: []}` sentinel keeps the capture "live" so a
+//! later foreign copy still supersedes it — exactly the X11 / Windows pattern.
 
 use std::collections::{HashMap, VecDeque};
+use std::fs::File;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use block2::{DynBlock, RcBlock};
 use objc2::rc::{Retained, autoreleasepool};
-use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol};
+use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{AnyThread, DefinedClass, define_class, msg_send};
+// `NSFilenamesPboardType` is deprecated (10.14) but is still the only files type
+// that is agnostic to the file COUNT — the modern `public.file-url` is one item
+// per file, which a pure metadata offer cannot size up front. The Finder still
+// translates it, so it stays the source-detection type.
+#[allow(deprecated)]
+use objc2_app_kit::NSFilenamesPboardType;
 use objc2_app_kit::{
     NSBitmapImageFileType, NSBitmapImageRep, NSBitmapImageRepPropertyKey, NSPasteboard,
     NSPasteboardType, NSPasteboardTypeOwner, NSPasteboardTypePNG, NSPasteboardTypeString,
-    NSPasteboardTypeTIFF,
+    NSPasteboardTypeTIFF, NSPasteboardWriting,
 };
 use objc2_foundation::{
-    NSArray, NSData, NSDate, NSDefaultRunLoopMode, NSDictionary, NSInteger, NSRunLoop, NSString,
+    NSArray, NSData, NSDate, NSDefaultRunLoopMode, NSDictionary, NSFileCoordinator,
+    NSFilePresenter, NSInteger, NSOperationQueue, NSRunLoop, NSString, NSURL,
 };
 use tokio::sync::{mpsc, oneshot};
 
-use crate::backend::{BackendEvent, ClipboardBackend, Format, LocalClip, RemoteClip};
+use crate::backend::{
+    BackendEvent, ClipboardBackend, FileFetcher, Format, LocalClip, RemoteClip, RemoteFile,
+};
 
 /// Deadline of a pending paste: past it, refuse cleanly (the app never freezes).
 /// A safety net independent of `release()` when a disconnection is silent.
@@ -118,6 +165,7 @@ const BACKEND_EVENT_CAPACITY: usize = 256;
 /// Core v1 format strings.
 const FORMAT_TEXT: &str = "text";
 const FORMAT_PNG: &str = "image/png";
+const FORMAT_FILES: &str = "files";
 
 // --- The modern pasteboard UTIs, as their stable string values. Kept as plain
 // `&str` so the format↔type mapping is pure and unit-tested off a Mac; the thin
@@ -143,6 +191,13 @@ enum Cmd {
     },
     /// Take ownership of the pasteboard, promising a remote clip (bytes later).
     Offer(RemoteClip),
+    /// Take ownership for a remote FILES clip: build the skeleton, register a
+    /// presenter per leaf, and publish the top-level `file://` URLs. The leaves
+    /// are filled from `fetcher` on the first coordinated read (fill-on-paste).
+    OfferFiles {
+        clip: RemoteClip,
+        fetcher: Arc<dyn FileFetcher>,
+    },
     /// Drop OS ownership (promise withdrawn / superseded / shutting down).
     Release,
     /// Stop the loop with this process exit code (dropping ownership first).
@@ -272,6 +327,10 @@ impl ClipboardBackend for MacBackend {
 
     fn offer(&self, clip: RemoteClip) {
         self.push(Cmd::Offer(clip));
+    }
+
+    fn offer_files(&self, clip: RemoteClip, fetcher: Arc<dyn FileFetcher>) {
+        self.push(Cmd::OfferFiles { clip, fetcher });
     }
 
     fn deliver(&self, token: u64, _format: &str, bytes: Vec<u8>) {
@@ -534,6 +593,328 @@ fn render_into(sender: &NSPasteboard, uti: &str, ty: &NSPasteboardType, bytes: V
     // Any other UTI is unreachable (only promised types reach here) — no-op.
 }
 
+// === Files: fill-on-paste skeleton + NSFilePresenter (destination side) =======
+
+/// The deprecated `NSFilenamesPboardType` (a plist array of POSIX paths) — the
+/// only files type agnostic to the file count (see the module docs). Still
+/// translated by the Finder, so it is our source-detection type.
+fn filenames_type() -> &'static NSPasteboardType {
+    // SAFETY: AppKit `extern` static, valid while the framework is loaded.
+    #[allow(deprecated)]
+    unsafe {
+        NSFilenamesPboardType
+    }
+}
+
+/// An existing on-disk `Path` → its `file://` `NSURL`. The skeleton already
+/// exists when this runs, so `fileURLWithPath:`'s `stat` classifies it correctly.
+fn file_url(path: &Path) -> Retained<NSURL> {
+    let s = NSString::from_str(&path.to_string_lossy());
+    NSURL::fileURLWithPath(&s)
+}
+
+/// A self-deleting, uid-private (0700) temp dir holding one files-clip skeleton.
+/// Its `Drop` does a best-effort `remove_dir_all` (a fill in flight writes into an
+/// already-unlinked inode — harmless). We avoid the dev-only `tempfile` crate,
+/// mirroring the FUSE tier's uid-private mount discipline.
+struct ScopedTempDir {
+    path: PathBuf,
+}
+
+impl ScopedTempDir {
+    fn new() -> std::io::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "universallink-clip-files-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        Ok(Self { path: dir })
+    }
+}
+
+impl Drop for ScopedTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// One skeleton leaf to fill: the manifest `file_id` and the absolute skeleton
+/// path the Core will write DIRECTLY (no temp+rename — that is impossible on an
+/// OS-watched skeleton path). These pairs are the [`FileFetcher::fill`] entries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LeafEntry {
+    file_id: String,
+    dest: PathBuf,
+}
+
+/// Whether a manifest path is unsafe to place in the skeleton. The receiving Core
+/// has re-validated it, but a files backend must still never join an absolute
+/// path, a `..`/`.` component, or a `\0` (never a filename). Unlike the X11/FUSE
+/// tree we do NOT reject `:` — it is a legal byte in a macOS (APFS/HFS+) filename.
+fn path_is_malformed(path: &str, comps: &[&str]) -> bool {
+    path.starts_with('/')
+        || comps
+            .iter()
+            .any(|c| *c == ".." || *c == "." || c.contains('\0'))
+}
+
+/// Build the skeleton for `files` under `base`: create every declared and implied
+/// directory, and one EMPTY file per non-`dir` leaf (filled at paste time).
+/// Returns the leaves (the `fill` entries) and the ordered, de-duplicated
+/// top-level component names (the `file://` roots to publish). Malformed entries
+/// are skipped, never joined. Pure of AppKit (std `fs` only), so it is unit-tested
+/// off a Mac.
+fn build_skeleton(
+    base: &Path,
+    files: &[RemoteFile],
+) -> std::io::Result<(Vec<LeafEntry>, Vec<String>)> {
+    let mut leaves: Vec<LeafEntry> = Vec::new();
+    let mut roots: Vec<String> = Vec::new();
+    for f in files {
+        let comps: Vec<&str> = f.path.split('/').filter(|c| !c.is_empty()).collect();
+        if comps.is_empty() || path_is_malformed(&f.path, &comps) {
+            continue;
+        }
+        let root = comps[0].to_string();
+        if !roots.iter().any(|r| r == &root) {
+            roots.push(root);
+        }
+        // Rebuild from the sanitized components so a leading/duplicate `/` cannot
+        // escape `base`.
+        let dest = base.join(comps.iter().collect::<PathBuf>());
+        if f.dir {
+            std::fs::create_dir_all(&dest)?;
+        } else {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            File::create(&dest)?; // empty leaf — filled on the first coordinated read
+            leaves.push(LeafEntry {
+                file_id: f.file_id.clone(),
+                dest,
+            });
+        }
+    }
+    Ok((leaves, roots))
+}
+
+/// State of the one whole-clip fill shared by every leaf presenter of an offer.
+enum FillProgress {
+    /// No leaf has been read yet.
+    Idle,
+    /// One leaf's relinquish is running the whole-clip fill; others wait on it.
+    InFlight,
+    /// The fill finished; `success` is `false` if it failed (leaves may be empty).
+    Done { success: bool },
+}
+
+/// Coordinates the single whole-clip fill across an offer's leaf presenters.
+/// Shared by `Arc` between all presenters of one offer and the [`FileOffer`]. The
+/// FIRST relinquish to arrive runs [`FileFetcher::fill`] ONCE with every leaf
+/// entry; concurrent and later relinquishes block on the same result and then
+/// release immediately. Pure Rust (no AppKit), so the coordination is unit-tested.
+struct FillCoordinator {
+    fetcher: Arc<dyn FileFetcher>,
+    /// Every non-`dir` leaf as `(file_id, dest_path)`: the exact `fill` argument.
+    entries: Vec<(String, PathBuf)>,
+    progress: Mutex<FillProgress>,
+    cv: Condvar,
+}
+
+impl FillCoordinator {
+    fn new(fetcher: Arc<dyn FileFetcher>, entries: Vec<(String, PathBuf)>) -> Arc<Self> {
+        Arc::new(Self {
+            fetcher,
+            entries,
+            progress: Mutex::new(FillProgress::Idle),
+            cv: Condvar::new(),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, FillProgress> {
+        self.progress.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Ensure the whole clip is filled, blocking until it is (called from a
+    /// presenter's serial operation queue — a plain OS thread, so the blocking
+    /// `fill` is legal here). Returns only once it is safe to release the reader:
+    /// the first caller runs the fill; the rest wait on the `Condvar`, and every
+    /// caller returns whether the fill succeeded or failed (the reader is released
+    /// either way — the Finder has no refusal channel).
+    fn ensure_filled(&self) {
+        let mut guard = self.lock();
+        loop {
+            match &*guard {
+                FillProgress::Idle => {
+                    // We are first: claim the fill, then run it WITHOUT holding the
+                    // lock so waiters can queue on the Condvar meanwhile.
+                    *guard = FillProgress::InFlight;
+                    drop(guard);
+                    let success = self.run_fill();
+                    let mut g = self.lock();
+                    *g = FillProgress::Done { success };
+                    self.cv.notify_all();
+                    return;
+                }
+                // Another leaf is filling the whole clip: wait for it to finish.
+                FillProgress::InFlight => {
+                    guard = self.cv.wait(guard).unwrap_or_else(|p| p.into_inner());
+                }
+                FillProgress::Done { .. } => return,
+            }
+        }
+    }
+
+    /// Issue the one blocking whole-clip `fill`. `Ok` → the Core wrote every leaf;
+    /// `Err` → left incomplete (logged, counted through `Done{success:false}`).
+    /// A panic in `fill` is caught: it must not unwind across the Objective-C
+    /// relinquish callback (undefined behavior — the brick-6 COM-boundary lesson),
+    /// and it must not skip the `Done`/notify that unblocks the other leaves'
+    /// waiters. A caught panic is treated as a failed (incomplete) fill.
+    fn run_fill(&self) -> bool {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.fetcher.fill(&self.entries)
+        }));
+        match outcome {
+            Ok(Ok(_)) => true,
+            Ok(Err(e)) => {
+                warn(&format!("files fill failed — paste left incomplete: {e}"));
+                false
+            }
+            Err(_) => {
+                warn("files fill panicked — paste left incomplete");
+                false
+            }
+        }
+    }
+
+    /// Whether the fill finished but failed (at least one empty leaf was pasted).
+    fn incomplete(&self) -> bool {
+        matches!(&*self.lock(), FillProgress::Done { success: false })
+    }
+}
+
+/// Instance variables of a leaf file presenter. All fields are `Send`+`Sync`
+/// (`Retained<NSURL>`/`Retained<NSOperationQueue>` are immutable/thread-safe;
+/// `Arc<FillCoordinator>` is `Send`+`Sync`), so the class is NOT `MainThreadOnly`
+/// — its callbacks are delivered on the instance's own serial operation queue.
+struct PresenterIvars {
+    /// `file://` URL of this leaf (returned by `presentedItemURL`).
+    url: Retained<NSURL>,
+    /// The SERIAL queue (maxConcurrency 1) the system schedules our callbacks on.
+    queue: Retained<NSOperationQueue>,
+    /// Shared with every leaf of this offer: runs the one whole-clip fill.
+    coordinator: Arc<FillCoordinator>,
+}
+
+define_class!(
+    // SAFETY:
+    // - The `NSObject` superclass imposes no subclassing requirement.
+    // - No unsound `dealloc`/`Drop`; every ivar is `Send`+`Sync`, so the class is
+    //   not `MainThreadOnly` (callbacks arrive on the instance's serial queue).
+    #[unsafe(super(NSObject))]
+    #[name = "UniversalLinkClipboardFilePresenter"]
+    #[ivars = PresenterIvars]
+    struct FilePresenter;
+
+    unsafe impl NSObjectProtocol for FilePresenter {}
+
+    unsafe impl NSFilePresenter for FilePresenter {
+        // Required: the URL of the presented item (the leaf). Returns a `Retained`,
+        // so it is a `method_id` (retain semantics), like the generated protocol.
+        #[unsafe(method_id(presentedItemURL))]
+        fn presented_item_url(&self) -> Option<Retained<NSURL>> {
+            Some(self.ivars().url.clone())
+        }
+
+        // Required: the (serial) queue our callbacks are scheduled on — NEVER nil.
+        #[unsafe(method_id(presentedItemOperationQueue))]
+        fn presented_item_operation_queue(&self) -> Retained<NSOperationQueue> {
+            self.ivars().queue.clone()
+        }
+
+        // Files fill-on-paste: before a coordinated reader (Finder at Cmd-V) reads
+        // this leaf, the system asks us to relinquish access. We fill the WHOLE
+        // clip once (shared coordinator), then invoke the `reader` block, handing
+        // it a `reacquirer` (called back when the reader is done). Runs on this
+        // instance's serial operation queue (a plain OS thread, off the tokio
+        // runtime) — so the blocking `fill` is legal here.
+        //
+        // SAFETY: protocol-generated signature (`unsafe fn`, block-of-block). The
+        // `reader` block is called exactly once; the `reacquirer` outlives that
+        // call (the `reader` copies/retains it if it defers).
+        #[unsafe(method(relinquishPresentedItemToReader:))]
+        unsafe fn relinquish_to_reader(&self, reader: &DynBlock<dyn Fn(*mut DynBlock<dyn Fn()>)>) {
+            // Clone the coordinator `Arc` FIRST, so NO borrow of `self` is held
+            // across the blocking whole-clip fill. If this offer is released
+            // (dropped) mid-fill — a withdraw / shutdown during an active Cmd-V —
+            // the fill keeps running on the independently-owned `Arc` and this
+            // method never dereferences the freed presenter again; `reader` is the
+            // caller's own block, independent of `self`. Without the clone, the
+            // `self.ivars()` borrow would span the whole (possibly long, networked)
+            // transfer and a mid-fill drop would be a use-after-free.
+            let coordinator = self.ivars().coordinator.clone();
+            coordinator.ensure_filled();
+            // Always release the reader, even if the fill failed (otherwise the
+            // Finder would hang); the leaf then reads as the empty skeleton file.
+            let reacquirer = RcBlock::new(|| {});
+            reader.call((RcBlock::as_ptr(&reacquirer),));
+        }
+    }
+);
+
+impl FilePresenter {
+    fn new(url: Retained<NSURL>, coordinator: Arc<FillCoordinator>) -> Retained<Self> {
+        // A dedicated serial queue (one relinquish at a time for this leaf).
+        let queue = NSOperationQueue::new();
+        queue.setMaxConcurrentOperationCount(1);
+        let this = Self::alloc().set_ivars(PresenterIvars {
+            url,
+            queue,
+            coordinator,
+        });
+        // SAFETY: `NSObject`'s `init` has this signature.
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+/// A live files offer: the skeleton (self-deleting), its leaf presenters (kept
+/// ALIVE — `addFilePresenter:` does not retain them), and the shared fill
+/// coordinator. [`unregister`](Self::unregister) does the `removeFilePresenter:`
+/// before the offer is retired/dropped.
+struct FileOffer {
+    _tempdir: ScopedTempDir,
+    presenters: Vec<Retained<FilePresenter>>,
+    coordinator: Arc<FillCoordinator>,
+}
+
+impl FileOffer {
+    /// Deregister every presenter from the shared `NSFileCoordinator` (no new
+    /// callbacks). An in-flight relinquish on a presenter's queue keeps running —
+    /// which is why the offer is kept alive (retired), not dropped, until release.
+    fn unregister(&self) {
+        for p in &self.presenters {
+            let proto = ProtocolObject::from_ref(&**p);
+            NSFileCoordinator::removeFilePresenter(proto);
+        }
+    }
+}
+
+impl Drop for FileOffer {
+    fn drop(&mut self) {
+        // Diagnostic: at least one leaf was pasted empty (the fill failed / was
+        // cut short). No native Finder refusal channel exists (mirrors clipnet);
+        // for now we log it — a GUI notification lands with the desktop app. The
+        // skeleton is removed immediately after (ScopedTempDir's Drop).
+        if self.coordinator.incomplete() {
+            warn("files paste left incomplete (a fill failed) — some leaves stayed empty");
+        }
+    }
+}
+
 /// Backend state, living on the pump (main) thread. Owns the non-`Send`
 /// `Retained<NSPasteboard>` and `Retained<Owner>`, so it is not `Send` (created
 /// and pumped here only).
@@ -557,6 +938,14 @@ struct Backend {
     /// change is detected (AppKit has dropped our promise, like an X11
     /// `SelectionClear`). Guards `on_release` from wiping another app's clipboard.
     is_owner: bool,
+    /// The live files offer's skeleton + presenters (fill-on-paste), if any.
+    /// `None` outside a files clip.
+    files_offer: Option<FileOffer>,
+    /// Files offers RETIRED (presenters deregistered) but kept alive until the
+    /// next full release: a `relinquish` may still be running on a presenter's
+    /// queue when its offer is superseded, and dropping the presenter under its
+    /// own callback is a use-after-free (FreeRDP #12355). Bounded by session.
+    retired_files: Vec<FileOffer>,
     shutdown: bool,
     exit_code: Option<i32>,
 }
@@ -590,6 +979,8 @@ impl Backend {
             next_generation: 0,
             last_change,
             is_owner: false,
+            files_offer: None,
+            retired_files: Vec::new(),
             shutdown: false,
             exit_code: None,
         })
@@ -665,6 +1056,7 @@ impl Backend {
                     let _ = reply.send(self.cache.get(generation, &format));
                 }
                 Cmd::Offer(clip) => self.on_offer(clip),
+                Cmd::OfferFiles { clip, fetcher } => self.on_offer_files(clip, fetcher),
                 Cmd::Release => self.on_release(),
                 Cmd::Exit(code) => {
                     self.exit_code = Some(code);
@@ -680,6 +1072,9 @@ impl Backend {
     /// `provide` for the old generation must stop vouching — invalidate the cache.
     fn on_offer(&mut self, clip: RemoteClip) {
         self.cache.invalidate();
+        // A text/image offer supersedes any files offer: retire its presenters
+        // (kept alive until release — a fill may be in flight on their queues).
+        self.retire_files_offer();
         let types: Vec<&NSPasteboardType> = clip
             .formats
             .iter()
@@ -688,7 +1083,7 @@ impl Backend {
             .collect();
         if types.is_empty() {
             // Nothing we can promise: relinquish rather than hold a stale offer.
-            self.on_release();
+            self.relinquish_ownership();
             return;
         }
         // OS confidentiality markers (org.nspasteboard.ConcealedType et al.) are a
@@ -705,8 +1100,111 @@ impl Backend {
         self.is_owner = true;
     }
 
-    /// Relinquish ownership if we still hold it (drop the delayed-render promise).
-    /// Shared by `Cmd::Release`, the shutdown path, and `Drop`.
+    /// Take ownership for a remote FILES clip: build the skeleton, register one
+    /// presenter per leaf, and publish the top-level `file://` URLs. A files offer
+    /// supersedes any local capture (a remote promise wins convergence), so the
+    /// cache is invalidated; any prior offer is retired first. Every refusal path
+    /// relinquishes ownership so we never keep owning the pasteboard while
+    /// promising files we cannot serve (the brick-5 phantom-ownership bug class).
+    fn on_offer_files(&mut self, clip: RemoteClip, fetcher: Arc<dyn FileFetcher>) {
+        self.cache.invalidate();
+        self.retire_files_offer();
+
+        let tempdir = match ScopedTempDir::new() {
+            Ok(dir) => dir,
+            Err(e) => {
+                warn(&format!(
+                    "cannot create files skeleton dir: {e} — files refused"
+                ));
+                self.relinquish_ownership();
+                return;
+            }
+        };
+        let (leaves, roots) = match build_skeleton(&tempdir.path, &clip.files) {
+            Ok(built) => built,
+            Err(e) => {
+                warn(&format!("cannot build files skeleton: {e} — files refused"));
+                self.relinquish_ownership();
+                return;
+            }
+        };
+        if leaves.is_empty() {
+            // Nothing fillable (dir-only or all-malformed manifest): a dir-only
+            // presenter would paste an empty folder, so make no promise.
+            self.relinquish_ownership();
+            return;
+        }
+
+        let entries: Vec<(String, PathBuf)> = leaves
+            .iter()
+            .map(|l| (l.file_id.clone(), l.dest.clone()))
+            .collect();
+        let coordinator = FillCoordinator::new(fetcher, entries);
+
+        // One presenter per leaf (never a single one on a directory), each sharing
+        // the offer's coordinator so the FIRST relinquish fills the whole clip.
+        let mut presenters = Vec::with_capacity(leaves.len());
+        for leaf in &leaves {
+            let presenter = FilePresenter::new(file_url(&leaf.dest), coordinator.clone());
+            // `addFilePresenter:` does NOT retain — we keep the presenter alive in
+            // the FileOffer below.
+            let proto = ProtocolObject::from_ref(&*presenter);
+            NSFileCoordinator::addFilePresenter(proto);
+            presenters.push(presenter);
+        }
+
+        // Publish ONLY the top-level `file://` URLs (`writeObjects:` writes them as
+        // concrete data — NOT a lazy promise). For a directory root the Finder then
+        // enumerates the now-non-empty tree and coordinated-reads each leaf.
+        let root_urls: Vec<Retained<NSURL>> = roots
+            .iter()
+            .map(|r| file_url(&tempdir.path.join(r)))
+            .collect();
+        self.write_file_urls(&root_urls);
+
+        self.files_offer = Some(FileOffer {
+            _tempdir: tempdir,
+            presenters,
+            coordinator,
+        });
+    }
+
+    /// Publish a list of `file://` URLs on the pasteboard (taking ownership), with
+    /// the same anti-re-entrancy + anti-echo discipline as `on_offer`. NSURL is
+    /// concrete `NSPasteboardWriting` data, so — unlike text/image — no delayed
+    /// render is involved; the file CONTENTS come later via the leaf presenters.
+    fn write_file_urls(&mut self, urls: &[Retained<NSURL>]) {
+        let writers: Vec<&ProtocolObject<dyn NSPasteboardWriting>> = urls
+            .iter()
+            .map(|u| ProtocolObject::from_ref(&**u))
+            .collect();
+        let array = NSArray::from_slice(&writers);
+        self.owner.set_suppress(true);
+        let _ = self.pb.clearContents();
+        let ok = self.pb.writeObjects(&array);
+        self.owner.set_suppress(false);
+        // `clearContents` + `writeObjects:` both moved the counter: record the
+        // FINAL value so our own write is not re-read as a foreign copy.
+        self.last_change = self.pb.changeCount();
+        self.is_owner = true;
+        if !ok {
+            warn("writeObjects: refused some file URLs");
+        }
+    }
+
+    /// Retire the current files offer: deregister its presenters (no new
+    /// callbacks) and move it to the kept-alive list — a `relinquish` may still be
+    /// running on a presenter's queue, and dropping it here would be a
+    /// use-after-free (FreeRDP #12355). Freed at the next full release.
+    fn retire_files_offer(&mut self) {
+        if let Some(offer) = self.files_offer.take() {
+            offer.unregister();
+            self.retired_files.push(offer);
+        }
+    }
+
+    /// Relinquish pasteboard ownership if we still hold it. Shared by `on_release`,
+    /// the files-refusal branches, and (via `on_release`) shutdown / `Drop`.
     ///
     /// The `is_owner` flag alone is NOT enough: macOS delivers no change event, so
     /// a foreign copy that lands while the pump is blocked leaves `is_owner`
@@ -718,7 +1216,7 @@ impl Backend {
     /// fresh copy, so we drop our claim instead and let the next poll read and
     /// announce it. This is the analogue of Windows' live `GetClipboardOwner() ==
     /// hwnd` guard in `relinquish`.
-    fn on_release(&mut self) {
+    fn relinquish_ownership(&mut self) {
         if !self.is_owner {
             return;
         }
@@ -737,6 +1235,16 @@ impl Backend {
         // recording `cc` absorbs it (subsumes X11's clear gate).
         self.last_change = cc;
         self.is_owner = false;
+    }
+
+    /// Full release (promise withdrawn / superseded / shutting down): relinquish
+    /// pasteboard ownership AND free every files offer. Retiring the current offer
+    /// first (deregister, keep alive) then clearing the retired list frees them
+    /// only once — the session is ending, so no live presenter should be filling.
+    fn on_release(&mut self) {
+        self.relinquish_ownership();
+        self.retire_files_offer();
+        self.retired_files.clear();
     }
 
     // ----- Source side: a foreign copy → eager read → Copied/Cleared -----
@@ -760,6 +1268,34 @@ impl Backend {
     /// under a fresh generation, and announce the metadata. If nothing usable is
     /// there, supersede the stale capture instead of continuing to vouch for it.
     fn read_and_announce_copy(&mut self) {
+        // Files take priority over inline formats, mirroring X11 / Windows: a files
+        // copy usually ALSO offers the paths as text, which must not be mistaken
+        // for content. If any file path is present, announce a files copy and stop
+        // — the Core reads the paths, so no inline bytes are cached. A `{files: []}`
+        // sentinel keeps the capture "live" so a later foreign non-files copy still
+        // supersedes it (fires `Cleared`), exactly like the X11 / Windows sentinel.
+        if let Some(paths) = self.read_files() {
+            let generation = self.next_generation;
+            self.next_generation += 1;
+            let mut sentinel: HashMap<String, Vec<u8>> = HashMap::new();
+            sentinel.insert(FORMAT_FILES.to_string(), Vec::new());
+            self.cache.store(generation, sentinel);
+            self.emit(BackendEvent::Copied {
+                generation,
+                clip: LocalClip {
+                    formats: vec![Format {
+                        id: FORMAT_FILES.to_string(),
+                        size: None,
+                    }],
+                    paths,
+                    // OS confidentiality markers (org.nspasteboard.ConcealedType)
+                    // are brick 8: nothing is announced sensitive yet.
+                    sensitive: false,
+                },
+            });
+            return;
+        }
+
         let mut bytes_by_format: HashMap<String, Vec<u8>> = HashMap::new();
         let mut formats: Vec<Format> = Vec::new();
 
@@ -806,6 +1342,35 @@ impl Backend {
             self.cache.invalidate();
             self.emit(BackendEvent::Cleared);
         }
+    }
+
+    /// Read `NSFilenamesPboardType` (a plist array of POSIX paths) as a files copy:
+    /// the announced TOP-LEVEL paths (the Core enumerates them itself — we do NOT
+    /// walk directories, mirroring the X11 / Windows source sides). `None` if the
+    /// type is absent or the array is empty (the caller then falls through to
+    /// text/image).
+    fn read_files(&self) -> Option<Vec<PathBuf>> {
+        let plist = self.pb.propertyListForType(filenames_type())?;
+        // `NSFilenamesPboardType` is, by contract, an `NSArray<NSString>` of POSIX
+        // paths — but the general pasteboard is a shared surface ANY local process
+        // can write, and AppKit stores/returns this legacy type's plist verbatim
+        // with no schema enforcement. Sending `count`/`objectAtIndex:`/`NSString`
+        // selectors to a wrong-class object (a dictionary, an array of numbers…)
+        // would raise an Objective-C exception that unwinds out of the pump and
+        // aborts the process. So validate the shape with CHECKED downcasts and
+        // refuse the whole read (`None`) on any mismatch — never send a selector to
+        // an unverified class. `NSArray<AnyObject>` is a downcast target (its
+        // element type is not runtime-checkable, so we downcast each element to
+        // `NSString` individually).
+        let array = plist.downcast::<NSArray>().ok()?;
+        let count = array.count();
+        let mut paths = Vec::with_capacity(count);
+        for i in 0..count {
+            let element = array.objectAtIndex(i);
+            let s = element.downcast::<NSString>().ok()?;
+            paths.push(PathBuf::from(s.to_string()));
+        }
+        if paths.is_empty() { None } else { Some(paths) }
     }
 
     /// Read `public.utf8-plain-text` as Core `text` (UTF-8). `stringForType`
@@ -992,5 +1557,184 @@ mod tests {
         // refuse on write) — never a panic.
         assert_eq!(png_to_tiff(b"not an image"), None);
         assert_eq!(tiff_to_png(b"not an image"), None);
+    }
+
+    // ----- Files: skeleton build + fill-coordination (AppKit-free) -----
+
+    use std::sync::atomic::AtomicUsize;
+
+    fn rfile(file_id: &str, path: &str, size: u64) -> RemoteFile {
+        RemoteFile {
+            file_id: file_id.into(),
+            path: path.into(),
+            size,
+            dir: false,
+        }
+    }
+
+    fn rdir(path: &str) -> RemoteFile {
+        RemoteFile {
+            file_id: String::new(),
+            path: path.into(),
+            size: 0,
+            dir: true,
+        }
+    }
+
+    /// `build_skeleton` creates the (declared + implied) directory tree and one
+    /// EMPTY file per leaf, and returns the leaves (file_id → dest) plus the
+    /// ordered, de-duplicated top-level roots. Malformed entries are dropped.
+    #[test]
+    fn build_skeleton_creates_empty_tree_leaves_and_roots() {
+        let base = std::env::temp_dir().join(format!(
+            "universallink-clip-skel-test-{}-{:p}",
+            std::process::id(),
+            &0u8
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let files = vec![
+            rfile("f0", "dir/a.bin", 10),          // implies dir/
+            rfile("f1", "dir/sub/b.bin", 20),      // implies dir/sub/
+            rdir("dir/empty"),                     // explicit empty dir
+            rfile("f2", "solo.bin", 5),            // top-level file
+            rfile("bad-abs", "/etc/passwd", 1),    // dropped (absolute)
+            rfile("bad-dotdot", "a/../escape", 1), // dropped (..)
+            rfile("bad-empty", "", 1),             // dropped (empty)
+        ];
+        let (mut leaves, roots) = build_skeleton(&base, &files).unwrap();
+        leaves.sort_by(|a, b| a.file_id.cmp(&b.file_id));
+
+        // Roots: first component of each kept entry, ordered, de-duplicated.
+        assert_eq!(roots, vec!["dir".to_string(), "solo.bin".to_string()]);
+
+        // Directories exist (declared + implied).
+        assert!(base.join("dir").is_dir());
+        assert!(base.join("dir/sub").is_dir(), "implied intermediate dir");
+        assert!(base.join("dir/empty").is_dir(), "explicit empty dir");
+
+        // Leaves exist, are EMPTY, and map to the right dests.
+        assert_eq!(leaves.len(), 3);
+        for (fid, rel) in [
+            ("f0", "dir/a.bin"),
+            ("f1", "dir/sub/b.bin"),
+            ("f2", "solo.bin"),
+        ] {
+            let leaf = leaves.iter().find(|l| l.file_id == fid).unwrap();
+            assert_eq!(leaf.dest, base.join(rel));
+            assert!(leaf.dest.is_file(), "{rel} must exist");
+            assert_eq!(
+                std::fs::metadata(&leaf.dest).unwrap().len(),
+                0,
+                "{rel} empty"
+            );
+        }
+
+        // None of the malformed entries leaked onto disk or into the roots.
+        assert!(!base.join("escape").exists());
+        assert!(!roots.iter().any(|r| r == "etc" || r == "a"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn build_skeleton_dir_only_manifest_has_no_leaves() {
+        let base = std::env::temp_dir().join(format!(
+            "universallink-clip-skel-dironly-{}-{:p}",
+            std::process::id(),
+            &1u8
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let (leaves, roots) = build_skeleton(&base, &[rdir("only")]).unwrap();
+        assert!(leaves.is_empty(), "a dir-only manifest fills nothing");
+        assert_eq!(roots, vec!["only".to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A `FileFetcher` double: records how many times `fill` was called and with
+    /// which entries, and returns a scripted result.
+    struct RecordingFetcher {
+        calls: AtomicUsize,
+        seen_entries: Mutex<Vec<(String, PathBuf)>>,
+        ok: bool,
+    }
+
+    impl RecordingFetcher {
+        fn new(ok: bool) -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+                seen_entries: Mutex::new(Vec::new()),
+                ok,
+            })
+        }
+    }
+
+    impl FileFetcher for RecordingFetcher {
+        fn read(&self, _file_id: &str, _offset: u64, _len: u64) -> std::io::Result<Vec<u8>> {
+            unreachable!("macOS uses fill, never read")
+        }
+        fn fill(&self, entries: &[(String, PathBuf)]) -> std::io::Result<Vec<PathBuf>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.seen_entries.lock().unwrap() = entries.to_vec();
+            if self.ok {
+                Ok(entries.iter().map(|(_, p)| p.clone()).collect())
+            } else {
+                Err(std::io::Error::other("scripted fill failure"))
+            }
+        }
+    }
+
+    fn entries() -> Vec<(String, PathBuf)> {
+        vec![
+            ("f0".into(), PathBuf::from("/skel/a.bin")),
+            ("f1".into(), PathBuf::from("/skel/b.bin")),
+        ]
+    }
+
+    /// The whole-clip fill runs exactly ONCE across many concurrent relinquishes,
+    /// with EVERY leaf entry, and every caller returns (unblocks its reader).
+    #[test]
+    fn fill_coordinator_fills_the_whole_clip_once_across_threads() {
+        let fetcher = RecordingFetcher::new(true);
+        let coord = FillCoordinator::new(fetcher.clone(), entries());
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let c = coord.clone();
+            handles.push(std::thread::spawn(move || c.ensure_filled()));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1, "fill runs once");
+        assert_eq!(
+            *fetcher.seen_entries.lock().unwrap(),
+            entries(),
+            "all leaves"
+        );
+        assert!(!coord.incomplete(), "a successful fill is not incomplete");
+    }
+
+    /// A subsequent relinquish after the fill is Done returns immediately and does
+    /// NOT re-run the fill.
+    #[test]
+    fn fill_coordinator_is_idempotent_after_done() {
+        let fetcher = RecordingFetcher::new(true);
+        let coord = FillCoordinator::new(fetcher.clone(), entries());
+        coord.ensure_filled();
+        coord.ensure_filled();
+        coord.ensure_filled();
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A failed fill still completes (the reader must be released, per the Finder
+    /// having no refusal channel) and flags the offer as incomplete.
+    #[test]
+    fn fill_coordinator_marks_incomplete_on_failure() {
+        let fetcher = RecordingFetcher::new(false);
+        let coord = FillCoordinator::new(fetcher.clone(), entries());
+        coord.ensure_filled(); // returns despite the failure (no hang)
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+        assert!(coord.incomplete(), "a failed fill is incomplete");
     }
 }

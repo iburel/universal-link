@@ -7192,6 +7192,7 @@ dependencies = [
 name = "universallink-clipboard"
 version = "0.2.0"
 dependencies = [
+ "block2",
  "fuser",
  "image",
  "libc",

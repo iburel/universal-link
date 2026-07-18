@@ -29,18 +29,28 @@
 
 #![cfg(target_os = "macos")]
 
+use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use block2::RcBlock;
+use objc2::rc::Retained;
 use objc2_app_kit::{
-    NSPasteboard, NSPasteboardType, NSPasteboardTypePNG, NSPasteboardTypeString,
-    NSPasteboardTypeTIFF,
+    NSPasteboard, NSPasteboardType, NSPasteboardTypeFileURL, NSPasteboardTypePNG,
+    NSPasteboardTypeString, NSPasteboardTypeTIFF,
 };
-use objc2_foundation::{NSArray, NSData, NSString};
+use objc2_foundation::{
+    NSArray, NSData, NSError, NSFileCoordinator, NSFileCoordinatorReadingOptions, NSString, NSURL,
+};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use universallink_clipboard::os;
-use universallink_clipboard::{BackendEvent, ClipboardBackend, Format, RemoteClip};
+use universallink_clipboard::{
+    BackendEvent, ClipboardBackend, FileFetcher, Format, RemoteClip, RemoteFile,
+};
 
 /// Serializes the process-global general pasteboard.
 static PASTEBOARD_LOCK: Mutex<()> = Mutex::const_new(());
@@ -198,6 +208,31 @@ fn set_pasteboard_png(png: &[u8]) {
     let _ = unsafe { pb.declareTypes_owner(&types, None) };
     let ok = pb.setData_forType(Some(&d), ty);
     assert!(ok, "setData:forType: (copy)");
+}
+
+/// Plays a foreign app copying FILES: writes the POSIX paths under
+/// `NSFilenamesPboardType` (the legacy array-of-strings a Finder copy exposes),
+/// declaring the type first. macOS canonicalizes these paths (security-scoped
+/// bookmarks) at WRITE time, so they must be real, existing paths — which is also
+/// why a malformed (non-string) `NSFilenamesPboardType` cannot be stored at all
+/// (the writer aborts), and the reader is safe from that shape by construction.
+fn set_pasteboard_filenames(paths: &[&Path]) {
+    let pb = general();
+    pb.clearContents();
+    let strings: Vec<Retained<NSString>> = paths
+        .iter()
+        .map(|p| NSString::from_str(&p.to_string_lossy()))
+        .collect();
+    let refs: Vec<&NSString> = strings.iter().map(|s| &**s).collect();
+    let array = NSArray::from_slice(&refs);
+    // SAFETY: AppKit extern static (the deprecated legacy filenames type).
+    #[allow(deprecated)]
+    let ty = unsafe { objc2_app_kit::NSFilenamesPboardType };
+    let types = NSArray::from_slice(&[ty]);
+    let _ = unsafe { pb.declareTypes_owner(&types, None) };
+    // SAFETY: `NSFilenamesPboardType`'s property list is an array of path strings.
+    let ok = unsafe { pb.setPropertyList_forType(&array, ty) };
+    assert!(ok, "setPropertyList:forType: (files copy)");
 }
 
 /// Delayed render, text happy path: we promise text; the app pastes →
@@ -420,6 +455,213 @@ async fn release_does_not_wipe_a_foreign_copy_that_raced_in() {
         survived.as_deref(),
         Some("foreign wins the race"),
         "release must not wipe another app's clipboard"
+    );
+
+    handle.request_exit(0);
+    loop_thread.join().unwrap();
+}
+
+/// Source side, files: a foreign app copies real files (their POSIX paths under
+/// `NSFilenamesPboardType`, as a Finder copy exposes them). The backend detects a
+/// FILES copy and announces `files` (the Core enumerates the paths — we do not
+/// walk directories). This is also the coverage for the checked-downcast
+/// `read_files`: a broken downcast would return `None`, and the copy would be
+/// announced as text (the paths are also legible as a string) or not at all,
+/// failing the `files` assertion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real macOS pasteboard; run manually with --ignored --test-threads=1"]
+async fn a_foreign_files_copy_is_detected() {
+    let _guard = PASTEBOARD_LOCK.lock().await;
+    let (handle, mut events, loop_thread) = skip_if_unsupported!(spawn_backend!());
+
+    // Real temp files: macOS canonicalizes the paths at write time.
+    let dir = std::env::temp_dir().join(format!("ul-clip-src-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let a = dir.join("a.txt");
+    let b = dir.join("b.txt");
+    std::fs::write(&a, b"a").expect("write a");
+    std::fs::write(&b, b"b").expect("write b");
+
+    set_pasteboard_filenames(&[&a, &b]);
+
+    let (_generation, formats, sensitive) = recv_copied(&mut events)
+        .await
+        .expect("a foreign files copy must be detected");
+    assert!(
+        formats.iter().any(|f| f.id == "files"),
+        "the copy must be announced as files (read_files parsed the array), got {formats:?}"
+    );
+    assert!(!sensitive);
+
+    handle.request_exit(0);
+    loop_thread.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ----- Files: fill-on-paste (destination side) -----
+
+/// A `FileFetcher` double standing in for the Core's push: on `fill` it writes the
+/// payload into each destination skeleton path (as the real Core would) and counts
+/// its calls. `read` is never used on macOS (fill-only).
+struct FillFetcher {
+    payload: Vec<u8>,
+    calls: AtomicUsize,
+}
+
+impl FillFetcher {
+    fn new(payload: Vec<u8>) -> Arc<Self> {
+        Arc::new(Self {
+            payload,
+            calls: AtomicUsize::new(0),
+        })
+    }
+}
+
+impl FileFetcher for FillFetcher {
+    fn read(&self, _file_id: &str, _offset: u64, _len: u64) -> std::io::Result<Vec<u8>> {
+        Err(std::io::Error::other("macOS uses fill, not read"))
+    }
+
+    fn fill(&self, entries: &[(String, PathBuf)]) -> std::io::Result<Vec<PathBuf>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mut written = Vec::new();
+        for (_file_id, dest) in entries {
+            std::fs::write(dest, &self.payload)?;
+            written.push(dest.clone());
+        }
+        Ok(written)
+    }
+}
+
+fn files_offer(files: Vec<RemoteFile>) -> RemoteClip {
+    RemoteClip {
+        tx_id: "tx-files".into(),
+        formats: vec![Format {
+            id: "files".into(),
+            size: None,
+        }],
+        files,
+        sensitive: false,
+    }
+}
+
+/// The POSIX path of the first published `file://` URL, waited for (bounded). Our
+/// skeleton names have no special characters, so a plain `file://<authority>/path`
+/// strip yields the path (no percent-decoding needed here).
+fn wait_for_published_path() -> Option<PathBuf> {
+    // SAFETY: AppKit extern static.
+    let ty = unsafe { NSPasteboardTypeFileURL };
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline {
+        if let Some(s) = general().stringForType(ty) {
+            let url = s.to_string();
+            if let Some(rest) = url.strip_prefix("file://") {
+                let idx = rest.find('/').unwrap_or(0);
+                return Some(PathBuf::from(&rest[idx..]));
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
+/// Source wiring: offering a files clip builds the skeleton, registers a presenter
+/// per leaf, and publishes the top-level `file://` URLs. We do NOT paste here (a
+/// real Finder is needed for that) — this exercises the whole objc2 SOURCE path
+/// (skeleton on disk + `NSFilePresenter`/`NSFileCoordinator` + `writeObjects:` +
+/// the `removeFilePresenter:` + skeleton removal on teardown) that no pure test
+/// covers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real macOS pasteboard; run manually with --ignored --test-threads=1"]
+async fn a_files_offer_publishes_file_urls() {
+    let _guard = PASTEBOARD_LOCK.lock().await;
+    let (handle, _events, loop_thread) = skip_if_unsupported!(spawn_backend!());
+
+    let fetcher = FillFetcher::new(b"unused".to_vec());
+    handle.offer_files(
+        files_offer(vec![RemoteFile {
+            file_id: "f0".into(),
+            path: "folder/leaf.bin".into(),
+            size: 6,
+            dir: false,
+        }]),
+        fetcher,
+    );
+
+    let path = wait_for_published_path().expect("a file URL must be published");
+    assert!(
+        path.to_string_lossy().contains("universallink-clip-files"),
+        "the published URL must point into the skeleton, got {path:?}"
+    );
+    // The published top-level element is the directory `folder`.
+    assert!(
+        path.ends_with("folder"),
+        "top-level URL is the root dir, got {path:?}"
+    );
+
+    // Teardown: request_exit → release → removeFilePresenter + skeleton removal,
+    // with no panic / use-after-free.
+    handle.request_exit(0);
+    loop_thread.join().unwrap();
+}
+
+/// Fill-on-paste: a coordinated read of a leaf triggers
+/// `relinquishPresentedItemToReader:`, which runs the whole-clip `fill` once; the
+/// empty skeleton leaf ends up holding exactly the pushed bytes. Uses a single
+/// top-level file so the published root URL IS the leaf.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real macOS pasteboard; run manually with --ignored --test-threads=1"]
+async fn a_coordinated_read_fills_the_leaf() {
+    let _guard = PASTEBOARD_LOCK.lock().await;
+    let (handle, _events, loop_thread) = skip_if_unsupported!(spawn_backend!());
+
+    let payload = b"filled by the core push".to_vec();
+    let fetcher = FillFetcher::new(payload.clone());
+    let probe = fetcher.clone();
+    handle.offer_files(
+        files_offer(vec![RemoteFile {
+            file_id: "f0".into(),
+            path: "solo.bin".into(),
+            size: payload.len() as u64,
+            dir: false,
+        }]),
+        fetcher,
+    );
+
+    let path = wait_for_published_path().expect("a file URL must be published");
+    assert_eq!(
+        std::fs::read(&path).unwrap().len(),
+        0,
+        "the skeleton leaf starts empty"
+    );
+
+    // A coordinated read blocks until the presenter's relinquish (and thus the
+    // fill) completes. Run it on a worker thread to keep the parity with a real
+    // reader; the accessor block itself is a no-op (we assert on disk after).
+    let read_path = path.clone();
+    let reader = thread::spawn(move || {
+        let coordinator = NSFileCoordinator::new();
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&read_path.to_string_lossy()));
+        let accessor = RcBlock::new(|_new_url: NonNull<NSURL>| {});
+        let mut error: Option<Retained<NSError>> = None;
+        coordinator.coordinateReadingItemAtURL_options_error_byAccessor(
+            &url,
+            NSFileCoordinatorReadingOptions(0),
+            Some(&mut error),
+            &accessor,
+        );
+    });
+    reader.join().unwrap();
+
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        payload,
+        "the coordinated read must have filled the leaf via fill()"
+    );
+    assert_eq!(
+        probe.calls.load(Ordering::SeqCst),
+        1,
+        "exactly one whole-clip fill"
     );
 
     handle.request_exit(0);

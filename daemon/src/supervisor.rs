@@ -237,11 +237,19 @@ pub fn official_components() -> Vec<ChildSpec> {
         "clipboard-backend",
         &["devices.read", "clipboard.read", "clipboard.write"],
     ));
+    // macOS pastes files via `transactions.fill`, whose completion is reported
+    // out-of-band on the `transfers` topic — hence the extra `transfers.read`
+    // (brick 7). The pull-at-paste platforms above do not need it.
     #[cfg(target_os = "macos")]
     official.push((
         "universallink-clipboard",
         "clipboard-backend",
-        &["devices.read", "clipboard.read", "clipboard.write"],
+        &[
+            "devices.read",
+            "clipboard.read",
+            "clipboard.write",
+            "transfers.read",
+        ],
     ));
 
     let Some(dir) = std::env::current_exe()

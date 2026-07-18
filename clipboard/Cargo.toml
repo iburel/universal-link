@@ -91,7 +91,13 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # native, in-memory `NSBitmapImageRep` TIFF↔PNG conversion (headless-safe via
 # ImageIO), so no image codec crate is needed. `NSDate`/`NSRunLoop` drive the
 # main-thread run-loop pump; `NSString`/`NSData`/`NSArray`/`NSDictionary` are the
-# value types we pass. Non-macOS targets never pull these.
+# value types we pass. The files brick (7) adds `NSURL`/`NSOperation`/
+# `NSFilePresenter`/`NSFileCoordinator` (the fill-on-paste skeleton) and the
+# `block2` feature — the `relinquishPresentedItemToReader:` callback takes an
+# Objective-C block, so its trait method is gated behind `block2` and its argument
+# type is `block2::DynBlock`. `block2` is already in the workspace lock as a
+# transitive dep of `objc2-app-kit` (0.6.2), so naming it directly adds no new
+# package. Non-macOS targets never pull these.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = [
@@ -101,12 +107,18 @@ objc2-foundation = { version = "0.3", features = [
     "NSDictionary",
     "NSDate",
     "NSRunLoop",
+    "NSURL",
+    "NSOperation",
+    "NSFilePresenter",
+    "NSFileCoordinator",
+    "block2",
 ] }
 objc2-app-kit = { version = "0.3", features = [
     "NSPasteboard",
     "NSImageRep",
     "NSBitmapImageRep",
 ] }
+block2 = "0.6"
 
 [dev-dependencies]
 tempfile = "3"
@@ -133,9 +145,21 @@ windows-sys = { version = "0.61", features = [
 
 # Live macOS-pasteboard round-trip tests (tests/macos.rs) play the copying /
 # pasting application against the real backend, driving `NSPasteboard` directly —
-# so the test side needs the same `objc2` surface. All `#[ignore]`d, validated
-# manually on a real Mac desktop (a logged-in GUI session, where `pbs` runs).
+# so the test side needs the same `objc2` surface. The files brick (7) also drives
+# a real coordinated read (`NSFileCoordinator`) to trigger the presenter fill, so
+# the test side pulls `NSFileCoordinator`/`NSURL`/`NSError` and `block2` (the
+# accessor is an Objective-C block). All `#[ignore]`d, validated manually on a
+# real Mac desktop (a logged-in GUI session, where `pbs` runs).
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSData", "NSArray"] }
+objc2-foundation = { version = "0.3", features = [
+    "NSString",
+    "NSData",
+    "NSArray",
+    "NSURL",
+    "NSError",
+    "NSFileCoordinator",
+    "block2",
+] }
 objc2-app-kit = { version = "0.3", features = ["NSPasteboard"] }
+block2 = "0.6"
