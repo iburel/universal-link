@@ -236,7 +236,10 @@ impl<B: ClipboardBackend> State<B> {
     /// Announces a local copy. It supersedes the previous transaction, so it
     /// also drops any remote promise we were holding.
     async fn announce(&mut self, generation: u64, clip: &crate::backend::LocalClip) {
-        let mut params = json!({ "formats": formats_to_json(&clip.formats) });
+        // `sensitive` omits the inline size hint (doc/core-api.md): enforced HERE,
+        // once, so every backend is correct by construction — a backend need only
+        // set `clip.sensitive`, never remember to strip sizes too.
+        let mut params = json!({ "formats": formats_to_json(&clip.formats, clip.sensitive) });
         if !clip.paths.is_empty() {
             params["paths"] = paths_to_json(&clip.paths);
         }
@@ -701,14 +704,19 @@ fn parse_transfer_outcome(method: &str, params: &Value) -> TransferOutcome {
 
 // --- JSON helpers ---------------------------------------------------------
 
-fn formats_to_json(formats: &[Format]) -> Value {
+/// Serialize the announced formats. When `sensitive`, the inline `size` hint is
+/// omitted for every format (the content is confidential — see doc/core-api.md);
+/// this is the single OS-agnostic point that enforces that invariant.
+fn formats_to_json(formats: &[Format], sensitive: bool) -> Value {
     Value::Array(
         formats
             .iter()
             .map(|f| {
                 let mut object = serde_json::Map::new();
                 object.insert("format".into(), json!(f.id));
-                if let Some(size) = f.size {
+                if let Some(size) = f.size
+                    && !sensitive
+                {
                     object.insert("size".into(), json!(size));
                 }
                 Value::Object(object)
@@ -814,12 +822,35 @@ mod tests {
                 size: None,
             },
         ];
-        let json = formats_to_json(&formats);
+        let json = formats_to_json(&formats, false);
         assert_eq!(
             json,
             json!([{ "format": "text", "size": 13 }, { "format": "image/png" }])
         );
         assert_eq!(parse_formats(&json), formats);
+    }
+
+    #[test]
+    fn a_sensitive_clip_omits_every_size_hint() {
+        // The invariant is enforced in the orchestrator, so a backend that leaves
+        // sizes on a sensitive copy (Windows/macOS set `sensitive` without
+        // stripping) still announces no size — confidential content leaks no
+        // length. Both formats drop their `size`.
+        let formats = vec![
+            Format {
+                id: "text".into(),
+                size: Some(13),
+            },
+            Format {
+                id: "image/png".into(),
+                size: Some(4096),
+            },
+        ];
+        let json = formats_to_json(&formats, true);
+        assert_eq!(
+            json,
+            json!([{ "format": "text" }, { "format": "image/png" }])
+        );
     }
 
     #[test]

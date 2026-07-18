@@ -81,14 +81,29 @@ struct FileEntry {
     size: u64,
 }
 
+/// The three confidentiality-marker format NAMES, in the order they are exposed.
+/// Registered (process-global ids) only for a `sensitive` offer; a clipboard
+/// manager that reads the OLE object then sees them and skips it. Windows clipboard
+/// history / cloud never capture file drops anyway, so for files the effective one
+/// is `ExcludeClipboardContentFromMonitorProcessing` (third-party managers); the
+/// other two are carried for parity with the inline offer (defense in depth).
+const MARKER_FORMAT_NAMES: [&str; 3] = [
+    "ExcludeClipboardContentFromMonitorProcessing",
+    "CanIncludeInClipboardHistory",
+    "CanUploadToCloudClipboard",
+];
+
 /// Register the two virtual-files clipboard formats and build the `IDataObject`
 /// for a remote FILES clip: the descriptor comes from the manifest, the contents
 /// are pulled through `fetcher` on demand (never read here). Only non-directory
 /// `files` entries are carried; their `path` (relative, `/`-separated) is
-/// converted to the `\`-separated form Windows expects.
+/// converted to the `\`-separated form Windows expects. When `sensitive`, the
+/// confidentiality markers are exposed as extra `TYMED_HGLOBAL` formats (each a
+/// DWORD `0`).
 pub fn build_files_data_object(
     files: &[RemoteFile],
     fetcher: Arc<dyn FileFetcher>,
+    sensitive: bool,
 ) -> WinResult<IDataObject> {
     // SAFETY: `RegisterClipboardFormatW` only reads the NUL-terminated string we
     // pass; it returns a process-global format id (or 0 on failure).
@@ -99,6 +114,17 @@ pub fn build_files_data_object(
     if cf_descriptor == 0 || cf_contents == 0 {
         return Err(E_FAIL.into());
     }
+    // The markers (only for a sensitive clip). A name that fails to register
+    // (id 0) is dropped rather than exposed as an invalid format.
+    let marker_formats: Vec<u16> = if sensitive {
+        MARKER_FORMAT_NAMES
+            .iter()
+            .map(|name| unsafe { RegisterClipboardFormatW(PCWSTR(wide_z(name).as_ptr())) } as u16)
+            .filter(|&id| id != 0)
+            .collect()
+    } else {
+        Vec::new()
+    };
     // Order = descriptor order = the `lindex` Explorer will hand back for
     // contents. Directories are implied by the file subpaths (see the module
     // limitation), so they are dropped here.
@@ -114,6 +140,7 @@ pub fn build_files_data_object(
     let obj = FilesDataObject {
         cf_descriptor,
         cf_contents,
+        marker_formats,
         files: entries,
         fetcher,
     };
@@ -281,6 +308,10 @@ impl IStream_Impl for PullStream_Impl {
 struct FilesDataObject {
     cf_descriptor: u16,
     cf_contents: u16,
+    /// Confidentiality-marker format ids (empty unless the clip is sensitive).
+    /// Each is served as a `TYMED_HGLOBAL` DWORD `0`, so a clipboard manager that
+    /// enumerates the OLE object sees the exclusion markers and skips it.
+    marker_formats: Vec<u16>,
     files: Vec<FileEntry>,
     fetcher: Arc<dyn FileFetcher>,
 }
@@ -336,6 +367,24 @@ impl FilesDataObject {
         Ok(hglobal)
     }
 
+    /// Build a 4-byte `HGLOBAL` holding a DWORD `0` — the payload of every
+    /// confidentiality marker. (The value is irrelevant for the monitor-exclusion
+    /// marker and means "do not include" for the history / cloud ones.)
+    fn build_marker_hglobal() -> WinResult<HGLOBAL> {
+        // SAFETY: allocate a movable 4-byte block, pin it, write the DWORD, unpin.
+        let hglobal = unsafe { GlobalAlloc(GMEM_MOVEABLE, std::mem::size_of::<u32>())? };
+        let ptr = unsafe { GlobalLock(hglobal) } as *mut u32;
+        if ptr.is_null() {
+            let _ = unsafe { GlobalFree(Some(hglobal)) };
+            return Err(E_FAIL.into());
+        }
+        unsafe {
+            core::ptr::write_unaligned(ptr, 0);
+            let _ = GlobalUnlock(hglobal);
+        }
+        Ok(hglobal)
+    }
+
     /// A `STGMEDIUM` wrapping an `HGLOBAL` (ownership transferred to the consumer).
     fn medium_hglobal(hglobal: HGLOBAL) -> STGMEDIUM {
         STGMEDIUM {
@@ -384,6 +433,12 @@ impl IDataObject_Impl for FilesDataObject_Impl {
             let stream: IStream =
                 PullStream::new(self.fetcher.clone(), entry.file_id.clone(), entry.size).into();
             Ok(FilesDataObject::medium_stream(stream))
+        } else if self.marker_formats.contains(&fe.cfFormat) {
+            if fe.tymed & (TYMED_HGLOBAL.0 as u32) == 0 {
+                return Err(DV_E_TYMED.into());
+            }
+            let h = FilesDataObject::build_marker_hglobal()?;
+            Ok(FilesDataObject::medium_hglobal(h))
         } else {
             Err(DV_E_FORMATETC.into())
         }
@@ -419,6 +474,12 @@ impl IDataObject_Impl for FilesDataObject_Impl {
             } else {
                 DV_E_TYMED
             }
+        } else if self.marker_formats.contains(&fe.cfFormat) {
+            if fe.tymed & (TYMED_HGLOBAL.0 as u32) != 0 {
+                S_OK
+            } else {
+                DV_E_TYMED
+            }
         } else {
             DV_E_FORMATETC
         }
@@ -444,10 +505,14 @@ impl IDataObject_Impl for FilesDataObject_Impl {
 
     fn EnumFormatEtc(&self, dwdirection: u32) -> WinResult<IEnumFORMATETC> {
         if dwdirection == DATADIR_GET.0 as u32 {
-            let entries = vec![
+            let mut entries = vec![
                 (self.cf_descriptor, TYMED_HGLOBAL.0 as u32),
                 (self.cf_contents, TYMED_ISTREAM.0 as u32),
             ];
+            // The confidentiality markers (only present for a sensitive clip).
+            for &cf in &self.marker_formats {
+                entries.push((cf, TYMED_HGLOBAL.0 as u32));
+            }
             Ok(FormatEnumerator::new(entries).into())
         } else {
             Err(E_NOTIMPL.into()) // no write formats (SetData is refused)
@@ -692,7 +757,7 @@ mod tests {
     #[test]
     fn query_get_data_accepts_the_two_formats_and_rejects_the_rest() {
         let (cf_d, cf_c) = cf_ids();
-        let obj = build_files_data_object(&sample_files(), fetcher(false)).expect("build");
+        let obj = build_files_data_object(&sample_files(), fetcher(false), false).expect("build");
 
         let t_h = TYMED_HGLOBAL.0 as u32;
         let t_s = TYMED_ISTREAM.0 as u32;
@@ -731,7 +796,7 @@ mod tests {
     #[test]
     fn enum_format_etc_yields_the_two_entries_then_s_false() {
         let (cf_d, cf_c) = cf_ids();
-        let obj = build_files_data_object(&sample_files(), fetcher(false)).expect("build");
+        let obj = build_files_data_object(&sample_files(), fetcher(false), false).expect("build");
         let enumr = unsafe { obj.EnumFormatEtc(DATADIR_GET.0 as u32) }.expect("enum");
 
         let mut buf = [formatetc(0, 0), formatetc(0, 0)];
@@ -754,7 +819,7 @@ mod tests {
     #[test]
     fn get_data_descriptor_carries_the_filtered_files() {
         let (cf_d, _cf_c) = cf_ids();
-        let obj = build_files_data_object(&sample_files(), fetcher(false)).expect("build");
+        let obj = build_files_data_object(&sample_files(), fetcher(false), false).expect("build");
 
         let mut medium: STGMEDIUM =
             unsafe { obj.GetData(&fe(cf_d, TYMED_HGLOBAL.0 as u32, DVASPECT_CONTENT.0, -1)) }
@@ -807,7 +872,7 @@ mod tests {
     #[test]
     fn get_data_contents_streams_the_fake_bytes_at_each_lindex() {
         let (_cf_d, cf_c) = cf_ids();
-        let obj = build_files_data_object(&sample_files(), fetcher(false)).expect("build");
+        let obj = build_files_data_object(&sample_files(), fetcher(false), false).expect("build");
 
         for (lindex, size) in [(0i32, 10u64), (1i32, 600u64)] {
             let mut medium = unsafe {
@@ -835,7 +900,7 @@ mod tests {
     #[test]
     fn get_data_contents_rejects_an_out_of_range_lindex() {
         let (_cf_d, cf_c) = cf_ids();
-        let obj = build_files_data_object(&sample_files(), fetcher(false)).expect("build");
+        let obj = build_files_data_object(&sample_files(), fetcher(false), false).expect("build");
         // `STGMEDIUM` is not `Debug`, so match rather than `expect_err`.
         let result =
             unsafe { obj.GetData(&fe(cf_c, TYMED_ISTREAM.0 as u32, DVASPECT_CONTENT.0, 2)) };
@@ -849,7 +914,7 @@ mod tests {
     #[test]
     fn stream_read_advances_across_small_reads() {
         let (_cf_d, cf_c) = cf_ids();
-        let obj = build_files_data_object(&sample_files(), fetcher(false)).expect("build");
+        let obj = build_files_data_object(&sample_files(), fetcher(false), false).expect("build");
         let mut medium =
             unsafe { obj.GetData(&fe(cf_c, TYMED_ISTREAM.0 as u32, DVASPECT_CONTENT.0, 0)) }
                 .expect("GetData contents");
@@ -885,7 +950,7 @@ mod tests {
     #[test]
     fn stream_read_returns_e_fail_on_a_failed_pull() {
         let (_cf_d, cf_c) = cf_ids();
-        let obj = build_files_data_object(&sample_files(), fetcher(true)).expect("build");
+        let obj = build_files_data_object(&sample_files(), fetcher(true), false).expect("build");
         let mut medium =
             unsafe { obj.GetData(&fe(cf_c, TYMED_ISTREAM.0 as u32, DVASPECT_CONTENT.0, 0)) }
                 .expect("GetData contents");
@@ -907,7 +972,8 @@ mod tests {
     #[test]
     fn stream_read_contains_a_fetcher_panic_as_e_fail() {
         let (_cf_d, cf_c) = cf_ids();
-        let obj = build_files_data_object(&sample_files(), panicking_fetcher()).expect("build");
+        let obj =
+            build_files_data_object(&sample_files(), panicking_fetcher(), false).expect("build");
         let mut medium =
             unsafe { obj.GetData(&fe(cf_c, TYMED_ISTREAM.0 as u32, DVASPECT_CONTENT.0, 0)) }
                 .expect("GetData contents");
@@ -933,5 +999,79 @@ mod tests {
         // yields — never an unwind across the COM boundary (which would abort).
         assert_eq!(hr, E_FAIL, "a fetcher panic must be contained as E_FAIL");
         assert_eq!(got, 0, "*pcbread must be 0 when the pull panics");
+    }
+
+    /// The registered ids of the three confidentiality markers.
+    fn marker_ids() -> Vec<u16> {
+        MARKER_FORMAT_NAMES
+            .iter()
+            .map(|name| unsafe { RegisterClipboardFormatW(PCWSTR(wide_z(name).as_ptr())) } as u16)
+            .collect()
+    }
+
+    #[test]
+    fn a_sensitive_object_exposes_the_confidentiality_markers() {
+        let (cf_d, cf_c) = cf_ids();
+        let markers = marker_ids();
+        let obj = build_files_data_object(&sample_files(), fetcher(false), true).expect("build");
+
+        let t_h = TYMED_HGLOBAL.0 as u32;
+        let content = DVASPECT_CONTENT.0;
+
+        // The enumerator lists the descriptor, the contents, THEN the markers.
+        let enumr = unsafe { obj.EnumFormatEtc(DATADIR_GET.0 as u32) }.expect("enum");
+        let mut buf: [FORMATETC; 8] = core::array::from_fn(|_| formatetc(0, 0));
+        let mut fetched: u32 = 0;
+        let hr = unsafe { enumr.Next(&mut buf, Some(&mut fetched)) };
+        assert_eq!(hr, S_FALSE, "fewer than 8 entries → S_FALSE");
+        assert_eq!(fetched as usize, 2 + markers.len());
+        assert_eq!(buf[0].cfFormat, cf_d);
+        assert_eq!(buf[1].cfFormat, cf_c);
+        for (i, &cf) in markers.iter().enumerate() {
+            assert_eq!(buf[2 + i].cfFormat, cf, "marker #{i} enumerated");
+            assert_eq!(buf[2 + i].tymed, t_h, "markers are TYMED_HGLOBAL");
+        }
+
+        // Each marker is accepted and serves a 4-byte DWORD 0.
+        for &cf in &markers {
+            assert_eq!(unsafe { obj.QueryGetData(&fe(cf, t_h, content, -1)) }, S_OK);
+            let mut medium =
+                unsafe { obj.GetData(&fe(cf, t_h, content, -1)) }.expect("marker GetData");
+            assert_eq!(medium.tymed, t_h);
+            let hglobal = unsafe { medium.u.hGlobal };
+            let ptr = unsafe { GlobalLock(hglobal) } as *const u32;
+            assert!(!ptr.is_null());
+            assert_eq!(unsafe { core::ptr::read_unaligned(ptr) }, 0);
+            let _ = unsafe { GlobalUnlock(hglobal) };
+            unsafe { ReleaseStgMedium(&mut medium) };
+        }
+    }
+
+    #[test]
+    fn a_non_sensitive_object_does_not_expose_the_markers() {
+        let markers = marker_ids();
+        let obj = build_files_data_object(&sample_files(), fetcher(false), false).expect("build");
+        let t_h = TYMED_HGLOBAL.0 as u32;
+        let content = DVASPECT_CONTENT.0;
+
+        // Only the two file formats are enumerated.
+        let enumr = unsafe { obj.EnumFormatEtc(DATADIR_GET.0 as u32) }.expect("enum");
+        let mut buf: [FORMATETC; 8] = core::array::from_fn(|_| formatetc(0, 0));
+        let mut fetched: u32 = 0;
+        let _ = unsafe { enumr.Next(&mut buf, Some(&mut fetched)) };
+        assert_eq!(fetched, 2, "no markers when not sensitive");
+
+        // A marker format is now unknown — refused, not served.
+        for &cf in &markers {
+            assert_eq!(
+                unsafe { obj.QueryGetData(&fe(cf, t_h, content, -1)) },
+                DV_E_FORMATETC
+            );
+            let result = unsafe { obj.GetData(&fe(cf, t_h, content, -1)) };
+            assert!(
+                result.is_err(),
+                "a marker must not be served when not sensitive"
+            );
+        }
     }
 }

@@ -288,6 +288,126 @@ async fn a_foreign_text_copy_is_detected_and_provided() {
     loop_thread.join().unwrap();
 }
 
+// ----- Confidentiality markers (sensitive, both directions) -----
+
+/// The three marker format names, mirrored from the backend.
+const MARKER_NAMES: [&str; 3] = [
+    "ExcludeClipboardContentFromMonitorProcessing",
+    "CanIncludeInClipboardHistory",
+    "CanUploadToCloudClipboard",
+];
+
+fn marker_id(name: &str) -> u32 {
+    unsafe { RegisterClipboardFormatW(marker_wide(name).as_ptr()) }
+}
+
+/// A `&str` → a `NUL`-terminated wide string (local copy so this section is
+/// self-contained above the files section's `wide`).
+fn marker_wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn sensitive_text_offer() -> RemoteClip {
+    RemoteClip {
+        tx_id: "tx-secret".into(),
+        formats: vec![Format {
+            id: "text".into(),
+            size: None,
+        }],
+        files: Vec::new(),
+        sensitive: true,
+    }
+}
+
+/// Plays a foreign PASSWORD MANAGER copying secret text: sets UTF-16LE text AND
+/// the `ExcludeClipboardContentFromMonitorProcessing` marker (a DWORD), in one
+/// clipboard session, so the backend must announce the copy `sensitive`.
+fn set_clipboard_text_marked_sensitive(text: &str) {
+    let mut blob: Vec<u8> = Vec::with_capacity(text.len() * 2 + 2);
+    for u in text.encode_utf16() {
+        blob.extend_from_slice(&u.to_le_bytes());
+    }
+    blob.extend_from_slice(&0u16.to_le_bytes());
+    let exclude_monitor = marker_id(MARKER_NAMES[0]);
+    unsafe {
+        assert!(
+            OpenClipboard(std::ptr::null_mut()) != 0,
+            "OpenClipboard (secret copy)"
+        );
+        EmptyClipboard();
+        // The text.
+        let h = GlobalAlloc(GMEM_MOVEABLE, blob.len());
+        assert!(!h.is_null(), "GlobalAlloc (text)");
+        let dst = GlobalLock(h) as *mut u8;
+        std::ptr::copy_nonoverlapping(blob.as_ptr(), dst, blob.len());
+        GlobalUnlock(h);
+        assert!(
+            !SetClipboardData(CF_UNICODETEXT, h as HWND).is_null(),
+            "SetClipboardData(text)"
+        );
+        // The exclusion marker: a 4-byte DWORD, as a password manager sets it.
+        let hm = GlobalAlloc(GMEM_MOVEABLE, 4);
+        assert!(!hm.is_null(), "GlobalAlloc (marker)");
+        let dm = GlobalLock(hm) as *mut u32;
+        *dm = 0;
+        GlobalUnlock(hm);
+        assert!(
+            !SetClipboardData(exclude_monitor, hm as HWND).is_null(),
+            "SetClipboardData(marker)"
+        );
+        CloseClipboard();
+    }
+}
+
+/// Destination: a SENSITIVE inline offer re-applies the OS confidentiality
+/// markers. The backend sets all three (defense in depth), but only
+/// `ExcludeClipboardContentFromMonitorProcessing` is asserted to REMAIN available:
+/// it is the marker third-party clipboard managers read, so the OS keeps it
+/// enumerable. `CanIncludeInClipboardHistory` / `CanUploadToCloudClipboard` are
+/// hints the clipboard-history / cloud service consumes at set time and does NOT
+/// guarantee to keep enumerable (observed on Windows 11 26xxx), so asserting their
+/// post-set presence is not reliable — their effect (exclusion from Win+V / cloud)
+/// is confirmed by the manual paste-into-history desktop check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real Windows clipboard; run manually with --ignored --test-threads=1"]
+async fn a_sensitive_offer_sets_the_confidentiality_markers() {
+    let _guard = CLIPBOARD_LOCK.lock().await;
+    let (handle, _events, loop_thread) = skip_if_unsupported!(spawn_backend!());
+
+    handle.offer(sensitive_text_offer());
+    assert!(wait_until_text_promised(), "backend never promised text");
+
+    let exclude_monitor = marker_id(MARKER_NAMES[0]);
+    assert!(
+        unsafe { IsClipboardFormatAvailable(exclude_monitor) } != 0,
+        "a sensitive offer must publish ExcludeClipboardContentFromMonitorProcessing"
+    );
+
+    handle.request_exit(0);
+    loop_thread.join().unwrap();
+}
+
+/// Source: a foreign password manager copies secret text (text + the exclusion
+/// marker). The backend detects the marker and announces the copy `sensitive`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real Windows clipboard; run manually with --ignored --test-threads=1"]
+async fn a_foreign_sensitive_copy_is_detected() {
+    let _guard = CLIPBOARD_LOCK.lock().await;
+    let (handle, mut events, loop_thread) = skip_if_unsupported!(spawn_backend!());
+
+    set_clipboard_text_marked_sensitive("hunter2");
+
+    let (_generation, formats, sensitive) = recv_copied(&mut events).await.expect("Copied upcall");
+    assert!(
+        formats.iter().any(|f| f.id == "text"),
+        "text must still be announced, got {formats:?}"
+    );
+    assert!(sensitive, "the exclusion marker must be read as sensitive");
+
+    handle.request_exit(0);
+    loop_thread.join().unwrap();
+}
+
 // ----- Files brick (OLE destination + CF_HDROP source) -----
 
 /// A `&str` → a `NUL`-terminated wide string for the `…W` APIs.

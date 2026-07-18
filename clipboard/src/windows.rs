@@ -371,6 +371,18 @@ impl WindowsLoop {
 /// ids. Pure helpers so they are unit-tested against a hand-built `Formats`.
 struct Formats {
     png: u32,
+    /// The three confidentiality markers, registered once. `RegisterClipboardFormatW`
+    /// returns a process-global id for a given name, so the ids we set on an offer
+    /// are the SAME ones a foreign password manager sets and we detect on a copy.
+    ///
+    /// - `exclude_monitor` (`ExcludeClipboardContentFromMonitorProcessing`): asks
+    ///   clipboard monitors / managers to skip the content. The one we DETECT on a
+    ///   foreign copy (what KeePass/Bitwarden/browsers-with-a-password-field set).
+    /// - `history` (`CanIncludeInClipboardHistory`, DWORD 0): keep it out of Win+V.
+    /// - `cloud` (`CanUploadToCloudClipboard`, DWORD 0): keep it off the cloud sync.
+    exclude_monitor: u32,
+    history: u32,
+    cloud: u32,
 }
 
 impl Formats {
@@ -535,9 +547,19 @@ impl Backend {
                 return Err("AddClipboardFormatListener failed".into());
             }
             let png = RegisterClipboardFormatW(wide("PNG").as_ptr());
+            let exclude_monitor = RegisterClipboardFormatW(
+                wide("ExcludeClipboardContentFromMonitorProcessing").as_ptr(),
+            );
+            let history = RegisterClipboardFormatW(wide("CanIncludeInClipboardHistory").as_ptr());
+            let cloud = RegisterClipboardFormatW(wide("CanUploadToCloudClipboard").as_ptr());
             Ok(Self {
                 hwnd,
-                formats: Formats { png },
+                formats: Formats {
+                    png,
+                    exclude_monitor,
+                    history,
+                    cloud,
+                },
                 cmds,
                 paste,
                 events_tx,
@@ -671,7 +693,33 @@ impl Backend {
                 // NULL = a delayed-render promise, honored at `WM_RENDERFORMAT`.
                 SetClipboardData(fmt, std::ptr::null_mut());
             }
+            // A sensitive clip re-applies the OS confidentiality markers when it
+            // takes ownership (doc/core-api.md). Set eagerly (real data, NOT a
+            // delayed-render placeholder) so a clipboard manager inspecting the
+            // clipboard right after the copy sees them immediately.
+            if clip.sensitive {
+                self.set_sensitivity_markers();
+            }
             CloseClipboard();
+        }
+    }
+
+    /// Set the three confidentiality markers on the ALREADY-OPEN clipboard (only
+    /// on a sensitive offer). Each carries a 4-byte DWORD `0`: the value is
+    /// irrelevant for the monitor-exclusion marker (presence is the signal) and
+    /// means "do not include" for the history / cloud markers. A marker whose
+    /// registration failed (id `0`) is skipped rather than passed to
+    /// `SetClipboardData`.
+    fn set_sensitivity_markers(&self) {
+        let zero = 0u32.to_ne_bytes();
+        for fmt in [
+            self.formats.exclude_monitor,
+            self.formats.history,
+            self.formats.cloud,
+        ] {
+            if fmt != 0 {
+                set_clipboard_blob(fmt, &zero);
+            }
         }
     }
 
@@ -697,7 +745,7 @@ impl Backend {
         // Withdraw any existing offer (a classic inline promise or a prior OLE
         // object) before installing the new one.
         self.relinquish();
-        match crate::windows_ole::build_files_data_object(&clip.files, fetcher) {
+        match crate::windows_ole::build_files_data_object(&clip.files, fetcher, clip.sensitive) {
             Ok(obj) => {
                 // OleSetClipboard makes a hidden OLE window the clipboard owner
                 // and AddRefs `obj`; we keep our own reference in `current_ole`
@@ -784,6 +832,12 @@ impl Backend {
     /// under a fresh generation, and announce the metadata. If nothing usable is
     /// there, supersede the stale capture instead of continuing to vouch for it.
     fn read_and_announce_copy(&mut self) {
+        // Confidentiality: a foreign owner that set the monitor-exclusion marker
+        // (a password manager, a browser password field) copied secret content.
+        // The check is a cheap `IsClipboardFormatAvailable` — no open needed — and
+        // holds for both a files and an inline copy. The orchestrator omits the
+        // size hint for a sensitive clip (doc/core-api.md).
+        let sensitive = self.is_sensitive_copy();
         // Files take priority over inline formats, mirroring the X11 backend: a
         // files copy often ALSO offers text (the dropped paths) that must not be
         // mistaken for content. If CF_HDROP parses to any path, announce a files
@@ -805,7 +859,7 @@ impl Backend {
                         size: None,
                     }],
                     paths,
-                    sensitive: false,
+                    sensitive,
                 },
             });
             return;
@@ -827,11 +881,19 @@ impl Backend {
             clip: LocalClip {
                 formats,
                 paths: Vec::new(),
-                // Windows confidentiality markers (clipboard-history exclusion)
-                // are a later brick: nothing is announced sensitive yet.
-                sensitive: false,
+                sensitive,
             },
         });
+    }
+
+    /// Whether the current clipboard owner marked the content confidential, i.e.
+    /// the `ExcludeClipboardContentFromMonitorProcessing` format is present. That
+    /// is the marker password managers (and browser password fields) set; the
+    /// history/cloud markers are DWORD flags whose value would have to be read to
+    /// interpret, so the reliable "this is secret" signal is this one's presence.
+    /// A cheap query — no `OpenClipboard`.
+    fn is_sensitive_copy(&self) -> bool {
+        self.formats.exclude_monitor != 0 && is_format_available(self.formats.exclude_monitor)
     }
 
     /// Detect and read a `CF_HDROP` files copy into absolute paths. `None` if
@@ -1100,8 +1162,9 @@ fn render_into_clipboard(requested: u32, png_format: u32, bytes: Vec<u8>) {
 
 /// Allocate a movable `HGLOBAL`, copy `buf` into it, and hand it to the clipboard
 /// with `SetClipboardData(fmt, h)`. If `SetClipboardData` fails, ownership was
-/// NOT transferred, so the block is freed. Must be called only from a
-/// `WM_RENDERFORMAT` handler (the clipboard is already open by the requestor).
+/// NOT transferred, so the block is freed. The clipboard must ALREADY be open —
+/// either by a `WM_RENDERFORMAT` requestor (rendering the paste) or by us inside
+/// an offer's `OpenClipboard`/`CloseClipboard` (the sensitivity markers).
 fn set_clipboard_blob(fmt: u32, buf: &[u8]) {
     unsafe {
         let h: HGLOBAL = GlobalAlloc(GMEM_MOVEABLE, buf.len());
@@ -1407,7 +1470,12 @@ mod tests {
 
     #[test]
     fn clipboard_format_mapping_round_trips() {
-        let f = Formats { png: 0xC001 };
+        let f = Formats {
+            png: 0xC001,
+            exclude_monitor: 0xC010,
+            history: 0xC011,
+            cloud: 0xC012,
+        };
         assert_eq!(f.format_for_clipformat(CF_UNICODETEXT), Some(FORMAT_TEXT));
         assert_eq!(f.format_for_clipformat(0xC001), Some(FORMAT_PNG));
         assert_eq!(f.format_for_clipformat(CF_DIBV5), Some(FORMAT_PNG));

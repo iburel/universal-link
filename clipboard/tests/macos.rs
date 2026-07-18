@@ -179,6 +179,25 @@ fn wait_until_type_available(ty: &NSPasteboardType) -> bool {
     false
 }
 
+/// Blocks (bounded) until `uti` is a MEMBER of the pasteboard's declared
+/// `types()` — the same presence primitive the backend's `detect_sensitive` uses
+/// (NOT `availableTypeFromArray:`, which matches by UTI conformance and does not
+/// reliably find a non-registered marker UTI).
+fn wait_until_type_present(uti: &str) -> bool {
+    let pb = general();
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline {
+        if let Some(types) = pb.types() {
+            let n = types.count();
+            if (0..n).any(|i| types.objectAtIndex(i).to_string() == uti) {
+                return true;
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
 /// Plays a foreign app copying text: writes UTF-8 text onto the general
 /// pasteboard (a change the backend sees as not its own). Like a real app, it
 /// DECLARES the type before writing — `setString:forType:` on an undeclared type
@@ -498,6 +517,98 @@ async fn a_foreign_files_copy_is_detected() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ----- Confidentiality marker (sensitive, both directions) -----
+
+/// The nspasteboard.org concealment type, mirrored from the backend.
+const UTI_CONCEALED: &str = "org.nspasteboard.ConcealedType";
+
+fn sensitive_text_offer() -> RemoteClip {
+    RemoteClip {
+        tx_id: "tx-secret".into(),
+        formats: vec![Format {
+            id: "text".into(),
+            size: None,
+        }],
+        files: Vec::new(),
+        sensitive: true,
+    }
+}
+
+/// Plays a foreign PASSWORD MANAGER copying secret text: declares BOTH the string
+/// type AND `org.nspasteboard.ConcealedType`, then writes the text and an empty
+/// concealed value — so the backend must announce the copy `sensitive`.
+fn set_pasteboard_text_concealed(text: &str) {
+    let pb = general();
+    pb.clearContents();
+    let s = NSString::from_str(text);
+    // SAFETY: `NSPasteboardTypeString` is an AppKit extern static.
+    let string_ty = unsafe { NSPasteboardTypeString };
+    let concealed = NSString::from_str(UTI_CONCEALED);
+    let concealed_ty: &NSPasteboardType = &concealed;
+    let types = NSArray::from_slice(&[string_ty, concealed_ty]);
+    let _ = unsafe { pb.declareTypes_owner(&types, None) };
+    assert!(pb.setString_forType(&s, string_ty), "setString:forType:");
+    let empty = NSData::with_bytes(&[]);
+    assert!(
+        pb.setData_forType(Some(&empty), concealed_ty),
+        "setData:forType: (concealed)"
+    );
+}
+
+/// Destination: a SENSITIVE inline offer re-applies the confidentiality marker.
+/// Once the backend has promised the text, `org.nspasteboard.ConcealedType` is
+/// present on the general pasteboard (a cooperating manager would skip the item).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real macOS pasteboard; run manually with --ignored --test-threads=1"]
+async fn a_sensitive_offer_marks_the_pasteboard_concealed() {
+    let _guard = PASTEBOARD_LOCK.lock().await;
+    let (handle, _events, loop_thread) = skip_if_unsupported!(spawn_backend!());
+
+    handle.offer(sensitive_text_offer());
+    // SAFETY: AppKit extern static.
+    let text_ty = unsafe { NSPasteboardTypeString };
+    assert!(
+        wait_until_type_available(text_ty),
+        "backend never promised text"
+    );
+
+    let concealed = NSString::from_str(UTI_CONCEALED);
+    let concealed_ty: &NSPasteboardType = &concealed;
+    assert!(
+        wait_until_type_available(concealed_ty),
+        "a sensitive offer must publish the ConcealedType marker"
+    );
+
+    handle.request_exit(0);
+    loop_thread.join().unwrap();
+}
+
+/// Source: a foreign password manager copies secret text (text + ConcealedType).
+/// The backend detects the marker and announces the copy `sensitive`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real macOS pasteboard; run manually with --ignored --test-threads=1"]
+async fn a_foreign_concealed_copy_is_detected() {
+    let _guard = PASTEBOARD_LOCK.lock().await;
+    let (handle, mut events, loop_thread) = skip_if_unsupported!(spawn_backend!());
+
+    set_pasteboard_text_concealed("hunter2");
+
+    let (_generation, formats, sensitive) = recv_copied(&mut events)
+        .await
+        .expect("a foreign concealed copy must be detected");
+    assert!(
+        formats.iter().any(|f| f.id == "text"),
+        "text must still be announced, got {formats:?}"
+    );
+    assert!(
+        sensitive,
+        "the ConcealedType marker must be read as sensitive"
+    );
+
+    handle.request_exit(0);
+    loop_thread.join().unwrap();
+}
+
 // ----- Files: fill-on-paste (destination side) -----
 
 /// A `FileFetcher` double standing in for the Core's push: on `fill` it writes the
@@ -601,6 +712,43 @@ async fn a_files_offer_publishes_file_urls() {
 
     // Teardown: request_exit → release → removeFilePresenter + skeleton removal,
     // with no panic / use-after-free.
+    handle.request_exit(0);
+    loop_thread.join().unwrap();
+}
+
+/// Destination, files + sensitive: a SENSITIVE files offer publishes the file URLs
+/// AND attaches the confidentiality marker. The files path uses the modern
+/// `writeObjects:` while the marker is added with legacy `addTypes:`/`setData:`, so
+/// this proves the two COMPOSE — the concealed type ends up a member of the
+/// pasteboard's declared `types()` (and adding it does not raise / wipe the URLs).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "real macOS pasteboard; run manually with --ignored --test-threads=1"]
+async fn a_sensitive_files_offer_marks_the_pasteboard_concealed() {
+    let _guard = PASTEBOARD_LOCK.lock().await;
+    let (handle, _events, loop_thread) = skip_if_unsupported!(spawn_backend!());
+
+    let fetcher = FillFetcher::new(b"unused".to_vec());
+    let mut clip = files_offer(vec![RemoteFile {
+        file_id: "f0".into(),
+        path: "folder/leaf.bin".into(),
+        size: 6,
+        dir: false,
+    }]);
+    clip.sensitive = true;
+    handle.offer_files(clip, fetcher);
+
+    // The URLs are still published (the marker does not wipe the writeObjects: content).
+    let path = wait_for_published_path().expect("a file URL must be published");
+    assert!(
+        path.to_string_lossy().contains("universallink-clip-files"),
+        "the published URL must point into the skeleton, got {path:?}"
+    );
+    // The concealed marker composed with writeObjects: and is present in types().
+    assert!(
+        wait_until_type_present(UTI_CONCEALED),
+        "a sensitive files offer must attach the ConcealedType marker"
+    );
+
     handle.request_exit(0);
     loop_thread.join().unwrap();
 }

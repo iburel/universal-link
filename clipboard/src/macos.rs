@@ -178,6 +178,18 @@ const UTI_TEXT: &str = "public.utf8-plain-text";
 const UTI_PNG: &str = "public.png";
 const UTI_TIFF: &str = "public.tiff";
 
+/// The community-standard "this pasteboard item is confidential" marker
+/// (nspasteboard.org): a cooperating clipboard manager that sees it skips the
+/// item. macOS has no first-party concealment API, so this convention IS the
+/// mechanism — it is what password managers (1Password et al.) write, so we both
+/// re-apply it on a sensitive offer and detect it on a foreign copy.
+const UTI_CONCEALED: &str = "org.nspasteboard.ConcealedType";
+
+/// The concealed marker type as an `NSString` (== `NSPasteboardType`).
+fn concealed_type() -> Retained<NSString> {
+    NSString::from_str(UTI_CONCEALED)
+}
+
 /// A downcall from the orchestrator, queued for the main-thread loop. Note the
 /// two paste replies — `deliver`/`paste_failed` — are NOT here: they go through
 /// [`PasteSync`] because the pump is blocked in the synchronous provide callback
@@ -1086,9 +1098,6 @@ impl Backend {
             self.relinquish_ownership();
             return;
         }
-        // OS confidentiality markers (org.nspasteboard.ConcealedType et al.) are a
-        // later brick: nothing is announced sensitive yet, exactly as brick 3
-        // deferred the Windows clipboard-history exclusion.
         let array = NSArray::from_slice(&types);
         let owner_obj: &AnyObject = self.owner.as_ref();
         // Raise the anti-re-entrancy flag around our own acquisition.
@@ -1098,6 +1107,32 @@ impl Backend {
         self.owner.set_suppress(false);
         self.last_change = cc;
         self.is_owner = true;
+        // A sensitive clip re-applies the OS confidentiality marker when it takes
+        // ownership (doc/core-api.md). It re-reads `last_change` itself.
+        if clip.sensitive {
+            self.apply_concealed_marker();
+        }
+    }
+
+    /// Add the confidentiality marker (`org.nspasteboard.ConcealedType`) to the
+    /// clip we just took ownership of, so a cooperating clipboard manager skips it
+    /// (macOS has no OS-level concealment — this nspasteboard.org convention is the
+    /// mechanism). Added with a NIL owner and an empty placeholder value set
+    /// eagerly, so no delayed-render callback is promised for it. Re-reads
+    /// `last_change` so our own mutation is not mistaken for a foreign copy at the
+    /// next poll.
+    fn apply_concealed_marker(&mut self) {
+        let concealed = concealed_type();
+        let ty: &NSPasteboardType = &concealed;
+        let types = NSArray::from_slice(&[ty]);
+        self.owner.set_suppress(true);
+        // SAFETY: `addTypes:owner:` appends types to the pasteboard we already own;
+        // a nil owner is valid because we provide the data ourselves right below.
+        let _ = unsafe { self.pb.addTypes_owner(&types, None) };
+        let placeholder = NSData::with_bytes(&[]);
+        self.pb.setData_forType(Some(&placeholder), ty);
+        self.owner.set_suppress(false);
+        self.last_change = self.pb.changeCount();
     }
 
     /// Take ownership for a remote FILES clip: build the skeleton, register one
@@ -1161,6 +1196,11 @@ impl Backend {
             .map(|r| file_url(&tempdir.path.join(r)))
             .collect();
         self.write_file_urls(&root_urls);
+        // A sensitive files clip re-applies the confidentiality marker too (after
+        // the URLs are written, so `addTypes:` appends to our own offer).
+        if clip.sensitive {
+            self.apply_concealed_marker();
+        }
 
         self.files_offer = Some(FileOffer {
             _tempdir: tempdir,
@@ -1268,6 +1308,10 @@ impl Backend {
     /// under a fresh generation, and announce the metadata. If nothing usable is
     /// there, supersede the stale capture instead of continuing to vouch for it.
     fn read_and_announce_copy(&mut self) {
+        // Confidentiality: a foreign owner that wrote `org.nspasteboard.ConcealedType`
+        // (a password manager) copied secret content. Holds for a files or an inline
+        // copy; the orchestrator omits the size hint for a sensitive clip.
+        let sensitive = self.detect_sensitive();
         // Files take priority over inline formats, mirroring X11 / Windows: a files
         // copy usually ALSO offers the paths as text, which must not be mistaken
         // for content. If any file path is present, announce a files copy and stop
@@ -1288,9 +1332,7 @@ impl Backend {
                         size: None,
                     }],
                     paths,
-                    // OS confidentiality markers (org.nspasteboard.ConcealedType)
-                    // are brick 8: nothing is announced sensitive yet.
-                    sensitive: false,
+                    sensitive,
                 },
             });
             return;
@@ -1326,9 +1368,23 @@ impl Backend {
             clip: LocalClip {
                 formats,
                 paths: Vec::new(),
-                sensitive: false,
+                sensitive,
             },
         });
+    }
+
+    /// Whether the current pasteboard carries the confidentiality marker
+    /// (`org.nspasteboard.ConcealedType`), i.e. a foreign app marked the copy
+    /// secret. Tests exact MEMBERSHIP in the declared `types()` — NOT
+    /// `availableTypeFromArray:`, which matches by UTI CONFORMANCE and does not
+    /// reliably find a non-registered marker UTI. A plain read of the declared type
+    /// list, so it pulls no data and never triggers a foreign owner's callback.
+    fn detect_sensitive(&self) -> bool {
+        let Some(types) = self.pb.types() else {
+            return false;
+        };
+        let count = types.count();
+        (0..count).any(|i| types.objectAtIndex(i).to_string() == UTI_CONCEALED)
     }
 
     /// A foreign owner took the pasteboard but we could not capture a usable clip

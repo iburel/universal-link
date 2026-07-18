@@ -24,6 +24,35 @@
 //!
 //! The orchestrator is OS-agnostic on purpose, so it is exercised against a
 //! real Core (`tests/api/`) through a test double rather than a live desktop.
+//!
+//! # Confidentiality (`sensitive`)
+//!
+//! A clip is `sensitive` when the source OS carries a confidentiality marker; the
+//! flag flows end to end (both directions) and the orchestrator omits the inline
+//! size hint for it ([`orchestrator`], enforced once for every backend). Each
+//! backend maps `sensitive` to its platform's marker convention, in BOTH
+//! directions — detect it on a foreign copy, re-apply it when promising a remote
+//! clip (doc/core-api.md, "re-applies the OS confidentiality markers"):
+//! - **X11**: KDE's `x-kde-passwordManagerHint` (answered `"secret"`).
+//! - **Windows**: `ExcludeClipboardContentFromMonitorProcessing` (detected +
+//!   set), plus `CanIncludeInClipboardHistory` / `CanUploadToCloudClipboard`
+//!   (DWORD `0`) on an offer — defense in depth (out of monitors, Win+V, cloud).
+//! - **macOS**: `org.nspasteboard.ConcealedType` (nspasteboard.org — macOS has no
+//!   first-party concealment API).
+//!
+//! ## Residual: a speculative reader
+//!
+//! These markers only bind a COOPERATING reader (a clipboard manager / indexer /
+//! thumbnailer that honors them and skips the item). A reader that instead reads
+//! our promised offer WITHOUT a real user paste — some clipboard managers eager-
+//! read every target on an ownership change; a file indexer walks a mounted tree —
+//! triggers the same on-demand pull a paste would, so a `sensitive` clip's bytes
+//! can be pulled over the network with no paste. There is no portable way to tell
+//! a real paste from a speculative read, so this residual is documented and NOT
+//! worked around by refusing to offer (which would break legitimate pastes); the
+//! markers are the mitigation cooperating readers honor. The Linux FUSE files path
+//! is the most exposed (an indexer walking the mount), and a `sensitive` files
+//! clip there is already FUSE-only (never the weaker loopback WebDAV).
 
 pub mod backend;
 #[cfg(target_os = "linux")]
