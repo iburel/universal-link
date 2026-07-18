@@ -12,8 +12,20 @@
 //! each read pulling one byte range on demand. The preferred backend is a FUSE
 //! mount (see [`crate::fuse`]) advertising `file://` URIs; when FUSE is
 //! unavailable, a non-sensitive clip falls back to a loopback WebDAV server (see
-//! [`crate::webdav`]) advertising `dav://`/`webdav://` URIs. No INCR for inline
-//! formats (large transfers are refused cleanly, marked `TODO(INCR)`).
+//! [`crate::webdav`]) advertising `dav://`/`webdav://` URIs.
+//!
+//! Large inline transfers use the ICCCM INCR protocol (§2.7.2) in BOTH
+//! directions. Reading: a foreign owner answers an over-`maximum-request-size`
+//! conversion with a property of type `INCR` (a lower-bound size); we delete it
+//! to start, then accumulate the chunks the owner appends until a zero-length
+//! terminator. Deleting the `INCR` property is itself the "go" signal, so we
+//! must PEEK the reply type WITHOUT deleting first, and never start (never
+//! delete) a transfer we intend to abandon — otherwise a chunk parks in our
+//! scratch property and contaminates the next conversion. Writing: a `deliver`
+//! larger than one `ChangeProperty` starts an INCR send session, driven from
+//! the loop by the requestor's `PropertyNotify(Deleted)` on its own window.
+//! Reads stay bounded (`MAX_EAGER_READ`, `READ_BUDGET`); an over-cap read is
+//! skipped cleanly (`TODO(INCR)`: raising the read cap is a product/IPC decision).
 //!
 //! Two threads meet here. The non-`Send` [`xcb::Connection`] is pinned to the
 //! MAIN thread inside [`Backend`], pumped by [`X11Loop::run`] (a `mio::Poll`
@@ -56,11 +68,53 @@ const READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// even without a wake (a lost `Waker::wake` must not wedge the loop).
 const SHUTDOWN_POLL_CAP: Duration = Duration::from_millis(250);
 
-/// Cap of one eager read / one deferred write (a single `GetProperty` /
-/// `ChangeProperty`). The X server already caps a request at ~16 MiB
-/// (BIG-REQUESTS); past it INCR would be required — a later brick. A copy or a
-/// paste larger than this is skipped/refused rather than truncated or fatal.
+/// Cap of a whole eager read, INCR included: a foreign copy larger than this is
+/// skipped rather than announced (its bytes would not fit the eager-read model).
+/// `TODO(INCR)`: raising it is a product/IPC decision, orthogonal to the wire
+/// protocol — the write side is no longer bounded by it.
 const MAX_EAGER_READ: usize = 16 * 1024 * 1024;
+
+/// Sanity cap of one `deliver` payload. The bytes are already fully in RAM (from
+/// the Core), so there is no protocol reason to cap at `MAX_EAGER_READ` — INCR
+/// carries any size — but a pathological length would truncate the 32-bit INCR
+/// size hint and waste memory, so a generous ceiling refuses it cleanly.
+const MAX_DELIVER: usize = 256 * 1024 * 1024;
+
+/// Largest single INCR chunk we write (also bounded by the server's
+/// maximum-request-size, computed once in [`create`]). One ChangeProperty each.
+const INCR_MAX_CHUNK: usize = 1024 * 1024;
+
+/// Margin subtracted from the server's maximum-request-size to leave room for a
+/// `ChangeProperty` request header (24 bytes; 256 is comfortably conservative,
+/// matching the spirit of GTK's 100-byte / Qt's header-sized subtraction).
+const CHANGE_PROPERTY_OVERHEAD: usize = 256;
+
+/// Per-chunk deadline of an INCR READ, reset every time a chunk arrives (a stall
+/// is caught this fast); the whole read pass is additionally capped by
+/// [`READ_BUDGET`]. Mirrors Qt's per-property-event INCR timeout.
+const INCR_CHUNK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Aggregate wall-clock budget of one `read_and_announce_copy` pass — every
+/// SelectionNotify wait and every INCR chunk wait in the pass shares it, so a
+/// stalling/slow-dripping foreign owner can wedge the loop for at most this long
+/// (well under [`PASTE_TIMEOUT`], so a concurrent pending paste survives it).
+const READ_BUDGET: Duration = Duration::from_secs(10);
+
+/// No-progress deadline of an INCR SEND session, reset on every chunk the
+/// requestor consumes. Aligned with Qt's 5 s selection timeout: short enough
+/// that an abandoned session does not linger long enough to collide with the
+/// requestor's next paste on the same property.
+const INCR_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Cap on concurrent INCR send sessions. A large deliver beyond this is refused
+/// cleanly (never told a transfer is coming that no session will drive).
+const MAX_INCR_SENDS: usize = 8;
+
+/// Scratch properties we read `ConvertSelection` results into. A small pool so a
+/// mid-stream-abandoned INCR read (we already sent the "go") can rotate to a
+/// fresh atom, leaving the old owner's late chunk to land on a property the next
+/// conversion no longer uses.
+const SCRATCH_POOL: usize = 4;
 
 /// Bounded capacity of the upcall channel. Generous; the orchestrator drains
 /// promptly, and a full queue only ever means it has stalled or gone.
@@ -203,8 +257,10 @@ struct Atoms {
     string: x::Atom,
     text: x::Atom,
     image_png: x::Atom,
-    /// Scratch property we read our own `ConvertSelection` results into.
-    prop: x::Atom,
+    /// The ICCCM INCR type atom: the reply type of a large deferred transfer,
+    /// in both directions (a foreign owner's over-cap answer, and our own
+    /// large-paste marker).
+    incr: x::Atom,
     /// KDE confidentiality hint: advertised for a sensitive offer, and answered
     /// with `"secret"` so Klipper/KWallet keep it out of history.
     kde_password_hint: x::Atom,
@@ -235,7 +291,7 @@ impl Atoms {
             string: intern(conn, b"STRING")?,
             text: intern(conn, b"TEXT")?,
             image_png: intern(conn, b"image/png")?,
-            prop: intern(conn, b"UNIVERSALLINK_SELECTION")?,
+            incr: intern(conn, b"INCR")?,
             kde_password_hint: intern(conn, b"x-kde-passwordManagerHint")?,
             uri_list: intern(conn, b"text/uri-list")?,
             gnome_copied: intern(conn, b"x-special/gnome-copied-files")?,
@@ -297,6 +353,26 @@ struct PendingPaste {
     deadline: Instant,
     /// Correlation token minted from `next_paste_token`.
     token: u64,
+}
+
+/// One in-flight INCR SEND: a large paste we render to a requestor in chunks,
+/// driven by the requestor deleting the property between appends (ICCCM §2.7.2).
+/// Keyed in the table by `(requestor, property)`. Independent of [`PendingPaste`]
+/// (the bytes are already rendered), it survives a new offer/release — the paste
+/// was already "answered" — and is collected by no-progress deadline, completion,
+/// requestor death (`BadWindow`), or shutdown.
+struct IncrSend {
+    requestor: x::Window,
+    property: x::Atom,
+    /// Property TYPE of each chunk (the Core format's type: UTF8_STRING / PNG).
+    type_atom: x::Atom,
+    bytes: Vec<u8>,
+    /// Bytes written so far; `offset == bytes.len()` means only the zero-length
+    /// terminator is left to send.
+    offset: usize,
+    /// The zero-length terminator has been written; the next delete completes it.
+    terminated: bool,
+    deadline: Instant,
 }
 
 /// The per-generation eager-read cache: the bytes of the local copy announced
@@ -385,6 +461,24 @@ struct Backend {
     /// A CLIPBOARD owner change observed *during* a synchronous read; the main
     /// loop reconciles it once the read returns (never nested inside a read).
     pending_owner_change: Option<x::Window>,
+    /// The scratch properties `ConvertSelection` results land in, and the index
+    /// of the one currently in use. Rotated only when a started INCR read is
+    /// abandoned mid-stream (see [`Backend::rotate_scratch`]).
+    scratch: Vec<x::Atom>,
+    scratch_idx: usize,
+    /// Aggregate deadline of the current read pass ([`READ_BUDGET`]); set at the
+    /// top of `read_and_announce_copy`, shared by every wait in that pass.
+    read_deadline: Instant,
+    /// In-flight INCR SEND sessions, keyed by `(requestor, property)`.
+    incr_sends: HashMap<(x::Window, x::Atom), IncrSend>,
+    /// Whether the live offer is `sensitive` — the INCR size hint is declared 0
+    /// for it (a valid lower bound, consistent with the omitted size hint).
+    offer_sensitive: bool,
+    /// Largest payload we write in a single `ChangeProperty` (server
+    /// maximum-request-size minus overhead); above it, an INCR send starts.
+    direct_max: usize,
+    /// Size of each INCR send chunk (`min(direct_max, INCR_MAX_CHUNK)`).
+    incr_chunk: usize,
     shutdown: bool,
     exit_code: Option<i32>,
 }
@@ -440,11 +534,19 @@ impl Backend {
             self.drain_xcb();
             // An owner change captured during a read (which must not re-enter a
             // read) is acted on here, at the top level, so a concurrent clear is
-            // not lost.
+            // not lost. The paste/INCR deadlines are re-checked after EACH pass:
+            // a hostile owner churning ownership while dripping slow replies could
+            // otherwise chain several READ_BUDGET passes and starve the pending
+            // paste's safety net past its deadline. Each read pass still blocks
+            // the loop up to READ_BUDGET (Cmds are not processed mid-read), so a
+            // concurrent deliver waits that long — inherent to synchronous reads.
             while let Some(owner) = self.pending_owner_change.take() {
                 self.on_clipboard_update(owner);
+                self.check_paste_timeout();
+                self.check_incr_timeouts();
             }
             self.check_paste_timeout();
+            self.check_incr_timeouts();
             if self.shutdown {
                 self.on_release();
                 let _ = self.conn.flush();
@@ -464,12 +566,33 @@ impl Backend {
         }
     }
 
+    /// The scratch property currently used for `ConvertSelection` replies.
+    fn scratch(&self) -> x::Atom {
+        self.scratch[self.scratch_idx]
+    }
+
+    /// Move to the next scratch property. Called only after abandoning a STARTED
+    /// INCR read (we already deleted the property, so the old owner may still
+    /// append a chunk): the next conversion uses a different atom, so a late
+    /// chunk lands where nothing reads it instead of corrupting a fresh reply.
+    fn rotate_scratch(&mut self) {
+        self.scratch_idx = (self.scratch_idx + 1) % self.scratch.len();
+    }
+
     /// Drain all buffered X events (edge-triggered epoll → empty fully).
     fn drain_xcb(&mut self) {
         loop {
             match self.conn.poll_for_event() {
                 Ok(Some(xcb::Event::XFixes(xfixes::Event::SelectionNotify(e)))) => {
                     if e.selection() == self.atoms.clipboard {
+                        // A directly-handled owner change supersedes any change
+                        // stashed during an earlier read (events are in order, so
+                        // a stashed one is strictly older). Clear it BEFORE the
+                        // read, which may itself stash a genuinely newer change.
+                        // Otherwise a stale stash (e.g. a transient clear) applied
+                        // after this could emit a spurious `Cleared` for a live
+                        // foreign clip.
+                        self.pending_owner_change = None;
                         self.on_clipboard_update(e.owner());
                     }
                 }
@@ -501,9 +624,24 @@ impl Backend {
             {
                 // Another app took the selection (or an echo of our release):
                 // supersede — drop ownership state and any live files offer.
+                // In-flight INCR sends are deliberately NOT torn down: their
+                // paste was already answered and continues on the requestor's
+                // deletes (ICCCM), independent of who owns the selection now.
                 self.owned = false;
                 self.advertised.clear();
                 self.drop_files_offer();
+            }
+            xcb::Event::X(x::Event::PropertyNotify(e)) if e.state() == x::Property::Delete => {
+                // The requestor consumed a chunk of an INCR send → append the
+                // next. Our own reads' delete:true also fire PropertyNotify here,
+                // but `(self.window, scratch)` is never a send key (a session's
+                // requestor is never our own window), so they no-op. Routed from
+                // both the main drain AND the read sub-loops, so a send keeps
+                // progressing even while we are blocked in an eager read.
+                let key = (e.window(), e.atom());
+                if self.incr_sends.contains_key(&key) {
+                    self.advance_incr_send(key);
+                }
             }
             _ => {}
         }
@@ -533,6 +671,10 @@ impl Backend {
     /// Eager-read EVERY inline format the foreign owner offers, cache the bytes
     /// under a fresh generation, and announce the metadata.
     fn read_and_announce_copy(&mut self) {
+        // Bound the WHOLE pass: every SelectionNotify wait and INCR chunk wait
+        // below shares this deadline, so a stalling owner cannot wedge the loop
+        // past READ_BUDGET regardless of how many formats or chunks it offers.
+        self.read_deadline = Instant::now() + READ_BUDGET;
         let Some(targets) = self.query_targets() else {
             // The new owner would not (or could not) tell us its targets; we can
             // no longer vouch for our previous capture.
@@ -658,23 +800,26 @@ impl Backend {
     }
 
     fn query_targets(&mut self) -> Option<Vec<x::Atom>> {
+        let scratch = self.scratch();
         self.conn.send_request(&x::ConvertSelection {
             requestor: self.window,
             selection: self.atoms.clipboard,
             target: self.atoms.targets,
-            property: self.atoms.prop,
+            property: scratch,
             time: x::CURRENT_TIME,
         });
         if self.conn.flush().is_err() {
             return None;
         }
-        if !self.wait_selection_notify() {
+        if !self.wait_selection_notify(self.atoms.targets) {
             return None;
         }
+        // TARGETS is an atom list, never large enough to warrant INCR, so a plain
+        // delete:true read is fine here (unlike content reads below).
         let cookie = self.conn.send_request(&x::GetProperty {
             delete: true,
             window: self.window,
-            property: self.atoms.prop,
+            property: scratch,
             r#type: x::ATOM_ATOM,
             long_offset: 0,
             long_length: 1024,
@@ -687,61 +832,149 @@ impl Backend {
     }
 
     /// `ConvertSelection` a target then read (bounded) the resulting property.
+    /// Handles an INCR reply transparently (see [`Backend::read_incr`]).
     fn convert_and_read(&mut self, target: x::Atom) -> Option<Vec<u8>> {
+        let scratch = self.scratch();
         self.conn.send_request(&x::ConvertSelection {
             requestor: self.window,
             selection: self.atoms.clipboard,
             target,
-            property: self.atoms.prop,
+            property: scratch,
             time: x::CURRENT_TIME,
         });
         if self.conn.flush().is_err() {
             return None;
         }
-        if !self.wait_selection_notify() {
+        if !self.wait_selection_notify(target) {
             return None;
         }
+        // PEEK without deleting: the reply TYPE decides INCR vs direct, and
+        // deleting an INCR property is the "go" signal (ICCCM §2.7.2). Deleting
+        // before we have decided would strand the owner mid-protocol on our
+        // scratch property. A direct read is finished by an explicit delete
+        // below; an INCR read deletes as its first, committed step.
         let cookie = self.conn.send_request(&x::GetProperty {
-            delete: true,
+            delete: false,
             window: self.window,
-            property: self.atoms.prop,
+            property: scratch,
             r#type: x::ATOM_ANY,
             long_offset: 0,
             long_length: (MAX_EAGER_READ / 4) as u32,
         });
         let reply = self.conn.wait_for_reply(cookie).ok()?;
+        if reply.r#type() == self.atoms.incr {
+            let bound = reply.value::<u32>().first().copied().unwrap_or(0) as usize;
+            return self.read_incr(scratch, bound);
+        }
+        // Direct reply: clear the scratch (tiny request, no data) and take it.
+        self.conn.send_request(&x::DeleteProperty {
+            window: self.window,
+            property: scratch,
+        });
         if reply.format() != 8 {
             return None;
         }
         if reply.bytes_after() > 0 {
-            // TODO(INCR): later brick — a copy larger than one GetProperty is
-            // skipped rather than announced/served truncated.
+            // A non-INCR property larger than one read: with INCR handled above
+            // this is rare, and raising the eager-read cap is a product decision.
             warn(&format!(
-                "local copy > {MAX_EAGER_READ} bytes — not announced (TODO(INCR))"
+                "local copy > {MAX_EAGER_READ} bytes and not INCR — not announced (TODO(INCR))"
             ));
             return None;
         }
         Some(reply.value::<u8>().to_vec())
     }
 
-    /// Sub-loop: wait for a `SelectionNotify` on OUR property, with a deadline.
-    /// `true` if the property is set, `false` on refusal/timeout/disconnect.
-    /// Processes commands while waiting (so `release`/`Exit` are not starved)
-    /// but skips XFixes to avoid a re-entrant `ConvertSelection`.
-    fn wait_selection_notify(&mut self) -> bool {
-        let deadline = Instant::now() + READ_TIMEOUT;
+    /// Consume an INCR transfer whose header we just peeked on `scratch` (its
+    /// declared lower-bound size is `bound`). Deleting the property starts the
+    /// owner; we then accumulate the chunks it appends until a zero-length
+    /// terminator, bounded per-chunk by [`INCR_CHUNK_TIMEOUT`] and overall by the
+    /// pass's [`READ_BUDGET`]. `None` (format skipped) on over-cap, stall, or
+    /// disconnect. Crucially, an over-cap declared bound abandons BEFORE deleting
+    /// (the owner never starts, nothing parks); any abandon AFTER the start
+    /// rotates the scratch property so a late chunk cannot contaminate the next
+    /// conversion.
+    fn read_incr(&mut self, scratch: x::Atom, bound: usize) -> Option<Vec<u8>> {
+        if bound > MAX_EAGER_READ {
+            // Not started (not deleted): the owner keeps waiting and times out
+            // on its own; our scratch stays untouched for the next conversion.
+            warn(&format!(
+                "INCR copy declares {bound} bytes > cap — not started (TODO(INCR))"
+            ));
+            return None;
+        }
+        // Delete the INCR property: the ICCCM "go" — the owner now starts
+        // appending chunks. From here every abandon must rotate the scratch.
+        self.conn.send_request(&x::DeleteProperty {
+            window: self.window,
+            property: scratch,
+        });
+        if self.conn.flush().is_err() {
+            self.rotate_scratch();
+            return None;
+        }
+        let mut acc: Vec<u8> = Vec::with_capacity(bound.min(MAX_EAGER_READ));
+        loop {
+            let chunk_deadline = (Instant::now() + INCR_CHUNK_TIMEOUT).min(self.read_deadline);
+            if !self.wait_property_new_value(scratch, chunk_deadline) {
+                warn("INCR read stalled or interrupted — abandoning the format");
+                self.rotate_scratch();
+                return None;
+            }
+            let cookie = self.conn.send_request(&x::GetProperty {
+                delete: true,
+                window: self.window,
+                property: scratch,
+                r#type: x::ATOM_ANY,
+                long_offset: 0,
+                long_length: (MAX_EAGER_READ / 4) as u32,
+            });
+            let Ok(reply) = self.conn.wait_for_reply(cookie) else {
+                self.rotate_scratch();
+                return None;
+            };
+            let chunk = reply.value::<u8>();
+            if chunk.is_empty() {
+                // Zero-length terminator: the transfer is complete.
+                return Some(acc);
+            }
+            if acc.len() + chunk.len() > MAX_EAGER_READ || reply.bytes_after() > 0 {
+                warn(&format!(
+                    "INCR copy exceeded the {MAX_EAGER_READ}-byte cap — abandoning"
+                ));
+                self.rotate_scratch();
+                return None;
+            }
+            acc.extend_from_slice(chunk);
+        }
+    }
+
+    /// Sub-loop: wait for the `SelectionNotify` answering OUR conversion of
+    /// `target`, with a deadline. `true` if our property is set, `false` on
+    /// refusal/timeout/disconnect. The reply is matched on BOTH the echoed target
+    /// AND our scratch property: a late reply for a PREVIOUS (timed-out)
+    /// conversion shares the scratch property, so matching the property alone
+    /// would accept it and serve one format's bytes as another. On a timeout the
+    /// scratch property is rotated, so that timed-out request's still-in-flight
+    /// reply lands on an atom the next conversion no longer reads (the direct
+    /// analogue of the started-INCR rotation). Skips XFixes to avoid a re-entrant
+    /// `ConvertSelection`.
+    fn wait_selection_notify(&mut self, target: x::Atom) -> bool {
+        // Capped at the pass budget so this wait counts against READ_BUDGET too.
+        let deadline = (Instant::now() + READ_TIMEOUT).min(self.read_deadline);
+        let scratch = self.scratch();
         let mut events = Events::with_capacity(8);
         loop {
             loop {
                 match self.conn.poll_for_event() {
                     Ok(Some(xcb::Event::X(x::Event::SelectionNotify(e)))) => {
-                        if e.property() == x::ATOM_NONE {
-                            return false; // owner refused
+                        if e.target() == target {
+                            // The answer to OUR request: accept the property, or
+                            // treat NONE / an unexpected property as a refusal.
+                            return e.property() == scratch;
                         }
-                        if e.property() == self.atoms.prop {
-                            return true;
-                        }
-                        // A SelectionNotify from another read: ignored.
+                        // A late reply for a different (abandoned) request on the
+                        // shared property: ignore it and keep waiting for ours.
                     }
                     Ok(Some(xcb::Event::XFixes(xfixes::Event::SelectionNotify(e))))
                         if e.selection() == self.atoms.clipboard =>
@@ -766,6 +999,9 @@ impl Backend {
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                // This conversion is still in flight on `scratch`; rotate so its
+                // tardy reply cannot be mistaken for the next conversion's.
+                self.rotate_scratch();
                 return false;
             }
             if self.conn.flush().is_err() {
@@ -785,9 +1021,72 @@ impl Backend {
         }
     }
 
+    /// Sub-loop for an INCR READ: wait until the owner appends the next chunk —
+    /// a `PropertyNotify(NewValue)` on OUR window for `scratch` — bounded by
+    /// `deadline`. Other events go through `dispatch_xcb_event` (so an in-flight
+    /// INCR SEND keeps progressing on the requestor's deletes even while we read)
+    /// and a concurrent CLIPBOARD owner change is captured into
+    /// `pending_owner_change` (reconciled after the read, never re-entered here).
+    /// The match is strict — our own delete:true reads fire `Deleted` on this
+    /// same window/atom, and only `NewValue` means a fresh chunk.
+    fn wait_property_new_value(&mut self, scratch: x::Atom, deadline: Instant) -> bool {
+        let mut events = Events::with_capacity(8);
+        loop {
+            loop {
+                match self.conn.poll_for_event() {
+                    Ok(Some(xcb::Event::X(x::Event::PropertyNotify(e))))
+                        if e.window() == self.window
+                            && e.atom() == scratch
+                            && e.state() == x::Property::NewValue =>
+                    {
+                        return true;
+                    }
+                    Ok(Some(xcb::Event::XFixes(xfixes::Event::SelectionNotify(e))))
+                        if e.selection() == self.atoms.clipboard =>
+                    {
+                        self.pending_owner_change = Some(e.owner());
+                    }
+                    Ok(Some(other)) => self.dispatch_xcb_event(other),
+                    Ok(None) => break,
+                    Err(xcb::Error::Protocol(e)) => {
+                        warn(&format!(
+                            "X protocol error during INCR read (ignored): {e:?}"
+                        ));
+                    }
+                    Err(xcb::Error::Connection(e)) => {
+                        warn(&format!("X connection lost during INCR read: {e:?}"));
+                        self.shutdown = true;
+                        return false;
+                    }
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            if self.conn.flush().is_err() {
+                return false;
+            }
+            if let Err(e) = self.poll.poll(&mut events, Some(remaining)) {
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return false;
+            }
+        }
+    }
+
     // ----- Destination side: we own the selection, answer deferred -----
 
     fn on_selection_request(&mut self, e: &x::SelectionRequestEvent) {
+        if e.requestor() == self.window {
+            // A request naming our own window is never legitimate (we never
+            // paste from ourselves). Refuse — in particular this keeps an INCR
+            // send from ever being keyed on our own window, where our own reads'
+            // PropertyNotify would masquerade as the requestor's chunk deletes.
+            self.notify(e.requestor(), e.target(), x::ATOM_NONE, e.time());
+            return;
+        }
         let target = e.target();
         if target == self.atoms.targets {
             self.respond_targets(e);
@@ -924,29 +1223,37 @@ impl Backend {
             Some(p) if p.token == token => self.pending.take().unwrap(),
             _ => return,
         };
-        if bytes.len() > MAX_EAGER_READ {
-            // TODO(INCR): later brick — refuse cleanly rather than have libxcb
-            // close the connection on an over-length ChangeProperty.
+        if bytes.len() > MAX_DELIVER {
+            // The bytes are already in RAM, so there is no protocol cap — but a
+            // pathological length would truncate the 32-bit INCR size hint.
             warn(&format!(
-                "paste bytes ({}) over the {MAX_EAGER_READ} cap — refusing (TODO(INCR))",
+                "paste bytes ({}) over the {MAX_DELIVER}-byte sanity cap — refusing",
                 bytes.len()
             ));
             self.refuse(&pending);
             return;
         }
-        self.conn.send_request(&x::ChangeProperty {
-            mode: x::PropMode::Replace,
-            window: pending.requestor,
-            property: pending.property,
-            r#type: pending.type_atom,
-            data: &bytes,
-        });
-        self.notify(
-            pending.requestor,
-            pending.target,
-            pending.property,
-            pending.time,
-        );
+        if bytes.len() <= self.direct_max {
+            // Fits one ChangeProperty: write it directly, a single reply every
+            // requestor reads in one GetProperty (no INCR, no regression for
+            // requestors that never implemented INCR consume).
+            self.conn.send_request(&x::ChangeProperty {
+                mode: x::PropMode::Replace,
+                window: pending.requestor,
+                property: pending.property,
+                r#type: pending.type_atom,
+                data: &bytes,
+            });
+            self.notify(
+                pending.requestor,
+                pending.target,
+                pending.property,
+                pending.time,
+            );
+            return;
+        }
+        // Too large for one request: hand it off to an INCR send session.
+        self.start_incr_send(pending, bytes);
     }
 
     fn on_paste_failed(&mut self, token: u64, _format: &str) {
@@ -989,6 +1296,146 @@ impl Backend {
         if expired {
             let p = self.pending.take().unwrap();
             self.refuse(&p);
+        }
+    }
+
+    /// Begin an INCR SEND for a paste too large for one request: select
+    /// PropertyNotify on the requestor, plant the INCR marker (declared size, 0
+    /// when the offer is sensitive), answer the request, and register the
+    /// session. A colliding live session (the requestor re-issued the same
+    /// request) is dropped and replaced — its re-request proves it abandoned the
+    /// first. A full table refuses cleanly BEFORE any marker is written, so the
+    /// requestor is never promised a transfer no session will drive.
+    fn start_incr_send(&mut self, pending: PendingPaste, bytes: Vec<u8>) {
+        let key = (pending.requestor, pending.property);
+        self.incr_sends.remove(&key);
+        if self.incr_sends.len() >= MAX_INCR_SENDS {
+            warn("INCR send table full — refusing paste");
+            self.refuse(&pending);
+            return;
+        }
+        let declared = incr_declared_size(self.offer_sensitive, bytes.len());
+        // Select PropertyNotify on the requestor (per-client mask; leaves the
+        // requestor's and every other client's masks untouched). Ordered before
+        // the marker + the answering notify, and all flushed together by notify,
+        // so the mask is set by the time the requestor can act on the reply — its
+        // first delete of the marker is never missed.
+        self.conn.send_request(&x::ChangeWindowAttributes {
+            window: pending.requestor,
+            value_list: &[x::Cw::EventMask(x::EventMask::PROPERTY_CHANGE)],
+        });
+        self.conn.send_request(&x::ChangeProperty {
+            mode: x::PropMode::Replace,
+            window: pending.requestor,
+            property: pending.property,
+            r#type: self.atoms.incr,
+            data: &[declared],
+        });
+        self.notify(
+            pending.requestor,
+            pending.target,
+            pending.property,
+            pending.time,
+        );
+        self.incr_sends.insert(
+            key,
+            IncrSend {
+                requestor: pending.requestor,
+                property: pending.property,
+                type_atom: pending.type_atom,
+                bytes,
+                offset: 0,
+                terminated: false,
+                deadline: Instant::now() + INCR_SEND_TIMEOUT,
+            },
+        );
+    }
+
+    /// Drive one INCR SEND step, triggered by the requestor deleting the property
+    /// (ICCCM: delete = "chunk consumed, send the next"). Appends the next chunk,
+    /// or — all data sent — the zero-length terminator, or — terminator already
+    /// sent — finishes. Every step resets the no-progress deadline.
+    fn advance_incr_send(&mut self, key: (x::Window, x::Atom)) {
+        let chunk_size = self.incr_chunk;
+        enum Step {
+            Chunk(Vec<u8>),
+            Terminate,
+            Done,
+        }
+        let step = {
+            let Some(s) = self.incr_sends.get_mut(&key) else {
+                return;
+            };
+            s.deadline = Instant::now() + INCR_SEND_TIMEOUT;
+            if s.terminated {
+                Step::Done
+            } else if s.offset < s.bytes.len() {
+                let end = (s.offset + chunk_size).min(s.bytes.len());
+                let chunk = s.bytes[s.offset..end].to_vec();
+                s.offset = end;
+                Step::Chunk(chunk)
+            } else {
+                s.terminated = true;
+                Step::Terminate
+            }
+        };
+        if let Step::Done = step {
+            self.finish_incr_send(key);
+            return;
+        }
+        let (requestor, property, type_atom) = {
+            let s = &self.incr_sends[&key];
+            (s.requestor, s.property, s.type_atom)
+        };
+        let data: &[u8] = match &step {
+            Step::Chunk(chunk) => chunk,
+            _ => &[],
+        };
+        self.conn.send_request(&x::ChangeProperty {
+            mode: x::PropMode::Replace,
+            window: requestor,
+            property,
+            r#type: type_atom,
+            data,
+        });
+        if let Err(e) = self.conn.flush() {
+            warn(&format!("INCR chunk flush failed: {e:?}"));
+            self.finish_incr_send(key);
+        }
+    }
+
+    /// Tear down one INCR SEND: drop the session and, unless another live session
+    /// still needs it, deselect our PropertyNotify interest on the requestor
+    /// (per-client, leaving others' masks intact). A `BadWindow` from a
+    /// since-destroyed requestor is tolerated (logged by the drain), never fatal.
+    fn finish_incr_send(&mut self, key: (x::Window, x::Atom)) {
+        let Some(s) = self.incr_sends.remove(&key) else {
+            return;
+        };
+        let still_needed = self.incr_sends.values().any(|o| o.requestor == s.requestor);
+        if !still_needed {
+            self.conn.send_request(&x::ChangeWindowAttributes {
+                window: s.requestor,
+                value_list: &[x::Cw::EventMask(x::EventMask::empty())],
+            });
+            let _ = self.conn.flush();
+        }
+    }
+
+    /// Collect INCR SEND sessions that made no progress within
+    /// [`INCR_SEND_TIMEOUT`] (the requestor gave up, vanished, or never
+    /// consumed). Runs every main-loop iteration alongside `check_paste_timeout`,
+    /// both at `<= SHUTDOWN_POLL_CAP` granularity.
+    fn check_incr_timeouts(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<(x::Window, x::Atom)> = self
+            .incr_sends
+            .iter()
+            .filter(|(_, s)| now >= s.deadline)
+            .map(|(k, _)| *k)
+            .collect();
+        for key in expired {
+            self.finish_incr_send(key);
         }
     }
 
@@ -1039,6 +1486,7 @@ impl Backend {
         }
         self.cache.invalidate();
         self.drop_files_offer();
+        self.offer_sensitive = clip.sensitive;
         let mut advertised: Vec<x::Atom> = clip
             .formats
             .iter()
@@ -1065,6 +1513,7 @@ impl Backend {
         }
         self.cache.invalidate();
         self.drop_files_offer();
+        self.offer_sensitive = clip.sensitive;
 
         // 1. FUSE (preferred). Clone the `Arc` so the fetcher survives a FUSE
         //    failure and can still be handed to the WebDAV fallback.
@@ -1171,6 +1620,10 @@ impl Backend {
             self.owned = false;
         }
         self.advertised.clear();
+        // A live INCR send is deliberately left running: its paste was already
+        // answered and completes on the requestor's deletes, independent of
+        // ownership. Only the current offer's sensitivity is forgotten.
+        self.offer_sensitive = false;
     }
 
     fn on_release(&mut self) {
@@ -1186,6 +1639,17 @@ impl Backend {
 /// the byte length otherwise.
 fn size_hint(sensitive: bool, len: usize) -> Option<u64> {
     if sensitive { None } else { Some(len as u64) }
+}
+
+/// The 32-bit INCR size hint declared at the start of a send: `0` for a
+/// sensitive offer (a valid lower bound, consistent with the omitted inline size
+/// hint), else the payload length saturated into `u32`.
+fn incr_declared_size(sensitive: bool, len: usize) -> u32 {
+    if sensitive {
+        0
+    } else {
+        len.min(u32::MAX as usize) as u32
+    }
 }
 
 /// The property to write into, falling back to the target atom for old-ICCCM
@@ -1239,11 +1703,33 @@ pub fn create() -> Result<crate::os::Created, String> {
         border_width: 0,
         class: x::WindowClass::InputOutput,
         visual,
-        value_list: &[],
+        // PROPERTY_CHANGE on our own window: an INCR READ is driven by the owner
+        // appending chunks to our scratch property (PropertyNotify NewValue).
+        value_list: &[x::Cw::EventMask(x::EventMask::PROPERTY_CHANGE)],
     });
     conn.flush().map_err(|e| format!("flush init: {e:?}"))?;
 
     let atoms = Atoms::intern_all(&conn)?;
+
+    // A small pool of scratch properties (see SCRATCH_POOL): a mid-stream-
+    // abandoned INCR read rotates to a fresh one so a late chunk from the old
+    // owner lands where the next conversion no longer looks.
+    let mut scratch = Vec::with_capacity(SCRATCH_POOL);
+    for i in 0..SCRATCH_POOL {
+        scratch.push(intern(
+            &conn,
+            format!("UNIVERSALLINK_SELECTION_{i}").as_bytes(),
+        )?);
+    }
+
+    // The server's maximum request size (four-byte units; libxcb negotiates
+    // BIG-REQUESTS internally on first call). A ChangeProperty larger than this
+    // minus header overhead is impossible in one request, so above it we switch
+    // the write path to INCR; each INCR chunk is bounded by the same limit.
+    let direct_max = (conn.get_maximum_request_length() as usize)
+        .saturating_mul(4)
+        .saturating_sub(CHANGE_PROPERTY_OVERHEAD);
+    let incr_chunk = direct_max.clamp(1, INCR_MAX_CHUNK);
 
     // XFixes: be notified of CLIPBOARD owner changes (local copies).
     conn.send_request(&xfixes::SelectSelectionInput {
@@ -1287,6 +1773,13 @@ pub fn create() -> Result<crate::os::Created, String> {
         next_paste_token: 0,
         cache: Cache::default(),
         pending_owner_change: None,
+        scratch,
+        scratch_idx: 0,
+        read_deadline: Instant::now(),
+        incr_sends: HashMap::new(),
+        offer_sensitive: false,
+        direct_max,
+        incr_chunk,
         shutdown: false,
         exit_code: None,
     };
@@ -1317,7 +1810,7 @@ mod tests {
             string: x::ATOM_CARDINAL,
             text: x::ATOM_WINDOW,
             image_png: x::ATOM_BITMAP,
-            prop: x::ATOM_DRAWABLE,
+            incr: x::ATOM_DRAWABLE,
             kde_password_hint: x::ATOM_FONT,
             uri_list: x::ATOM_POINT,
             gnome_copied: x::ATOM_RECTANGLE,
@@ -1399,5 +1892,17 @@ mod tests {
     fn size_hint_is_absent_when_sensitive() {
         assert_eq!(size_hint(false, 42), Some(42));
         assert_eq!(size_hint(true, 42), None);
+    }
+
+    #[test]
+    fn incr_declared_size_is_zero_when_sensitive_and_saturates() {
+        assert_eq!(incr_declared_size(false, 100), 100);
+        assert_eq!(incr_declared_size(true, 100), 0);
+        // A payload past u32::MAX declares the max (still a valid lower bound),
+        // never a truncated small value.
+        assert_eq!(
+            incr_declared_size(false, (u32::MAX as usize) + 10),
+            u32::MAX
+        );
     }
 }
