@@ -74,15 +74,19 @@ jobs:
       # Linux only. The webkit/gtk -dev packages (as in ci.yml) let the GUI
       # link, plus the extras the AppImage bundler needs: librsvg (icon
       # rendering), file + patchelf (linuxdeploy rewrites rpaths), and libfuse2
-      # (the AppImage runtime). These libraries are bundled INTO the AppImage,
-      # so the end user's machine does not need them — only the build host.
+      # (the AppImage runtime). libxcb + xcb-xfixes -dev let the clipboard
+      # sidecar link (the `xcb` crate binds the system libxcb; xfixes drives the
+      # selection-owner notifications). The webkit/gtk libraries are bundled INTO
+      # the AppImage, so the end user's machine does not need them — only the
+      # build host; libxcb is present on every X11/XWayland desktop at runtime.
       - name: System dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
-            file patchelf libfuse2
+            file patchelf libfuse2 \
+            libxcb1-dev libxcb-xfixes0-dev
 
       - name: Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
@@ -127,6 +131,14 @@ jobs:
       - name: Build the tray (sidecar)
         run: cargo build -p universallink-tray --bin universallink-tray --release --locked
 
+      # The clipboard backend, a third sidecar. The Core's supervisor looks it up
+      # next to itself and spawns it (`official_components`); without it the Core
+      # runs but ships no clipboard. Same flags. Its per-OS system libraries are
+      # loaded at runtime, not linked-and-bundled here: on Linux the host libxcb
+      # (build dep above), on Windows/macOS the OS Win32/AppKit already present.
+      - name: Build the clipboard backend (sidecar)
+        run: cargo build -p universallink-clipboard --bin universallink-clipboard --release --locked
+
       # Tauri expects each sidecar named with the target triple, next to the GUI.
       - name: Stage the sidecars
         shell: bash
@@ -136,6 +148,8 @@ jobs:
              "gui/binaries/universallink-core-${{ matrix.triple }}${{ matrix.bin_ext }}"
           cp "target/release/universallink-tray${{ matrix.bin_ext }}" \
              "gui/binaries/universallink-tray-${{ matrix.triple }}${{ matrix.bin_ext }}"
+          cp "target/release/universallink-clipboard${{ matrix.bin_ext }}" \
+             "gui/binaries/universallink-clipboard-${{ matrix.triple }}${{ matrix.bin_ext }}"
 
       # `externalBin` is injected HERE (and not in tauri.conf.json) so that the
       # `cargo build`/clippy runs in ci.yml don't require the sidecar to be
@@ -145,7 +159,7 @@ jobs:
         shell: bash
         run: |
           cargo tauri build --features webview --bundles ${{ matrix.bundles }} \
-            --config '{"bundle":{"externalBin":["binaries/universallink-core","binaries/universallink-tray"]}}'
+            --config '{"bundle":{"externalBin":["binaries/universallink-core","binaries/universallink-tray","binaries/universallink-clipboard"]}}'
 
       # Always: retrievable from the run (tests the chain without a tag).
       - name: Run artifact
