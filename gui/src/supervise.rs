@@ -119,11 +119,11 @@ pub fn stabilize_core_path(bundled: &Path) -> PathBuf {
     }
     let staged = data_home().and_then(|data| {
         let core = stage_core_copy(bundled, &data)?;
-        // Bring the tray sidecar alongside the durable Core: the Core's
-        // supervisor looks for it next to its OWN executable, which is now this
-        // copy — not the AppImage mount. Best-effort — a Core without a tray
-        // still works.
-        stage_tray_copy(bundled, &data);
+        // Bring the sidecars (tray, clipboard backend) alongside the durable
+        // Core: the Core's supervisor looks for them next to its OWN executable,
+        // which is now this copy — not the AppImage mount. Best-effort — a Core
+        // without its tray or clipboard still works.
+        stage_sidecars(bundled, &data);
         Ok(core)
     });
     match staged {
@@ -305,24 +305,31 @@ fn stage_core_copy(src: &Path, data_home: &Path) -> std::io::Result<PathBuf> {
     Ok(dest)
 }
 
-/// The tray sidecar's name, next to the Core.
+/// The sidecars the Core's supervisor looks up next to its OWN executable
+/// (`official_components`). Inside an AppImage they sit next to the bundled Core
+/// on the ephemeral mount; the durable copy must carry them too, or the
+/// supervisor won't find them once we run from the copy. This list grows as
+/// components are added (tray, clipboard backend, and the contextual menu next).
 #[cfg(target_os = "linux")]
-const TRAY_BIN: &str = "universallink-tray";
+const STAGED_SIDECARS: &[&str] = &["universallink-tray", "universallink-clipboard"];
 
-/// Copies the tray sidecar next to the durable Core (best-effort). It lives
-/// next to the bundled Core inside the AppImage mount; the durable copy must
-/// carry it too, or the supervisor won't find it once we run from the copy.
+/// Copies each sidecar next to the durable Core (best-effort). A sidecar absent
+/// from this build is skipped; a copy failure is logged but not fatal — a Core
+/// without its tray or clipboard still runs.
 #[cfg(target_os = "linux")]
-fn stage_tray_copy(bundled_core: &Path, data_home: &Path) {
-    let Some(src) = bundled_core.parent().map(|d| d.join(TRAY_BIN)) else {
+fn stage_sidecars(bundled_core: &Path, data_home: &Path) {
+    let Some(dir) = bundled_core.parent() else {
         return;
     };
-    if !src.exists() {
-        return; // no tray in this build
-    }
-    let dest = data_home.join("universallink").join(TRAY_BIN);
-    if let Err(e) = stage_copy(&src, &dest) {
-        eprintln!("[universallink] cannot stage the tray copy ({e})");
+    for bin in STAGED_SIDECARS {
+        let src = dir.join(bin);
+        if !src.exists() {
+            continue; // not in this build
+        }
+        let dest = data_home.join("universallink").join(bin);
+        if let Err(e) = stage_copy(&src, &dest) {
+            eprintln!("[universallink] cannot stage the {bin} copy ({e})");
+        }
     }
 }
 
@@ -499,15 +506,82 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().expect("tempdir");
-        let src = tmp.path().join(TRAY_BIN);
+        let src = tmp.path().join("universallink-tray");
         std::fs::write(&src, b"tray").expect("write src");
 
-        let dest = tmp.path().join("data").join("universallink").join(TRAY_BIN);
+        let dest = tmp
+            .path()
+            .join("data")
+            .join("universallink")
+            .join("universallink-tray");
         stage_copy(&src, &dest).expect("stage");
 
         assert_eq!(std::fs::read(&dest).expect("read"), b"tray");
         let mode = std::fs::metadata(&dest).expect("meta").permissions().mode();
         assert_eq!(mode & 0o111, 0o111, "the sibling copy must be executable");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn staging_sidecars_brings_the_tray_and_the_clipboard_next_to_the_core() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Mimic the bundled layout: the Core and its sidecars side by side, as
+        // on the AppImage mount.
+        let mount = tmp.path().join("mount");
+        std::fs::create_dir_all(&mount).expect("mount dir");
+        let core = mount.join(CORE_BIN);
+        std::fs::write(&core, b"core").expect("core");
+        for bin in STAGED_SIDECARS {
+            std::fs::write(mount.join(bin), bin.as_bytes()).expect("sidecar");
+        }
+
+        let data_home = tmp.path().join("data");
+        stage_sidecars(&core, &data_home);
+
+        // Every declared sidecar lands next to the durable Core — the clipboard
+        // backend included, which is the whole point (a bundled-but-unstaged
+        // clipboard would never be launched by the supervisor).
+        for bin in STAGED_SIDECARS {
+            let dest = data_home.join("universallink").join(bin);
+            assert!(dest.exists(), "{bin} must be staged next to the Core");
+            assert_eq!(std::fs::read(&dest).expect("read"), bin.as_bytes());
+        }
+        assert!(
+            data_home
+                .join("universallink")
+                .join("universallink-clipboard")
+                .exists(),
+            "the clipboard backend must be staged"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn staging_sidecars_skips_the_ones_absent_from_the_build() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mount = tmp.path().join("mount");
+        std::fs::create_dir_all(&mount).expect("mount dir");
+        let core = mount.join(CORE_BIN);
+        std::fs::write(&core, b"core").expect("core");
+        // Only the tray is present; the clipboard is missing from this build.
+        std::fs::write(mount.join("universallink-tray"), b"tray").expect("tray");
+
+        let data_home = tmp.path().join("data");
+        stage_sidecars(&core, &data_home); // must not panic on the absent one
+
+        assert!(
+            data_home
+                .join("universallink")
+                .join("universallink-tray")
+                .exists()
+        );
+        assert!(
+            !data_home
+                .join("universallink")
+                .join("universallink-clipboard")
+                .exists(),
+            "an absent sidecar is skipped, not fabricated"
+        );
     }
 
     #[cfg(target_os = "linux")]
