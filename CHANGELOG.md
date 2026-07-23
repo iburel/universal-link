@@ -4,6 +4,50 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-23
+
+Shared clipboard across your devices, and folder support for transfers. The
+Core now supervises a per-OS clipboard backend and a system tray, both shipped
+inside the installers.
+
+### Added
+
+- **Shared clipboard** — copy on one device and paste on another. A dedicated
+  clipboard backend (a sidecar the Core supervises) bridges the real system
+  clipboard for text, images, single files, and whole folders, on Linux (X11,
+  with ICCCM INCR for large payloads), Windows, and macOS. It is pull-at-paste:
+  the payload moves over the cross-Core data plane only when the receiver
+  actually pastes, and content the OS marks sensitive (e.g. a password manager)
+  is honored in both directions and carries no size hint.
+- **Send and paste folders** — a whole directory tree, empty folders included,
+  can now be sent by drag-and-drop or shared through the clipboard, not just
+  single files.
+- **System tray** — a tray icon showing status, with a Quit action that shuts
+  the Core down cleanly. Bundled as a sidecar next to the Core.
+- **Bidirectional local IPC** — the client gained incoming requests and a data
+  channel, the transport the clipboard and transfers ride on.
+
+### Changed
+
+- All three installers now bundle and stage the clipboard backend as a sidecar,
+  alongside the existing Core and tray.
+- **Server** — the OIDC verifier refreshes its JWKS on an unknown key id, so it
+  follows the identity provider's key rotation without a restart.
+- CI runs the test suite under `cargo-nextest` — the cross-reactor data-channel
+  tests are serialized and the residual contention flake is retried, ending a
+  macOS flake — and `rustfmt` is pinned and enforced.
+
+### Fixed
+
+- Windows clipboard images: a 3-pixel horizontal shift on synthesized
+  `CF_DIBV5` bitmaps (miscounted trailing channel masks) is corrected.
+
+### Known limitations
+
+- Installers remain unsigned (milestone 1); the OS shows a first-launch warning.
+- No context-menu integration yet.
+- Account key rotation is not implemented.
+
 ## [0.2.0] - 2026-07-14
 
 Milestone 1 packaging: the client now installs and configures itself. A fresh
@@ -68,5 +112,6 @@ Linux, macOS, and Windows.
 - Flat transfers only (no directory trees).
 - Account key rotation is not implemented.
 
+[0.3.0]: https://github.com/iburel/universal-link/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/iburel/universal-link/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/iburel/universal-link/releases/tag/v0.1.0
