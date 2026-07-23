@@ -23,6 +23,16 @@
 //! (responder → initiator): a single `done` frame once everything is on disk,
 //! which serves as the acknowledgment.
 //!
+//! A manifest entry whose `name` carries a relative, `/`-separated path is a
+//! file inside a copied folder: the receiver recreates the parent directories
+//! and joins the path onto its receive folder. An entry marked `dir: true` is an
+//! EMPTY directory to recreate (size 0, no body) — a non-empty directory is
+//! implied by its file entries and never listed. The path-traversal defense
+//! (`is_safe_rel_path`, shared with the clipboard manifest) refuses anything a
+//! naive join could turn into a write outside the receive folder (`..`, an
+//! absolute or `\`-separated segment, `:`, a control character), so a
+//! compromised sender cannot escape it.
+//!
 //! Framing (u32 length + payload, never the EOF) for CONTROL only, bounded by
 //! `MAX_FRAME`. The bodies, by contrast, are streamed in fixed-size buffers
 //! (`CHUNK`): we NEVER allocate on a length announced by the peer — no OOM
@@ -46,6 +56,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
 
 use crate::connector::IoStream;
+use crate::rpc::RpcErr;
 use crate::state::AppState;
 
 /// Where to reach a peer on the data plane. The `node_id` is the device's
@@ -324,19 +335,25 @@ pub(crate) fn account_peers(state: &AppState) -> Vec<PeerAddr> {
 // The transfer protocol.
 // ---------------------------------------------------------------------------
 
-/// A file to send: its name (announced to the peer), its source on disk, and
-/// its size at the moment of the offer.
+/// A manifest entry to send. `name` is what the peer sees: a plain basename for
+/// a flat file, or a relative `/`-separated path for a file inside a copied
+/// folder. `is_dir` marks an empty directory to recreate (no `source`, size 0);
+/// every other entry is a file whose bytes are read from `source`. Invariant:
+/// `source.is_none() == is_dir`.
 pub struct OutgoingFile {
     pub name: String,
-    pub source: PathBuf,
+    pub source: Option<PathBuf>,
     pub size: u64,
+    pub is_dir: bool,
 }
 
-/// A manifest entry, as the receiver reads it from the offer.
+/// A manifest entry, as the receiver reads it from the offer. `is_dir` is the
+/// wire `dir: true` — an empty directory to recreate, no body.
 #[derive(Clone, Debug)]
 pub struct FileHeader {
     pub name: String,
     pub size: u64,
+    pub is_dir: bool,
 }
 
 /// INITIATOR side: sends the offer then the bodies, and waits for the
@@ -353,7 +370,7 @@ pub async fn send_transfer(
     let total = files.iter().fold(0u64, |a, f| a.saturating_add(f.size));
     let manifest: Vec<Value> = files
         .iter()
-        .map(|f| json!({ "name": f.name, "size": f.size }))
+        .map(|f| offer_entry(&f.name, f.size, f.is_dir))
         .collect();
     write_control(stream, &json!({ "type": "offer", "files": manifest })).await?;
 
@@ -361,7 +378,10 @@ pub async fn send_transfer(
     progress(done, total);
     let mut buf = vec![0u8; CHUNK];
     for f in files {
-        let mut file = bounded(STALL_TIMEOUT, tokio::fs::File::open(&f.source), "open").await?;
+        // A directory entry carries no body: the receiver recreates it from the
+        // manifest alone.
+        let Some(source) = &f.source else { continue };
+        let mut file = bounded(STALL_TIMEOUT, tokio::fs::File::open(source), "open").await?;
         let mut remaining = f.size;
         while remaining > 0 {
             let want = remaining.min(CHUNK as u64) as usize;
@@ -436,7 +456,29 @@ fn parse_manifest(value: &Value) -> std::io::Result<Vec<FileHeader>> {
             let size = f.get("size").and_then(Value::as_u64).ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "file without a size")
             })?;
-            Ok(FileHeader { name, size })
+            // `dir` is optional and defaults to false (a flat-file offer, or an
+            // older sender that never emits it). Anything but a bool or null is
+            // a malformed frame — fail-closed rather than guess.
+            let is_dir = match f.get("dir") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(b)) => *b,
+                Some(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "file with a non-boolean dir",
+                    ));
+                }
+            };
+            // A directory carries no body: a non-zero size would desync the body
+            // stream (we skip a dir's body, so the announced bytes would be read
+            // as the NEXT file's). Refuse the whole offer rather than misalign.
+            if is_dir && size != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "directory entry with a non-zero size",
+                ));
+            }
+            Ok(FileHeader { name, size, is_dir })
         })
         .collect()
 }
@@ -459,35 +501,80 @@ pub async fn receive_bodies(
     Ok(written)
 }
 
+/// A received manifest entry, pending commit: a file whose bytes are already in
+/// a `.part` temporary, or an empty directory to recreate. `rel` is the
+/// validated, `/`-separated relative path (a plain basename for a flat file).
+enum Received {
+    File { part: PartFile, rel: String },
+    Dir { rel: String },
+}
+
+impl Received {
+    fn rel(&self) -> &str {
+        match self {
+            Received::File { rel, .. } | Received::Dir { rel } => rel,
+        }
+    }
+}
+
 /// Receives the bodies into `.part` temporaries — the CANCELABLE phase. The
 /// bodies announced by `manifest` are streamed into `dest_dir` (created if
 /// needed). Nothing is visible yet: each file is a `.part` guarded by a
-/// `PartFile` whose `Drop` erases it as long as it is not committed. If the
+/// `PartFile` whose `Drop` erases it as long as it is not committed. Directory
+/// entries carry no body — they are recorded for the commit to recreate. If the
 /// future is abandoned (cancellation) or returns an error, NO partial file
-/// remains. Returns the guards to commit.
+/// remains. Returns the entries to commit.
 async fn receive_to_parts(
     stream: &mut Box<dyn IoStream>,
     dest_dir: &Path,
     manifest: &[FileHeader],
     progress: &mut (dyn FnMut(u64, u64) + Send),
-) -> std::io::Result<Vec<(PartFile, String)>> {
+) -> std::io::Result<Vec<Received>> {
     tokio::fs::create_dir_all(dest_dir).await?;
     let total = manifest.iter().fold(0u64, |a, f| a.saturating_add(f.size));
     let mut done = 0u64;
     progress(done, total);
 
-    let mut parts: Vec<(PartFile, String)> = Vec::with_capacity(manifest.len());
+    let mut received: Vec<Received> = Vec::with_capacity(manifest.len());
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(manifest.len());
     let mut buf = vec![0u8; CHUNK];
     for f in manifest {
-        // Path-traversal defense, even in v1 "flat files": a name like
-        // "../../etc/passwd" from a compromised sender must NOT write outside
-        // the receive folder.
-        let name = safe_file_name(&f.name).ok_or_else(|| {
-            std::io::Error::new(
+        // Path-traversal defense: a relative `/`-separated path only, so a name
+        // like "../../etc/passwd" (or a rooted / `\`-separated / drive-qualified
+        // one) from a compromised sender can NOT write outside the receive
+        // folder. Accepts a plain basename (a flat file) as a single segment.
+        if !crate::clipboard::is_safe_rel_path(&f.name) {
+            return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("refused file name: {:?}", f.name),
-            )
-        })?;
+            ));
+        }
+        // Reject a duplicate path — but ONLY for a directory or a NESTED file,
+        // which the commit places by an exact rename with no collision suffix, so
+        // a repeat would silently clobber the first (or, for a file-vs-directory
+        // clash, fail the commit half-done). A plain top-level FILE is exempt: it
+        // still goes through `unique_dest`, which disambiguates a repeat into
+        // `f (1).txt` — the historical behavior an older sender relies on (it did
+        // not uniquify basenames, so two sources named `f.txt` in one send are
+        // legitimate). A conforming folder sender never emits a duplicate anyway
+        // (`freeze_manifest`'s names are unique), so this only bites a hostile or
+        // buggy offer, making the commit's "nothing is ever overwritten" hold
+        // even then. Fail-closed, like the clipboard's `validate_remote_manifest`.
+        let is_root_file = !f.is_dir && !f.name.contains('/');
+        if !is_root_file && !seen.insert(f.name.clone()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("duplicate path in offer: {:?}", f.name),
+            ));
+        }
+        let rel = f.name.clone();
+        if f.is_dir {
+            // No body (its size was validated to be 0 by `parse_manifest`): just
+            // record it so the commit recreates the empty directory.
+            received.push(Received::Dir { rel });
+            continue;
+        }
         // A single descriptor OPEN at a time: the file is written THEN closed
         // (the handle is dropped); only the `.part` path survives until the
         // rename. A peer offering thousands of small files does not exhaust the
@@ -513,25 +600,121 @@ async fn receive_to_parts(
             progress(done, total);
         }
         drop(file);
-        parts.push((part, name));
+        received.push(Received::File { part, rel });
     }
-    Ok(parts)
+    Ok(received)
 }
 
-/// Renames the received temporaries to their final names — the COMMIT phase,
-/// NON-cancelable (see `serve_incoming`). Choosing the free name and the rename
-/// are serialized by `COMMIT_NAMING`: two incoming transfers of the same
-/// basename cannot overwrite each other.
-async fn commit_parts(
-    dest_dir: &Path,
-    parts: Vec<(PartFile, String)>,
-) -> std::io::Result<Vec<PathBuf>> {
+/// Materializes the received entries under `dest_dir` — the COMMIT phase,
+/// NON-cancelable (see `serve_incoming`). Choosing free names and renaming are
+/// serialized by `COMMIT_NAMING`: two incoming transfers cannot overwrite each
+/// other.
+///
+/// Collisions are resolved at the TOP LEVEL only — the tree structure below a
+/// copied folder is preserved verbatim. A top-level DIRECTORY that already
+/// exists is redirected to a fresh sibling (`folder (1)/`) and created empty, so
+/// the whole received subtree lands there without merging into (or clobbering)
+/// the existing one. A top-level FILE keeps the flat-file rule (`report (1).pdf`,
+/// suffix before the extension). Distinct tops never collide (the sender
+/// uniquifies top-level names) and every path is unique (`receive_to_parts`
+/// rejects a duplicate before the commit, so even a hostile offer cannot make
+/// one entry overwrite another). Nothing is ever overwritten.
+async fn commit_parts(dest_dir: &Path, entries: Vec<Received>) -> std::io::Result<Vec<PathBuf>> {
     let _naming = COMMIT_NAMING.lock().await;
-    let mut written = Vec::with_capacity(parts.len());
-    for (part, name) in parts {
-        written.push(bounded(STALL_TIMEOUT, part.commit(dest_dir, &name), "rename").await?);
+
+    // Pass 1: pick a free name for every distinct top-level DIRECTORY and
+    // create it empty — reserving it on disk so a later top cannot pick the
+    // same name, and so files can be renamed into it. A top is a directory when
+    // an entry has a deeper segment under it, or is itself an empty-dir entry.
+    let mut dir_top: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for entry in &entries {
+        let (top, rest) = split_top(entry.rel());
+        let is_dir_top = rest.is_some() || matches!(entry, Received::Dir { .. });
+        if is_dir_top && !dir_top.contains_key(top) {
+            let chosen = unique_child_name(dest_dir, top, true);
+            bounded(
+                STALL_TIMEOUT,
+                tokio::fs::create_dir_all(dest_dir.join(&chosen)),
+                "create directory",
+            )
+            .await?;
+            dir_top.insert(top.to_string(), chosen);
+        }
+    }
+
+    // Pass 2: create the empty directories and rename each file into place. All
+    // directory tops now exist, so a plain top-level file's `unique_dest` sees
+    // them (defensive — the sender never collides a file and a folder top).
+    let mut written = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let rel = entry.rel().to_string();
+        let (top, rest) = split_top(&rel);
+        match entry {
+            Received::Dir { .. } => {
+                // A bare empty-dir top is already created in pass 1; a deeper
+                // empty dir (`folder/empty`) is created here under its remapped
+                // top.
+                let dest = dest_path(dest_dir, &dir_top, top, rest);
+                bounded(
+                    STALL_TIMEOUT,
+                    tokio::fs::create_dir_all(&dest),
+                    "create directory",
+                )
+                .await?;
+                written.push(dest);
+            }
+            Received::File { part, .. } => {
+                let dest = if rest.is_some() {
+                    // A file inside a copied folder: its top is a reserved
+                    // directory; recreate any intermediate parents, then rename.
+                    let dest = dest_path(dest_dir, &dir_top, top, rest);
+                    if let Some(parent) = dest.parent() {
+                        bounded(
+                            STALL_TIMEOUT,
+                            tokio::fs::create_dir_all(parent),
+                            "create directory",
+                        )
+                        .await?;
+                    }
+                    dest
+                } else {
+                    // A flat top-level file: the historical " (n)" collision rule.
+                    unique_dest(dest_dir, top)
+                };
+                written.push(bounded(STALL_TIMEOUT, part.commit_to(&dest), "rename").await?);
+            }
+        }
     }
     Ok(written)
+}
+
+/// Splits a `/`-separated relative path into its top-level component and the
+/// remainder (`None` when the path is a single segment).
+fn split_top(rel: &str) -> (&str, Option<&str>) {
+    match rel.split_once('/') {
+        Some((top, rest)) => (top, Some(rest)),
+        None => (rel, None),
+    }
+}
+
+/// The destination path for an entry: the (possibly remapped) top-level
+/// component joined with the remaining segments, pushed one at a time so `/`
+/// never reaches the OS as a literal path component.
+fn dest_path(
+    dest_dir: &Path,
+    dir_top: &std::collections::HashMap<String, String>,
+    top: &str,
+    rest: Option<&str>,
+) -> PathBuf {
+    let mapped = dir_top.get(top).map(String::as_str).unwrap_or(top);
+    let mut path = dest_dir.to_path_buf();
+    path.push(mapped);
+    if let Some(rest) = rest {
+        for seg in rest.split('/') {
+            path.push(seg);
+        }
+    }
+    path
 }
 
 /// Sends the "done" acknowledgment then holds the stream until the initiator
@@ -592,7 +775,7 @@ async fn serve_transfer(
 
     let files_json: Vec<Value> = manifest
         .iter()
-        .map(|f| json!({ "name": f.name, "size": f.size }))
+        .map(|f| offer_entry(&f.name, f.size, f.is_dir))
         .collect();
     notify_transfers(
         &state,
@@ -664,8 +847,12 @@ pub(crate) enum SendError {
     UnknownDevice,
     /// Target known but with no published relay: unreachable for now.
     Offline,
-    /// Invalid path (missing, directory, unreadable) — message for the caller.
+    /// Invalid path (missing, unreadable) — message for the caller.
     BadPath(String),
+    /// The manifest walk refused the paths (an unrepresentable name, a folder
+    /// too deep, or over the manifest cap): the `freeze_manifest` error is
+    /// relayed to the caller as-is.
+    Rejected(RpcErr),
 }
 
 /// Starts an outgoing transfer: validates the paths, resolves the peer (C7),
@@ -686,32 +873,22 @@ pub(crate) fn start_send(
         return Err(SendError::Offline);
     }
 
-    // v1 "flat files": each path must be a regular file. A directory is refused
-    // outright (directory trees are a follow-up building block).
-    let mut files = Vec::with_capacity(paths.len());
-    for p in paths {
-        let source = PathBuf::from(p);
-        let meta =
-            std::fs::metadata(&source).map_err(|e| SendError::BadPath(format!("{p} — {e}")))?;
-        if meta.is_dir() {
-            return Err(SendError::BadPath(format!(
-                "folders are not supported (v1 files only): {p}"
-            )));
-        }
-        if !meta.is_file() {
-            return Err(SendError::BadPath(format!("non-regular path: {p}")));
-        }
-        let name = source
-            .file_name()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| SendError::BadPath(format!("path without a file name: {p}")))?
-            .to_string();
-        files.push(OutgoingFile {
-            name,
-            source,
-            size: meta.len(),
-        });
-    }
+    // The SAME walk the clipboard uses to freeze a copied folder: a regular
+    // file becomes one entry, a directory is walked into `<folder>/<rel>`
+    // entries (an empty folder into a `dir:true` entry), top-level names are
+    // uniquified, and every relative path is validated fail-closed so the
+    // receiver's re-validation cannot drop it. The `file_id`s it mints are
+    // unused here (the transfer pushes bodies in order, it does not pull by id).
+    let files: Vec<OutgoingFile> = crate::clipboard::freeze_manifest(paths)
+        .map_err(SendError::Rejected)?
+        .into_iter()
+        .map(|e| OutgoingFile {
+            name: e.rel_path,
+            source: e.backing.map(|b| b.source),
+            size: e.size,
+            is_dir: e.is_dir,
+        })
+        .collect();
 
     let (transfer_id, cancel) = state.transfers.lock().expect("lock transfers").register();
     tokio::spawn(run_send(
@@ -738,7 +915,7 @@ async fn run_send(
     let total = files.iter().fold(0u64, |a, f| a.saturating_add(f.size));
     let files_json: Vec<Value> = files
         .iter()
-        .map(|f| json!({ "name": f.name, "size": f.size }))
+        .map(|f| offer_entry(&f.name, f.size, f.is_dir))
         .collect();
     notify_transfers(
         &state,
@@ -879,12 +1056,12 @@ impl PartFile {
             .await
     }
 
-    /// Renames the temporary (already durable) to a free name in `dir`.
-    async fn commit(mut self, dir: &Path, name: &str) -> std::io::Result<PathBuf> {
-        let dest = unique_dest(dir, name);
-        tokio::fs::rename(&self.path, &dest).await?;
+    /// Renames the temporary (already durable) to `dest`, an exact path the
+    /// caller has already chosen free (and whose parent directories exist).
+    async fn commit_to(mut self, dest: &Path) -> std::io::Result<PathBuf> {
+        tokio::fs::rename(&self.path, dest).await?;
         self.committed = true;
-        Ok(dest)
+        Ok(dest.to_path_buf())
     }
 }
 
@@ -897,50 +1074,55 @@ impl Drop for PartFile {
     }
 }
 
-/// Accepts only a plain BASENAME; refuses anything carrying a path structure —
-/// the data plane's path-traversal defense. A legitimate sender only sends a
-/// basename (`files.send` derives it from the source name), so this refusal
-/// only affects a malicious or buggy peer. Deliberately WITHOUT
-/// `Path::file_name`: its splitting is OS-dependent (`\` separates on Windows,
-/// not on Linux), which would diverge across platforms; we reason on the raw
-/// string, regardless of the OS. Refused: empty, `.`/`..`, any separator (`/`
-/// OR `\`), colon (Windows drive/ADS), and control characters.
-fn safe_file_name(raw: &str) -> Option<String> {
-    if raw.is_empty() || raw == "." || raw == ".." {
-        return None;
+/// A manifest/notification entry as JSON: `{name, size}`, plus `dir: true` for
+/// an empty directory (omitted for a file — the default, and what an older peer
+/// expects). The single builder for the offer manifest and the `transfer.*`
+/// notifications, so the three stay in lockstep.
+fn offer_entry(name: &str, size: u64, is_dir: bool) -> Value {
+    let mut v = json!({ "name": name, "size": size });
+    if is_dir {
+        v["dir"] = json!(true);
     }
-    if raw
-        .chars()
-        .any(|c| matches!(c, '/' | '\\' | ':') || c.is_control())
-    {
-        return None;
-    }
-    Some(raw.to_string())
+    v
 }
 
-/// A free destination path in `dir` for `name` (already sanitized): the name
-/// as-is if it is free, otherwise suffixed " (n)" before the extension. Never
-/// an overwrite — a received file does not destroy an existing file.
+/// A free destination path in `dir` for a top-level FILE `name`: the flat-file
+/// collision rule (the name as-is if free, otherwise suffixed " (n)" before the
+/// extension). Never an overwrite — a received file does not destroy an existing
+/// one.
 fn unique_dest(dir: &Path, name: &str) -> PathBuf {
-    let direct = dir.join(name);
-    if !direct.exists() {
-        return direct;
+    dir.join(unique_child_name(dir, name, false))
+}
+
+/// A free child name in `dir` for `name`: `name` as-is if nothing there bears
+/// it, otherwise a " (n)" suffix. A FILE suffixes before the extension
+/// (`report (1).pdf`); a DIRECTORY suffixes the whole name (`folder (1)`, never
+/// split on a dot). Never returns a name that already exists — a received tree
+/// never merges into, or clobbers, an existing entry.
+fn unique_child_name(dir: &Path, name: &str, is_dir: bool) -> String {
+    if !dir.join(name).exists() {
+        return name.to_string();
     }
-    let path = Path::new(name);
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
-    let ext = path.extension().and_then(|s| s.to_str());
+    let (stem, ext) = if is_dir {
+        (name, None)
+    } else {
+        let path = Path::new(name);
+        (
+            path.file_stem().and_then(|s| s.to_str()).unwrap_or(name),
+            path.extension().and_then(|s| s.to_str()),
+        )
+    };
     for n in 1..=9999 {
         let candidate = match ext {
             Some(ext) => format!("{stem} ({n}).{ext}"),
             None => format!("{stem} ({n})"),
         };
-        let candidate = dir.join(candidate);
-        if !candidate.exists() {
+        if !dir.join(&candidate).exists() {
             return candidate;
         }
     }
     // Implausible: we fall back on a random suffix rather than overwrite.
-    dir.join(format!("{stem}-{}", crate::state::random_hex(4)))
+    format!("{stem}-{}", crate::state::random_hex(4))
 }
 
 // ---------------------------------------------------------------------------
@@ -1032,40 +1214,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{safe_file_name, unique_dest};
-
-    #[test]
-    fn safe_file_name_keeps_a_plain_basename() {
-        assert_eq!(safe_file_name("report.pdf").as_deref(), Some("report.pdf"));
-        assert_eq!(
-            safe_file_name("my file (1).txt").as_deref(),
-            Some("my file (1).txt")
-        );
-        assert_eq!(
-            safe_file_name("archive.tar.gz").as_deref(),
-            Some("archive.tar.gz")
-        );
-    }
-
-    #[test]
-    fn safe_file_name_refuses_anything_with_path_structure() {
-        // IDENTICAL result on every OS (no platform-dependent
-        // `Path::file_name`): nothing carrying a path structure is accepted, no
-        // "keep the last segment" that would diverge Windows/Linux.
-        assert_eq!(safe_file_name(""), None);
-        assert_eq!(safe_file_name("."), None);
-        assert_eq!(safe_file_name(".."), None);
-        assert_eq!(safe_file_name("stuff/.."), None);
-        assert_eq!(safe_file_name("../../etc/passwd"), None);
-        assert_eq!(safe_file_name("/etc/passwd"), None);
-        assert_eq!(safe_file_name("folder/file.txt"), None);
-        // Windows separator (refused regardless of the OS), ADS/drive colon,
-        // control character.
-        assert_eq!(safe_file_name(r"..\..\evil"), None);
-        assert_eq!(safe_file_name(r"folder\file.txt"), None);
-        assert_eq!(safe_file_name("stream:ads"), None);
-        assert_eq!(safe_file_name("line\nbreak"), None);
-    }
+    use super::{
+        dest_path, offer_entry, parse_manifest, split_top, unique_child_name, unique_dest,
+    };
+    use serde_json::json;
 
     #[test]
     fn unique_dest_never_overwrites() {
@@ -1089,5 +1241,86 @@ mod tests {
             unique_dest(dir.path(), "noext"),
             dir.path().join("noext (1)")
         );
+    }
+
+    #[test]
+    fn unique_child_name_suffixes_a_folder_without_splitting_on_a_dot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A folder named like a file must NOT be split on the dot: the whole
+        // name is suffixed.
+        std::fs::create_dir(dir.path().join("my.folder")).unwrap();
+        assert_eq!(
+            unique_child_name(dir.path(), "my.folder", true),
+            "my.folder (1)"
+        );
+        // A free name is returned as-is.
+        assert_eq!(unique_child_name(dir.path(), "clean", true), "clean");
+    }
+
+    #[test]
+    fn split_top_separates_the_first_segment() {
+        assert_eq!(split_top("report.pdf"), ("report.pdf", None));
+        assert_eq!(split_top("folder/a.txt"), ("folder", Some("a.txt")));
+        assert_eq!(split_top("folder/sub/a.txt"), ("folder", Some("sub/a.txt")));
+    }
+
+    #[test]
+    fn dest_path_applies_the_top_remap_and_pushes_segments() {
+        let root = std::path::Path::new("/recv");
+        let mut remap = std::collections::HashMap::new();
+        remap.insert("folder".to_string(), "folder (1)".to_string());
+        // The top is remapped; deeper segments are pushed verbatim (never a
+        // literal `/` reaching the OS as one component).
+        assert_eq!(
+            dest_path(root, &remap, "folder", Some("sub/a.txt")),
+            root.join("folder (1)").join("sub").join("a.txt")
+        );
+        // An unmapped top stays as-is.
+        assert_eq!(
+            dest_path(root, &remap, "loose.txt", None),
+            root.join("loose.txt")
+        );
+    }
+
+    #[test]
+    fn offer_entry_marks_only_directories() {
+        assert_eq!(
+            offer_entry("a.txt", 10, false),
+            json!({"name":"a.txt","size":10})
+        );
+        assert_eq!(
+            offer_entry("empty", 0, true),
+            json!({"name":"empty","size":0,"dir":true})
+        );
+    }
+
+    #[test]
+    fn parse_manifest_reads_the_dir_flag_and_fails_closed() {
+        // A file (no `dir`), an explicit empty directory, and default-false.
+        let ok = parse_manifest(&json!({
+            "type": "offer",
+            "files": [
+                { "name": "folder/a.txt", "size": 3 },
+                { "name": "folder/empty", "size": 0, "dir": true },
+            ]
+        }))
+        .expect("well-formed offer");
+        assert_eq!(ok.len(), 2);
+        assert!(!ok[0].is_dir);
+        assert!(ok[1].is_dir);
+
+        // A directory with a non-zero size would desync the body stream.
+        parse_manifest(&json!({
+            "type": "offer",
+            "files": [ { "name": "d", "size": 5, "dir": true } ]
+        }))
+        .expect_err("a sized directory is refused");
+
+        // A non-boolean `dir` is malformed.
+        parse_manifest(&json!({
+            "type": "offer",
+            "files": [ { "name": "d", "size": 0, "dir": 1 } ]
+        }))
+        .expect_err("a non-boolean dir is refused");
     }
 }

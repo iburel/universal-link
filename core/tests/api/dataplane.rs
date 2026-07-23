@@ -229,6 +229,234 @@ async fn a_second_file_with_the_same_name_does_not_overwrite() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_directory_tree_is_walked_and_recreated_on_the_receiver() {
+    let server = TestServer::start().await;
+    let (a, b) = TestCore::start_pair(&server).await;
+
+    let mut sender = spawn_component(
+        &a,
+        "sender",
+        "menu-backend",
+        &["files.send", "devices.read", "session.read"],
+    )
+    .await;
+    let mut watcher = spawn_component(
+        &b,
+        "watcher",
+        "tray",
+        &["transfers.read", "devices.read", "session.read"],
+    )
+    .await;
+    subscribe_transfers(&mut watcher).await;
+    wait_server_connected(&mut sender, true).await;
+    wait_server_connected(&mut watcher, true).await;
+    wait_reachable(&mut sender, b.device_id()).await;
+    wait_attested(&mut watcher, a.device_id()).await;
+
+    // top/a.txt, top/sub/b.bin (nested), top/empty/ (empty dir, no body).
+    let (_guard, top) = scratch_tree();
+    sender
+        .request(
+            "files.send",
+            json!({ "device_id": b.device_id(), "paths": [top.to_str().unwrap()] }),
+        )
+        .await
+        .expect("files.send a folder");
+
+    // The manifest carries the empty directory as a `dir:true`, sizeless entry.
+    let incoming = watcher.wait_notification("transfer.incoming").await;
+    let files = incoming["files"].as_array().expect("files");
+    assert_eq!(files.len(), 3);
+    assert!(
+        files
+            .iter()
+            .any(|f| f["dir"] == json!(true) && f["size"] == json!(0)),
+        "the empty folder is announced as a dir: {files:?}"
+    );
+
+    watcher.wait_notification("transfer.finished").await;
+
+    // The tree is recreated verbatim under the receive directory.
+    let root = b.receive_dir().join("top");
+    assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"alpha");
+    assert_eq!(
+        std::fs::read(root.join("sub").join("b.bin")).unwrap(),
+        b"beta bytes"
+    );
+    assert!(
+        root.join("empty").is_dir(),
+        "the empty directory was recreated"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_folder_of_the_same_name_lands_beside_the_first() {
+    let server = TestServer::start().await;
+    let (a, b) = TestCore::start_pair(&server).await;
+
+    let mut sender = spawn_component(
+        &a,
+        "sender",
+        "menu-backend",
+        &["files.send", "devices.read", "session.read"],
+    )
+    .await;
+    let mut watcher = spawn_component(
+        &b,
+        "watcher",
+        "tray",
+        &["transfers.read", "devices.read", "session.read"],
+    )
+    .await;
+    subscribe_transfers(&mut watcher).await;
+    wait_server_connected(&mut sender, true).await;
+    wait_server_connected(&mut watcher, true).await;
+    wait_reachable(&mut sender, b.device_id()).await;
+    wait_attested(&mut watcher, a.device_id()).await;
+
+    let (_guard, top) = scratch_tree();
+    let path = top.to_str().unwrap();
+
+    // First copy: lands in `top/`.
+    sender
+        .request(
+            "files.send",
+            json!({ "device_id": b.device_id(), "paths": [path] }),
+        )
+        .await
+        .expect("files.send #1");
+    watcher.wait_notification("transfer.finished").await;
+
+    // Second copy of the SAME folder: the top-level directory already exists, so
+    // the whole subtree is redirected to a fresh sibling — never merged into, or
+    // clobbering, the first.
+    sender
+        .request(
+            "files.send",
+            json!({ "device_id": b.device_id(), "paths": [path] }),
+        )
+        .await
+        .expect("files.send #2");
+    watcher.wait_notification("transfer.finished").await;
+
+    assert_eq!(
+        std::fs::read(b.receive_dir().join("top").join("a.txt")).unwrap(),
+        b"alpha",
+        "the first copy is intact"
+    );
+    assert_eq!(
+        std::fs::read(b.receive_dir().join("top (1)").join("a.txt")).unwrap(),
+        b"alpha",
+        "the second copy lands in a fresh sibling"
+    );
+    assert!(b.receive_dir().join("top (1)").join("empty").is_dir());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forged_folder_path_that_escapes_is_refused_and_writes_nothing() {
+    let server = TestServer::start().await;
+    let switchboard = MemorySwitchboard::new();
+    let code = universallink_core::account_key::generate_recovery_code();
+    let victim = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
+    let (rogue_id, _conn, rogue) = attested_sink(&server, &switchboard, &code).await;
+
+    let mut vc = spawn_component(&victim, "obs-v", "tray", &["session.read", "devices.read"]).await;
+    wait_server_connected(&mut vc, true).await;
+    wait_attested(&mut vc, &rogue_id).await;
+
+    let peer = victim_peer(&victim);
+    let mut stream = rogue.open(&peer).await.expect("the switchboard routes");
+    // A `/`-separated name climbing out with a `..` segment — the tree receiver
+    // accepts `/` (a folder path) but must still refuse a traversal segment.
+    let evil = b"escape";
+    offer_then_close(
+        &mut stream,
+        &[("sub/../../pown.txt", evil.len() as u64, evil)],
+    )
+    .await;
+
+    assert!(received_files(&victim).is_empty(), "no file written");
+    let escape = victim
+        .receive_dir()
+        .parent()
+        .expect("parent directory")
+        .join("pown.txt");
+    assert!(!escape.exists(), "no write outside the receive directory");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forged_offer_with_a_duplicate_path_is_refused_and_writes_nothing() {
+    let server = TestServer::start().await;
+    let switchboard = MemorySwitchboard::new();
+    let code = universallink_core::account_key::generate_recovery_code();
+    let victim = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
+    let (rogue_id, _conn, rogue) = attested_sink(&server, &switchboard, &code).await;
+
+    let mut vc = spawn_component(&victim, "obs-v", "tray", &["session.read", "devices.read"]).await;
+    wait_server_connected(&mut vc, true).await;
+    wait_attested(&mut vc, &rogue_id).await;
+
+    let peer = victim_peer(&victim);
+    let mut stream = rogue.open(&peer).await.expect("the switchboard routes");
+    // Two entries with the SAME nested path: a conforming sender never emits one
+    // (freeze_manifest's names are unique), so the receiver refuses the whole
+    // offer rather than let the second silently clobber the first.
+    offer_then_close(
+        &mut stream,
+        &[("dup/a.txt", 3, b"AAA"), ("dup/a.txt", 3, b"BBB")],
+    )
+    .await;
+
+    assert!(
+        received_files(&victim).is_empty(),
+        "a duplicate-path offer writes nothing"
+    );
+    assert!(
+        !victim.receive_dir().join("dup").exists(),
+        "not even the top-level directory is created"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flat_offer_with_two_same_basename_files_still_disambiguates() {
+    // Version skew: a pre-folder sender did not uniquify basenames, so it could
+    // offer two files both named "f.txt" in ONE transfer. The receiver must still
+    // disambiguate them (f.txt + f (1).txt) as before — the duplicate-path guard
+    // is scoped to directories and nested paths, never a plain top-level file.
+    let server = TestServer::start().await;
+    let switchboard = MemorySwitchboard::new();
+    let code = universallink_core::account_key::generate_recovery_code();
+    let victim = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
+    let (rogue_id, _conn, rogue) = attested_sink(&server, &switchboard, &code).await;
+
+    let mut watcher = spawn_component(
+        &victim,
+        "watcher",
+        "tray",
+        &["transfers.read", "devices.read", "session.read"],
+    )
+    .await;
+    subscribe_transfers(&mut watcher).await;
+    wait_server_connected(&mut watcher, true).await;
+    wait_attested(&mut watcher, &rogue_id).await;
+
+    let peer = victim_peer(&victim);
+    let mut stream = rogue.open(&peer).await.expect("the switchboard routes");
+    offer_then_close(&mut stream, &[("f.txt", 3, b"AAA"), ("f.txt", 3, b"BBB")]).await;
+
+    let finished = watcher.wait_notification("transfer.finished").await;
+    assert_eq!(finished["paths"].as_array().expect("paths").len(), 2);
+    assert_eq!(
+        std::fs::read(victim.receive_dir().join("f.txt")).unwrap(),
+        b"AAA"
+    );
+    assert_eq!(
+        std::fs::read(victim.receive_dir().join("f (1).txt")).unwrap(),
+        b"BBB"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_peer_outside_the_directory_is_refused() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
@@ -816,17 +1044,6 @@ async fn files_send_validates_paths_and_target() {
         .expect_err("unknown target");
     assert_eq!(err.app_code(), "DEVICE_UNKNOWN");
 
-    // A directory is not a file (v1 "flat files").
-    let dir = a.config_dir().to_str().unwrap();
-    let err = sender
-        .request(
-            "files.send",
-            json!({ "device_id": b.device_id(), "paths": [dir] }),
-        )
-        .await
-        .expect_err("directory refused");
-    assert_eq!(err.code, -32602, "{err:?}");
-
     // An absent path.
     let missing = a.config_dir().join("not-there.txt");
     let err = sender
@@ -904,8 +1121,9 @@ async fn transfer_is_refused(rogue: &Arc<MemoryTransport>, node_id: &str, relay:
     let (_dir, src) = scratch_file(b"payload");
     let files = vec![OutgoingFile {
         name: "f.bin".into(),
-        source: src,
+        source: Some(src),
         size: b"payload".len() as u64,
+        is_dir: false,
     }];
     let peer = PeerAddr {
         node_id: node_id.to_string(),
@@ -977,6 +1195,19 @@ fn scratch_file(contents: &[u8]) -> (tempfile::TempDir, PathBuf) {
     let path = dir.path().join("f.bin");
     std::fs::write(&path, contents).expect("write the temporary file");
     (dir, path)
+}
+
+/// A temporary source TREE to send, returning `(guard, top)`:
+///   top/a.txt = "alpha", top/sub/b.bin = "beta bytes", top/empty/ (empty).
+/// The `TempDir` guard must outlive the send.
+fn scratch_tree() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let top = dir.path().join("top");
+    std::fs::create_dir_all(top.join("sub")).expect("create sub");
+    std::fs::create_dir_all(top.join("empty")).expect("create empty dir");
+    std::fs::write(top.join("a.txt"), b"alpha").expect("write a.txt");
+    std::fs::write(top.join("sub").join("b.bin"), b"beta bytes").expect("write b.bin");
+    (dir, top)
 }
 
 /// A peer of the account (attested under `code`) whose transport ACCEPTS

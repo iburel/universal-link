@@ -747,8 +747,10 @@ impl Conn {
 
     /// Starts an outgoing transfer toward `device_id`. Fire-and-forget: returns
     /// the `transfer_id` right away, tracking goes through the `transfers`
-    /// topic. Resolving the peer verifies the C7 attestation (fail-closed).
-    /// v1 "flat files": a directory in `paths` is refused (`-32602`).
+    /// topic. Resolving the peer verifies the C7 attestation (fail-closed). A
+    /// directory in `paths` is walked into a tree manifest (the same walk the
+    /// clipboard uses); an unrepresentable name or an over-cap manifest is
+    /// refused (`-32602` / `MANIFEST_TOO_LARGE`).
     fn files_send(&self, params: &Value) -> Result<Value, RpcErr> {
         self.require_scope("files.send")?;
         let device_id = rpc::required_str(params, "device_id")?;
@@ -758,6 +760,7 @@ impl Conn {
             Err(crate::dataplane::SendError::UnknownDevice) => Err(RpcErr::app("DEVICE_UNKNOWN")),
             Err(crate::dataplane::SendError::Offline) => Err(RpcErr::app("DEVICE_OFFLINE")),
             Err(crate::dataplane::SendError::BadPath(msg)) => Err(RpcErr::invalid_params(&msg)),
+            Err(crate::dataplane::SendError::Rejected(err)) => Err(err),
         }
     }
 

@@ -540,7 +540,7 @@ pub fn freeze_manifest(paths: &[String]) -> Result<Vec<FileEntry>, RpcErr> {
                 // it (nothing under it would otherwise imply it).
                 walk.push(top, 0, true, None)?;
             }
-        } else {
+        } else if meta.is_file() {
             walk.push(
                 top,
                 meta.len(),
@@ -550,6 +550,15 @@ pub fn freeze_manifest(paths: &[String]) -> Result<Vec<FileEntry>, RpcErr> {
                     source,
                 }),
             )?;
+        } else {
+            // A fifo, socket, or device node explicitly named at the top level:
+            // there are no bytes to serve, so refuse the whole announce rather
+            // than mint a bogus 0-byte "file" (a special file found INSIDE a
+            // walked folder is skipped instead — see `walk_dir` — but an
+            // explicitly-copied path the caller pointed at is an error).
+            return Err(RpcErr::invalid_params(&format!(
+                "not a regular file: {raw}"
+            )));
         }
     }
     Ok(walk.files)
@@ -732,8 +741,10 @@ pub fn validate_remote_manifest(files: &[Value]) -> Option<Vec<FileEntry>> {
 /// A manifest `path` a destination may safely join onto its paste target:
 /// relative, `/`-separated, no traversal. Reasoning on the raw string (never
 /// `Path`, whose splitting diverges across platforms) — the same OS-independent
-/// discipline as `safe_base_name` and the transfer receiver.
-fn is_safe_rel_path(raw: &str) -> bool {
+/// discipline as `safe_base_name`. Shared with the transfer receiver
+/// (`dataplane`), so a copied folder and a `files.send` folder validate names
+/// by the exact same rule.
+pub(crate) fn is_safe_rel_path(raw: &str) -> bool {
     if raw.is_empty() || raw.starts_with('/') {
         return false;
     }
@@ -1012,6 +1023,20 @@ mod tests {
         let bad = top.join(std::ffi::OsStr::from_bytes(b"x\xffy.txt"));
         std::fs::write(&bad, b"b").unwrap();
         let err = freeze_manifest(&[top.to_string_lossy().into_owned()]).unwrap_err();
+        assert_eq!(err.code, -32602);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn freeze_manifest_refuses_a_non_regular_top_level_path() {
+        // A unix socket (neither a regular file nor a directory) explicitly named
+        // at the top level has no bytes to serve: fail closed rather than mint a
+        // bogus 0-byte "file". (A special file found INSIDE a walk is skipped
+        // instead — see `walk_dir` — but an explicitly-copied path is an error.)
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let err = freeze_manifest(&[sock.to_string_lossy().into_owned()]).unwrap_err();
         assert_eq!(err.code, -32602);
     }
 
