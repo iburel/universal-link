@@ -59,6 +59,9 @@ activity — only connections, heartbeats, and the directory.
    `node_id`).
 3. The server validates the ID token (signature via the issuer's JWKS, `aud`,
    `exp`), verifies the proof, creates the device under the account `(iss, sub)`.
+   The JWKS is cached and re-fetched when a token carries an unknown key id, so
+   an issuer key rotation is picked up without a restart (rate-limited by
+   `UNIVERSALLINK_JWKS_REFRESH_MIN_SECS`).
 
 ### Nominal connection (at every startup)
 

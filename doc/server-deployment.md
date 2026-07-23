@@ -175,7 +175,10 @@ Required: `UNIVERSALLINK_SERVER_BIND`, `UNIVERSALLINK_OIDC_ISSUER`,
 `UNIVERSALLINK_SERVER_STATE` (`universallink-directory.json`),
 `UNIVERSALLINK_HEARTBEAT_SECS` (30), `UNIVERSALLINK_HEARTBEAT_MAX_MISSED` (2),
 `UNIVERSALLINK_NONCE_TTL_SECS` (60), `UNIVERSALLINK_FRESH_TOKEN_MAX_AGE_SECS`
-(300), `UNIVERSALLINK_MAX_REQUESTS_PER_MINUTE` (120; `0` = unlimited),
+(300), `UNIVERSALLINK_JWKS_REFRESH_MIN_SECS` (60; shortest delay between two
+JWKS fetches — the issuer's signing keys are re-fetched on a key-id miss, i.e. a
+key rotation, but no more often than this),
+`UNIVERSALLINK_MAX_REQUESTS_PER_MINUTE` (120; `0` = unlimited),
 `UNIVERSALLINK_LOG` (log level). Detail and semantics:
 [`server-daemon/src/config.rs`](../server-daemon/src/config.rs) and
 [`server-api.md`](server-api.md).

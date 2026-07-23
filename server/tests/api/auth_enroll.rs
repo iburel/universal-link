@@ -209,6 +209,69 @@ async fn enroll_rejects_token_without_issuer() {
     assert_eq!(err.app_code(), "OIDC_INVALID");
 }
 
+// The issuer rotates its signing keys periodically. The server caches the JWKS,
+// so it must re-fetch when a token arrives under a key id it has not seen —
+// otherwise every enrollment fails from the first rotation until a restart.
+
+#[tokio::test]
+async fn enroll_accepts_token_after_idp_key_rotation() {
+    // No refresh cooldown: the rotation and the retry happen within one test,
+    // far under the production floor.
+    let env = TestEnv::start_with(|c| c.oidc.jwks_refresh_min_interval = Duration::ZERO).await;
+
+    // A first enroll makes the server fetch and cache the issuer's JWKS.
+    let _ = enroll_device(&env, "alice", "Before", "linux").await;
+
+    // The IdP rotates: new tokens carry a `kid` absent from the cached JWKS.
+    env.oidc.rotate_signing_key();
+
+    // The server must re-fetch the JWKS on the key-id miss and accept the token.
+    let mut conn = env.connect().await;
+    let key = DeviceKey::generate();
+    let nonce = challenge(&mut conn).await;
+    let result = try_enroll(
+        &mut conn,
+        env.oidc.id_token("alice"),
+        key.node_id(),
+        key.proof(&nonce),
+    )
+    .await
+    .expect("enroll after rotation");
+    assert!(
+        result["device_id"]
+            .as_str()
+            .expect("device_id")
+            .starts_with("d_")
+    );
+}
+
+#[tokio::test]
+async fn unknown_key_id_does_not_refetch_jwks_within_cooldown() {
+    // With a real cooldown, a flood of tokens bearing unknown key ids must not
+    // become one JWKS request per token (amplification against the issuer).
+    let env =
+        TestEnv::start_with(|c| c.oidc.jwks_refresh_min_interval = Duration::from_secs(60)).await;
+
+    for _ in 0..3 {
+        let mut conn = env.connect().await;
+        let key = DeviceKey::generate();
+        let nonce = challenge(&mut conn).await;
+        let err = try_enroll(
+            &mut conn,
+            env.oidc.id_token_unknown_kid("alice"),
+            key.node_id(),
+            key.proof(&nonce),
+        )
+        .await
+        .expect_err("unknown kid");
+        assert_eq!(err.app_code(), "OIDC_INVALID");
+    }
+
+    // Exactly one fetch: the first miss re-fetched (the cache was empty), the
+    // rest fell inside the cooldown.
+    assert_eq!(env.oidc.jwks_fetch_count(), 1);
+}
+
 #[tokio::test]
 async fn enroll_rejects_unknown_platform() {
     let env = TestEnv::start().await;

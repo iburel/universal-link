@@ -580,6 +580,7 @@ mod tests {
                     issuer_url: "http://127.0.0.1:9".into(),
                     client_id: "tests".into(),
                     max_fresh_token_age: Duration::from_secs(300),
+                    jwks_refresh_min_interval: Duration::from_secs(60),
                 },
                 heartbeat_interval: Duration::from_secs(30),
                 heartbeat_max_missed: 2,

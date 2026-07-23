@@ -54,6 +54,11 @@ pub struct OidcConfig {
     /// Maximum age (`iat`) of an ID token for sensitive operations
     /// (`auth.enroll`, `devices.revoke`).
     pub max_fresh_token_age: Duration,
+    /// Shortest delay between two JWKS fetches. The issuer's signing keys are
+    /// re-fetched when a token carries a key id absent from the cache (IdP key
+    /// rotation), but no more often than this — otherwise tokens bearing
+    /// unknown key ids could each trigger a request to the issuer.
+    pub jwks_refresh_min_interval: Duration,
 }
 
 pub struct ServerHandle {
