@@ -23,7 +23,7 @@
 //! remote manifest carries no local backing, only the metadata a paste needs.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use serde_json::{Value, json};
@@ -481,47 +481,215 @@ pub fn parse_formats(params: &Value) -> Result<Vec<Format>, RpcErr> {
     Ok(formats)
 }
 
+/// Defensive bound on how deep a copied folder is walked before the announce is
+/// refused (`-32602`). Real trees never approach it, but it keeps the recursion
+/// below from ever overflowing the stack on a pathological (locally-crafted)
+/// tree. Kept well under the ~550-frame overflow point of a debug build on the
+/// 2 MiB stack of a tokio worker thread (where the RPC handler runs), so the
+/// guard fires gracefully under every build profile rather than aborting.
+const MAX_WALK_DEPTH: usize = 256;
+
 /// Freezes the file manifest from the backend-supplied `paths`: canonicalizes
 /// each path, `stat`s it (no byte read), captures its identity, and assigns a
-/// unique relative name. v1 "flat files": a directory is refused (`-32602`) —
-/// tree freezing is a follow-up, the manifest shape (`dir`) already anticipates
-/// it. Beyond `MANIFEST_MAX` entries, `MANIFEST_TOO_LARGE`.
+/// unique relative name. A directory is **walked** — every regular file under it
+/// becomes an entry (`<folder>/<rel>`), and a folder with no files under it
+/// becomes a `dir:true` entry so the destination recreates it. Beyond
+/// `MANIFEST_MAX` entries, `MANIFEST_TOO_LARGE`.
+///
+/// Fail-closed, so every entry we mint survives the destination's re-validation
+/// ([`validate_remote_manifest`]) and no paste is ever silently partial: a name
+/// that is not UTF-8, or carries a character the wire path forbids (`\`, `:`, a
+/// control char — legal on Linux, not on the wire), or an unreadable directory,
+/// refuses the whole announce rather than dropping the offending file. Symlinks
+/// discovered during the walk are followed only to a regular file (serving the
+/// target's bytes, as the top-level `canonicalize` already does for an
+/// explicitly-copied link); a directory symlink is never traversed (cycles,
+/// escapes) and is skipped with a log.
 pub fn freeze_manifest(paths: &[String]) -> Result<Vec<FileEntry>, RpcErr> {
     if paths.len() > MANIFEST_MAX {
         return Err(RpcErr::app("MANIFEST_TOO_LARGE"));
     }
     let mut used = HashSet::new();
-    let mut files = Vec::with_capacity(paths.len());
-    for (index, raw) in paths.iter().enumerate() {
-        // Canonicalize first: it both resolves the real target (symlinks
-        // followed once, here) and proves the path exists. The bytes are later
-        // served strictly from this canonical path.
+    let mut walk = Walk {
+        files: Vec::new(),
+        next_id: 0,
+    };
+    for raw in paths {
+        // Canonicalize first: it both resolves the real target (an explicitly
+        // copied symlink is followed once, here) and proves the path exists. The
+        // bytes are later served strictly from this canonical path.
         let source = std::fs::canonicalize(raw)
             .map_err(|e| RpcErr::invalid_params(&format!("{raw} — {e}")))?;
         let meta = std::fs::metadata(&source)
             .map_err(|e| RpcErr::invalid_params(&format!("{raw} — {e}")))?;
+        // The displayed name comes from the ORIGINAL path (what the user copied),
+        // not the canonical target: a copied `link.txt` stays `link.txt` even
+        // though we read its target's bytes. Trailing separators are trimmed first
+        // — a copied folder often arrives as `.../folder/`, whose bare basename
+        // would otherwise be empty. Uniquified only at the top level — every
+        // descendant is prefixed by its (unique) top, so descendants are unique by
+        // construction.
+        let trimmed = raw.trim_end_matches(['/', '\\']);
+        let base = safe_base_name(trimmed)
+            .ok_or_else(|| RpcErr::invalid_params(&format!("path without a usable name: {raw}")))?;
+        let top = unique_rel(&mut used, &base);
         if meta.is_dir() {
+            if walk.walk_dir(&source, &top, 0)? == 0 {
+                // An empty top-level folder: emit it so the destination recreates
+                // it (nothing under it would otherwise imply it).
+                walk.push(top, 0, true, None)?;
+            }
+        } else {
+            walk.push(
+                top,
+                meta.len(),
+                false,
+                Some(LocalBacking {
+                    identity: identity_of(&meta),
+                    source,
+                }),
+            )?;
+        }
+    }
+    Ok(walk.files)
+}
+
+/// The accumulating state of a [`freeze_manifest`] walk: the entries frozen so
+/// far and the next opaque `file_id` to hand out. `file_id`s are a monotonic
+/// counter (one top-level path now expands to many entries), unique and opaque
+/// as the contract requires.
+struct Walk {
+    files: Vec<FileEntry>,
+    next_id: usize,
+}
+
+impl Walk {
+    /// Appends one manifest entry, enforcing the manifest cap and the wire-path
+    /// safety invariant on every `rel_path` we mint.
+    fn push(
+        &mut self,
+        rel_path: String,
+        size: u64,
+        is_dir: bool,
+        backing: Option<LocalBacking>,
+    ) -> Result<(), RpcErr> {
+        if self.files.len() >= MANIFEST_MAX {
+            return Err(RpcErr::app("MANIFEST_TOO_LARGE"));
+        }
+        // Guarantee here what the destination re-validates fail-closed: a path it
+        // would reject drops the WHOLE announce cross-device, so refuse it at the
+        // source instead — a copied folder holding one unrepresentable name fails
+        // exactly as that single file already does today.
+        if !is_safe_rel_path(&rel_path) {
             return Err(RpcErr::invalid_params(&format!(
-                "folders are not supported yet (v1 files only): {raw}"
+                "unsupported name in a copied folder: {rel_path}"
             )));
         }
-        // The displayed name comes from the ORIGINAL path (what the user
-        // copied), not the canonical target: a copied `link.txt` stays
-        // `link.txt` even though we read its target's bytes.
-        let base = safe_base_name(raw)
-            .ok_or_else(|| RpcErr::invalid_params(&format!("path without a usable name: {raw}")))?;
-        files.push(FileEntry {
-            file_id: format!("f{index}"),
-            rel_path: unique_rel(&mut used, &base),
-            size: meta.len(),
-            is_dir: false,
-            backing: Some(LocalBacking {
-                identity: identity_of(&meta),
-                source,
-            }),
+        let file_id = format!("f{}", self.next_id);
+        self.next_id += 1;
+        self.files.push(FileEntry {
+            file_id,
+            rel_path,
+            size,
+            is_dir,
+            backing,
         });
+        Ok(())
     }
-    Ok(files)
+
+    /// Walks the canonical directory `dir`, whose entries are exposed under the
+    /// relative prefix `rel_prefix`. Emits one entry per regular file and one
+    /// `dir:true` entry per directory that ends up with no emitted descendant (an
+    /// empty folder, or one holding only skipped symlinks). Returns how many
+    /// entries the subtree contributed — `0` tells the caller to emit `dir:true`
+    /// for `dir` itself. Deterministic: entries are processed name-sorted.
+    fn walk_dir(&mut self, dir: &Path, rel_prefix: &str, depth: usize) -> Result<usize, RpcErr> {
+        if depth > MAX_WALK_DEPTH {
+            return Err(RpcErr::invalid_params(&format!(
+                "folder nesting too deep: {rel_prefix}"
+            )));
+        }
+        let mut names: Vec<std::ffi::OsString> = Vec::new();
+        let rd = std::fs::read_dir(dir)
+            .map_err(|e| RpcErr::invalid_params(&format!("{rel_prefix} — {e}")))?;
+        for entry in rd {
+            let entry =
+                entry.map_err(|e| RpcErr::invalid_params(&format!("{rel_prefix} — {e}")))?;
+            names.push(entry.file_name());
+            // Bound the transient buffer against the cap while enumerating: a
+            // single directory holding millions of entries must be refused after
+            // reading ~MANIFEST_MAX names, not drained and sorted whole into
+            // memory before the per-entry cap in `push` fires.
+            if self.files.len() + names.len() > MANIFEST_MAX {
+                return Err(RpcErr::app("MANIFEST_TOO_LARGE"));
+            }
+        }
+        names.sort();
+
+        let before = self.files.len();
+        for name in names {
+            // A non-UTF-8 name cannot be a JSON wire `path`: fail-closed.
+            let Some(name_str) = name.to_str() else {
+                return Err(RpcErr::invalid_params(&format!(
+                    "non-UTF-8 name in a copied folder under {rel_prefix}"
+                )));
+            };
+            let child_rel = format!("{rel_prefix}/{name_str}");
+            let child_path = dir.join(&name);
+            // lstat: classify without following — we never traverse a symlink as
+            // a directory.
+            let lmeta = std::fs::symlink_metadata(&child_path)
+                .map_err(|e| RpcErr::invalid_params(&format!("{child_rel} — {e}")))?;
+            let ft = lmeta.file_type();
+            if ft.is_symlink() {
+                // Follow only to a regular file (serve the target's bytes). A
+                // directory symlink, a broken one, or a special target is skipped.
+                match std::fs::metadata(&child_path) {
+                    Ok(m) if m.is_file() => {
+                        let source = std::fs::canonicalize(&child_path)
+                            .map_err(|e| RpcErr::invalid_params(&format!("{child_rel} — {e}")))?;
+                        self.push(
+                            child_rel,
+                            m.len(),
+                            false,
+                            Some(LocalBacking {
+                                identity: identity_of(&m),
+                                source,
+                            }),
+                        )?;
+                    }
+                    _ => tracing::warn!(
+                        path = %child_rel,
+                        "clipboard: symlink in a copied folder not followed"
+                    ),
+                }
+            } else if ft.is_dir() {
+                // A real subdirectory — the join stays canonical (no symlink
+                // component). Recurse; if it contributed nothing, it is empty.
+                if self.walk_dir(&child_path, &child_rel, depth + 1)? == 0 {
+                    self.push(child_rel, 0, true, None)?;
+                }
+            } else if ft.is_file() {
+                self.push(
+                    child_rel,
+                    lmeta.len(),
+                    false,
+                    Some(LocalBacking {
+                        identity: identity_of(&lmeta),
+                        source: child_path,
+                    }),
+                )?;
+            } else {
+                // A fifo, socket, or device node: not a regular file, no bytes to
+                // serve — skipped with a log rather than failing the copy.
+                tracing::warn!(
+                    path = %child_rel,
+                    "clipboard: non-regular entry in a copied folder skipped"
+                );
+            }
+        }
+        Ok(self.files.len() - before)
+    }
 }
 
 /// Re-validates a manifest received over the network (`clip_announce`) and
@@ -701,10 +869,276 @@ mod tests {
         assert!(!files[0].is_dir);
     }
 
+    /// Look an entry up by its relative manifest path.
+    fn by_path<'a>(files: &'a [FileEntry], path: &str) -> &'a FileEntry {
+        files
+            .iter()
+            .find(|f| f.rel_path == path)
+            .unwrap_or_else(|| panic!("no manifest entry {path:?} in {:?}", paths_of(files)))
+    }
+
+    fn paths_of(files: &[FileEntry]) -> Vec<&str> {
+        files.iter().map(|f| f.rel_path.as_str()).collect()
+    }
+
     #[test]
-    fn freeze_manifest_refuses_a_directory() {
+    fn freeze_manifest_walks_a_directory_tree() {
+        // top/
+        //   a.txt            (file)
+        //   sub/b.txt        (file, implies `top` and `top/sub`)
+        //   empty/           (empty dir → its own `dir:true` entry)
         let dir = tempfile::tempdir().unwrap();
-        let err = freeze_manifest(&[dir.path().to_string_lossy().into_owned()]).unwrap_err();
+        let top = dir.path().join("top");
+        std::fs::create_dir(&top).unwrap();
+        std::fs::write(top.join("a.txt"), b"hello").unwrap();
+        std::fs::create_dir(top.join("sub")).unwrap();
+        std::fs::write(top.join("sub/b.txt"), b"world!").unwrap();
+        std::fs::create_dir(top.join("empty")).unwrap();
+
+        let files = freeze_manifest(&[top.to_string_lossy().into_owned()]).unwrap();
+
+        // The two files carry backing + size; paths are `/`-separated under `top`.
+        let a = by_path(&files, "top/a.txt");
+        assert_eq!(a.size, 5);
+        assert!(!a.is_dir);
+        assert!(a.backing.is_some());
+        assert_eq!(by_path(&files, "top/sub/b.txt").size, 6);
+
+        // The empty folder is materialized as a `dir:true`, sizeless, backing-less
+        // entry; the non-empty `top` and `top/sub` are implied, never emitted.
+        let empty = by_path(&files, "top/empty");
+        assert!(empty.is_dir);
+        assert_eq!(empty.size, 0);
+        assert!(empty.backing.is_none());
+        assert!(
+            !paths_of(&files).contains(&"top"),
+            "non-empty top is implied"
+        );
+        assert!(
+            !paths_of(&files).contains(&"top/sub"),
+            "non-empty sub is implied"
+        );
+
+        // Every file_id is unique.
+        let ids: HashSet<&str> = files.iter().map(|f| f.file_id.as_str()).collect();
+        assert_eq!(ids.len(), files.len(), "file_ids collide");
+    }
+
+    #[test]
+    fn freeze_manifest_emits_a_lone_empty_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path().join("solo");
+        std::fs::create_dir(&top).unwrap();
+        let files = freeze_manifest(&[top.to_string_lossy().into_owned()]).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].rel_path, "solo");
+        assert!(files[0].is_dir);
+        assert!(files[0].backing.is_none());
+    }
+
+    #[test]
+    fn freeze_manifest_disambiguates_two_top_level_folders_of_the_same_name() {
+        // Two distinct folders both named `dup`, each with a file: the second's
+        // whole subtree is re-rooted under the uniquified `dup (1)`.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("p/dup");
+        let q = dir.path().join("q/dup");
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::create_dir_all(&q).unwrap();
+        std::fs::write(p.join("x.txt"), b"a").unwrap();
+        std::fs::write(q.join("y.txt"), b"bb").unwrap();
+
+        let files = freeze_manifest(&[
+            p.to_string_lossy().into_owned(),
+            q.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        by_path(&files, "dup/x.txt");
+        by_path(&files, "dup (1)/y.txt");
+    }
+
+    #[test]
+    fn freeze_manifest_still_freezes_a_lone_directory_symlink_by_following_it() {
+        // A directory passed EXPLICITLY (even via a symlink) is followed — the
+        // top-level `canonicalize`. Only symlinks DISCOVERED inside a walk are not.
+        #[cfg(unix)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let real = dir.path().join("real");
+            std::fs::create_dir(&real).unwrap();
+            std::fs::write(real.join("f.txt"), b"z").unwrap();
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let files = freeze_manifest(&[link.to_string_lossy().into_owned()]).unwrap();
+            // Named after the copied `link`, bytes from the real tree.
+            by_path(&files, "link/f.txt");
+        }
+    }
+
+    #[test]
+    fn freeze_manifest_refuses_more_top_level_paths_than_the_cap() {
+        let too_many = vec!["x".to_string(); MANIFEST_MAX + 1];
+        let err = freeze_manifest(&too_many).unwrap_err();
+        assert_eq!(err.code, RpcErr::app("MANIFEST_TOO_LARGE").code);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn freeze_manifest_refuses_a_wire_unsafe_name_in_a_tree() {
+        // A newline is a legal Linux filename byte but never a legal wire path:
+        // rather than drop the file (and paste a silently-incomplete folder), the
+        // whole announce is refused — as copying that single file already is.
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path().join("top");
+        std::fs::create_dir(&top).unwrap();
+        std::fs::write(top.join("ok.txt"), b"a").unwrap();
+        std::fs::write(top.join("ba\nd.txt"), b"b").unwrap();
+        let err = freeze_manifest(&[top.to_string_lossy().into_owned()]).unwrap_err();
+        assert_eq!(err.code, -32602);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn freeze_manifest_refuses_a_non_utf8_name_in_a_tree() {
+        use std::os::unix::ffi::OsStrExt;
+        // A 0xFF byte is a legal Linux filename byte but not valid UTF-8: it can
+        // never be a JSON wire path, so the whole announce fails closed — never a
+        // lossy U+FFFD substitution that would pass validation yet name no file.
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path().join("top");
+        std::fs::create_dir(&top).unwrap();
+        std::fs::write(top.join("ok.txt"), b"a").unwrap();
+        let bad = top.join(std::ffi::OsStr::from_bytes(b"x\xffy.txt"));
+        std::fs::write(&bad, b"b").unwrap();
+        let err = freeze_manifest(&[top.to_string_lossy().into_owned()]).unwrap_err();
+        assert_eq!(err.code, -32602);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn freeze_manifest_contains_and_follows_symlinks_discovered_inside_a_walk() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        // A tree OUTSIDE the copied folder, to prove a discovered directory
+        // symlink is never traversed (no escape from the copied tree).
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"do-not-leak").unwrap();
+        let target = dir.path().join("target.bin");
+        std::fs::write(&target, b"12345678").unwrap(); // 8 bytes
+
+        let top = dir.path().join("top");
+        std::fs::create_dir(&top).unwrap();
+        std::fs::write(top.join("real.txt"), b"ok").unwrap();
+        symlink(&outside, top.join("dirlink")).unwrap(); // dir symlink -> skipped
+        symlink(&target, top.join("filelink")).unwrap(); // file symlink -> followed
+        symlink(dir.path().join("nope"), top.join("dangling")).unwrap(); // broken -> skipped
+
+        let files = freeze_manifest(&[top.to_string_lossy().into_owned()]).unwrap();
+        let paths = paths_of(&files);
+        // The dir symlink is neither traversed nor emitted; nothing under `outside`
+        // leaks into the manifest.
+        assert!(
+            !paths.iter().any(|p| p.contains("secret")),
+            "escaped the copied tree: {paths:?}"
+        );
+        assert!(!paths.contains(&"top/dirlink"));
+        assert!(!paths.contains(&"top/dangling"));
+        // The file symlink IS followed: the entry serves the TARGET's bytes, from
+        // the canonical target path.
+        let fl = by_path(&files, "top/filelink");
+        assert!(!fl.is_dir);
+        assert_eq!(
+            fl.size, 8,
+            "size must be the target length, not the symlink's"
+        );
+        let backing = fl
+            .backing
+            .as_ref()
+            .expect("a followed symlink carries backing");
+        assert_eq!(backing.source, std::fs::canonicalize(&target).unwrap());
+        by_path(&files, "top/real.txt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn freeze_manifest_emits_dir_true_for_a_folder_holding_only_skipped_symlinks() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let realdir = dir.path().join("realdir");
+        std::fs::create_dir(&realdir).unwrap();
+        let top = dir.path().join("top");
+        std::fs::create_dir(&top).unwrap();
+        symlink(&realdir, top.join("dirlink")).unwrap();
+        symlink(dir.path().join("missing"), top.join("broken")).unwrap();
+        let files = freeze_manifest(&[top.to_string_lossy().into_owned()]).unwrap();
+        // `top` held only skipped symlinks -> emitted as a single empty dir entry.
+        assert_eq!(
+            files.len(),
+            1,
+            "only `top` expected: {:?}",
+            paths_of(&files)
+        );
+        assert_eq!(files[0].rel_path, "top");
+        assert!(files[0].is_dir);
+        assert!(files[0].backing.is_none());
+    }
+
+    #[test]
+    fn freeze_manifest_emits_only_the_deepest_of_a_nested_empty_chain() {
+        // a/b/c all exist and are empty, with no files anywhere: exactly ONE dir
+        // entry (the deepest); `a` and `a/b` are implied by its path.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        std::fs::create_dir_all(a.join("b/c")).unwrap();
+        let files = freeze_manifest(&[a.to_string_lossy().into_owned()]).unwrap();
+        assert_eq!(paths_of(&files), vec!["a/b/c"]);
+        assert!(files[0].is_dir);
+        assert!(files[0].backing.is_none());
+    }
+
+    #[test]
+    fn freeze_manifest_names_a_top_level_folder_given_a_trailing_slash() {
+        // A copied folder often arrives as `.../folder/`; the trailing separator
+        // must not empty the derived name and refuse the copy.
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path().join("folder");
+        std::fs::create_dir(&top).unwrap();
+        std::fs::write(top.join("a.txt"), b"x").unwrap();
+        let raw = format!("{}/", top.to_string_lossy());
+        let files = freeze_manifest(&[raw]).unwrap();
+        by_path(&files, "folder/a.txt");
+    }
+
+    #[test]
+    fn walk_push_enforces_the_in_walk_manifest_cap() {
+        // The pre-walk guard bounds only the count of top-level PATHS; a single
+        // large copy accumulating entries must trip the in-walk cap instead.
+        let mut walk = Walk {
+            files: Vec::new(),
+            next_id: 0,
+        };
+        for i in 0..MANIFEST_MAX {
+            walk.push(format!("f{i}"), 0, true, None).unwrap();
+        }
+        let err = walk
+            .push("one-too-many".to_string(), 0, true, None)
+            .unwrap_err();
+        assert_eq!(err.code, RpcErr::app("MANIFEST_TOO_LARGE").code);
+    }
+
+    #[test]
+    fn freeze_manifest_refuses_a_tree_nested_beyond_the_depth_cap() {
+        // Deeper than MAX_WALK_DEPTH: the guard returns -32602 gracefully and never
+        // overflows the stack (the cap is kept below the debug-build overflow point).
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path().join("top");
+        let mut deep = top.clone();
+        for i in 0..(MAX_WALK_DEPTH + 4) {
+            deep.push(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let err = freeze_manifest(&[top.to_string_lossy().into_owned()]).unwrap_err();
         assert_eq!(err.code, -32602);
     }
 
