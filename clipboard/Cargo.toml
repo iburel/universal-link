@@ -79,6 +79,7 @@ windows = { version = "0.61", features = [
     "Win32_System_Ole",                   # OleInitialize/OleSetClipboard/OleIsCurrentClipboard/ReleaseStgMedium
     "Win32_System_Memory",                # GlobalAlloc/Lock/Unlock for the FILEGROUPDESCRIPTORW
     "Win32_System_DataExchange",          # RegisterClipboardFormatW
+    "Win32_Storage_FileSystem",           # FILE_ATTRIBUTE_DIRECTORY for empty-dir descriptor entries
     "Win32_UI_Shell",                     # FILEGROUPDESCRIPTORW / FILEDESCRIPTORW / FD_*
 ] }
 image = { version = "0.25", default-features = false, features = ["png"] }
