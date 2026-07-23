@@ -27,9 +27,13 @@
 nextest-version = { required = "0.9.120", recommended = "0.9.140" }
 
 [profile.ci]
-# A contention flake that survives two spaced retries is not a flake — fail.
-# Backoff (not immediate) so a retry does not re-hit the same burst of load.
-retries = { backoff = "exponential", count = 2, delay = "2s", max-delay = "8s" }
+# Retry a contention flake so it never reddens a job or `main`; a failure that
+# survives every attempt is a real one. Backoff (not immediate) so a retry does
+# not re-hit the same burst of load. count=4: the Windows named-pipe data-channel
+# test (channel::a_cancelled_read_resynchronizes_on_the_next_request) was observed
+# to time out on its first TWO attempts under runner contention and only pass once
+# the rest of the suite drained — count=2 left zero margin, so we give it more.
+retries = { backoff = "exponential", count = 4, delay = "2s", max-delay = "10s" }
 # Report every failure across the run; the OS matrix already runs to completion
 # per platform, and a papered-over flake must stay visible, not silent.
 fail-fast = false
