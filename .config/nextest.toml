@@ -1,0 +1,89 @@
+# cargo-nextest configuration (CI test runner).
+#
+# WHY nextest and not `cargo test`. `cargo test --workspace` runs each crate's
+# test binary as its own process, all in parallel; its `--test-threads` knob
+# only bounds concurrency *within* one binary. Several integration tests here
+# spin up two full Cores (each with its own tokio reactor) plus their IPC data
+# channels inside a single process. When several such tests overlap on a
+# 3-core CI runner, the OS readiness queue (macOS kqueue, Windows named pipes)
+# can starve one connection past the Core's 30 s FETCH_TIMEOUT; the test then
+# fails with an ~30 s "closed" / CLIP_STALE / PEER_GONE. This is NOT a product
+# bug — in production each Core is its own process with its own reactor, and a
+# single relay never stalls (reproduced natively; only co-located concurrent
+# ones do). Linux (epoll) never exhibits it. `--test-threads=1` could not fix
+# it because it left the OTHER crates' binaries running in parallel.
+#
+# nextest schedules *tests* (not binaries) under one global semaphore, which
+# lets us do the two things `cargo test` could not:
+#   1. cap a set of tests to a chosen concurrency across the WHOLE run (test
+#      groups below);
+#   2. retry the rare residual flake so it never reddens a job or `main`.
+#
+# CAVEAT nextest changes: it runs every test in its OWN process. Tests that
+# serialized on a *process-global* `static Mutex` therefore no longer serialize
+# under nextest — see `serial-os-clipboard`. (Doctests are NOT run by nextest;
+# the CI keeps a dedicated `cargo test --doc` step for them.)
+
+nextest-version = { required = "0.9.120", recommended = "0.9.140" }
+
+[profile.ci]
+# Retry a contention flake so it never reddens a job or `main`; a failure that
+# survives every attempt is a real one. Backoff (not immediate) so a retry does
+# not re-hit the same burst of load. count=4: the Windows named-pipe data-channel
+# test (channel::a_cancelled_read_resynchronizes_on_the_next_request) was observed
+# to time out on its first TWO attempts under runner contention and only pass once
+# the rest of the suite drained — count=2 left zero margin, so we give it more.
+retries = { backoff = "exponential", count = 4, delay = "2s", max-delay = "10s" }
+# Report every failure across the run; the OS matrix already runs to completion
+# per platform, and a papered-over flake must stay visible, not silent.
+fail-fast = false
+# Flaky-but-passed tests are listed in the final summary — the whole point is
+# that a retried flake is surfaced, not swept under the rug.
+final-status-level = "flaky"
+# A genuinely hung test (a real deadlock, not slowness) is killed and retried
+# instead of eating the 45-min job timeout. 60 s is comfortably above the
+# Core's 30 s deadlines, so a slow-but-progressing relay is never killed;
+# 3 × 60 s = 180 s is the hard per-attempt cap.
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[test-groups]
+# At most one heavy cross-reactor test in flight across the entire run. A single
+# such test never stalls (proven natively); only co-located concurrent ones do.
+serial-ipc = { max-threads = 1 }
+# At most one OS-clipboard integration test in flight. These drive a per-session
+# global (the X CLIPBOARD selection, the NSPasteboard, the Win32 clipboard, or a
+# FUSE mount) and each test file already serializes on an in-process `Mutex` and
+# documents "must run single-threaded". That Mutex is defeated by nextest's
+# process-per-test model, so the serialization is re-expressed here as a global
+# group. (`linux_webdav` is deliberately absent: it isolates every test behind
+# its own loopback server + temp dir, so it stays fully parallel.)
+serial-os-clipboard = { max-threads = 1 }
+
+# --- serial-ipc: the data-channel co-location flake -------------------------
+# Scoped to macOS + Windows: Linux (epoll) never starves, so it keeps full
+# parallelism and pays nothing. The filtersets match the integration-test
+# families observed to flake, but correctness does not hinge on the list being
+# exhaustive — `retries` is the real safety net; the group only drives the
+# flake rate to ~0 so retries almost never fire.
+[[profile.ci.overrides]]
+platform = 'cfg(any(target_os = "macos", target_os = "windows"))'
+filter = 'package(universallink-core) & kind(test) & test(/clipboard|dataplane/)'
+test-group = 'serial-ipc'
+
+[[profile.ci.overrides]]
+platform = 'cfg(any(target_os = "macos", target_os = "windows"))'
+filter = 'package(universallink-ipc-client) & kind(test) & test(/channel::/)'
+test-group = 'serial-ipc'
+
+[[profile.ci.overrides]]
+platform = 'cfg(any(target_os = "macos", target_os = "windows"))'
+filter = 'package(universallink-clipboard) & kind(test) & test(/source::/)'
+test-group = 'serial-ipc'
+
+# --- serial-os-clipboard: shared per-session OS resources -------------------
+# No platform scope needed: each of these binaries is `#![cfg(target_os = ...)]`
+# and simply does not exist off its own OS. Anchored regexes so the `linux`
+# prefix never catches `linux_webdav`.
+[[profile.ci.overrides]]
+filter = 'binary(/^x11$/) | binary(/^linux_files$/) | binary(/^macos$/) | binary(/^windows$/)'
+test-group = 'serial-os-clipboard'
