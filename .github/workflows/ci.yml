@@ -160,22 +160,28 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      # Without --all-targets, which would exclude the doctests. Parallelism capped:
-      # the tests depend on 100-to-300 ms windows that a runner's CPU
-      # contention can overrun.
-      #
-      # macOS runs single-threaded (=1), the others =2. The cross-Core relay
-      # tests (e.g. clipboard_net::a_remote_inline_blob_relays_from_the_source_backend)
-      # co-locate two full Cores + their data channels in one process's tokio
-      # reactor; when two such tests overlap on the 3-core macOS runner, macOS's
-      # kqueue readiness ordering can starve one connection past the Core's 30 s
-      # FETCH_TIMEOUT, surfacing as an ~30 s CLIP_STALE/"closed"/PEER_GONE (Linux
-      # epoll does not; reproduced natively — a single relay never stalls, only
-      # co-located concurrent ones do). Serializing macOS keeps at most one such
-      # test in flight, the configuration that is 100% green. Not a product bug:
-      # in production each Core is its own process with its own reactor.
+      # Tests run under cargo-nextest, not `cargo test`. nextest schedules
+      # *tests* (not per-crate binaries) under one global scheduler, which lets
+      # `.config/nextest.toml` (a) cap the co-location-sensitive cross-reactor
+      # tests to one-at-a-time via a test group — the macOS kqueue / Windows
+      # named-pipe data-channel flake that `--test-threads` could not reach,
+      # since that only bounds concurrency *within* a single binary — and
+      # (b) retry the rare residual scheduling flake so it never reddens a job
+      # or `main`. See that file for the full rationale, including why the
+      # OS-clipboard tests are re-serialized by a group (nextest runs each test
+      # in its own process, defeating their in-process serialization Mutex).
+      - name: Install nextest
+        uses: taiki-e/install-action@7572810d7dd469b651bb7793945692cf78da5dd7 # v2.85.0
+        with:
+          tool: nextest
+
       - name: Tests
-        run: cargo test --workspace --locked -- --test-threads=${{ runner.os == 'macOS' && '1' || '2' }}
+        run: cargo nextest run --workspace --locked --profile ci
+
+      # nextest does not run doctests — keep them covered with a dedicated step.
+      # (`--doc` is mutually exclusive with `--all-targets`, hence its own run.)
+      - name: Doctests
+        run: cargo test --workspace --doc --locked
 
       # The real GUI binary is behind `required-features = webview`
       # (its generate_context! embeds ui/dist): --workspace does not cover
