@@ -24,6 +24,7 @@ const DEFAULT_HEARTBEAT_SECS: u64 = 30;
 const DEFAULT_HEARTBEAT_MAX_MISSED: u32 = 2;
 const DEFAULT_NONCE_TTL_SECS: u64 = 60;
 const DEFAULT_FRESH_TOKEN_MAX_AGE_SECS: u64 = 300;
+const DEFAULT_JWKS_REFRESH_MIN_SECS: u64 = 60;
 const DEFAULT_MAX_REQUESTS_PER_MINUTE: u32 = 120;
 
 /// Reads the configuration from the process environment.
@@ -77,6 +78,12 @@ fn load_from(env: &dyn Fn(&str) -> Option<String>) -> Result<Config, String> {
         DEFAULT_FRESH_TOKEN_MAX_AGE_SECS,
         &mut errors,
     );
+    let jwks_refresh_min_interval = optional_secs(
+        env,
+        "UNIVERSALLINK_JWKS_REFRESH_MIN_SECS",
+        DEFAULT_JWKS_REFRESH_MIN_SECS,
+        &mut errors,
+    );
     let max_requests_per_minute = optional_rate_limit(env, &mut errors);
 
     if !errors.is_empty() {
@@ -90,6 +97,7 @@ fn load_from(env: &dyn Fn(&str) -> Option<String>) -> Result<Config, String> {
             issuer_url: issuer_url.expect("validated"),
             client_id: client_id.expect("validated"),
             max_fresh_token_age: max_fresh_token_age.expect("validated"),
+            jwks_refresh_min_interval: jwks_refresh_min_interval.expect("validated"),
         },
         heartbeat_interval: heartbeat_interval.expect("validated"),
         heartbeat_max_missed: heartbeat_max_missed.expect("validated"),
@@ -223,6 +231,10 @@ mod tests {
         assert_eq!(config.heartbeat_max_missed, 2);
         assert_eq!(config.nonce_ttl, Duration::from_secs(60));
         assert_eq!(config.oidc.max_fresh_token_age, Duration::from_secs(300));
+        assert_eq!(
+            config.oidc.jwks_refresh_min_interval,
+            Duration::from_secs(60)
+        );
         assert_eq!(config.max_requests_per_minute, Some(120));
     }
 
@@ -266,12 +278,17 @@ mod tests {
         vars.push(("UNIVERSALLINK_HEARTBEAT_MAX_MISSED", "5"));
         vars.push(("UNIVERSALLINK_NONCE_TTL_SECS", "15"));
         vars.push(("UNIVERSALLINK_FRESH_TOKEN_MAX_AGE_SECS", "600"));
+        vars.push(("UNIVERSALLINK_JWKS_REFRESH_MIN_SECS", "90"));
         vars.push(("UNIVERSALLINK_MAX_REQUESTS_PER_MINUTE", "300"));
         let config = load_from(&env_of(&vars)).expect("valid config");
         assert_eq!(config.heartbeat_interval, Duration::from_secs(10));
         assert_eq!(config.heartbeat_max_missed, 5);
         assert_eq!(config.nonce_ttl, Duration::from_secs(15));
         assert_eq!(config.oidc.max_fresh_token_age, Duration::from_secs(600));
+        assert_eq!(
+            config.oidc.jwks_refresh_min_interval,
+            Duration::from_secs(90)
+        );
         assert_eq!(config.max_requests_per_minute, Some(300));
     }
 

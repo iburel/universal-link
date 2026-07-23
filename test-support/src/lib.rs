@@ -10,6 +10,7 @@
 //! carries only the common machinery.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -109,6 +110,31 @@ D4t4ISEGy0B/qoKF9PCFrQ==
 -----END PRIVATE KEY-----";
 
 const TEST_OIDC_KID: &str = "test-key";
+/// Second signing key, used by `rotate_signing_key` to simulate an IdP key
+/// rotation. Its material is `TEST_OIDC_WRONG_KEY_PEM`; the modulus below is
+/// that key's `n` (base64url), so the JWKS can advertise it after rotation.
+const TEST_OIDC_KID_2: &str = "test-key-2";
+const TEST_OIDC_WRONG_KEY_N_B64: &str = "6Elq28amekLjQmYAhrRsxnkhAUJ-RRdjxaqNDj0iBLaA62eiEL9DQhIrRD3Ulc4TwCV1WJCUBn6s-Fnt2X7fDVLWofI2fLSgRHNRyrOi9xkTkhp1NLv2BDHNvmvhJnO8uFtOUU4Rr6Pqy8x0ORbQd00_ukz3tNjasprhI7uxSMcbV6lADsxnSHB_8YOYjCI3IXDEqofsHZbwzbEuy8uVQ1oltpm0P0yDTbk_9trYrC8QmyN41F_b8BzeOgptEiYWWji3DVUqLc4KePb1wXWz-Z3gNUxSvPxQxPu09PxLbezXpvCKuOYN2sBVmbeXtVkQsHQ862Iv85hXaxeKusnuTQ";
+
+/// An IdP signing key as the fake serves it: `kid`, the PEM it signs with, and
+/// the modulus (`n`) it advertises in the JWKS.
+#[derive(Clone, Copy)]
+struct IssuerKey {
+    kid: &'static str,
+    pem: &'static str,
+    n_b64: &'static str,
+}
+
+const PRIMARY_ISSUER_KEY: IssuerKey = IssuerKey {
+    kid: TEST_OIDC_KID,
+    pem: TEST_OIDC_KEY_PEM,
+    n_b64: TEST_OIDC_KEY_N_B64,
+};
+const ROTATED_ISSUER_KEY: IssuerKey = IssuerKey {
+    kid: TEST_OIDC_KID_2,
+    pem: TEST_OIDC_WRONG_KEY_PEM,
+    n_b64: TEST_OIDC_WRONG_KEY_N_B64,
+};
 
 /// The live state of the browser flow: the user the next `authorize`
 /// authenticates, the authorization codes to exchange, and the refresh
@@ -123,6 +149,9 @@ struct OidcFlows {
     /// (valid token but no longer "fresh") — to exercise the server-side
     /// `OIDC_INVALID` rejection of sensitive operations.
     stale_refresh: bool,
+    /// Current signing key: what `id_token(...)` signs with and what `/jwks`
+    /// advertises. Swapped by `rotate_signing_key`.
+    signing: IssuerKey,
 }
 
 /// Authorization code awaiting exchange, tied to its request (PKCE).
@@ -136,6 +165,9 @@ struct AuthCode {
 pub struct FakeOidc {
     base_url: String,
     flows: Arc<Mutex<OidcFlows>>,
+    /// Number of times `/jwks` has been served — lets a test assert the server
+    /// does not re-fetch the key set on every token (rate-limited refresh).
+    jwks_hits: Arc<AtomicUsize>,
 }
 
 impl FakeOidc {
@@ -151,22 +183,14 @@ impl FakeOidc {
             "authorization_endpoint": format!("{base_url}/authorize"),
             "token_endpoint": format!("{base_url}/token"),
         });
-        let jwks = json!({
-            "keys": [{
-                "kty": "RSA",
-                "use": "sig",
-                "alg": "RS256",
-                "kid": TEST_OIDC_KID,
-                "n": TEST_OIDC_KEY_N_B64,
-                "e": "AQAB",
-            }]
-        });
         let flows = Arc::new(Mutex::new(OidcFlows {
             user: (TEST_SUB.to_string(), Some(TEST_EMAIL.to_string())),
             codes: HashMap::new(),
             refresh_tokens: HashMap::new(),
             stale_refresh: false,
+            signing: PRIMARY_ISSUER_KEY,
         }));
+        let jwks_hits = Arc::new(AtomicUsize::new(0));
 
         let app = axum::Router::new()
             .route(
@@ -178,9 +202,27 @@ impl FakeOidc {
             )
             .route(
                 "/jwks",
-                axum::routing::get(move || {
-                    let v = jwks.clone();
-                    async move { axum::Json(v) }
+                axum::routing::get({
+                    let flows = flows.clone();
+                    let hits = jwks_hits.clone();
+                    move || {
+                        let flows = flows.clone();
+                        let hits = hits.clone();
+                        async move {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            let key = flows.lock().expect("lock OIDC").signing;
+                            axum::Json(json!({
+                                "keys": [{
+                                    "kty": "RSA",
+                                    "use": "sig",
+                                    "alg": "RS256",
+                                    "kid": key.kid,
+                                    "n": key.n_b64,
+                                    "e": "AQAB",
+                                }]
+                            }))
+                        }
+                    }
                 }),
             )
             .route(
@@ -208,11 +250,28 @@ impl FakeOidc {
             axum::serve(listener, app).await.expect("fake OIDC");
         });
 
-        FakeOidc { base_url, flows }
+        FakeOidc {
+            base_url,
+            flows,
+            jwks_hits,
+        }
     }
 
     pub fn issuer(&self) -> String {
         self.base_url.clone()
+    }
+
+    /// Simulates an IdP signing-key rotation: subsequent `id_token(...)` are
+    /// signed by a new key under a new `kid`, and `/jwks` advertises that key
+    /// (only). A server that cached the previous JWKS must re-fetch to accept
+    /// the new tokens.
+    pub fn rotate_signing_key(&self) {
+        self.flows.lock().expect("lock OIDC").signing = ROTATED_ISSUER_KEY;
+    }
+
+    /// How many times the server has fetched `/jwks`.
+    pub fn jwks_fetch_count(&self) -> usize {
+        self.jwks_hits.load(Ordering::SeqCst)
     }
 
     /// The user the next browser flow will authenticate.
@@ -244,21 +303,40 @@ impl FakeOidc {
     }
 
     /// ID token whose default claims `tweak` may alter
-    /// (`iss`, `sub`, `aud`, `iat` = now, `exp` = +1 h).
+    /// (`iss`, `sub`, `aud`, `iat` = now, `exp` = +1 h). Signed by the current
+    /// signing key (see `rotate_signing_key`).
     pub fn id_token_with(
         &self,
         sub: &str,
         tweak: impl FnOnce(&mut serde_json::Map<String, Value>),
     ) -> String {
+        let signing = self.flows.lock().expect("lock OIDC").signing;
         let mut claims = self.default_claims(sub);
         tweak(&mut claims);
-        sign_token(TEST_OIDC_KEY_PEM, &claims)
+        sign_token(signing.kid, signing.pem, &claims)
     }
 
-    /// ID token with valid claims but signed by a key absent from the JWKS.
+    /// ID token with valid claims, stamped with the current `kid` but signed
+    /// with the wrong private key: the signature check fails.
     pub fn id_token_wrong_key(&self, sub: &str) -> String {
+        let signing = self.flows.lock().expect("lock OIDC").signing;
+        // A key genuinely different from the one the JWKS advertises for `kid`.
+        let wrong_pem = if signing.pem == TEST_OIDC_KEY_PEM {
+            TEST_OIDC_WRONG_KEY_PEM
+        } else {
+            TEST_OIDC_KEY_PEM
+        };
         let claims = self.default_claims(sub);
-        sign_token(TEST_OIDC_WRONG_KEY_PEM, &claims)
+        sign_token(signing.kid, wrong_pem, &claims)
+    }
+
+    /// ID token with valid claims, stamped with a `kid` the IdP never
+    /// advertises. The server cannot resolve the key — exercises the
+    /// unknown-key-id path (and, with a real cooldown, its rate limit) without
+    /// an actual rotation.
+    pub fn id_token_unknown_kid(&self, sub: &str) -> String {
+        let claims = self.default_claims(sub);
+        sign_token("no-such-kid", TEST_OIDC_KEY_PEM, &claims)
     }
 
     fn default_claims(&self, sub: &str) -> serde_json::Map<String, Value> {
@@ -273,18 +351,25 @@ impl FakeOidc {
     }
 }
 
-fn sign_token(pem: &str, claims: &serde_json::Map<String, Value>) -> String {
+fn sign_token(kid: &str, pem: &str, claims: &serde_json::Map<String, Value>) -> String {
     let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
-    header.kid = Some(TEST_OIDC_KID.into());
+    header.kid = Some(kid.into());
     let key = jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()).expect("test RSA key");
     jsonwebtoken::encode(&header, claims, &key).expect("JWT signature")
 }
 
-/// ID token issued by the browser flow or a refresh. `email`: the claim
-/// from which the Core derives session.json's `account` (absent if `None`).
-/// `iat_age`: seconds by which the `iat` is aged (0 = fresh) — the `exp`
-/// stays in the future, the token is valid but no longer "fresh".
-fn signed_id_token(issuer: &str, sub: &str, email: Option<&str>, iat_age: u64) -> String {
+/// ID token issued by the browser flow or a refresh, signed by the IdP's
+/// current key. `email`: the claim from which the Core derives session.json's
+/// `account` (absent if `None`). `iat_age`: seconds by which the `iat` is aged
+/// (0 = fresh) — the `exp` stays in the future, the token is valid but no
+/// longer "fresh".
+fn signed_id_token(
+    signing: &IssuerKey,
+    issuer: &str,
+    sub: &str,
+    email: Option<&str>,
+    iat_age: u64,
+) -> String {
     let now = unix_now();
     let mut claims = serde_json::Map::new();
     claims.insert("iss".into(), json!(issuer));
@@ -295,7 +380,7 @@ fn signed_id_token(issuer: &str, sub: &str, email: Option<&str>, iat_age: u64) -
     if let Some(email) = email {
         claims.insert("email".into(), json!(email));
     }
-    sign_token(TEST_OIDC_KEY_PEM, &claims)
+    sign_token(signing.kid, signing.pem, &claims)
 }
 
 /// `GET /authorize`: validates the request (client, PKCE S256), authenticates
@@ -402,21 +487,23 @@ fn token(flows: &Mutex<OidcFlows>, issuer: &str, body: &str) -> axum::response::
             let refresh = format!("rt_{}", random_hex(16));
             f.refresh_tokens
                 .insert(refresh.clone(), (auth.sub.clone(), auth.email.clone()));
+            let signing = f.signing;
             chunked_json(json!({
-                "id_token": signed_id_token(issuer, &auth.sub, auth.email.as_deref(), 0),
+                "id_token": signed_id_token(&signing, issuer, &auth.sub, auth.email.as_deref(), 0),
                 "refresh_token": refresh,
                 "token_type": "Bearer",
                 "expires_in": 3600,
             }))
         }
         Some("refresh_token") => {
-            let (known, stale) = {
+            let (known, stale, signing) = {
                 let f = flows.lock().expect("lock OIDC");
                 (
                     params
                         .get("refresh_token")
                         .and_then(|t| f.refresh_tokens.get(t).cloned()),
                     f.stale_refresh,
+                    f.signing,
                 )
             };
             let Some((sub, email)) = known else {
@@ -426,7 +513,7 @@ fn token(flows: &Mutex<OidcFlows>, issuer: &str, body: &str) -> axum::response::
             // sensitive operations.
             let iat_age = if stale { 3600 } else { 0 };
             chunked_json(json!({
-                "id_token": signed_id_token(issuer, &sub, email.as_deref(), iat_age),
+                "id_token": signed_id_token(&signing, issuer, &sub, email.as_deref(), iat_age),
                 "token_type": "Bearer",
                 "expires_in": 3600,
             }))
