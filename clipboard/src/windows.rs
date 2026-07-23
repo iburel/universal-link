@@ -1291,7 +1291,9 @@ fn rgba_to_dibv5(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
 /// 32bpp (BGRA), `BI_RGB` or `BI_BITFIELDS` with the conventional ARGB masks;
 /// any other layout (palettized, exotic masks, other header sizes) returns
 /// `None` rather than risk wrong colors. A 32bpp source whose alpha is uniformly
-/// zero is treated as opaque (the "alpha ignored" bug mitigation).
+/// zero is treated as opaque (the "alpha ignored" bug mitigation). The pixel
+/// offset is tail-anchored to tolerate the redundant trailing masks Windows
+/// appends to a synthesized `CF_DIBV5` (see the offset computation below).
 fn dib_to_rgba(dib: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     if dib.len() < 40 {
         return None;
@@ -1347,8 +1349,21 @@ fn dib_to_rgba(dib: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
         24 => ((w as usize * 3 + 3) & !3, 3usize),
         _ => return None,
     };
-    let needed = pixel_off.checked_add(stride.checked_mul(h as usize)?)?;
-    if dib.len() < needed {
+    let row_bytes = stride.checked_mul(h as usize)?;
+    // Where the pixel data actually begins. `pixel_off` above is what the header
+    // *implies*; Windows synthesizes `CF_DIBV5` (from a `CF_BITMAP`/`CF_DIB`
+    // source — a PrintScreen capture, Paint, a .NET `Clipboard.SetImage`) as a
+    // `BITMAPV5HEADER` whose masks live IN the header, then appends a redundant
+    // copy of the 3 RGB masks (12 bytes) BEFORE the bits — so the pixels start 12
+    // bytes past `header_size`. Left uncorrected this shifts the whole image by
+    // `12 / bytes_per_px` pixels (3px at 32bpp — confirmed live W→L). Anchor to the
+    // tail of the blob when it lands within that 12-byte window; never trust a far
+    // tail (a `bV5ProfileData` ICC profile trails the bits in a V5 DIB).
+    let pixel_off = match dib.len().checked_sub(row_bytes) {
+        Some(tail) if tail >= pixel_off && tail <= pixel_off + 12 => tail,
+        _ => pixel_off,
+    };
+    if dib.len() < pixel_off.checked_add(row_bytes)? {
         return None;
     }
     let mut rgba = vec![0u8; w as usize * h as usize * 4];
@@ -1550,6 +1565,43 @@ mod tests {
         let (rw, rh, back) = dib_to_rgba(&dib).expect("decode our own DIBV5");
         assert_eq!((rw, rh), (w, h));
         assert_eq!(back, rgba, "pixels (and alpha) must survive the round trip");
+    }
+
+    #[test]
+    fn dib_to_rgba_decodes_a_windows_synthesized_v5_with_trailing_masks() {
+        // Verbatim `CF_DIBV5` the real Windows clipboard synthesized (from a
+        // `CF_BITMAP` set via `Clipboard.SetImage`) for a 3x2 image, captured over
+        // interop. It is a 124-byte `BITMAPV5HEADER` (`BI_BITFIELDS`, masks in the
+        // header) THEN a redundant 12-byte copy of the RGB masks, THEN 24 bytes of
+        // bottom-up BGRA bits: 124 + 12 + 24 = 160. Decoding at `header_size`
+        // (124) shifts the picture by 3 pixels; we must anchor to the tail (136).
+        #[rustfmt::skip]
+        let dib: [u8; 160] = [
+            0x7c, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x20, 0x00, 0x03, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0xff, 0x00, 0x00,
+            0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x42, 0x47, 0x52, 0x73,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, // <- end of 124-byte header
+            0x00, 0x00, 0xff, 0x00, 0x00, 0xff, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, // 12 redundant trailing masks
+            0x78, 0x6e, 0x64, 0xff, 0x96, 0x8c, 0x82, 0xff, 0xb4, 0xaa, 0xa0, 0xff, // bits: bottom row (y=1)
+            0x1e, 0x14, 0x0a, 0xff, 0x3c, 0x32, 0x28, 0xff, 0x5a, 0x50, 0x46, 0xff, // bits: top row (y=0)
+        ];
+        let (w, h, rgba) = dib_to_rgba(&dib).expect("decode Windows-synthesized V5");
+        assert_eq!((w, h), (3, 2));
+        // Top-to-bottom, row-major RGBA — NOT shifted.
+        assert_eq!(
+            rgba,
+            vec![
+                10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, // y=0
+                100, 110, 120, 255, 130, 140, 150, 255, 160, 170, 180, 255, // y=1
+            ],
+        );
     }
 
     #[test]
