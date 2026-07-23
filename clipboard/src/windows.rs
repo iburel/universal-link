@@ -80,7 +80,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_RENDERFORMAT, WNDCLASSW,
 };
 
-use crate::backend::{BackendEvent, ClipboardBackend, FileFetcher, Format, LocalClip, RemoteClip};
+use crate::backend::{
+    BackendEvent, ClipboardBackend, FileFetcher, Format, LocalClip, RemoteClip, RemoteFile,
+};
 
 // The `windows` crate's safe `OleIsCurrentClipboard` maps EVERY success HRESULT
 // — S_OK *and* S_FALSE — to `Ok(())`, collapsing the exact bit the files
@@ -727,8 +729,8 @@ impl Backend {
     /// clipboard (`OleSetClipboard`); its contents are pulled through `fetcher`
     /// one range at a time at paste/copy-out. A remote promise supersedes any
     /// local inline capture (convergence), so the cache is invalidated exactly
-    /// like [`on_offer`](Self::on_offer). Without an OLE apartment, or with no
-    /// non-directory file to promise, this refuses cleanly (withdraw + return).
+    /// like [`on_offer`](Self::on_offer). Without an OLE apartment, or with an
+    /// empty manifest, this refuses cleanly (withdraw + return).
     fn on_offer_files(&mut self, clip: RemoteClip, fetcher: Arc<dyn FileFetcher>) {
         self.cache.invalidate();
         if !self.ole_available {
@@ -736,9 +738,10 @@ impl Backend {
             self.relinquish();
             return;
         }
-        // `build_files_data_object` filters `!dir`; if that leaves nothing, there
-        // is nothing to promise.
-        if !clip.files.iter().any(|f| !f.dir) {
+        // Nothing to promise only when the manifest is truly empty. An all-directory
+        // offer (e.g. a lone empty folder) is now honored: `build_files_data_object`
+        // emits `FILE_ATTRIBUTE_DIRECTORY` descriptor entries Explorer recreates.
+        if !should_promise_files(&clip.files) {
             self.relinquish();
             return;
         }
@@ -1037,6 +1040,17 @@ impl Backend {
 /// clipboard need not be open for this query.
 fn is_format_available(fmt: u32) -> bool {
     unsafe { IsClipboardFormatAvailable(fmt) != 0 }
+}
+
+/// Whether a FILES manifest is worth promising on the clipboard. Any non-empty
+/// manifest is — a file OR an explicit empty directory (which
+/// [`build_files_data_object`](crate::windows_ole::build_files_data_object)
+/// renders as a `FILE_ATTRIBUTE_DIRECTORY` descriptor entry). Only a truly empty
+/// manifest is not. Extracted as a pure function so this deliberate decision —
+/// empty folders DO count, unlike the pre-brick-2 "must contain a file" rule — is
+/// unit-tested without needing an OLE apartment (see `on_offer_files`).
+fn should_promise_files(files: &[RemoteFile]) -> bool {
+    !files.is_empty()
 }
 
 /// Read `CF_UNICODETEXT` (UTF-16LE) as Core `text` (UTF-8). The trailing `NUL`
@@ -1469,6 +1483,28 @@ mod tests {
     //! live suite in `tests/windows.rs`). They compile and run on the Windows
     //! target in CI (the module is `cfg(target_os = "windows")`).
     use super::*;
+
+    fn remote_file(path: &str, dir: bool) -> RemoteFile {
+        RemoteFile {
+            file_id: format!("id-{path}"),
+            path: path.into(),
+            size: if dir { 0 } else { 1 },
+            dir,
+        }
+    }
+
+    #[test]
+    fn should_promise_files_honors_a_lone_empty_folder_but_not_an_empty_manifest() {
+        // The brick-2 decision: an all-directory offer is worth promising (the old
+        // rule required at least one file). A truly empty manifest is not.
+        assert!(should_promise_files(&[remote_file("lone", true)]));
+        assert!(should_promise_files(&[remote_file("a.txt", false)]));
+        assert!(should_promise_files(&[
+            remote_file("a.txt", false),
+            remote_file("empty", true),
+        ]));
+        assert!(!should_promise_files(&[]));
+    }
 
     #[test]
     fn wide_text_blob_is_utf16le_nul_terminated() {

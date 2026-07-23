@@ -73,8 +73,9 @@ async fn the_core_transfer_protocol_survives_real_quic() {
         let ask = async {
             let files = vec![OutgoingFile {
                 name: "payload.bin".into(),
-                source: src.clone(),
+                source: Some(src.clone()),
                 size: contents.len() as u64,
+                is_dir: false,
             }];
             let mut stream = b.open(&peer).await.expect("open B->A");
             send_transfer(&mut stream, &files, &mut |_, _| {})

@@ -169,22 +169,60 @@ async fn a_files_announce_freezes_a_manifest() {
 }
 
 #[tokio::test]
-async fn a_files_announce_refuses_a_directory() {
+async fn a_files_announce_walks_a_directory_tree() {
     let core = TestCore::start().await;
     let mut clip = backend(&core).await;
 
-    // v1 flat files: a directory in the paths is refused.
-    let err = clip
-        .request(
-            "clipboard.updated",
-            json!({
-                "formats": [{ "format": "files" }],
-                "paths": [core.config_dir().to_string_lossy()],
-            }),
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(err.code, -32602);
+    // Build outbox/tree/{a.txt, sub/b.txt, empty/} and announce the FOLDER.
+    let outbox = core
+        .write_source("anchor", b"")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let tree = outbox.join("tree");
+    std::fs::create_dir_all(tree.join("sub")).unwrap();
+    std::fs::create_dir(tree.join("empty")).unwrap();
+    std::fs::write(tree.join("a.txt"), b"AAAA").unwrap();
+    std::fs::write(tree.join("sub/b.txt"), b"BB").unwrap();
+
+    clip.request(
+        "clipboard.updated",
+        json!({
+            "formats": [{ "format": "files" }],
+            "paths": [tree.to_string_lossy()],
+        }),
+    )
+    .await
+    .unwrap();
+
+    let current = clip.request("clipboard.current", json!({})).await.unwrap();
+    let files = current["files"].as_array().expect("manifest").clone();
+    let paths: std::collections::HashSet<&str> =
+        files.iter().map(|f| f["path"].as_str().unwrap()).collect();
+    // Files carry `/`-separated relative paths under the copied folder; the empty
+    // folder is materialized on its own; the non-empty parents are implied.
+    assert!(paths.contains("tree/a.txt"), "paths were {paths:?}");
+    assert!(paths.contains("tree/sub/b.txt"), "paths were {paths:?}");
+    assert!(paths.contains("tree/empty"), "paths were {paths:?}");
+    assert!(!paths.contains("tree"), "the non-empty root is implied");
+    assert!(
+        !paths.contains("tree/sub"),
+        "the non-empty subdir is implied"
+    );
+
+    let a = files
+        .iter()
+        .find(|f| f["path"] == json!("tree/a.txt"))
+        .unwrap();
+    assert_eq!(a["size"], json!(4));
+    assert!(a.get("dir").is_none(), "a file is not a dir");
+    let empty = files
+        .iter()
+        .find(|f| f["path"] == json!("tree/empty"))
+        .unwrap();
+    assert_eq!(empty["dir"], json!(true));
+    // No on-disk source path (the outbox) leaks into the metadata.
+    assert!(!current.to_string().contains("outbox"));
 }
 
 #[tokio::test]

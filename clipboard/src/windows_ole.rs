@@ -34,12 +34,16 @@
 //! addressed, so [`PullStream`] simply asks for `[read_so_far, read_so_far+cb)`
 //! and advances. There is no reader object and no reader cache.
 //!
-//! # Limitation
+//! # Empty directories
 //!
-//! Empty directories are NOT listed: the descriptor carries only files, and
-//! Explorer recreates the intermediate folders from each file's relative path.
-//! A directory with no files under it therefore does not appear (same as the
-//! reference; acceptable — the file tree is the payload).
+//! Non-empty folders are implied by their file subpaths — Explorer recreates the
+//! intermediate folders from each file's relative path, so they need no entry.
+//! An EMPTY folder has no file to imply it, so the manifest carries an explicit
+//! directory entry (`is_dir`), emitted here as a `FILEDESCRIPTORW` flagged
+//! `FILE_ATTRIBUTE_DIRECTORY` with no `FileContents` stream. `lindex` still maps
+//! straight onto the descriptor array (files AND dirs, one vec, in order): a
+//! `FileContents` request that lands on a directory index is refused defensively
+//! (Explorer never asks — a directory has no stream).
 //!
 //! Real cross-process delivery (COM marshaling to Explorer) is NOT testable off
 //! a real Windows desktop: this module is cross-compiled and covered by the
@@ -52,6 +56,7 @@ use windows::Win32::Foundation::{
     DV_E_DVASPECT, DV_E_FORMATETC, DV_E_LINDEX, DV_E_TYMED, E_FAIL, E_NOTIMPL, GlobalFree, HGLOBAL,
     OLE_E_ADVISENOTSUPPORTED, S_FALSE, S_OK, STG_E_ACCESSDENIED, STG_E_INVALIDFUNCTION,
 };
+use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
 use windows::Win32::System::Com::{
     DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl,
     IEnumFORMATETC, IEnumFORMATETC_Impl, IEnumSTATDATA, ISequentialStream_Impl, IStream,
@@ -61,7 +66,7 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::UI::Shell::{
-    FD_FILESIZE, FD_PROGRESSUI, FD_UNICODE, FILEDESCRIPTORW, FILEGROUPDESCRIPTORW,
+    FD_ATTRIBUTES, FD_FILESIZE, FD_PROGRESSUI, FD_UNICODE, FILEDESCRIPTORW, FILEGROUPDESCRIPTORW,
 };
 use windows::core::{BOOL, HRESULT, PCWSTR, Ref, Result as WinResult, implement};
 
@@ -72,13 +77,16 @@ fn wide_z(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// One FILE entry of the offer (directories are filtered out): its manifest
-/// `file_id` (for the fetcher), its relative path already `\`-separated (for the
-/// descriptor), and its size (for the descriptor + `IStream::Stat`).
+/// One entry of the offer: a file, or an EMPTY directory to recreate. Fields:
+/// the manifest `file_id` (for the fetcher; unused for a directory), the relative
+/// path already `\`-separated (for the descriptor), the size (for the descriptor
+/// and `IStream::Stat`; `0` for a directory), and whether it is a directory (a
+/// `FILE_ATTRIBUTE_DIRECTORY` descriptor entry with no content stream).
 struct FileEntry {
     file_id: String,
     rel_path_backslash: String,
     size: u64,
+    is_dir: bool,
 }
 
 /// The three confidentiality-marker format NAMES, in the order they are exposed.
@@ -95,11 +103,11 @@ const MARKER_FORMAT_NAMES: [&str; 3] = [
 
 /// Register the two virtual-files clipboard formats and build the `IDataObject`
 /// for a remote FILES clip: the descriptor comes from the manifest, the contents
-/// are pulled through `fetcher` on demand (never read here). Only non-directory
-/// `files` entries are carried; their `path` (relative, `/`-separated) is
-/// converted to the `\`-separated form Windows expects. When `sensitive`, the
-/// confidentiality markers are exposed as extra `TYMED_HGLOBAL` formats (each a
-/// DWORD `0`).
+/// are pulled through `fetcher` on demand (never read here). Every `files` entry
+/// is carried — files AND explicit empty directories — in manifest order (which
+/// is the `lindex` space); each `path` (relative, `/`-separated) is converted to
+/// the `\`-separated form Windows expects. When `sensitive`, the confidentiality
+/// markers are exposed as extra `TYMED_HGLOBAL` formats (each a DWORD `0`).
 pub fn build_files_data_object(
     files: &[RemoteFile],
     fetcher: Arc<dyn FileFetcher>,
@@ -125,16 +133,18 @@ pub fn build_files_data_object(
     } else {
         Vec::new()
     };
-    // Order = descriptor order = the `lindex` Explorer will hand back for
-    // contents. Directories are implied by the file subpaths (see the module
-    // limitation), so they are dropped here.
+    // Order = descriptor order = the `lindex` Explorer hands back for contents.
+    // Keep files AND explicit empty directories in one vec so `lindex` indexes it
+    // directly (a `FileContents` request landing on a directory is refused in
+    // `GetData` — Explorer never asks). Non-empty folders carry no entry: they are
+    // implied by their file subpaths.
     let entries: Vec<FileEntry> = files
         .iter()
-        .filter(|f| !f.dir)
         .map(|f| FileEntry {
             file_id: f.file_id.clone(),
             rel_path_backslash: f.path.replace('/', "\\"),
             size: f.size,
+            is_dir: f.dir,
         })
         .collect();
     let obj = FilesDataObject {
@@ -353,12 +363,25 @@ impl FilesDataObject {
                 {
                     *slot = w;
                 }
-                let fd = FILEDESCRIPTORW {
-                    dwFlags: (FD_FILESIZE.0 | FD_PROGRESSUI.0 | FD_UNICODE.0) as u32,
-                    nFileSizeLow: (entry.size & 0xFFFF_FFFF) as u32,
-                    nFileSizeHigh: (entry.size >> 32) as u32,
-                    cFileName: cfile,
-                    ..Default::default()
+                // A directory carries FILE_ATTRIBUTE_DIRECTORY (via FD_ATTRIBUTES)
+                // and no size/progress: Explorer creates the empty folder and never
+                // requests contents for it. A file advertises its size + a progress
+                // UI for the on-demand pull.
+                let fd = if entry.is_dir {
+                    FILEDESCRIPTORW {
+                        dwFlags: (FD_ATTRIBUTES.0 | FD_UNICODE.0) as u32,
+                        dwFileAttributes: FILE_ATTRIBUTE_DIRECTORY.0,
+                        cFileName: cfile,
+                        ..Default::default()
+                    }
+                } else {
+                    FILEDESCRIPTORW {
+                        dwFlags: (FD_FILESIZE.0 | FD_PROGRESSUI.0 | FD_UNICODE.0) as u32,
+                        nFileSizeLow: (entry.size & 0xFFFF_FFFF) as u32,
+                        nFileSizeHigh: (entry.size >> 32) as u32,
+                        cFileName: cfile,
+                        ..Default::default()
+                    }
                 };
                 core::ptr::write(fds.add(i), fd);
             }
@@ -424,12 +447,18 @@ impl IDataObject_Impl for FilesDataObject_Impl {
             if fe.tymed & (TYMED_ISTREAM.0 as u32) == 0 {
                 return Err(DV_E_TYMED.into());
             }
-            // `lindex` = the file's index in the descriptor.
+            // `lindex` = the entry's index in the descriptor (files AND dirs).
             let lindex = fe.lindex;
             if lindex < 0 || lindex as usize >= self.files.len() {
                 return Err(DV_E_LINDEX.into());
             }
             let entry = &self.files[lindex as usize];
+            // A directory has no content stream. Explorer never asks (it created
+            // the folder from the descriptor), but refuse defensively rather than
+            // hand back an empty/again-directory stream.
+            if entry.is_dir {
+                return Err(DV_E_LINDEX.into());
+            }
             let stream: IStream =
                 PullStream::new(self.fetcher.clone(), entry.file_id.clone(), entry.size).into();
             Ok(FilesDataObject::medium_stream(stream))
@@ -668,8 +697,10 @@ mod tests {
         }
     }
 
-    /// The two-file manifest used across the tests: a top-level file and a file in
-    /// a subdirectory, plus a directory entry that must be filtered out.
+    /// The manifest used across the tests: a top-level file, an EMPTY directory
+    /// (recreated as a `FILE_ATTRIBUTE_DIRECTORY` entry — no content stream), and a
+    /// file in a subdirectory. The empty dir sits at descriptor index 1 on purpose,
+    /// so the file at index 2 exercises the `lindex`-lands-past-a-directory case.
     fn sample_files() -> Vec<RemoteFile> {
         vec![
             RemoteFile {
@@ -680,7 +711,7 @@ mod tests {
             },
             RemoteFile {
                 file_id: "id-dir".into(),
-                path: "sub".into(),
+                path: "empty".into(),
                 size: 0,
                 dir: true,
             },
@@ -816,8 +847,42 @@ mod tests {
         assert_eq!(fetched2, 0);
     }
 
+    /// The fields of one `FILEDESCRIPTORW` read out by value (the struct is
+    /// `#[repr(C, packed(1))]`, so every field is copied out, never referenced).
+    struct FdView {
+        name: String,
+        size_lo: u32,
+        size_hi: u32,
+        flags: u32,
+        attributes: u32,
+    }
+
+    /// Read the `cItems` descriptors out of a group-descriptor `HGLOBAL`.
+    fn read_group_descriptor(hglobal: HGLOBAL) -> Vec<FdView> {
+        let base = unsafe { GlobalLock(hglobal) } as *const FILEGROUPDESCRIPTORW;
+        assert!(!base.is_null());
+        let views = unsafe {
+            let n = (*base).cItems as usize;
+            let fds = core::ptr::addr_of!((*base).fgd) as *const FILEDESCRIPTORW;
+            (0..n)
+                .map(|i| {
+                    let fd = core::ptr::read(fds.add(i));
+                    FdView {
+                        name: fd_name(fd.cFileName),
+                        size_lo: fd.nFileSizeLow,
+                        size_hi: fd.nFileSizeHigh,
+                        flags: fd.dwFlags,
+                        attributes: fd.dwFileAttributes,
+                    }
+                })
+                .collect()
+        };
+        let _ = unsafe { GlobalUnlock(hglobal) };
+        views
+    }
+
     #[test]
-    fn get_data_descriptor_carries_the_filtered_files() {
+    fn get_data_descriptor_carries_files_and_an_empty_dir() {
         let (cf_d, _cf_c) = cf_ids();
         let obj = build_files_data_object(&sample_files(), fetcher(false), false).expect("build");
 
@@ -826,40 +891,74 @@ mod tests {
                 .expect("GetData descriptor");
         assert_eq!(medium.tymed, TYMED_HGLOBAL.0 as u32);
 
-        let hglobal = unsafe { medium.u.hGlobal };
-        let base = unsafe { GlobalLock(hglobal) } as *const FILEGROUPDESCRIPTORW;
-        assert!(!base.is_null());
-        let (c_items, name0, lo0, hi0, flags0, name1, lo1, hi1) = unsafe {
-            let c_items = (*base).cItems;
-            let fds = core::ptr::addr_of!((*base).fgd) as *const FILEDESCRIPTORW;
-            let fd0 = core::ptr::read(fds.add(0));
-            let fd1 = core::ptr::read(fds.add(1));
-            // `cFileName` must be copied out BY VALUE first: FILEDESCRIPTORW is
-            // `#[repr(C, packed(1))]`, so a *reference* to the field would be an
-            // unaligned-reference error. An array read is a plain copy.
-            (
-                c_items,
-                fd_name(fd0.cFileName),
-                fd0.nFileSizeLow,
-                fd0.nFileSizeHigh,
-                fd0.dwFlags,
-                fd_name(fd1.cFileName),
-                fd1.nFileSizeLow,
-                fd1.nFileSizeHigh,
-            )
-        };
-        let _ = unsafe { GlobalUnlock(hglobal) };
+        let fds = read_group_descriptor(unsafe { medium.u.hGlobal });
+        assert_eq!(fds.len(), 3, "file + empty dir + file are all carried");
 
-        assert_eq!(c_items, 2, "the directory entry must be filtered out");
-        assert_eq!(name0, "a.txt");
-        assert_eq!((lo0, hi0), (10, 0));
-        assert_eq!(name1, "sub\\b.bin", "the subpath uses backslashes");
-        assert_eq!((lo1, hi1), (600, 0));
-        let want = (FD_FILESIZE.0 | FD_PROGRESSUI.0 | FD_UNICODE.0) as u32;
-        assert_eq!(flags0, want);
+        let file_flags = (FD_FILESIZE.0 | FD_PROGRESSUI.0 | FD_UNICODE.0) as u32;
+        let dir_flags = (FD_ATTRIBUTES.0 | FD_UNICODE.0) as u32;
+
+        // 0: the top-level file.
+        assert_eq!(fds[0].name, "a.txt");
+        assert_eq!((fds[0].size_lo, fds[0].size_hi), (10, 0));
+        assert_eq!(fds[0].flags, file_flags);
+        assert_eq!(fds[0].attributes & FILE_ATTRIBUTE_DIRECTORY.0, 0);
+
+        // 1: the empty directory — FILE_ATTRIBUTE_DIRECTORY, no size, no progress.
+        assert_eq!(fds[1].name, "empty");
+        assert_eq!(fds[1].flags, dir_flags);
+        assert_eq!(
+            fds[1].attributes & FILE_ATTRIBUTE_DIRECTORY.0,
+            FILE_ATTRIBUTE_DIRECTORY.0
+        );
+        assert_eq!((fds[1].size_lo, fds[1].size_hi), (0, 0));
+
+        // 2: the file in a subdirectory (backslash-separated, size preserved).
+        assert_eq!(fds[2].name, "sub\\b.bin", "the subpath uses backslashes");
+        assert_eq!((fds[2].size_lo, fds[2].size_hi), (600, 0));
+        assert_eq!(fds[2].flags, file_flags);
 
         // Release the transferred medium (tymed HGLOBAL, no pUnkForRelease).
         unsafe { ReleaseStgMedium(&mut medium) };
+    }
+
+    #[test]
+    fn get_data_descriptor_of_an_all_directory_offer_lists_the_dir() {
+        let (cf_d, cf_c) = cf_ids();
+        // A lone empty folder builds a valid one-entry descriptor. (The decision to
+        // PROMISE such an offer at all is `should_promise_files` in windows.rs; this
+        // covers the descriptor path once build is reached.)
+        let files = vec![RemoteFile {
+            file_id: "id-only".into(),
+            path: "lone".into(),
+            size: 0,
+            dir: true,
+        }];
+        let obj = build_files_data_object(&files, fetcher(false), false).expect("build");
+
+        let mut medium: STGMEDIUM =
+            unsafe { obj.GetData(&fe(cf_d, TYMED_HGLOBAL.0 as u32, DVASPECT_CONTENT.0, -1)) }
+                .expect("GetData descriptor");
+        let fds = read_group_descriptor(unsafe { medium.u.hGlobal });
+        assert_eq!(fds.len(), 1);
+        assert_eq!(fds[0].name, "lone");
+        // A directory entry: DIRECTORY attribute, the exact dir flag set (no
+        // FD_FILESIZE/FD_PROGRESSUI creeping in), and no size.
+        assert_eq!(
+            fds[0].attributes & FILE_ATTRIBUTE_DIRECTORY.0,
+            FILE_ATTRIBUTE_DIRECTORY.0
+        );
+        assert_eq!(fds[0].flags, (FD_ATTRIBUTES.0 | FD_UNICODE.0) as u32);
+        assert_eq!((fds[0].size_lo, fds[0].size_hi), (0, 0));
+        unsafe { ReleaseStgMedium(&mut medium) };
+
+        // The lone dir at lindex 0 has no content stream — a FileContents request
+        // is refused, not served an empty stream.
+        let contents =
+            unsafe { obj.GetData(&fe(cf_c, TYMED_ISTREAM.0 as u32, DVASPECT_CONTENT.0, 0)) };
+        match contents {
+            Ok(_) => panic!("a directory has no contents and must be refused"),
+            Err(e) => assert_eq!(e.code(), DV_E_LINDEX),
+        }
     }
 
     /// Extract the NUL-terminated name out of a `cFileName` array (taken by value
@@ -874,7 +973,8 @@ mod tests {
         let (_cf_d, cf_c) = cf_ids();
         let obj = build_files_data_object(&sample_files(), fetcher(false), false).expect("build");
 
-        for (lindex, size) in [(0i32, 10u64), (1i32, 600u64)] {
+        // lindex 1 is the empty directory (no stream); the files sit at 0 and 2.
+        for (lindex, size) in [(0i32, 10u64), (2i32, 600u64)] {
             let mut medium = unsafe {
                 obj.GetData(&fe(
                     cf_c,
@@ -903,9 +1003,24 @@ mod tests {
         let obj = build_files_data_object(&sample_files(), fetcher(false), false).expect("build");
         // `STGMEDIUM` is not `Debug`, so match rather than `expect_err`.
         let result =
-            unsafe { obj.GetData(&fe(cf_c, TYMED_ISTREAM.0 as u32, DVASPECT_CONTENT.0, 2)) };
+            unsafe { obj.GetData(&fe(cf_c, TYMED_ISTREAM.0 as u32, DVASPECT_CONTENT.0, 3)) };
         let err = match result {
-            Ok(_) => panic!("lindex 2 is out of range (only 0,1 exist) and must be rejected"),
+            Ok(_) => panic!("lindex 3 is out of range (only 0,1,2 exist) and must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code(), DV_E_LINDEX);
+    }
+
+    #[test]
+    fn get_data_contents_refuses_a_directory_lindex() {
+        let (_cf_d, cf_c) = cf_ids();
+        let obj = build_files_data_object(&sample_files(), fetcher(false), false).expect("build");
+        // lindex 1 is the empty directory: it has no content stream. Explorer
+        // never asks, but a request must be refused, not served an empty stream.
+        let result =
+            unsafe { obj.GetData(&fe(cf_c, TYMED_ISTREAM.0 as u32, DVASPECT_CONTENT.0, 1)) };
+        let err = match result {
+            Ok(_) => panic!("a directory lindex has no contents and must be refused"),
             Err(e) => e,
         };
         assert_eq!(err.code(), DV_E_LINDEX);
