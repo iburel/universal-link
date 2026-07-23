@@ -482,12 +482,13 @@ pub fn parse_formats(params: &Value) -> Result<Vec<Format>, RpcErr> {
 }
 
 /// Defensive bound on how deep a copied folder is walked before the announce is
-/// refused (`-32602`). Real trees never approach it, but it keeps the recursion
+/// refused (`-32602`). Real trees are far shallower, but it keeps the recursion
 /// below from ever overflowing the stack on a pathological (locally-crafted)
-/// tree. Kept well under the ~550-frame overflow point of a debug build on the
-/// 2 MiB stack of a tokio worker thread (where the RPC handler runs), so the
-/// guard fires gracefully under every build profile rather than aborting.
-const MAX_WALK_DEPTH: usize = 256;
+/// tree. Kept deliberately small: a debug build's frames are several KiB each,
+/// so even on the ~1 MiB stack of a test harness thread (let alone the 2 MiB of
+/// the tokio worker the RPC handler runs on) the guard fires gracefully rather
+/// than aborting. A tree deeper than this is refused, not crashed.
+const MAX_WALK_DEPTH: usize = 64;
 
 /// Freezes the file manifest from the backend-supplied `paths`: canonicalizes
 /// each path, `stat`s it (no byte read), captures its identity, and assigns a
@@ -1128,17 +1129,21 @@ mod tests {
     }
 
     #[test]
-    fn freeze_manifest_refuses_a_tree_nested_beyond_the_depth_cap() {
-        // Deeper than MAX_WALK_DEPTH: the guard returns -32602 gracefully and never
-        // overflows the stack (the cap is kept below the debug-build overflow point).
+    fn walk_dir_refuses_recursion_past_the_depth_cap() {
+        // The guard fires on depth alone, so exercise it directly rather than
+        // materializing a tree deeper than the cap: macOS/Windows cap path length
+        // well below MAX_WALK_DEPTH components, and walking a real deep tree would
+        // recurse enough to overflow a debug test-thread stack — the very crash
+        // the guard exists to prevent. Passing an over-cap depth returns -32602 on
+        // the first frame, no deep tree and no deep recursion.
         let dir = tempfile::tempdir().unwrap();
-        let top = dir.path().join("top");
-        let mut deep = top.clone();
-        for i in 0..(MAX_WALK_DEPTH + 4) {
-            deep.push(format!("d{i}"));
-        }
-        std::fs::create_dir_all(&deep).unwrap();
-        let err = freeze_manifest(&[top.to_string_lossy().into_owned()]).unwrap_err();
+        let mut walk = Walk {
+            files: Vec::new(),
+            next_id: 0,
+        };
+        let err = walk
+            .walk_dir(dir.path(), "top", MAX_WALK_DEPTH + 1)
+            .unwrap_err();
         assert_eq!(err.code, -32602);
     }
 
