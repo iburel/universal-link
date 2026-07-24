@@ -961,7 +961,7 @@ impl Conn {
         // Announcing is the exclusive backend's privilege (role + scope), not a
         // right any `clipboard.write` holder gets.
         self.require_clipboard_backend()?;
-        let formats = crate::clipboard::parse_formats(params)?;
+        let mut formats = crate::clipboard::parse_formats(params)?;
         let sensitive = rpc::optional_bool(params, "sensitive")?.unwrap_or(false);
         let paths = rpc::optional_str_array(params, "paths")?;
         let has_files = formats.iter().any(|f| f.format == "files");
@@ -971,6 +971,16 @@ impl Conn {
             (false, None) => Vec::new(),
             _ => return Err(RpcErr::invalid_params("paths")),
         };
+        // Materialized (push-at-copy, Model B): the caller supplies the inline
+        // bytes now. `parse_materialized` validates (inline-only, non-sensitive,
+        // capped) and rewrites each format's `size` to its exact decoded length.
+        let materialized_blobs =
+            crate::clipboard::parse_materialized(params, &mut formats, sensitive, has_files)?;
+        let materialized: std::collections::HashMap<String, std::sync::Arc<Vec<u8>>> =
+            materialized_blobs
+                .as_ref()
+                .map(|b| b.iter().cloned().collect())
+                .unwrap_or_default();
         let device_id = self
             .state
             .session
@@ -990,9 +1000,12 @@ impl Conn {
             },
             superseded: false,
             sessions: 0,
+            materialized,
         };
-        // Announce locally (last copier wins here), then broadcast the metadata
-        // to the account's other devices so they converge on this copy.
+        // Announce locally (last copier wins here), then broadcast to the
+        // account's other devices so they converge on this copy: a plain
+        // `clip_announce` (metadata only, pulled at paste), or — when
+        // materialized — a `clip_push` that also carries the inline bytes.
         let (tx_id, net) = {
             let mut cb = self.state.clipboard.lock().expect("lock clipboard");
             let tx_id = cb.announce_local(tx, now_millis());
@@ -1000,7 +1013,10 @@ impl Conn {
             (tx_id, net)
         };
         if let Some(net) = net {
-            crate::clipnet::propagate(&self.state, net);
+            match materialized_blobs {
+                Some(blobs) => crate::clipnet::propagate_materialized(&self.state, net, blobs),
+                None => crate::clipnet::propagate(&self.state, net),
+            }
         }
         Ok(json!({ "tx_id": tx_id }))
     }
@@ -1025,17 +1041,22 @@ impl Conn {
     fn transactions_open(&self, params: &Value) -> Result<Value, RpcErr> {
         self.require_scope("clipboard.read")?;
         let tx_id = rpc::required_str(params, "tx_id")?;
-        let origin = {
+        let (origin, materialized) = {
             let cb = self.state.clipboard.lock().expect("lock clipboard");
             if !cb.is_openable(&tx_id) {
                 return Err(RpcErr::app("TX_STALE"));
             }
-            cb.origin_of(&tx_id)
+            (cb.origin_of(&tx_id), cb.is_materialized(&tx_id))
         };
         // A remote clip whose source is no longer reachable (re-enrolled under a
         // new node_id, or with no published relay) fails fast here — the
-        // control-plane twin of the data channel's `PEER_GONE`.
-        if let Some(crate::clipboard::Origin::Remote { node_id, device_id }) = origin {
+        // control-plane twin of the data channel's `PEER_GONE`. A MATERIALIZED
+        // remote clip is exempt: it is served from the local cache, so the source
+        // need not be reachable — indeed it may already be gone, which is the
+        // whole point of push-at-copy.
+        if !materialized
+            && let Some(crate::clipboard::Origin::Remote { node_id, device_id }) = origin
+        {
             let reachable = crate::dataplane::resolve_peer(&self.state, &device_id)
                 .is_some_and(|p| p.node_id == node_id && p.relay_url.is_some());
             if !reachable {

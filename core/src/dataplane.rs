@@ -744,6 +744,7 @@ async fn serve_incoming(state: Arc<AppState>, peer: String, mut stream: Box<dyn 
     match first.get("type").and_then(Value::as_str) {
         Some("offer") => serve_transfer(state, peer, first, stream).await,
         Some("clip_announce") => crate::clipnet::recv_announce(state, peer, first, stream).await,
+        Some("clip_push") => crate::clipnet::recv_push(state, peer, first, stream).await,
         Some("clip_session") => crate::clipnet::serve_session(state, first, stream).await,
         other => {
             tracing::debug!(peer = %peer, kind = ?other, "unknown incoming frame type: abandoned");
