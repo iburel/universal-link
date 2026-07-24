@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
+
+# Tauri MOBILE shell of the GUI (spike): the SAME Svelte frontend and the SAME
+# `universallink-gui` bridge as the desktop app, but the Core is embedded
+# in-process (Android cannot spawn a separate daemon) and reached over an
+# in-process UDS. One UI, one transport (`invoke`), no new core API.
+#
+# EXCLUDED from the workspace (see the root Cargo.toml): built only for
+# aarch64-linux-android via the Tauri Android tooling (cargo-ndk under the
+# hood), never by the native CI jobs — so it perturbs neither the workspace
+# build (`cargo build --workspace --all-targets`) nor cargo-deny. It still
+# path-depends on the workspace crates. All its deps are already in the lock
+# (via `gui`, `daemon`, and `client`), so no new crate enters the tree.
+[package]
+name = "universallink-gui-mobile"
+version = "0.0.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[lib]
+# staticlib/cdylib for the Android tooling; rlib so a host `cargo check` of this
+# crate still works during development.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+anyhow = "1"
+tauri = { version = "2", default-features = false, features = [
+  "wry",
+  "compression",
+  # Web inspector (chrome://inspect) — needed to diagnose the mobile webview.
+  "devtools",
+] }
+tauri-plugin-opener = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+
+# TLS for the embedded Core's outbound streams (OIDC discovery/token exchange +
+# the server WebSocket). Same rustls/ring stack as the daemon, but the trust
+# roots are the bundled Mozilla set (webpki-roots) rather than the OS store:
+# the desktop daemon's `rustls-platform-verifier` needs a JNI + Kotlin bridge
+# and the app Context on Android, and the Core only reaches PUBLIC endpoints
+# here. Both crates are already in the lock transitively (via `daemon`/`gui`),
+# so no new crate enters the tree. See `src/tls.rs`.
+tokio-rustls = { version = "0.26", default-features = false, features = [
+  "logging",
+  "ring",
+  "tls12",
+] }
+webpki-roots = "1"
+
+# The desktop bridge, reused verbatim (commands + connection relay).
+universallink-gui = { path = "../gui" }
+universallink-ipc-client = { path = "../client" }
+# The embedded Core and its production iroh data-plane wiring.
+universallink-core = { path = "../core" }
+universallink-daemon = { path = "../daemon" }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

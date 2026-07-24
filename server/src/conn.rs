@@ -47,7 +47,7 @@ const RELAY_URL_MAX: usize = 2048;
 /// Bounded loosely: the server does not decode it, it just rejects the absurd.
 const ATTESTATION_MAX: usize = 256;
 
-const PLATFORMS: [&str; 3] = ["windows", "macos", "linux"];
+const PLATFORMS: [&str; 4] = ["windows", "macos", "linux", "android"];
 
 struct RateWindow {
     start: Instant,
