@@ -86,6 +86,14 @@ fn log_dir_from(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
     Some(PathBuf::from(local).join("UniversalLink").join("logs"))
 }
 
+#[cfg(target_os = "android")]
+fn log_dir_from(_env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    // Android: the Core is embedded in the app, not launched from a session
+    // whose environment tells it where to write. The app supplies its own
+    // private data dir directly; this discovery path is never taken.
+    None
+}
+
 #[cfg(target_os = "linux")]
 fn endpoint_from(env: &dyn Fn(&str) -> Option<String>) -> Option<Endpoint> {
     // XDG Base Directory spec: an empty variable counts as absent, a relative
@@ -133,6 +141,14 @@ fn endpoint_from(env: &dyn Fn(&str) -> Option<String>) -> Option<Endpoint> {
         ipc_path: PathBuf::from(format!(r"\\.\pipe\universallink-core-{domain}-{user}")),
         config_dir: PathBuf::from(appdata).join("UniversalLink"),
     })
+}
+
+#[cfg(target_os = "android")]
+fn endpoint_from(_env: &dyn Fn(&str) -> Option<String>) -> Option<Endpoint> {
+    // Android: the embedded Core is handed its app-private data dir by the JNI
+    // shim; there is no per-user environment to resolve a socket from. This
+    // discovery path is never taken (the shim builds `Config` directly).
+    None
 }
 
 #[cfg(test)]

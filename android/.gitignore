@@ -1,0 +1,11 @@
+# Gradle / Android build output
+.gradle/
+build/
+app/build/
+local.properties
+.cxx/
+
+# Native artifacts (built by cargo-ndk, not committed)
+app/src/main/jniLibs/
+ffi/target/
+ffi/Cargo.lock
