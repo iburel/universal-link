@@ -180,6 +180,14 @@ fn download_dir(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
         .map(|profile| PathBuf::from(profile).join("Downloads"))
 }
 
+#[cfg(target_os = "android")]
+fn download_dir(_env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    // Android: the app owns its storage; received files land under the Core's
+    // own data dir (`<config dir>/received`). No system Downloads directory is
+    // resolved from the environment.
+    None
+}
+
 /// `Ok(None)`: nothing is set, the Core has never been configured.
 /// `Err`: half set, or set in a nonsensical way.
 fn validate(fields: &Fields) -> Result<Option<ServerConfig>, String> {

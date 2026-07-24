@@ -169,18 +169,20 @@ pub(crate) async fn serve_consumer<R, W>(
 {
     // The transaction may have been deleted between `transactions.open` and
     // this attach: no session to serve.
-    let origin = state
+    let mode = state
         .clipboard
         .lock()
         .expect("lock clipboard")
         .begin_session(&tx_id);
-    let Some(origin) = origin else {
+    let Some(mode) = mode else {
         let _ = write_error(&mut write, "TX_STALE").await;
         return;
     };
-    match origin {
-        crate::clipboard::Origin::Local { .. } => serve_local(state, reader, write, &tx_id).await,
-        crate::clipboard::Origin::Remote { node_id, device_id } => {
+    match mode {
+        // Local disk/announcer AND every materialized clip (served from its
+        // cache, whatever its origin — the source is never contacted).
+        crate::clipboard::ServeMode::Local => serve_local(state, reader, write, &tx_id).await,
+        crate::clipboard::ServeMode::Remote { node_id, device_id } => {
             crate::clipnet::pipe_consumer(state, reader, write, &tx_id, &node_id, &device_id).await;
         }
     }
@@ -310,6 +312,20 @@ where
     let format = req["format"]
         .as_str()
         .ok_or_else(|| unexpected("FETCH format"))?;
+
+    // Materialized (push-at-copy): the bytes are cached on the transaction —
+    // serve them straight, without pulling from the announcer or relaying to the
+    // source device. This is exactly what lets an ephemeral source (a phone)
+    // vanish the instant its copy has been pushed.
+    let materialized = state
+        .clipboard
+        .lock()
+        .expect("lock clipboard")
+        .materialized_blob(tx_id, format);
+    if let Some(bytes) = materialized {
+        stream_bytes(write, &bytes).await?;
+        return Ok(false);
+    }
 
     // Resolve then release the lock — the branches below await.
     let source = state
@@ -488,6 +504,21 @@ where
         write_data(write, pos, &buf[..n]).await?;
         pos += n as u64;
         remaining -= n as u64;
+    }
+    write_msg(write, TAG_EOF, &[]).await
+}
+
+/// Streams a whole in-memory blob — a materialized inline payload — as `DATA`
+/// chunks then `EOF`, the FETCH answer served straight from the cache. An empty
+/// blob is a bare `EOF` (a legitimate zero-length inline format).
+pub(crate) async fn stream_bytes<W>(write: &mut W, bytes: &[u8]) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut offset = 0u64;
+    for chunk in bytes.chunks(CHUNK) {
+        write_data(write, offset, chunk).await?;
+        offset += chunk.len() as u64;
     }
     write_msg(write, TAG_EOF, &[]).await
 }

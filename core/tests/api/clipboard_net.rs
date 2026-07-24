@@ -20,6 +20,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use universallink_core::{PeerAddr, PeerTransport};
@@ -75,6 +76,25 @@ async fn announce_text(c: &mut TestComponent, text: &str) -> String {
     c.request(
         "clipboard.updated",
         json!({ "formats": [{ "format": "text", "size": text.len() }] }),
+    )
+    .await
+    .expect("clipboard.updated")["tx_id"]
+        .as_str()
+        .expect("tx_id")
+        .to_string()
+}
+
+/// Announces a MATERIALIZED (push-at-copy) text clip: the inline bytes travel
+/// with the announce. Returns the `tx_id`.
+async fn announce_text_materialized(c: &mut TestComponent, text: &str) -> String {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    c.request(
+        "clipboard.updated",
+        json!({
+            "formats": [{ "format": "text" }],
+            "materialize": true,
+            "blobs": { "text": b64 },
+        }),
     )
     .await
     .expect("clipboard.updated")["tx_id"]
@@ -501,6 +521,125 @@ async fn fill_requires_the_read_scope() {
         .await
         .unwrap_err();
     assert_eq!(err.app_code(), "SCOPE_DENIED");
+}
+
+// ---------------------------------------------------------------------------
+// Brick 2 (Android): materialized transactions (push-at-copy). The source ships
+// the inline bytes at copy time; the destination caches them and serves its
+// pastes locally, so the source may vanish right after copying.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_materialized_copy_is_served_from_the_destination_cache() {
+    let server = TestServer::start().await;
+    let (_a, mut ca, b, mut cb) = connected_pair(&server).await;
+
+    // A copies with `materialize`: the bytes are pushed with the announce.
+    let tx = announce_text_materialized(&mut ca, "pushed at copy").await;
+
+    // B learns it — the note fires only once the pushed bytes are cached, and
+    // the size is the exact decoded length.
+    let note = cb.wait_notification("clipboard.remote_updated").await;
+    assert_eq!(note["tx_id"], json!(tx));
+    assert_eq!(note["formats"], json!([{ "format": "text", "size": 14 }]));
+
+    // B pastes: the blob comes from B's OWN cache — no `clip_session` to A, and
+    // A's backend is never asked for `clipboard.get_data`.
+    let token = open_channel_token(&mut cb, &tx).await;
+    let mut ch = b.open_channel(&token).await;
+    assert_eq!(ch.fetch("text").await.unwrap(), b"pushed at copy");
+
+    // The proof of "served locally": A's backend saw no request during the
+    // paste (a pull-at-paste clip would have hit `clipboard.get_data` here).
+    ca.assert_silent().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_materialized_paste_survives_the_source_going_offline() {
+    let server = TestServer::start().await;
+    let (a, mut ca, b, mut cb) = connected_pair(&server).await;
+
+    let tx = announce_text_materialized(&mut ca, "outlives its source").await;
+    // Ensure the push has landed and been cached BEFORE the source leaves.
+    cb.wait_notification("clipboard.remote_updated").await;
+
+    // The source (a phone the OS would kill) goes away entirely: its Core stops.
+    drop(ca);
+    drop(a);
+
+    // B still pastes: `transactions.open` does NOT fail `DEVICE_OFFLINE` (a
+    // materialized clip is exempt from the reachability check), and the FETCH is
+    // served from the local cache with the source unreachable.
+    let token = open_channel_token(&mut cb, &tx).await;
+    let mut ch = b.open_channel(&token).await;
+    assert_eq!(ch.fetch("text").await.unwrap(), b"outlives its source");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_materialized_clip_is_superseded_and_freed_like_any_other() {
+    let server = TestServer::start().await;
+    let (_a, mut ca, b, mut cb) = connected_pair(&server).await;
+
+    let tx1 = announce_text_materialized(&mut ca, "first materialized").await;
+    let n1 = cb.wait_notification("clipboard.remote_updated").await;
+    assert_eq!(n1["tx_id"], json!(tx1));
+
+    // A newer copy supersedes it globally; B converges onto tx2.
+    let tx2 = announce_text_materialized(&mut ca, "second materialized").await;
+    let n2 = cb.wait_notification("clipboard.remote_updated").await;
+    assert_eq!(n2["tx_id"], json!(tx2));
+
+    // The superseded materialized clip refuses a NEW session (its cache is gone
+    // with it), while the fresh one still pastes from its cache.
+    assert_eq!(
+        cb.request("transactions.open", json!({ "tx_id": tx1 }))
+            .await
+            .unwrap_err()
+            .app_code(),
+        "TX_STALE"
+    );
+    let token = open_channel_token(&mut cb, &tx2).await;
+    let mut ch = b.open_channel(&token).await;
+    assert_eq!(ch.fetch("text").await.unwrap(), b"second materialized");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn materialize_refuses_sensitive_and_files() {
+    let server = TestServer::start().await;
+    let (a, mut ca, _b, _cb) = connected_pair(&server).await;
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(b"secret");
+    // sensitive + materialize is a contradiction: a concealed clip stays
+    // pull-at-paste.
+    let err = ca
+        .request(
+            "clipboard.updated",
+            json!({
+                "formats": [{ "format": "text" }],
+                "sensitive": true,
+                "materialize": true,
+                "blobs": { "text": b64 },
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, -32602);
+
+    // files + materialize: a manifest is not bytes (files use pull / fill).
+    let path = a.write_source("x.bin", b"x");
+    let err = ca
+        .request(
+            "clipboard.updated",
+            json!({
+                "formats": [{ "format": "files" }],
+                "paths": [path.to_string_lossy()],
+                "materialize": true,
+                "blobs": {},
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, -32602);
 }
 
 // ---------------------------------------------------------------------------

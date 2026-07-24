@@ -24,6 +24,7 @@
 //!   channel (`pipe_consumer`) or drives it itself to fill files
 //!   (`transactions.fill`).
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,7 +33,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
 
-use crate::clipboard::{FillPlan, Origin, Transaction};
+use crate::clipboard::{FillPlan, Origin, ServeMode, Transaction};
 use crate::connector::IoStream;
 use crate::datachannel;
 use crate::dataplane::{self, PeerAddr};
@@ -179,7 +180,197 @@ fn build_remote_tx(state: &AppState, peer_node_id: &str, first: &Value) -> Optio
         },
         superseded: false,
         sessions: 0,
+        // A `clip_announce` never carries bytes; a materialized clip's cache is
+        // filled from the trailing `clip_push` blobs (`recv_push`), not here.
+        materialized: HashMap::new(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Materialized transactions (push-at-copy): the source ships the inline bytes
+// to every online device at copy time, so an ephemeral source (a phone) may
+// then vanish (doc/core-api.md — "Materialized transactions"). Each device
+// caches them and serves its pastes locally, never opening a `clip_session`.
+// ---------------------------------------------------------------------------
+
+/// Chunk size for streaming a materialized blob over `clip_push` — under the
+/// data channel's `MAX_MSG`, so each chunk is one message the receiver reads.
+const PUSH_CHUNK: usize = 64 * 1024;
+
+/// Broadcasts a materialized copy: a `clip_push` to every online device,
+/// carrying the announce metadata then the inline blobs. Fire-and-forget like
+/// `propagate` (best-effort — an offline device simply misses the clip; it
+/// re-learns nothing, exactly as a missed announce). `blobs` is the per-format
+/// bytes; sharing them across the per-peer tasks is a cheap `Arc` clone.
+pub(crate) fn propagate_materialized(
+    state: &Arc<AppState>,
+    announce: Value,
+    blobs: crate::clipboard::MaterializedBlobs,
+) {
+    let peers = dataplane::account_peers(state);
+    if peers.is_empty() {
+        return;
+    }
+    // Only the METADATA frame is bounded by `MAX_FRAME`; the blobs stream
+    // separately (capped by `MATERIALIZE_MAX`). An inline announce is tiny, so
+    // this never fires in practice — kept for parity with `propagate`.
+    let serialized = serde_json::to_vec(&announce).map_or(usize::MAX, |b| b.len());
+    if serialized + 64 > dataplane::MAX_FRAME as usize {
+        tracing::warn!("clipboard materialized metadata too large to propagate; it stays local");
+        return;
+    }
+    let blobs = Arc::new(blobs);
+    for peer in peers {
+        let state = state.clone();
+        let announce = announce.clone();
+        let blobs = blobs.clone();
+        tokio::spawn(async move {
+            if let Err(e) = send_push(&state, &peer, &announce, &blobs).await {
+                tracing::debug!(peer = %peer.node_id, error = %e, "materialized clip not pushed");
+            }
+        });
+    }
+}
+
+/// Source half of a `clip_push`: opens a stream, writes the announce frame
+/// (`type: clip_push`), streams each inline format's bytes as `DATA*`+`EOF` in
+/// `formats` order, then waits for the receiver's ack and closes. The receiver
+/// knows each blob's length from `formats[].size` (made exact at the announce),
+/// so no per-blob header is needed.
+async fn send_push(
+    state: &Arc<AppState>,
+    peer: &PeerAddr,
+    announce: &Value,
+    blobs: &[(String, Arc<Vec<u8>>)],
+) -> std::io::Result<()> {
+    let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, state.transport.open(peer))
+        .await
+        .map_err(|_| timed_out("connect"))??;
+    let mut frame = announce.clone();
+    frame["type"] = json!("clip_push");
+    dataplane::write_frame(&mut stream, &serde_json::to_vec(&frame)?).await?;
+    if let Some(formats) = announce.get("formats").and_then(Value::as_array) {
+        for f in formats {
+            let Some(fmt) = f.get("format").and_then(Value::as_str) else {
+                continue;
+            };
+            if fmt == "files" {
+                continue; // never materialized
+            }
+            let Some((_, bytes)) = blobs.iter().find(|(k, _)| k == fmt) else {
+                // A format with no blob would desync the receiver's per-format
+                // reads: abandon rather than send a truncated stream.
+                return Err(datachannel::unexpected("materialize: missing blob"));
+            };
+            let mut offset = 0u64;
+            for chunk in bytes.chunks(PUSH_CHUNK) {
+                datachannel::write_data(&mut stream, offset, chunk).await?;
+                offset += chunk.len() as u64;
+            }
+            datachannel::write_msg(&mut stream, datachannel::TAG_EOF, &[]).await?;
+        }
+    }
+    let _ = tokio::time::timeout(ANNOUNCE_ACK_TIMEOUT, dataplane::read_frame(&mut stream)).await;
+    let _ = stream.shutdown().await;
+    Ok(())
+}
+
+/// Receiver half of a `clip_push`: re-validates the announce, reads the trailing
+/// inline blobs into the transaction's cache, adopts it if it wins the global
+/// election, notifies the local backend — then acks. Mirrors `recv_announce`,
+/// but the adopted transaction carries its bytes (a paste is served locally,
+/// even after the source goes offline).
+pub(crate) async fn recv_push(
+    state: Arc<AppState>,
+    peer_node_id: String,
+    first: Value,
+    mut stream: Box<dyn IoStream>,
+) {
+    if let Some((tx, record)) = build_pushed_tx(&state, &peer_node_id, &first, &mut stream).await {
+        let adopted = state
+            .clipboard
+            .lock()
+            .expect("lock clipboard")
+            .announce_remote(tx)
+            .is_some();
+        if adopted {
+            state.registry.lock().expect("lock registry").notify_topic(
+                "clipboard",
+                "clipboard.remote_updated",
+                &record,
+            );
+        }
+    }
+    // Ack + linger, exactly as `recv_announce`: let the source read the ack
+    // before it closes, then observe its close (also draining any blob bytes a
+    // dropped push left unread).
+    let ack = serde_json::to_vec(&json!({ "type": "clip_ack" })).expect("serialize ack");
+    let _ = dataplane::write_frame(&mut stream, &ack).await;
+    let _ = stream.shutdown().await;
+    let _ = tokio::time::timeout(LINGER, dataplane::drain(&mut stream)).await;
+}
+
+/// Builds a materialized REMOTE transaction: the same fail-closed validation as
+/// `build_remote_tx`, plus the inline-only / non-`sensitive` guard and reading
+/// each format's blob off the stream into the cache. Returns the transaction and
+/// its backend record, or `None` (drop, fail-closed) on any violation —
+/// including a blob that over/under-runs its announced size.
+async fn build_pushed_tx(
+    state: &AppState,
+    peer_node_id: &str,
+    first: &Value,
+    stream: &mut Box<dyn IoStream>,
+) -> Option<(Transaction, Value)> {
+    // A push MUST be flagged materialized (a plain announce carries no blobs),
+    // inline-only, and never sensitive — a concealed clip stays pull-at-paste.
+    if first.get("materialized").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let mut tx = build_remote_tx(state, peer_node_id, first)?;
+    if tx.sensitive || !tx.files.is_empty() {
+        return None;
+    }
+    let mut total = 0usize;
+    for f in &tx.formats {
+        // Every materialized format announces its exact length; the push carries
+        // precisely that many bytes, and the running total is capped.
+        let size = f.size? as usize;
+        total = total.saturating_add(size);
+        if total > crate::clipboard::MATERIALIZE_MAX {
+            return None;
+        }
+        let bytes = read_blob(stream, size).await?;
+        tx.materialized.insert(f.format.clone(), Arc::new(bytes));
+    }
+    let record = tx.record();
+    Some((tx, record))
+}
+
+/// Reads one inline blob off a `clip_push` stream: `DATA*` then `EOF`, exactly
+/// `expected` bytes. `None` on any framing error, an `ERROR` frame, a premature
+/// `EOF`, an overrun, or a size mismatch — a truncated clip is never cached.
+async fn read_blob(stream: &mut Box<dyn IoStream>, expected: usize) -> Option<Vec<u8>> {
+    let mut buf = Vec::with_capacity(expected.min(PUSH_CHUNK * 2));
+    loop {
+        match datachannel::bounded(datachannel::read_msg(stream)).await {
+            // A `DATA` frame MUST carry the 8-byte offset AND at least one byte
+            // of data: a data-less frame is a protocol violation, never emitted
+            // by a real push (`chunks()` yields no empty chunk, and an empty
+            // blob is a bare `EOF`). Requiring progress here is also what keeps
+            // this loop finite — every accepted frame advances `buf` toward the
+            // overrun cap, so a peer cannot pin it with an endless drip of
+            // zero-data frames (the per-frame stall budget alone would not).
+            Ok(Some((datachannel::TAG_DATA, payload))) if payload.len() > 8 => {
+                buf.extend_from_slice(&payload[8..]);
+                if buf.len() > expected {
+                    return None; // overruns the announced size
+                }
+            }
+            Ok(Some((datachannel::TAG_EOF, _))) => break,
+            _ => return None, // ERROR, premature/data-less frame, stall, or bad frame
+        }
+    }
+    (buf.len() == expected).then_some(buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -371,12 +562,12 @@ pub(crate) async fn run_fill(
     // Reserve the transaction against deletion for the whole fill (survives a
     // supersession, like a consumer channel). Gone since the plan was resolved:
     // TX_STALE.
-    let origin = state
+    let mode = state
         .clipboard
         .lock()
         .expect("lock clipboard")
         .begin_session(&tx_id);
-    let Some(origin) = origin else {
+    let Some(mode) = mode else {
         finish_fill(&state, &transfer_id, Err("TX_STALE".to_string()));
         return;
     };
@@ -385,7 +576,7 @@ pub(crate) async fn run_fill(
     // cancelled.
     let outcome = tokio::select! {
         biased;
-        r = fill_entries(&state, &tx_id, &origin, &plan, &transfer_id) => r,
+        r = fill_entries(&state, &tx_id, &mode, &plan, &transfer_id) => r,
         _ = cancel.notified() => Err("cancelled".to_string()),
     };
     state
@@ -425,7 +616,7 @@ fn finish_fill(state: &AppState, transfer_id: &str, outcome: Result<Vec<Value>, 
 async fn fill_entries(
     state: &Arc<AppState>,
     tx_id: &str,
-    origin: &Origin,
+    mode: &ServeMode,
     plan: &FillPlan,
     transfer_id: &str,
 ) -> Result<Vec<Value>, String> {
@@ -439,16 +630,17 @@ async fn fill_entries(
     progress(0);
 
     // A remote fill opens one session to the source for all the entries; a local
-    // fill reads straight from the disk.
-    let mut session = match origin {
-        Origin::Remote { node_id, device_id } => {
+    // fill reads straight from the disk. (A materialized clip has no files, so a
+    // fill never reaches it — it resolves to `Local` and reads nothing.)
+    let mut session = match mode {
+        ServeMode::Remote { node_id, device_id } => {
             let peer = match dataplane::resolve_peer(state, device_id) {
                 Some(p) if p.node_id == *node_id && p.relay_url.is_some() => p,
                 _ => return Err("PEER_GONE".to_string()),
             };
             Some(RemoteSession::open(state, &peer, tx_id).await?)
         }
-        Origin::Local { .. } => None,
+        ServeMode::Local => None,
     };
 
     let mut written = Vec::with_capacity(plan.items.len());

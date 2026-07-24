@@ -51,6 +51,9 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+# Already a normal dependency (above) and in the lock; re-declared here so the
+# integration-test crate can base64-encode materialized clipboard blobs.
+base64 = "0.22"
 tempfile = "3"
 universallink-server = { path = "../server" }
 universallink-test-support = { path = "../test-support" }

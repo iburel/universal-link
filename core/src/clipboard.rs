@@ -24,8 +24,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
+use base64::Engine;
 use serde_json::{Value, json};
 
 use crate::rpc::RpcErr;
@@ -43,6 +45,20 @@ const FORMATS: [&str; 3] = ["text", "image/png", "files"];
 /// locally and to a local paste but fails to PROPAGATE (best-effort, logged) —
 /// a known v1 limit that lazy enumeration (shared folders) will lift.
 const MANIFEST_MAX: usize = 65_536;
+
+/// Upper bound on the total bytes a single announce may **materialize**
+/// (push-at-copy, doc/core-api.md — "Materialized transactions"). Text is
+/// trivial and a phone screenshot is a few MiB; beyond this the announce is
+/// refused rather than pushing an unbounded blob into every online device's
+/// memory. Comfortably under the IPC frame cap once base64-expanded. Shared
+/// with the push receiver (`clipnet::recv_push`), which enforces the same bound
+/// on the bytes a peer streams.
+pub(crate) const MATERIALIZE_MAX: usize = 8 * 1024 * 1024;
+
+/// Materialized inline payloads (format → bytes), parsed from a `materialize`
+/// announce and streamed on the `clip_push`. Shared by the announce handler and
+/// the network push (`clipnet`).
+pub type MaterializedBlobs = Vec<(String, Arc<Vec<u8>>)>;
 
 /// An offered format and its advisory size (bytes). For inline formats the size
 /// is a hint — the content is re-serialized at paste time and the stream is
@@ -108,6 +124,19 @@ pub enum Origin {
     Remote { node_id: String, device_id: String },
 }
 
+/// How a paste session on a transaction is served — the routing decision the
+/// data channel makes when a session opens. Distinct from `Origin`: a
+/// **materialized** clip is served `Local` (from its cached bytes) whatever its
+/// origin, so a remote materialized clip needs no source contact at all.
+pub enum ServeMode {
+    /// Serve from this Core: disk file ranges, inline pulls from the announcer,
+    /// and/or the materialized cache. Every materialized clip lands here.
+    Local,
+    /// Relay to the source device (a non-materialized remote clip): open a
+    /// `clip_session` stream to it (`clipnet`).
+    Remote { node_id: String, device_id: String },
+}
+
 /// A transaction: a frozen offer, addressable by its unguessable `tx_id`.
 pub struct Transaction {
     pub tx_id: String,
@@ -130,6 +159,15 @@ pub struct Transaction {
     /// Open consumer channels / fills reading it. A superseded transaction is
     /// deleted once this reaches zero.
     pub sessions: u32,
+    /// Materialized inline payloads (Model B, push-at-copy — doc/core-api.md),
+    /// keyed by format. Non-empty exactly when the announce set `materialize`:
+    /// the source caches its own inline bytes here and pushes them to peers, so
+    /// an ephemeral source (a phone) may vanish right after the copy. A `FETCH`
+    /// of a present format is served straight from here — no pull from the
+    /// announcer, no relay to the source device — which is why a materialized
+    /// clip is served locally whatever its `origin`. Freed with the
+    /// transaction. Never holds a `sensitive` clip (those stay pull-at-paste).
+    pub materialized: HashMap<String, Arc<Vec<u8>>>,
 }
 
 impl Transaction {
@@ -302,6 +340,13 @@ impl ClipboardState {
         let t = self.transactions.get(tx_id)?;
         let mut v = t.record();
         v["seq"] = json!(t.seq);
+        // A materialized announce tells the peer that the inline blobs follow on
+        // the same stream (a `clip_push`); the bytes never ride this metadata
+        // frame. Their exact per-format lengths are the `formats[].size`s, made
+        // authoritative at the announce (`parse_materialized`).
+        if !t.materialized.is_empty() {
+            v["materialized"] = json!(true);
+        }
         Some(v)
     }
 
@@ -331,10 +376,43 @@ impl ClipboardState {
     /// already gone (deleted between `transactions.open` and the channel
     /// attach). Accepts a superseded-but-alive transaction: the grant was minted
     /// while it was openable, and an in-flight paste runs to completion.
-    pub fn begin_session(&mut self, tx_id: &str) -> Option<Origin> {
+    pub fn begin_session(&mut self, tx_id: &str) -> Option<ServeMode> {
         let t = self.transactions.get_mut(tx_id)?;
         t.sessions += 1;
-        Some(t.origin.clone())
+        // A materialized clip is served from its cache regardless of origin —
+        // that is the whole point (a remote materialized clip needs no source).
+        Some(if !t.materialized.is_empty() {
+            ServeMode::Local
+        } else {
+            match &t.origin {
+                Origin::Local { .. } => ServeMode::Local,
+                Origin::Remote { node_id, device_id } => ServeMode::Remote {
+                    node_id: node_id.clone(),
+                    device_id: device_id.clone(),
+                },
+            }
+        })
+    }
+
+    /// Whether `tx_id` is a materialized clip (its inline bytes are cached
+    /// here). A materialized clip is served locally and stays openable even when
+    /// its source is offline (`transactions.open` skips the reachability check).
+    pub fn is_materialized(&self, tx_id: &str) -> bool {
+        self.transactions
+            .get(tx_id)
+            .is_some_and(|t| !t.materialized.is_empty())
+    }
+
+    /// The cached bytes for a materialized `format`, if present — the fast path
+    /// a `FETCH` takes instead of pulling from the announcer or the source
+    /// device. `Arc` so the lock is released before the (possibly large) blob
+    /// is streamed.
+    pub fn materialized_blob(&self, tx_id: &str, format: &str) -> Option<Arc<Vec<u8>>> {
+        self.transactions
+            .get(tx_id)?
+            .materialized
+            .get(format)
+            .cloned()
     }
 
     /// Closes a session; deletes the transaction if it was superseded and this
@@ -479,6 +557,65 @@ pub fn parse_formats(params: &Value) -> Result<Vec<Format>, RpcErr> {
         formats.push(Format { format, size });
     }
     Ok(formats)
+}
+
+/// Parses and validates the `materialize` / `blobs` fields of
+/// `clipboard.updated` (Model B, push-at-copy — doc/core-api.md, "Materialized
+/// transactions"). Returns the inline payloads (format → bytes, in the order the
+/// formats were offered) when materialized, `Ok(None)` when not. Fail-closed:
+/// materialize excludes `files` and `sensitive` (a materialized clip is
+/// inline-only and never conceals — those stay pull-at-paste); it requires
+/// exactly one base64 `blobs` entry per offered format and no stray entry; and
+/// the total decoded size is capped (`MATERIALIZE_MAX`). Rewrites each format's
+/// `size` to its exact decoded length, which the peer reads off the push.
+pub fn parse_materialized(
+    params: &Value,
+    formats: &mut [Format],
+    sensitive: bool,
+    has_files: bool,
+) -> Result<Option<MaterializedBlobs>, RpcErr> {
+    if !crate::rpc::optional_bool(params, "materialize")?.unwrap_or(false) {
+        return Ok(None);
+    }
+    if sensitive {
+        return Err(RpcErr::invalid_params("materialize excludes sensitive"));
+    }
+    if has_files {
+        return Err(RpcErr::invalid_params("materialize excludes files"));
+    }
+    if formats.is_empty() {
+        return Err(RpcErr::invalid_params("materialize requires a format"));
+    }
+    let blobs = params
+        .get("blobs")
+        .and_then(Value::as_object)
+        .ok_or_else(|| RpcErr::invalid_params("blobs"))?;
+    // Exactly one blob per offered format, and no stray key: the push streams
+    // precisely these, in `formats` order.
+    if blobs.len() != formats.len() {
+        return Err(RpcErr::invalid_params("blobs: one per format"));
+    }
+    let engine = base64::engine::general_purpose::STANDARD;
+    let mut out = Vec::with_capacity(formats.len());
+    let mut total = 0usize;
+    for f in formats.iter_mut() {
+        let b64 = blobs
+            .get(&f.format)
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcErr::invalid_params(&format!("blobs: {}", f.format)))?;
+        let bytes = engine
+            .decode(b64)
+            .map_err(|_| RpcErr::invalid_params(&format!("blobs: {} not base64", f.format)))?;
+        total = total.saturating_add(bytes.len());
+        if total > MATERIALIZE_MAX {
+            return Err(RpcErr::invalid_params("blobs exceed the materialize cap"));
+        }
+        // The exact decoded length is authoritative: the peer reads this many
+        // bytes off the `clip_push`, and a local paste streams exactly them.
+        f.size = Some(bytes.len() as u64);
+        out.push((f.format.clone(), Arc::new(bytes)));
+    }
+    Ok(Some(out))
 }
 
 /// Defensive bound on how deep a copied folder is walked before the announce is
@@ -836,6 +973,67 @@ mod tests {
         assert!(parse_formats(&json!({ "formats": [{ "format": "video/mp4" }] })).is_err());
         assert!(parse_formats(&json!({ "formats": [{}] })).is_err());
         assert!(parse_formats(&json!({})).is_err());
+    }
+
+    #[test]
+    fn parse_materialized_validates_and_sizes_the_blobs() {
+        let engine = base64::engine::general_purpose::STANDARD;
+        let params = json!({
+            "formats": [{ "format": "text" }],
+            "materialize": true,
+            "blobs": { "text": engine.encode(b"hello world") },
+        });
+        let mut formats = parse_formats(&params).unwrap();
+        let out = parse_materialized(&params, &mut formats, false, false)
+            .unwrap()
+            .expect("materialized");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "text");
+        assert_eq!(&**out[0].1, b"hello world");
+        // The format's `size` is rewritten to the exact decoded length.
+        assert_eq!(formats[0].size, Some(11));
+
+        // Not materialized → None (unchanged pull-at-paste).
+        let plain = json!({ "formats": [{ "format": "text" }] });
+        let mut f = parse_formats(&plain).unwrap();
+        assert!(
+            parse_materialized(&plain, &mut f, false, false)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_materialized_is_fail_closed() {
+        let engine = base64::engine::general_purpose::STANDARD;
+        let good = json!({
+            "formats": [{ "format": "text" }],
+            "materialize": true,
+            "blobs": { "text": engine.encode(b"x") },
+        });
+        // `sensitive` and `files` are both refused.
+        let mut f = parse_formats(&good).unwrap();
+        assert!(parse_materialized(&good, &mut f, true, false).is_err());
+        let mut f = parse_formats(&good).unwrap();
+        assert!(parse_materialized(&good, &mut f, false, true).is_err());
+
+        // A stray / missing blob (count mismatch with the offered formats).
+        let stray = json!({
+            "formats": [{ "format": "text" }],
+            "materialize": true,
+            "blobs": { "text": engine.encode(b"x"), "image/png": engine.encode(b"y") },
+        });
+        let mut f = parse_formats(&stray).unwrap();
+        assert!(parse_materialized(&stray, &mut f, false, false).is_err());
+
+        // Not base64.
+        let bad = json!({
+            "formats": [{ "format": "text" }],
+            "materialize": true,
+            "blobs": { "text": "@@@ not base64 @@@" },
+        });
+        let mut f = parse_formats(&bad).unwrap();
+        assert!(parse_materialized(&bad, &mut f, false, false).is_err());
     }
 
     #[test]

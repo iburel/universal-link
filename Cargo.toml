@@ -1,3 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["client", "clipboard", "core", "daemon", "gui", "paths", "server", "server-daemon", "test-support", "tray"]
+# The Android client's Rust cdylib (JNI shim). Excluded from the workspace: it
+# is built only for aarch64-linux-android via cargo-ndk, never by the native CI
+# jobs, so it perturbs neither the workspace build nor cargo-deny. It still
+# path-depends on the workspace crates.
+exclude = ["android/ffi"]

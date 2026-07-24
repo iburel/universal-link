@@ -199,6 +199,8 @@ Two kinds of resources, split by who holds the bytes:
   announce, they no longer exist anywhere: `CLIP_STALE`. Deliberate limit of
   pull-at-paste (nothing is snapshotted — a copied password never sits in the
   Core's memory), with a negligible window: an inline paste is a single fetch.
+  A **materialized** transaction lifts exactly this limit for a source that is
+  only briefly alive (a phone) — see *Materialized transactions* below.
 - **Files**: the backend hands over paths; the Core canonicalizes them and
   freezes the **manifest** at announce time (`stat` only — canonical paths,
   sizes, and each file's identity: device + inode where the OS gives one, plus
@@ -245,6 +247,41 @@ oversized frame). Lazy enumeration (which shared folders will need) is an
 additive extension: `file_id` is opaque and the manifest can become pageable
 without breaking consumers.
 
+### Materialized transactions (push-at-copy)
+
+Pull-at-paste assumes the source is still alive when a peer pastes: the source
+Core re-reads its OS clipboard (inline) or its disk (files) on demand. A source
+that is only briefly alive around the copy — a phone sharing a snippet from an
+app the OS then kills — cannot answer that later pull: the announcing
+connection, and the source Core with it, is gone (`CLIP_STALE`).
+
+A **materialized** transaction inverts the inline path for exactly that case:
+the source pushes the inline bytes to the account's online devices *at copy
+time*, and each destination Core caches them. A later paste is served from that
+cache, entirely locally — the source is never contacted, so it may vanish the
+instant the push completes. The share gesture is explicit, so spilling the
+bytes eagerly is the intent, not a leak.
+
+Constraints keep it a narrow, safe extension:
+
+- **Inline formats only** (`text`, `image/png`), never `files` — a file clip is
+  already a push when it needs to be (`files.send`), and a manifest is not
+  bytes. Bounded: the materialized payload is capped (a few MiB); a runaway is
+  refused at the announce.
+- **Never `sensitive`** — a concealed clip stays pull-at-paste, so its bytes
+  move only to the device that actually pastes and never sit in the memory of
+  devices that do not. A `materialize` request that also sets `sensitive` is
+  refused.
+- **Additive** — a non-materialized copy is unchanged (pull-at-paste). A
+  destination holding the cached bytes serves them locally (no `DEVICE_OFFLINE`
+  at `transactions.open`, no `PEER_GONE` at paste, even if the source has since
+  gone offline); a destination that was offline at copy time simply never
+  learned the clip, exactly as a missed announce today.
+
+Supersession and the Core-stop/logout cut drop the cached bytes with the
+transaction, like any other: a materialized clip is deleted (and its bytes
+freed) the moment it is superseded with no active session.
+
 ## `clipboard.*`
 
 **Pull-at-paste** model: on copy, only the metadata circulates (as a
@@ -258,7 +295,7 @@ contract of the backend.
 
 | Direction | Call | Description |
 |---|---|---|
-| component → Core | `clipboard.updated { formats: [{format, size?}], paths?, sensitive? }` → `{ tx_id }` | announces the local copy: opens the transaction that supersedes the previous one. `paths` mandatory if `files` (the manifest is frozen from them). `formats` may be empty — the clipboard was cleared; it supersedes like any announce (a contentless transaction), and destinations withdraw their promise. Inline `size` is an advisory hint (the content is re-serialized at paste time; the stream up to `EOF` is authoritative, a mismatch is not an error) and is omitted when `sensitive`. `sensitive`: set if the OS confidentiality markers are detected. The backend keeps the returned `tx_id` mapped to that clipboard generation |
+| component → Core | `clipboard.updated { formats: [{format, size?}], paths?, sensitive?, materialize?, blobs? }` → `{ tx_id }` | announces the local copy: opens the transaction that supersedes the previous one. `paths` mandatory if `files` (the manifest is frozen from them). `formats` may be empty — the clipboard was cleared; it supersedes like any announce (a contentless transaction), and destinations withdraw their promise. Inline `size` is an advisory hint (the content is re-serialized at paste time; the stream up to `EOF` is authoritative, a mismatch is not an error) and is omitted when `sensitive`. `sensitive`: set if the OS confidentiality markers are detected. `materialize: true` makes it a **materialized** transaction (push-at-copy): the caller supplies the inline bytes now as `blobs: { <format>: <base64> }` (one entry per inline format offered, capped), the Core pushes them to the account's online devices, and it also serves the source's own pastes from them — so the caller may exit right after the copy. It excludes `sensitive` and `files` (rejected). The backend keeps the returned `tx_id` mapped to that clipboard generation |
 | Core → component | `clipboard.get_data { tx_id, format, channel_token }` → `{}` | **request** from the Core when a device pastes an inline format: the backend re-reads the OS clipboard, streams the blob over the provider channel opened with `channel_token`, and replies `{}` only after `EOF` — the reply is the completion signal. It replies `CLIP_STALE` *without opening the channel* if it cannot vouch for the `tx_id` generation (the OS clipboard moved on — or this backend instance never knew it); a failure detected mid-stream surfaces as `ERROR` on the channel and mirrors in the reply |
 
 The files never pass through the backend: the Core serves their bytes from the
@@ -372,7 +409,10 @@ Network mapping (informative): between Cores, one iroh connection per device
 pair and **at least one stream per transaction** — one transaction's traffic
 never queues behind another's (a small copy pastes instantly while a big one is
 still pouring), and a consumer channel's requests relay 1:1 onto such a stream.
-The exact wire protocol is out of scope for this document.
+A materialized transaction instead pushes its inline bytes source → destination
+at copy time (one stream per online device, the metadata frame then the blobs);
+the destination caches them and serves its pastes with no stream at all. The
+exact wire protocol is out of scope for this document.
 
 ## Errors
 

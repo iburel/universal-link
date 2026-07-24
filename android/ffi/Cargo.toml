@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
+
+# The Android client's native shim. A `cdylib` loaded by the Kotlin app: its
+# JNI entry point starts the embedded Core (same wiring as the desktop daemon's
+# main.rs, minus the supervisor and OS signals) inside the app process. The Core
+# binds its UDS in the app-private data dir; the Kotlin app is a component that
+# speaks the existing core-api over it.
+#
+# EXCLUDED from the workspace (see the root Cargo.toml): built only for
+# aarch64-linux-android via cargo-ndk, never by the native CI jobs.
+[package]
+name = "universallink-android"
+version = "0.0.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1"
+# JNI 0.21: the stable API. (rustls-platform-verifier's Android trust-store
+# integration wants jni 0.22 + a companion Kotlin class — deferred to the login
+# brick, where TLS is actually exercised end-to-end.)
+jni = "0.21"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+
+# Brick-1 TLS reachability probe to the real server: bundled Mozilla roots
+# (no OS-trust-store JNI plumbing needed just to prove egress + handshake).
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+] }
+webpki-roots = "1"
+
+universallink-core = { path = "../../core" }
+# For the production iroh data-plane wiring (LazyIrohTransport / IrohTransport).
+universallink-daemon = { path = "../../daemon" }
