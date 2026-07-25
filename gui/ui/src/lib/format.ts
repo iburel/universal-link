@@ -70,6 +70,27 @@ export function relativeTime(
   );
 }
 
+const UNITS = ["B", "KiB", "MiB", "GiB", "TiB"];
+
+/**
+ * "2.4 MiB". Binary units, to match the limits the Core states in the same terms
+ * (doc/core-api.md). Returns "" for anything that is not a size, so a caller can
+ * print it without guarding.
+ */
+export function formatSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "";
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < UNITS.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  // A decimal on raw bytes reads oddly ("512.0 B"), and past a hundred of any
+  // unit the tenth is noise.
+  const digits = unit === 0 || value >= 100 ? 0 : 1;
+  return `${value.toFixed(digits)} ${UNITS[unit]}`;
+}
+
 /** This PC first, then online devices, then by name. */
 export function sortDevices(devices: readonly Device[]): Device[] {
   return [...devices].sort((a, b) => {

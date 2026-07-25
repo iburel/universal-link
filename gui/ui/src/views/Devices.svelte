@@ -4,13 +4,18 @@
 <script lang="ts">
   import type { Device } from "../lib/api";
   import { platformLabel, relativeTime, sortDevices } from "../lib/format";
-  import type { CoreStore, Transfer } from "../lib/store.svelte";
+  import { shareSummary, type CoreStore, type Transfer } from "../lib/store.svelte";
 
   // `now` is a parameter: tests don't have to freeze the clock.
   let { store, now = new Date() }: { store: CoreStore; now?: Date } = $props();
 
   const devices = $derived(sortDevices(store.devices));
   const disabled = $derived(store.connection.status !== "connected" || store.busy);
+
+  // Files shared from the Android share sheet, waiting for a destination: the
+  // list becomes a picker (one tap = one send), and the management actions step
+  // aside for it. Always null on the desktop.
+  const share = $derived(store.pendingShare);
 
   // One transfer per device on the card: an ACTIVE transfer takes priority (its
   // progress and its cancellation must stay accessible), otherwise the most
@@ -41,6 +46,16 @@
   let draft = $state("");
   let confirming = $state<string | null>(null);
 
+  // The picker replaces the management actions, Save and Cancel included: a
+  // rename or a revocation left half-open when a share arrives would have no
+  // button left to finish it.
+  $effect(() => {
+    if (share) {
+      editing = null;
+      confirming = null;
+    }
+  });
+
   function startRename(device: Device) {
     confirming = null;
     editing = device.device_id;
@@ -61,6 +76,18 @@
 </script>
 
 <section>
+  {#if share}
+    <div class="share" role="status">
+      <div class="what">
+        <strong>Send to…</strong>
+        <span class="meta">{shareSummary(share.files)}</span>
+      </div>
+      <button aria-label="Cancel the share" onclick={() => store.cancelShare()}>
+        Cancel
+      </button>
+    </div>
+  {/if}
+
   <h1>Devices</h1>
 
   {#if !store.primed}
@@ -106,7 +133,19 @@
             </div>
 
             <div class="actions">
-              {#if editing === device.device_id}
+              {#if share}
+                <!-- This phone cannot be a destination for its own share; an
+                     offline one is shown but not offered (the Core would refuse
+                     it with DEVICE_OFFLINE). -->
+                {#if !device.is_self}
+                  <button
+                    disabled={disabled || !store.targetFor(device.device_id)}
+                    aria-label="Send to {device.name}"
+                    onclick={() => store.sendShare(device.device_id)}
+                    >Send</button
+                  >
+                {/if}
+              {:else if editing === device.device_id}
                 <button {disabled} onclick={() => commitRename(device)}>
                   Save
                 </button>
@@ -192,6 +231,29 @@
   .muted {
     color: var(--muted);
     margin: 0;
+  }
+
+  /* The pending share: what the taps below are about. */
+  .share {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.6rem 0.75rem;
+    background: var(--panel);
+    border: 1px solid var(--accent);
+    border-radius: var(--radius);
+  }
+
+  .share .what {
+    display: grid;
+    min-width: 0;
+  }
+
+  .share .meta {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   ul {

@@ -219,3 +219,25 @@ test("a configured Core shows the app with a Server settings tab", () => {
   click(byText(app, "nav button", "Server"));
   expect(textOf(app)).toContain("this device connects to");
 });
+
+// Mobile: a file share from the Android share sheet needs a destination, and the
+// picker lives in the Devices view. Whatever the user was looking at, the app
+// takes them there — the share, not the navigation, is what they just did.
+test("a pending share opens the Devices view", async () => {
+  store.primed = true;
+  store.session = { logged_in: true, server_connected: true };
+  store.account = { attested: true, fingerprint: "AB12" };
+
+  const app = render(App, { store });
+  expect(app.querySelector("h1")?.textContent).toBe("Account");
+
+  store.pendingShare = {
+    phase: "pick",
+    id: "s_1",
+    files: [{ path: "/c/shares/s_1/a.pdf", name: "a.pdf", size: 10 }],
+  };
+  await vi.waitFor(() =>
+    expect(app.querySelector("h1")?.textContent).toBe("Devices"),
+  );
+  expect(textOf(app)).toContain("Send to…");
+});

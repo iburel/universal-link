@@ -49,18 +49,22 @@ import {
 } from "./api";
 import {
   connectionStatus,
+  discardShare,
   getServerConfig,
   onConnectionChanged,
   onCoreNotification,
   onShareStatus,
   setServerConfig,
   shareStatus,
+  shareTaken,
   type ConnectionStatus,
   type CoreNotification,
   type ServerConfigInput,
   type ShareStatus,
+  type SharedFile,
 } from "./core";
 import { humanize, isCoreError, isInvalidParams } from "./errors";
+import { formatSize } from "./format";
 
 export interface Notice {
   kind: "info" | "error";
@@ -76,18 +80,42 @@ export interface Notice {
 
 const devices = (n: number) => `${n} device${n === 1 ? "" : "s"}`;
 
+/** A file share waiting for a destination — the `pick` phase of a share. */
+export type PendingShare = Extract<ShareStatus, { phase: "pick" }>;
+
+/**
+ * Every share status EXCEPT the one that is not a message: a `pick` is a
+ * question, and it is answered by the device picker, not by a banner.
+ */
+export type ShareBanner = Exclude<ShareStatus, { phase: "pick" }>;
+
 /**
  * What a share's progress reads like in the banner (Android share sheet; see
  * {@link ShareStatus}). Kept honest on purpose: a share that reached none of
  * the account's devices says so, because the user has already walked away from
  * the app that shared it and will not find out any other way.
  */
-export function shareNotice(status: ShareStatus): Notice {
+export function shareNotice(status: ShareBanner): Notice {
   return { ...shareText(status), sticky: true };
 }
 
-function shareText(status: ShareStatus): Notice {
+/** "holiday.jpg · 2.4 MiB" / "3 files · 12.1 MiB" — what is about to be sent. */
+export function shareSummary(files: readonly SharedFile[]): string {
+  const total = files.reduce((bytes, file) => bytes + file.size, 0);
+  const what = files.length === 1 ? files[0].name : `${files.length} files`;
+  return `${what} · ${formatSize(total)}`;
+}
+
+function shareText(status: ShareBanner): Notice {
   switch (status.phase) {
+    case "preparing":
+      return {
+        kind: "info",
+        text:
+          status.files === 1
+            ? "Preparing the shared file…"
+            : `Preparing ${status.files} shared files…`,
+      };
     case "sending":
       return {
         kind: "info",
@@ -148,6 +176,18 @@ function shareText(status: ShareStatus): Notice {
               ? `Sharing failed: ${status.detail}`
               : "Sharing failed.",
           };
+        // The copy out of the share failed. Whatever the app that shared it
+        // meant to hand over, we never got it — so there is nothing to send.
+        case "unreadable":
+          return {
+            kind: "error",
+            text: "Could not read what was shared — nothing was sent.",
+          };
+        case "no_space":
+          return {
+            kind: "error",
+            text: "Not enough free space on this phone to prepare that share.",
+          };
       }
   }
 }
@@ -204,6 +244,14 @@ export class CoreStore {
    * an ineligible device (offline, this PC).
    */
   dropTarget = $state<string | null>(null);
+  /**
+   * Files shared from the Android share sheet, waiting for a destination
+   * (mobile only — always `null` on the desktop, which has drag-and-drop
+   * instead). The picker lives in the Devices view; consuming this is
+   * {@link sendShare} or {@link cancelShare}, and either way the copy in the
+   * app's cache is released.
+   */
+  pendingShare = $state<PendingShare | null>(null);
   /** Why the directory is empty, when the Core refuses to serve it. */
   devicesError = $state<string | null>(null);
   /** The last action's feedback, shown as a banner. */
@@ -233,6 +281,13 @@ export class CoreStore {
   /** Resnapshot generations: the most recent wins, the others withdraw. */
   #generation = 0;
   #sawConnectionEvent = false;
+  #sawShareStatus = false;
+  /**
+   * Which share a transfer is carrying (`transfer_id` → share id), so its cache
+   * copy can be released when the transfer ends. The `transfer_id` is used ONLY
+   * as a key here: no state is derived from a command's response (rule 1).
+   */
+  #shareOfTransfer = new Map<string, string>();
 
   /**
    * Subscribe THEN read the snapshot: the shell updates its snapshot before
@@ -261,7 +316,8 @@ export class CoreStore {
     // user happens to be, including behind the onboarding portals.
     this.#unlisten.push(
       await onShareStatus((s) => {
-        this.notice = shareNotice(s);
+        this.#sawShareStatus = true;
+        this.#applyShare(s);
       }),
     );
     const snapshot = await connectionStatus();
@@ -271,7 +327,34 @@ export class CoreStore {
     // above so a newer status cannot be missed. A live event wins — it is more
     // recent than the snapshot by construction.
     const share = await shareStatus();
-    if (share && !this.notice?.sticky) this.notice = shareNotice(share);
+    if (share && !this.#sawShareStatus) this.#applyShare(share);
+  }
+
+  /**
+   * Applies a share status: a `pick` becomes the question the Devices view asks,
+   * everything else becomes the banner.
+   */
+  #applyShare(status: ShareStatus): void {
+    if (status.phase === "pick") {
+      // Supersedes any earlier pick, and takes down the "Preparing…" banner this
+      // one follows.
+      this.#dropPending(status.id);
+      this.pendingShare = status;
+      this.notice = null;
+      return;
+    }
+    // A share being prepared supersedes one still waiting for a destination:
+    // the Rust side has already dropped its copy (share.rs `discard_pending`),
+    // and offering to send bytes that no longer exist would be a dead end.
+    if (status.phase === "preparing") this.#dropPending();
+    this.notice = shareNotice(status);
+  }
+
+  /** Forgets the pending pick and releases its copy — unless it IS `keep`. */
+  #dropPending(keep?: string): void {
+    const pending = this.pendingShare;
+    this.pendingShare = null;
+    if (pending && pending.id !== keep) void discardShare(pending.id);
   }
 
   stop(): void {
@@ -484,6 +567,9 @@ export class CoreStore {
       }
       case "transfer.finished": {
         const id = (params as { transfer_id?: string } | null)?.transfer_id;
+        // Before the tracking lookup: a shared file's copy must be released even
+        // if this transfer was never tracked here.
+        this.#releaseShare(id);
         const t = this.transfers.find((x) => x.transfer_id === id);
         if (!t) return false;
         t.status = "finished";
@@ -493,6 +579,7 @@ export class CoreStore {
       }
       case "transfer.failed": {
         const p = params as { transfer_id?: string; error?: string } | null;
+        this.#releaseShare(p?.transfer_id);
         const t = this.transfers.find((x) => x.transfer_id === p?.transfer_id);
         if (!t) return false;
         t.status = "failed";
@@ -743,17 +830,69 @@ export class CoreStore {
     return device && device.online && !device.is_self ? device_id : null;
   }
 
-  /** Sends `paths` to `device_id`. Tracking will arise from `transfer.started`. */
-  async sendFiles(device_id: string, paths: string[]): Promise<void> {
-    if (paths.length === 0) return;
+  /**
+   * Sends `paths` to `device_id`. Tracking arises from `transfer.started`; the
+   * returned `transfer_id` is not state, only a handle for a caller that has
+   * something to release when the transfer ends ({@link sendShare}).
+   */
+  async sendFiles(device_id: string, paths: string[]): Promise<string | null> {
+    if (paths.length === 0) return null;
     // Each drop starts from a clean banner: the error of a faulty drop (a
     // folder) must not survive a valid drop that follows it.
     this.notice = null;
     try {
-      await api.filesSend(device_id, paths);
+      const { transfer_id } = await api.filesSend(device_id, paths);
+      return transfer_id;
     } catch (e) {
       this.notice = { kind: "error", text: humanize(e) };
+      return null;
     }
+  }
+
+  /**
+   * Sends the pending share to `device_id` — one tap, one destination, and the
+   * share is spent. Its cache copy is released when the transfer ends, whichever
+   * way it ends.
+   */
+  async sendShare(device_id: string): Promise<void> {
+    const share = this.pendingShare;
+    if (!share) return;
+    // Consumed here, not on the way back: a second tap must not send twice.
+    this.pendingShare = null;
+    // Before anything can await: from now on this share is answered, and a share
+    // arriving meanwhile must not mistake it for one still waiting and delete the
+    // files the transfer is about to read.
+    void shareTaken(share.id);
+    const transfer_id = await this.sendFiles(
+      device_id,
+      share.files.map((file) => file.path),
+    );
+    if (transfer_id === null) {
+      // Refused outright (offline device, revoked...): the bytes are of no
+      // further use, and the banner already carries the reason.
+      void discardShare(share.id);
+      return;
+    }
+    this.#shareOfTransfer.set(transfer_id, share.id);
+    // The transfer may have ended while we awaited the response — its
+    // notifications ride the same queue as that response. No second
+    // `finished`/`failed` will come, so release it now.
+    const known = this.transfers.find((t) => t.transfer_id === transfer_id);
+    if (known && known.status !== "active") this.#releaseShare(transfer_id);
+  }
+
+  /** Gives up on the pending share (the picker's "Cancel"). */
+  cancelShare(): void {
+    this.#dropPending();
+  }
+
+  /** Releases the share a finished transfer was carrying, if it carried one. */
+  #releaseShare(transfer_id: string | undefined): void {
+    if (transfer_id === undefined) return;
+    const share = this.#shareOfTransfer.get(transfer_id);
+    if (share === undefined) return;
+    this.#shareOfTransfer.delete(transfer_id);
+    void discardShare(share);
   }
 
   /** Cancels a transfer. The outcome (`failed`/`finished`) will come by notification. */

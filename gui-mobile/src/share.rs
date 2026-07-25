@@ -28,8 +28,26 @@
 //! pastes (doc/core-api.md — "Materialized transactions"). The Core answers
 //! `pushed_to` and then reports the fan-out with `clipboard.pushed`, which is
 //! what lets the UI tell the truth about a share instead of assuming it worked.
+//!
+//! # Files
+//!
+//! A shared FILE takes a different route, and not by preference: a `content://`
+//! URI is a permission grant to this process, not a readable path, and it dies
+//! with the activity that received it — while the Core must read the bytes
+//! LATER, once the user has chosen a destination. So `ShareFiles.kt` copies them
+//! into the app's cache first, and this file publishes the result to the UI,
+//! which asks for a destination and calls `files.send` over the GUI bridge (a
+//! connection that already carries `files.send` and `transfers.read`, so the
+//! transfer shows up in the same cards the desktop uses for a drag-and-drop).
+//!
+//! Nothing about a file share touches the Core from here. What lives here is the
+//! cache's lifecycle: [`register`] adopts a copy and sweeps the ones no one is
+//! coming back for, [`discard_share`] drops one the moment the frontend is done
+//! with it (destination cancelled, or transfer over).
 
-use std::sync::{Mutex, OnceLock};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -88,15 +106,24 @@ const READY_POLL: Duration = Duration::from_millis(400);
 /// the bytes again for an outcome the user could not tell apart.
 const ANNOUNCE_ATTEMPTS: u32 = 2;
 
-type Shares = mpsc::UnboundedReceiver<String>;
+/// One gesture from the share sheet.
+enum Share {
+    /// Text to announce to the whole account (materialized clipboard).
+    Text(String),
+    /// A file share whose bytes are already in the cache: only its status is
+    /// left to publish, the destination being the frontend's business.
+    Files(Value),
+}
 
-/// Shared texts, queued between the JVM thread that receives the intent and the
-/// worker that announces them. Created on first touch from EITHER side: on a
+type Shares = mpsc::UnboundedReceiver<Share>;
+
+/// Shares, queued between the JVM thread that receives the intent and the
+/// worker that acts on them. Created on first touch from EITHER side: on a
 /// cold share the intent can reach us while the Core is still booting, and
 /// dropping the user's share because we were not ready yet is not an option.
-static QUEUE: OnceLock<(mpsc::UnboundedSender<String>, Mutex<Option<Shares>>)> = OnceLock::new();
+static QUEUE: OnceLock<(mpsc::UnboundedSender<Share>, Mutex<Option<Shares>>)> = OnceLock::new();
 
-fn queue() -> &'static (mpsc::UnboundedSender<String>, Mutex<Option<Shares>>) {
+fn queue() -> &'static (mpsc::UnboundedSender<Share>, Mutex<Option<Shares>>) {
     QUEUE.get_or_init(|| {
         let (tx, rx) = mpsc::unbounded_channel();
         (tx, Mutex::new(Some(rx)))
@@ -105,12 +132,12 @@ fn queue() -> &'static (mpsc::UnboundedSender<String>, Mutex<Option<Shares>>) {
 
 /// Takes a shared text from the share sheet. Never blocks and never fails: the
 /// queue is unbounded and drained by the worker as soon as it exists.
-fn submit(text: String) {
+fn submit_text(text: String) {
     if text.is_empty() {
         return;
     }
     tracing::info!(bytes = text.len(), "shared text received");
-    let _ = queue().0.send(text);
+    let _ = queue().0.send(Share::Text(text));
 }
 
 /// `org.universallink.mobile.ShareBridge.onShareText` — see `ShareBridge.kt`.
@@ -128,12 +155,215 @@ pub extern "system" fn Java_org_universallink_mobile_ShareBridge_onShareText(
     // dropped with a log instead of taking the app down.
     let taken = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         match env.get_string(&text) {
-            Ok(s) => submit(String::from(s)),
+            Ok(s) => submit_text(String::from(s)),
             Err(e) => tracing::error!(error = %e, "unreadable shared text"),
         }
     }));
     if taken.is_err() {
         tracing::error!("panic while taking a shared text; it was dropped");
+    }
+}
+
+/// `org.universallink.mobile.ShareBridge.onShareFiles` — see `ShareFiles.kt`.
+///
+/// The payload is JSON rather than a flat argument list because a file share has
+/// three shapes (see [`file_share_status`]), and one seam that carries its own
+/// structure beats three externs that have to stay in step with each other.
+///
+/// Always called from Kotlin's single copy worker, never from the UI thread —
+/// every shape reaches disk here (even `preparing`, which drops a superseded
+/// share's copy), and that worker being single is what makes the sweep in
+/// [`register`] safe.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_universallink_mobile_ShareBridge_onShareFiles(
+    mut env: tauri::tao::platform::android::prelude::JNIEnv<'_>,
+    _class: tauri::tao::platform::android::prelude::JClass<'_>,
+    json: tauri::tao::platform::android::prelude::JString<'_>,
+) {
+    // A panic unwinding back into the JVM is undefined behaviour.
+    let taken = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match env.get_string(&json) {
+            Ok(s) => submit_files(&String::from(s)),
+            Err(e) => tracing::error!(error = %e, "unreadable file share"),
+        }
+    }));
+    if taken.is_err() {
+        tracing::error!("panic while taking a file share; it was dropped");
+    }
+}
+
+/// Queues a file share for publication, after validating it and adopting its
+/// cache copy.
+fn submit_files(json: &str) {
+    match file_share_status(json) {
+        Some(status) => {
+            tracing::info!(status = %status, "file share received");
+            let _ = queue().0.send(Share::Files(status));
+        }
+        // The payload comes from our own Kotlin, so this is a programming error,
+        // not a user-facing one — and a status the UI could not act on is worse
+        // than none.
+        None => tracing::error!(json, "a file share was dropped: unusable payload"),
+    }
+}
+
+/// Validates a file share from `ShareFiles.kt` and returns the status to publish.
+/// Fail-closed on every field: a share whose paths we cannot vouch for is not
+/// handed to the UI, which would offer to send it.
+///
+/// The three shapes, in the order they occur:
+/// ```text
+/// {"phase":"preparing","files":2}
+/// {"phase":"pick","dir":"…/shares/<id>","files":[{"path":…,"name":…,"size":…}]}
+/// {"phase":"failed","reason":"unreadable"|"no_space"}
+/// ```
+fn file_share_status(json: &str) -> Option<Value> {
+    let payload: Value = serde_json::from_str(json).ok()?;
+    match payload["phase"].as_str()? {
+        "preparing" => {
+            // A new share supersedes one still waiting for a destination: its
+            // copy is bytes the user has already moved on from.
+            discard_pending();
+            Some(json!({ "phase": "preparing", "files": payload["files"].as_u64()? }))
+        }
+        "failed" => {
+            // Kotlin's vocabulary, narrowed to what the UI has words for.
+            let reason = match payload["reason"].as_str().unwrap_or_default() {
+                "no_space" => "no_space",
+                _ => "unreadable",
+            };
+            Some(json!({ "phase": "error", "reason": reason }))
+        }
+        "pick" => {
+            let dir = PathBuf::from(payload["dir"].as_str()?);
+            // The share's id IS its directory's name: one string identifies the
+            // share for the frontend and locates its bytes for us.
+            let id = dir.file_name()?.to_str()?.to_owned();
+            let mut files = Vec::new();
+            for entry in payload["files"].as_array()? {
+                let path = entry["path"].as_str()?;
+                let name = entry["name"].as_str()?;
+                let size = entry["size"].as_u64()?;
+                // These paths are handed to the Core to read: they must be the
+                // copies we just wrote, inside this share's own directory.
+                if Path::new(path).parent() != Some(dir.as_path()) {
+                    tracing::error!(path, "a shared file lies outside its share directory");
+                    return None;
+                }
+                // And they must still BE there, at that size. Offering a
+                // destination for bytes that are gone would fail much later, as an
+                // opaque Core error, on a share the user believed was ready.
+                match std::fs::metadata(path) {
+                    Ok(meta) if meta.is_file() && meta.len() == size => {}
+                    _ => {
+                        tracing::error!(path, size, "a shared file is not the copy we expected");
+                        return None;
+                    }
+                }
+                files.push(json!({ "path": path, "name": name, "size": size }));
+            }
+            if files.is_empty() {
+                return None;
+            }
+            register(&id, &dir);
+            Some(json!({ "phase": "pick", "id": id, "files": files }))
+        }
+        _ => None,
+    }
+}
+
+/// Cache directories holding shared files, by share id. A share stays here from
+/// the moment its copy is complete until the frontend is done with it — which
+/// covers the whole transfer, since the Core reads these files as it sends.
+static SHARES: LazyLock<Mutex<HashMap<String, PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Adopts a share's copy, then sweeps the directories no one is coming back for.
+///
+/// The sweep is what makes the cache self-limiting: the frontend discards a share
+/// as soon as its transfer ends, but an app killed mid-transfer (or a webview
+/// that never loaded) leaves its copy behind with nothing left to release it.
+/// Anything not in [`SHARES`] is exactly that — a leftover, including everything
+/// from a previous run of the app.
+///
+/// That reading holds only because copies do not overlap: Kotlin runs them on ONE
+/// worker (`ShareFiles.worker`), so no directory is being written while this runs.
+/// Two copies at once and this would delete the other one's directory mid-write.
+fn register(id: &str, dir: &Path) {
+    let mut shares = SHARES.lock().expect("lock shares");
+    shares.insert(id.to_owned(), dir.to_path_buf());
+    let Some(root) = dir.parent() else { return };
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let live = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| shares.contains_key(name));
+        if !live {
+            // Only ever directories in here (Kotlin creates one per share); a
+            // stray file is left alone rather than guessed at.
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Drops a share's cache copy and forgets it — the frontend calls this when the
+/// destination pick is cancelled and when the transfer that was reading it ends.
+/// Idempotent: an unknown id is not an error.
+#[tauri::command]
+pub fn discard_share(id: String) {
+    discard(&id);
+}
+
+/// The pick has been ANSWERED: forget the question, keep the bytes. The transfer
+/// is about to read them, so this cannot delete anything — and it is what keeps
+/// [`discard_pending`] honest, by making a retained `pick` mean "still waiting".
+#[tauri::command]
+pub fn share_taken(id: String) {
+    forget(&id);
+}
+
+fn discard(id: &str) {
+    let dir = SHARES.lock().expect("lock shares").remove(id);
+    if let Some(dir) = dir {
+        tracing::info!(id, dir = %dir.display(), "dropping a share's copy");
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            tracing::warn!(error = %e, dir = %dir.display(), "could not drop a share's copy");
+        }
+    }
+    forget(id);
+}
+
+/// Retires a pick from the retained status: a question already answered (or whose
+/// bytes are gone) must not be put to a webview that loads afterwards.
+fn forget(id: &str) {
+    let mut last = LAST.lock().expect("lock last share status");
+    let open = last
+        .as_ref()
+        .is_some_and(|s| s["phase"] == "pick" && s["id"].as_str() == Some(id));
+    if open {
+        *last = None;
+    }
+}
+
+/// Drops the share still waiting for a destination, if any — a new share means
+/// the user has moved on from it.
+///
+/// Deleting here is safe because of [`share_taken`]: the frontend retires a pick
+/// the instant it answers one, so a retained `pick` is one no transfer is reading.
+/// Without that, this would happily delete the files of a transfer in flight.
+fn discard_pending() {
+    let pending = LAST
+        .lock()
+        .expect("lock last share status")
+        .as_ref()
+        .filter(|s| s["phase"] == "pick")
+        .and_then(|s| s["id"].as_str().map(str::to_owned));
+    if let Some(id) = pending {
+        discard(&id);
     }
 }
 
@@ -179,8 +409,17 @@ async fn run(app: AppHandle, config: ClientConfig, mut shares: Shares) {
     // for its own report without also owning the event stream.
     let (reports_tx, mut reports) = mpsc::unbounded_channel();
     tauri::async_runtime::spawn(relay_reports(events, reports_tx));
-    while let Some(text) = shares.recv().await {
-        share(&app, &client, &mut reports, text).await;
+    while let Some(share) = shares.recv().await {
+        match share {
+            Share::Text(text) => share_text(&app, &client, &mut reports, text).await,
+            // A file share asks the Core for nothing: publishing its status IS
+            // the work, and the frontend takes it from there (it needs a
+            // destination first, and `files.send` goes over the GUI bridge).
+            // One queue for both kinds keeps them ordered — the cost being that
+            // a file share queued behind a slow text share waits for it, which
+            // needs two share gestures in the same second to even happen.
+            Share::Files(status) => emit(&app, status),
+        }
     }
 }
 
@@ -245,7 +484,7 @@ async fn wait_ready(client: &Client) -> Readiness {
 /// Announces one shared text, then follows it to its delivery report. Every exit
 /// path emits a terminal `core:share` — a share that silently goes nowhere would
 /// leave the UI stuck on "sharing".
-async fn share(
+async fn share_text(
     app: &AppHandle,
     client: &Client,
     reports: &mut mpsc::UnboundedReceiver<Value>,
@@ -341,7 +580,9 @@ async fn share(
 async fn await_report(reports: &mut mpsc::UnboundedReceiver<Value>, tx_id: &str) -> Option<Value> {
     let deadline = tokio::time::Instant::now() + REPORT_TIMEOUT;
     loop {
-        let report = tokio::time::timeout_at(deadline, reports.recv()).await.ok()??;
+        let report = tokio::time::timeout_at(deadline, reports.recv())
+            .await
+            .ok()??;
         if report["tx_id"].as_str() == Some(tx_id) {
             return Some(report);
         }
@@ -353,6 +594,10 @@ async fn await_report(reports: &mut mpsc::UnboundedReceiver<Value>, tx_id: &str)
 /// already registered — so without this the outcome of the very share that
 /// started the app would never be shown. Same subscribe-then-read-the-snapshot
 /// contract as the connection status (`gui`'s `connection_status`).
+///
+/// For a file share it carries more than feedback: a retained `pick` IS the share
+/// waiting for a destination, and it is the normal case rather than a corner one
+/// — the picker exists precisely because the share is what started the app.
 static LAST: Mutex<Option<Value>> = Mutex::new(None);
 
 /// Snapshot of the last share's status, or `null`. Read by the frontend right

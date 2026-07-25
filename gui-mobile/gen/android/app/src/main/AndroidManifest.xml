@@ -42,6 +42,19 @@
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:mimeType="text/plain" />
             </intent-filter>
+
+            <!-- Share sheet: any file, sent to one device of the account (the
+                 app asks which). `*/*` is what puts UniversalLink in every
+                 share sheet — the filter above stays, and is not redundant: a
+                 text/plain share carries no stream, so only that one matches
+                 it (see MainActivity.handleShare, which routes on the stream,
+                 not on the MIME type). -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
         </activity>
 
         <service
