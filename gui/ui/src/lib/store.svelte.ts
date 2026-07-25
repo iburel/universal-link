@@ -51,6 +51,7 @@ import {
   connectionStatus,
   discardShare,
   getServerConfig,
+  keepAlive,
   onConnectionChanged,
   onCoreNotification,
   onShareStatus,
@@ -656,8 +657,21 @@ export class CoreStore {
 
   login(): Promise<void> {
     return this.#act(async () => {
-      const { auth_url } = await api.sessionLogin();
-      await openUrl(auth_url);
+      // Mobile: the browser is about to take the foreground, and this app's
+      // process has to survive long enough for the Core to finish the exchange.
+      // Declared BEFORE the round-trip — awaited, so the service is asked for
+      // while this app is still the foreground one (Android refuses a foreground
+      // service started from the background) — and released if the round-trip
+      // never gets under way. The shell expires the hold on its own if we never
+      // come back at all.
+      await keepAlive("auth", true);
+      try {
+        const { auth_url } = await api.sessionLogin();
+        await openUrl(auth_url);
+      } catch (e) {
+        void keepAlive("auth", false);
+        throw e;
+      }
       this.notice = {
         kind: "info",
         text: "Finish signing in through your browser.",
@@ -782,7 +796,10 @@ export class CoreStore {
       const result = await api.devicesRevoke(device_id);
       if (result.status === "reauth_required") {
         // The server requires a fresh ID token: the browser completion will
-        // carry out the revocation, and `device.removed` will follow.
+        // carry out the revocation, and `device.removed` will follow. Same
+        // round-trip as a login, so the same hold on the process — this one comes
+        // back to the Core's loopback listener too (mobile only).
+        await keepAlive("auth", true);
         await openUrl(result.auth_url);
         this.notice = {
           kind: "info",
@@ -840,12 +857,19 @@ export class CoreStore {
     // Each drop starts from a clean banner: the error of a faulty drop (a
     // folder) must not survive a valid drop that follows it.
     this.notice = null;
+    // Mobile: until the Core answers, no `transfer.started` has been emitted and
+    // nothing holds this process up — while the user has every reason to put the
+    // phone down the moment they tapped. Released as soon as the answer is in:
+    // by then the transfer, if any, is the shell's to follow.
+    await keepAlive("send", true);
     try {
       const { transfer_id } = await api.filesSend(device_id, paths);
       return transfer_id;
     } catch (e) {
       this.notice = { kind: "error", text: humanize(e) };
       return null;
+    } finally {
+      void keepAlive("send", false);
     }
   }
 

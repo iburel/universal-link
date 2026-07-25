@@ -157,6 +157,38 @@ export async function shareTaken(id: string): Promise<void> {
 }
 
 /**
+ * Work that only the frontend knows is under way (`true`) or over (`false`), so
+ * the shell can keep the process alive through it.
+ *
+ * MOBILE ONLY, and only for what the Core's event stream cannot tell the shell by
+ * itself:
+ *
+ * - `"auth"` — a round-trip through the browser (signing in, or re-authorizing a
+ *   revocation). Both come back into the Core's own loopback listener, while
+ *   Android has this app backgrounded behind the browser — where it suspends its
+ *   network and may reclaim the process outright.
+ * - `"send"` — a `files.send` waiting to be accepted. Until `transfer.started`
+ *   there is no transfer for the shell to follow, and the user may well pocket
+ *   the phone the moment they have tapped.
+ *
+ * The shell bounds every hold on its own side, so a webview that dies mid-flow
+ * cannot leak one; `false` is an optimization, not the only way out.
+ *
+ * The desktop shell does not implement the command: a rejection there IS the
+ * answer ("this process needs no help staying alive").
+ */
+export async function keepAlive(
+  kind: "auth" | "send",
+  on: boolean,
+): Promise<void> {
+  try {
+    await invoke("keep_alive", { kind, on });
+  } catch {
+    // Desktop, or a shell too old to know: the flow proceeds either way.
+  }
+}
+
+/**
  * The server + OIDC fields the setup screen collects, mirroring the shell's
  * `ServerConfigForm` (gui/src/bridge.rs). The secret is optional (a conformant
  * PKCE IdP has none); a blank one clears the key on write.

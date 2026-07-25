@@ -100,6 +100,8 @@ interface Fake {
   discards: string[];
   /** The share ids answered through `share_taken` (mobile only), in order. */
   taken: string[];
+  /** The keep-alive declarations (mobile only): `kind:on`, in order. */
+  holds: string[];
   methods: Record<string, Method>;
 }
 
@@ -128,6 +130,7 @@ function mockCore(options: {
     ipc: [],
     discards: [],
     taken: [],
+    holds: [],
     methods: {
       "session.status": () => SESSION,
       "account.status": () => ATTESTED,
@@ -167,6 +170,11 @@ function mockCore(options: {
       }
       if (cmd === "share_taken") {
         fake.taken.push(args.id);
+        return null;
+      }
+      // Mobile-only: the process must outlive work the shell cannot see.
+      if (cmd === "keep_alive") {
+        fake.holds.push(`${args.kind}:${args.on}`);
         return null;
       }
       if (cmd === "core_request") {
@@ -632,6 +640,31 @@ test("login opens the URL returned by the Core", async () => {
   expect(fake.opened).toEqual(["https://idp.test/auth"]);
   expect(store.notice?.kind).toBe("info");
   expect(store.busy).toBe(false);
+  // Mobile: the browser takes the foreground, and the token exchange runs in
+  // this process. The hold is declared before the round-trip and left standing —
+  // the shell releases it when the session lands (or when it times out).
+  expect(fake.holds).toEqual(["auth:true"]);
+});
+
+// A login that never reached the browser must not leave the phone holding itself
+// awake for the whole timeout.
+test("a login that fails on the spot gives the process back", async () => {
+  const fake = mockCore({
+    status: CONNECTED,
+    methods: {
+      "session.login": () => {
+        throw appError("NOT_CONFIGURED", "no server configured");
+      },
+    },
+  });
+  await store.start();
+  await vi.waitFor(() => expect(store.primed).toBe(true));
+
+  await store.login();
+
+  expect(fake.opened).toEqual([]);
+  expect(fake.holds).toEqual(["auth:true", "auth:false"]);
+  expect(store.notice?.kind).toBe("error");
 });
 
 test("each action starts from a clean banner", async () => {
@@ -724,6 +757,10 @@ test("a revocation that requires re-auth opens the browser", async () => {
   await store.revokeDevice("d_mac");
 
   expect(fake.opened).toEqual(["https://idp.test/reauth"]);
+  // Same round-trip as a login, so the same hold: the revocation is carried out
+  // by a callback that comes back into THIS process, while the browser has the
+  // foreground (mobile only — see keepAlive).
+  expect(fake.holds).toEqual(["auth:true"]);
   expect(store.notice?.kind).toBe("info");
   expect(ids(store.devices)).toEqual(["d_self", "d_mac"]); // device.removed will be authoritative
 });
@@ -940,6 +977,9 @@ test("sendFiles passes target and paths to the Core, without writing state", asy
   });
   // The tracking state comes only from transfer.started, not from the response.
   expect(store.transfers).toEqual([]);
+  // Mobile: the phone must survive being pocketed between the tap and the Core's
+  // answer, after which the transfer itself is what the shell follows.
+  expect(fake.holds).toEqual(["send:true", "send:false"]);
 });
 
 test("sendFiles does not call the Core for an empty list", async () => {
@@ -948,6 +988,8 @@ test("sendFiles does not call the Core for an empty list", async () => {
   await store.sendFiles("d_win", []);
 
   expect(fake.calls.some((c) => c.method === "files.send")).toBe(false);
+  // Nothing was asked of the Core, so nothing had to be held up either.
+  expect(fake.holds).toEqual([]);
 });
 
 test("a send to an offline device is explained", async () => {

@@ -48,8 +48,17 @@ pub(crate) async fn open_ws(state: &AppState, url: &str) -> Result<ServerWs, Str
     Ok(ws)
 }
 
-/// Cap of the exponential reconnection backoff.
-const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
+/// Cap of the exponential reconnection backoff, as a multiple of
+/// `Config.reconnect_base_delay` — six doublings, so a 1 s base caps at ~1 min
+/// (what the daemon gets, its network being a stable one).
+///
+/// Tied to the base rather than absolute because how long a Core may stay
+/// unreachable is a property of its host: on a phone the network comes and goes
+/// (suspension when the app leaves the foreground, cell/wifi handovers), and a
+/// minute-long sleep between attempts would mean opening the app to a session
+/// that takes another minute to come back — and a share that gives up waiting
+/// for one. The mobile shell therefore asks for a short base.
+const RECONNECT_MAX_MULTIPLE: u32 = 64;
 /// A setup (connection + auth + snapshot) that drags on beyond this counts as
 /// a failed attempt — without it, a mute server would freeze reconnection.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -156,7 +165,7 @@ pub async fn run(state: Arc<AppState>, info: SessionInfo) {
                     delay = base_delay;
                 }
                 tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(RECONNECT_MAX_DELAY);
+                delay = (delay * 2).min(base_delay * RECONNECT_MAX_MULTIPLE);
             }
         }
     }

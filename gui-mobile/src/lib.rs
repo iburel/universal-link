@@ -10,6 +10,7 @@
 //! Excluded from the workspace: built only for aarch64-linux-android via the
 //! Tauri Android tooling (cargo-ndk under the hood), never by the CI jobs.
 
+mod keepalive;
 mod logcat;
 mod share;
 mod tls;
@@ -18,6 +19,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use android_system_properties::AndroidSystemProperties;
 use anyhow::Context as _;
 use tauri::Manager;
 use tls::WebPkiConnector;
@@ -48,6 +50,10 @@ pub fn run() {
             share::share_status,
             share::share_taken,
             share::discard_share,
+            // Mobile-only: work the frontend has to declare, so the process
+            // survives not being the one in front — a round-trip through the
+            // browser, a send waiting to be accepted (see `keepalive`).
+            keepalive::keep_alive,
         ])
         .setup(|app| {
             // The app-private data dir is only resolvable here (it needs the
@@ -70,6 +76,10 @@ pub fn run() {
             app.manage(CoreState::new(data_dir.clone()));
 
             let handle = app.handle().clone();
+            // Before the bridge connects: what holds this process alive is read
+            // off the Core's own event stream, and a transfer that started unseen
+            // would never be protected (see `keepalive`).
+            keepalive::watch(&handle);
             // Boot the embedded Core, then run the same bridge loop the desktop
             // uses — pointed at the in-process socket instead of the daemon's.
             tauri::async_runtime::spawn(async move {
@@ -99,6 +109,44 @@ fn init_logging() {
             .with_max_level(tracing::Level::INFO)
             .try_init();
     });
+}
+
+/// Longest model string we will pass off as a device name. A real one is short
+/// ("Pixel 8", "CPH2449"); anything longer is not a model, and the devices list
+/// of every other device would have to live with it.
+const MAX_DEVICE_NAME: usize = 64;
+
+/// This phone's name in the account's devices list.
+///
+/// `ro.product.model` IS what `android.os.Build.MODEL` reads (frameworks'
+/// `Build` calls `SystemProperties.get("ro.product.model")`), and reading the
+/// property store directly keeps this on the Core's boot path: a JNI call would
+/// have to come FROM Kotlin, which runs after `run()` has already spawned the
+/// boot — the name would then be decided by a race, on the one value the user
+/// cannot correct without renaming the device.
+///
+/// Only enrollment sends it (core: `login.rs` `enroll`), so a phone that already
+/// joined the account keeps the name it joined with; `devices.rename` is how that
+/// one changes.
+fn device_name() -> String {
+    let model = AndroidSystemProperties::new()
+        .get("ro.product.model")
+        .unwrap_or_default();
+    let model = model.trim();
+    // A property that is missing (host build), empty, oversized or not text is
+    // not a name: the fallback is honest and stable.
+    let usable = !model.is_empty()
+        && model.chars().count() <= MAX_DEVICE_NAME
+        && !model.chars().any(char::is_control);
+    if !usable {
+        tracing::warn!(
+            model,
+            "no usable ro.product.model; naming this device Android"
+        );
+        return "Android".to_string();
+    }
+    tracing::info!(model, "device name from ro.product.model");
+    model.to_string()
 }
 
 /// Spawns the embedded Core and returns the client config the bridge uses to
@@ -141,14 +189,18 @@ async fn boot_core(data_dir: &Path) -> anyhow::Result<ClientConfig> {
         config_dir: data_dir.to_path_buf(),
         server: boot.server,
         reload_server,
-        // TODO(brick 6): derive from android.os.Build.MODEL so a user's phone
-        // shows a recognizable name in the devices list.
-        device_name: "Android".to_string(),
+        device_name: device_name(),
         secret_store: Arc::new(FileSecretStore::new(data_dir)),
         connector: Arc::new(WebPkiConnector::new().context("initializing the TLS stack")?),
         transport,
         receive_dir,
-        reconnect_base_delay: Duration::from_secs(1),
+        // Short on purpose: this Core's network is taken away whenever the app
+        // leaves the foreground (see `keepalive`), so failed attempts are the
+        // NORMAL state rather than a sign of trouble — and the backoff cap
+        // derived from this (64×, ~13 s) is how long the app can look offline
+        // after being opened again, or a share can wait for a session that is
+        // there (share.rs `wait_ready`).
+        reconnect_base_delay: Duration::from_millis(200),
     };
 
     let core = universallink_core::spawn(config)

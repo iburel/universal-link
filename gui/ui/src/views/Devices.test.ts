@@ -100,10 +100,11 @@ test("this PC comes first, inactivity is dated", () => {
 
   const rows = [...view.querySelectorAll("li")];
   expect(rows[0].textContent).toContain("Office PC");
-  expect(rows[0].textContent).toContain("this PC");
-  expect(rows[0].textContent).toContain("online");
+  // Separators included: the space before each one is what the markup used to
+  // eat ("Linux· this PC").
+  expect(rows[0].textContent).toContain("Linux · this PC · online");
   expect(rows[1].textContent).toContain("MacBook");
-  expect(rows[1].textContent).toContain("last seen 3 h ago");
+  expect(rows[1].textContent).toContain("macOS · last seen 3 h ago");
 });
 
 test("renaming sends the cleaned name to the Core", async () => {
@@ -171,6 +172,18 @@ test("revoking this PC is announced as such", () => {
   click(byLabel(view, "Revoke Office PC"));
 
   expect(textOf(view)).toContain("Revoking this PC will disconnect");
+});
+
+// Same view, run on the phone: it is the platform that decides what the device
+// calls itself, in the list and in the warning.
+test("on a phone, the self device is a phone", () => {
+  store.devices = [{ ...SELF, name: "CPH2449", platform: "android" }];
+
+  const view = render(Devices, { store, now: NOW });
+  expect(textOf(view)).toContain("Android · this phone");
+
+  click(byLabel(view, "Revoke CPH2449"));
+  expect(textOf(view)).toContain("Revoking this phone will disconnect");
 });
 
 test("cancelling a revocation revokes nothing", () => {

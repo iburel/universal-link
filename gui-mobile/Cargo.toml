@@ -25,6 +25,10 @@ publish = false
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
+# `ro.product.model` (= android.os.Build.MODEL) for this phone's device name,
+# read from the property store instead of over JNI — see `device_name`. Already
+# in the lock (via chrono's iana-time-zone), so no new crate enters the tree.
+android_system_properties = "0.1"
 anyhow = "1"
 # Inline bytes of a materialized clipboard announce travel base64-encoded
 # (doc/core-api.md); same crate and version the Core decodes them with. Already

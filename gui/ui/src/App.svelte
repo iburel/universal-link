@@ -83,10 +83,13 @@
   <Onboarding {store} />
 {:else}
   <div class="app">
+    <!-- Outside the <nav> on purpose: on a narrow screen the sections become a
+         bottom tab bar, and the connection line stays at the top. -->
+    <p class="core" class:connected={store.connection.status === "connected"}>
+      <span class="dot" aria-hidden="true"></span>{coreLabel}
+    </p>
+
     <nav aria-label="Sections">
-      <p class="core" class:connected={store.connection.status === "connected"}>
-        <span class="dot" aria-hidden="true"></span>{coreLabel}
-      </p>
       <button
         class:active={view === "account"}
         aria-current={view === "account" ? "page" : undefined}
@@ -148,7 +151,30 @@
   .app {
     display: grid;
     grid-template-columns: 180px 1fr;
+    grid-template-rows: auto 1fr;
+    grid-template-areas:
+      "core main"
+      "nav main";
     height: 100%;
+  }
+
+  .core {
+    grid-area: core;
+  }
+
+  nav {
+    grid-area: nav;
+  }
+
+  main {
+    grid-area: main;
+  }
+
+  /* Two cells, one sidebar: they share its skin. */
+  .core,
+  nav {
+    background: var(--nav);
+    border-right: 1px solid var(--line);
   }
 
   nav {
@@ -156,8 +182,6 @@
     flex-direction: column;
     gap: 0.25rem;
     padding: 0.75rem;
-    background: var(--nav);
-    border-right: 1px solid var(--line);
   }
 
   nav button {
@@ -186,7 +210,9 @@
     display: flex;
     align-items: center;
     gap: 0.4rem;
-    margin: 0 0 0.75rem;
+    /* No bottom padding: the nav cell's own top padding is the gap. */
+    margin: 0;
+    padding: 0.75rem 0.75rem 0;
     font-size: 0.8rem;
     color: var(--muted);
   }
@@ -246,5 +272,54 @@
     text-align: center;
     max-width: 30rem;
     margin: 0 auto;
+  }
+
+  /* Phone (360 dp here), and a desktop window squeezed that narrow: a fixed
+     180px column would eat half of it, so the sections become a bottom tab bar
+     — thumb-reachable, and out of the way of the content. The webview is
+     already inset from the gesture bar by the activity (MainActivity's
+     onWebViewCreate), so the bar needs no extra room of its own. */
+  @media (max-width: 600px) {
+    .app {
+      grid-template-columns: 1fr;
+      grid-template-rows: auto 1fr auto;
+      grid-template-areas:
+        "core"
+        "main"
+        "nav";
+    }
+
+    .core,
+    nav {
+      border-right: none;
+    }
+
+    .core {
+      padding: 0.35rem 0.75rem;
+      border-bottom: 1px solid var(--line);
+    }
+
+    nav {
+      flex-direction: row;
+      gap: 0.25rem;
+      padding: 0.35rem 0.5rem;
+      border-top: 1px solid var(--line);
+    }
+
+    nav button {
+      flex: 1;
+      /* Centred, and tall enough to be a tap target rather than a click one.
+         The gap replaces the sidebar's space-between, which centring drops —
+         without it the Approvals badge would touch its label. */
+      justify-content: center;
+      gap: 0.3rem;
+      min-height: 44px;
+      padding: 0.35rem 0.2rem;
+      font-size: 0.9rem;
+    }
+
+    main {
+      padding: 0.85rem;
+    }
   }
 </style>

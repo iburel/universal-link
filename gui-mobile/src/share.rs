@@ -411,7 +411,13 @@ async fn run(app: AppHandle, config: ClientConfig, mut shares: Shares) {
     tauri::async_runtime::spawn(relay_reports(events, reports_tx));
     while let Some(share) = shares.recv().await {
         match share {
-            Share::Text(text) => share_text(&app, &client, &mut reports, text).await,
+            Share::Text(text) => {
+                // By the time the Core pushes, the user is back in the app they
+                // shared FROM: this one is in the background, where Android would
+                // cut its network mid-announce (see `keepalive`).
+                let _hold = crate::keepalive::Hold::share();
+                share_text(&app, &client, &mut reports, text).await;
+            }
             // A file share asks the Core for nothing: publishing its status IS
             // the work, and the frontend takes it from there (it needs a
             // destination first, and `files.send` goes over the GUI bridge).

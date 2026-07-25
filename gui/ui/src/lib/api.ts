@@ -13,7 +13,7 @@
 
 import { coreRequest } from "./core";
 
-export type Platform = "windows" | "macos" | "linux";
+export type Platform = "windows" | "macos" | "linux" | "android";
 
 /** The device record from server-api.md, enriched with `is_self` by the Core. */
 export interface Device {
