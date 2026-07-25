@@ -61,19 +61,36 @@ export function onCoreNotification(
   );
 }
 
+/** A file waiting for a destination: a copy in the app's cache (ShareFiles.kt). */
+export interface SharedFile {
+  /** Absolute path, readable by the Core — what `files.send` takes. */
+  path: string;
+  /** The name the receiving device will see (the path's basename). */
+  name: string;
+  size: number;
+}
+
 /**
- * Progress of a text share from the Android share sheet (gui-mobile/src/
- * share.rs). MOBILE ONLY: the desktop shell never emits `core:share`, so this
- * stream is simply always silent there.
+ * Progress of a share from the Android share sheet (gui-mobile/src/share.rs).
+ * MOBILE ONLY: the desktop shell never emits `core:share`, so this stream is
+ * simply always silent there.
  *
- * A share always ends on `done` or `error` — never on `sending` — because the
+ * Shared TEXT goes to the whole account through the clipboard, and reports
+ * itself: `sending` → `done` | `error`. It never stops on `sending`, because the
  * banner it drives would otherwise stay up forever. `done` is the Core's
  * delivery report and may still say `delivered: 0`: reaching nobody is an
  * outcome, not an error to swallow.
+ *
+ * Shared FILES go to ONE device, so they stop half-way and wait for the user:
+ * `preparing` (the bytes are being copied out of the share) → `pick` (choose a
+ * destination) | `error`. From `pick` on, the frontend drives — the send is a
+ * plain `files.send`, tracked like a desktop drag-and-drop.
  */
 export type ShareStatus =
   | { phase: "sending"; targets?: number }
   | { phase: "done"; delivered: number; failed: number }
+  | { phase: "preparing"; files: number }
+  | { phase: "pick"; id: string; files: SharedFile[] }
   | {
       phase: "error";
       reason:
@@ -82,7 +99,9 @@ export type ShareStatus =
         | "refused"
         | "unconfirmed"
         | "not_signed_in"
-        | "offline";
+        | "offline"
+        | "unreadable"
+        | "no_space";
       detail?: string;
     };
 
@@ -106,6 +125,34 @@ export async function shareStatus(): Promise<ShareStatus | null> {
     return await invoke<ShareStatus | null>("share_status");
   } catch {
     return null;
+  }
+}
+
+/**
+ * Releases a shared file's cache copy: the destination was cancelled, or the
+ * transfer that was reading it is over. Idempotent on the Rust side, and a
+ * no-op on the desktop shell (which never hands out a share to release).
+ */
+export async function discardShare(id: string): Promise<void> {
+  try {
+    await invoke("discard_share", { id });
+  } catch {
+    // Nothing to recover: the copy lives in a cache the OS can reclaim, and the
+    // next share sweeps whatever is left behind (see share.rs `register`).
+  }
+}
+
+/**
+ * Says a destination has been chosen for a share: the question is answered, but
+ * its bytes must stay until the transfer has read them. Without this, a share
+ * arriving during a transfer would look like an unanswered one and take the files
+ * out from under it.
+ */
+export async function shareTaken(id: string): Promise<void> {
+  try {
+    await invoke("share_taken", { id });
+  } catch {
+    // Desktop shell, or a share the Rust side has already retired.
   }
 }
 

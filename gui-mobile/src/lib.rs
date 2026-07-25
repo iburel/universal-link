@@ -42,9 +42,12 @@ pub fn run() {
             universallink_gui::connection_status,
             universallink_gui::set_server_config,
             universallink_gui::get_server_config,
-            // Mobile-only: the snapshot of the last share sheet status (the
-            // desktop shell has no share surface at all).
+            // Mobile-only: the snapshot of the last share sheet status, and the
+            // release of a shared file's cache copy (the desktop shell has no
+            // share surface at all).
             share::share_status,
+            share::share_taken,
+            share::discard_share,
         ])
         .setup(|app| {
             // The app-private data dir is only resolvable here (it needs the

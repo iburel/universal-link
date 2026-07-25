@@ -299,3 +299,66 @@ test("a failed or cancelled send says so on the card", () => {
     "Send cancelled",
   );
 });
+
+// -- Android share sheet: the destination picker ------------------------------
+//
+// A file shared into the app turns this list into a picker: one tap sends it.
+// The management actions step aside so a tap cannot revoke a device by mistake
+// when the user meant to send to it.
+
+const PICK = {
+  phase: "pick" as const,
+  id: "s_1",
+  files: [{ path: "/c/shares/s_1/holiday.jpg", name: "holiday.jpg", size: 2516582 }],
+};
+
+test("a pending share turns the list into a destination picker", () => {
+  store.devices = [WIN, MAC, SELF];
+  store.pendingShare = PICK;
+
+  const view = render(Devices, { store, now: NOW });
+
+  // What is about to be sent, so the user can tell one share from another.
+  expect(textOf(view)).toContain("Send to…");
+  expect(textOf(view)).toContain("holiday.jpg · 2.4 MiB");
+  // Online device: offered. Offline: shown, refused (the Core would say
+  // DEVICE_OFFLINE). This phone: not a destination for its own share.
+  expect(byLabel(view, "Send to Living Room PC").hasAttribute("disabled")).toBe(false);
+  expect(byLabel(view, "Send to MacBook").hasAttribute("disabled")).toBe(true);
+  expect(view.querySelector('[aria-label="Send to Office PC"]')).toBeNull();
+  // No renaming or revoking while the list is a picker.
+  expect(view.querySelector('[aria-label="Revoke MacBook"]')).toBeNull();
+});
+
+test("tapping a device sends the pending share to it", () => {
+  store.devices = [WIN, SELF];
+  store.pendingShare = PICK;
+  const send = vi.spyOn(store, "sendShare").mockResolvedValue();
+
+  const view = render(Devices, { store, now: NOW });
+  click(byLabel(view, "Send to Living Room PC"));
+
+  expect(send).toHaveBeenCalledWith("d_win");
+});
+
+test("cancelling the share leaves the list alone", () => {
+  store.devices = [WIN, SELF];
+  store.pendingShare = PICK;
+  const cancel = vi.spyOn(store, "cancelShare").mockImplementation(() => {});
+
+  const view = render(Devices, { store, now: NOW });
+  click(byLabel(view, "Cancel the share"));
+
+  expect(cancel).toHaveBeenCalled();
+});
+
+// A disconnected Core cannot send: the picker must not pretend otherwise.
+test("with the Core unreachable, no destination is offered", () => {
+  store.devices = [WIN, SELF];
+  store.pendingShare = PICK;
+  store.connection = { status: "connecting" };
+
+  const view = render(Devices, { store, now: NOW });
+
+  expect(byLabel(view, "Send to Living Room PC").hasAttribute("disabled")).toBe(true);
+});

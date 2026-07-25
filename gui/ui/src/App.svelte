@@ -28,6 +28,13 @@
     };
   });
 
+  // A file share from the Android share sheet is waiting for a destination, and
+  // the picker lives in the Devices view. Mobile only: `pendingShare` is always
+  // null on the desktop, where a send starts from a drag-and-drop instead.
+  $effect(() => {
+    if (store.pendingShare) view = "devices";
+  });
+
   const coreLabel = $derived(
     store.connection.status === "connected"
       ? `Core connected (API v${store.connection.api_version})`

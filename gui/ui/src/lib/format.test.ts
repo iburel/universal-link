@@ -5,6 +5,7 @@ import { expect, test } from "vitest";
 
 import type { Device } from "./api";
 import {
+  formatSize,
   platformLabel,
   relativeTime,
   roleLabel,
@@ -62,4 +63,21 @@ test("sortDevices: this PC, then the connected ones, then by name", () => {
     "Zephyr",
     "Alpha",
   ]);
+});
+
+// Binary units, like the limits the Core states (doc/core-api.md). A size is
+// shown next to a file the user is about to send: precision past the tenth is
+// noise, and "512.0 B" reads like a machine.
+test.each([
+  [0, "0 B"],
+  [512, "512 B"],
+  [1024, "1.0 KiB"],
+  [1536, "1.5 KiB"],
+  [2516582, "2.4 MiB"],
+  [104857600, "100 MiB"],
+  [3 * 1024 ** 3, "3.0 GiB"],
+  [-1, ""],
+  [Number.NaN, ""],
+])("formatSize(%i) === %s", (bytes, text) => {
+  expect(formatSize(bytes)).toBe(text);
 });

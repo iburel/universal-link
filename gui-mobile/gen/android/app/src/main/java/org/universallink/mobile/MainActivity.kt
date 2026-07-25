@@ -54,26 +54,59 @@ class MainActivity : TauriActivity() {
         handleShare(intent)
     }
 
-    /** Shared text → the embedded Core (see ShareBridge / share.rs). */
+    /** A share → the embedded Core (see ShareBridge / ShareFiles / share.rs). */
     private fun handleShare(intent: Intent?) {
-        if (intent == null || intent.action != Intent.ACTION_SEND) return
+        if (intent == null) return
+        val action = intent.action
+        if (action != Intent.ACTION_SEND && action != Intent.ACTION_SEND_MULTIPLE) return
         // Relaunched from Recents: the system replays the ORIGINAL intent, and
         // the action we null below was only nulled in this process's copy — so a
-        // process death would otherwise re-share a text the user shared once.
+        // process death would otherwise re-share what the user shared once.
         if (intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0) return
-        if (intent.type?.startsWith("text/") != true) return
-        // EXTRA_TEXT is what a text share carries; some apps only fill ClipData.
-        val text = intent.getStringExtra(Intent.EXTRA_TEXT)
-            ?: intent.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.text?.toString()
-        if (text.isNullOrEmpty()) return
-        // Consume it: a later recreation must not share the same text twice.
-        intent.action = null
-        setIntent(intent)
+
+        // Text or files? The two are told apart HERE, once, because each side's
+        // answer depends on the other's: a stream wins over text (a plain-text
+        // FILE is shared as text/plain), while text wins over a bare ClipData URI
+        // (a shared link carries a preview thumbnail there — see ShareFiles).
+        val text = sharedText(intent)
+        var taken = false
+        try {
+            taken = ShareFiles.handle(this, intent, text != null)
+        } catch (t: Throwable) {
+            android.util.Log.e("ULCore", "failed to hand the shared files to the core", t)
+        }
+        if (!taken && action == Intent.ACTION_SEND && text != null) {
+            taken = shareText(intent, text)
+        }
+        // Consume it: a later recreation must not share the same thing twice.
+        if (taken) {
+            intent.action = null
+            setIntent(intent)
+        }
+    }
+
+    /**
+     * The text a share carries, or null. EXTRA_TEXT is where a text share puts it;
+     * some apps fill only the ClipData, whose FIRST item is then the text itself
+     * (a preview thumbnail is a URI item, and has no text).
+     */
+    private fun sharedText(intent: Intent): String? =
+        (intent.getStringExtra(Intent.EXTRA_TEXT)
+            ?: intent.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.text?.toString())
+            ?.takeIf { it.isNotEmpty() }
+
+    /** Shared text → the account's clipboard. Returns whether it took the intent. */
+    private fun shareText(intent: Intent, text: String): Boolean {
+        // A share that is not text/* but carries text (a caption, a subject) is not
+        // a text share: its payload is elsewhere, and we would send the caption.
+        if (intent.type?.startsWith("text/") != true) return false
         try {
             ShareBridge.onShareText(text)
         } catch (t: Throwable) {
             android.util.Log.e("ULCore", "failed to hand the shared text to the core", t)
+            return false
         }
+        return true
     }
 
     override fun onDestroy() {

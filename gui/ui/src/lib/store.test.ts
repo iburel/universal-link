@@ -18,7 +18,7 @@ import type {
   SessionState,
 } from "./api";
 import type { ConnectionStatus, CoreError } from "./core";
-import { CoreStore, shareNotice } from "./store.svelte";
+import { CoreStore, shareNotice, shareSummary } from "./store.svelte";
 
 // -- Fixtures ---------------------------------------------------------------
 
@@ -96,6 +96,10 @@ interface Fake {
   configWrites: unknown[];
   /** All the raw IPC commands, event subscriptions included. */
   ipc: string[];
+  /** The share ids released through `discard_share` (mobile only), in order. */
+  discards: string[];
+  /** The share ids answered through `share_taken` (mobile only), in order. */
+  taken: string[];
   methods: Record<string, Method>;
 }
 
@@ -122,6 +126,8 @@ function mockCore(options: {
     opened: [],
     configWrites: [],
     ipc: [],
+    discards: [],
+    taken: [],
     methods: {
       "session.status": () => SESSION,
       "account.status": () => ATTESTED,
@@ -152,6 +158,16 @@ function mockCore(options: {
       // Mobile-only snapshot: no retained share unless a test says otherwise.
       if (cmd === "share_status") {
         return options.retainedShare ?? null;
+      }
+      // Mobile-only: the release of a shared file's cache copy, and the
+      // retirement of a pick that has been answered.
+      if (cmd === "discard_share") {
+        fake.discards.push(args.id);
+        return null;
+      }
+      if (cmd === "share_taken") {
+        fake.taken.push(args.id);
+        return null;
       }
       if (cmd === "core_request") {
         const { method, params } = payload as {
@@ -1565,6 +1581,26 @@ test.each([
     "error",
     "Sharing failed.",
   ],
+  [
+    { phase: "preparing", files: 1 } as const,
+    "info",
+    "Preparing the shared file…",
+  ],
+  [
+    { phase: "preparing", files: 3 } as const,
+    "info",
+    "Preparing 3 shared files…",
+  ],
+  [
+    { phase: "error", reason: "unreadable" } as const,
+    "error",
+    "Could not read what was shared — nothing was sent.",
+  ],
+  [
+    { phase: "error", reason: "no_space" } as const,
+    "error",
+    "Not enough free space on this phone to prepare that share.",
+  ],
 ])("a share status reads as a banner: %o", (status, kind, text) => {
   // Sticky: a share reports itself while the user may not have touched the app,
   // so a resnapshot in between must not expire its feedback.
@@ -1642,4 +1678,188 @@ test("a non-sticky notice is still expired by a resnapshot", async () => {
   await store.resync();
 
   expect(store.notice).toBeNull();
+});
+
+// -- Android share sheet: files ---------------------------------------------
+//
+// A shared FILE goes to ONE device, so the share stops half-way and waits for
+// the user. What is at stake beyond the send: the copy Kotlin made in the app's
+// cache (ShareFiles.kt) must be released on EVERY exit — sent, cancelled or
+// superseded — because nothing else will ever come back for it.
+
+const PICK = {
+  phase: "pick",
+  id: "s_1",
+  files: [
+    { path: "/data/cache/shares/s_1/holiday.jpg", name: "holiday.jpg", size: 2516582 },
+  ],
+} as const;
+
+test("shared files wait for a destination instead of a banner", async () => {
+  await primed();
+  store.notice = { kind: "info", text: "Preparing the shared file…", sticky: true };
+
+  await emit("core:share", PICK);
+
+  await vi.waitFor(() => expect(store.pendingShare).toEqual(PICK));
+  // The pick IS the message: the "Preparing…" banner it follows steps aside.
+  expect(store.notice).toBeNull();
+});
+
+// The usual case, not a corner one: the share is what started the app, so the
+// pick was published before this webview existed.
+test("a pick made before the UI existed is read from the snapshot", async () => {
+  mockCore({ status: CONNECTED, retainedShare: PICK });
+
+  await store.start();
+
+  expect(store.pendingShare).toEqual(PICK);
+  // And the priming resnapshot does not take the question away.
+  await vi.waitFor(() => expect(store.primed).toBe(true));
+  expect(store.pendingShare).toEqual(PICK);
+});
+
+test("a new share supersedes the one still waiting, releasing its copy", async () => {
+  const fake = await primed();
+  await emit("core:share", PICK);
+  await vi.waitFor(() => expect(store.pendingShare).not.toBeNull());
+
+  // A second share, from the moment its bytes start being copied.
+  await emit("core:share", { phase: "preparing", files: 1 });
+
+  await vi.waitFor(() => expect(store.pendingShare).toBeNull());
+  expect(fake.discards).toEqual(["s_1"]);
+  expect(store.notice?.text).toBe("Preparing the shared file…");
+});
+
+test("a second pick replaces the first and releases only the first", async () => {
+  const fake = await primed();
+  await emit("core:share", PICK);
+  await vi.waitFor(() => expect(store.pendingShare).not.toBeNull());
+
+  const second = { ...PICK, id: "s_2" };
+  await emit("core:share", second);
+
+  await vi.waitFor(() => expect(store.pendingShare).toEqual(second));
+  expect(fake.discards).toEqual(["s_1"]);
+});
+
+test("sending the share sends its paths to the chosen device, once", async () => {
+  const fake = await primed({ "files.send": () => ({ transfer_id: "t_1" }) });
+  await emit("core:share", PICK);
+  await vi.waitFor(() => expect(store.pendingShare).not.toBeNull());
+
+  await store.sendShare("d_win");
+  // A second tap on another device: the share is already spent.
+  await store.sendShare("d_mac");
+
+  expect(fake.calls.filter((c) => c.method === "files.send")).toEqual([
+    {
+      method: "files.send",
+      params: { device_id: "d_win", paths: [PICK.files[0].path] },
+    },
+  ]);
+  expect(store.pendingShare).toBeNull();
+  // Answered, so a later share cannot mistake it for one still waiting — but not
+  // released: the Core is reading those files as it sends them.
+  expect(fake.taken).toEqual(["s_1"]);
+  expect(fake.discards).toEqual([]);
+});
+
+// The bytes of a transfer in flight are not the previous share's leftovers. The
+// two look alike from the Rust side — a retained `pick` — which is why answering
+// one retires it (`share_taken`).
+test("a share arriving during a transfer does not take its files away", async () => {
+  const fake = await primed({ "files.send": () => ({ transfer_id: "t_1" }) });
+  await emit("core:share", PICK);
+  await vi.waitFor(() => expect(store.pendingShare).not.toBeNull());
+  await store.sendShare("d_win");
+
+  // Another share, while t_1 is still reading /…/shares/s_1/holiday.jpg.
+  await emit("core:share", { phase: "preparing", files: 1 });
+  await flush();
+
+  expect(fake.discards).toEqual([]);
+});
+
+test.each([
+  ["transfer.finished", { transfer_id: "t_1" }],
+  ["transfer.failed", { transfer_id: "t_1", error: "cancelled" }],
+])("a share's copy is released when its transfer ends (%s)", async (method, params) => {
+  const fake = await primed({ "files.send": () => ({ transfer_id: "t_1" }) });
+  await emit("core:share", PICK);
+  await vi.waitFor(() => expect(store.pendingShare).not.toBeNull());
+  await store.sendShare("d_win");
+
+  await emit("core:notification", { method, params });
+
+  await vi.waitFor(() => expect(fake.discards).toEqual(["s_1"]));
+});
+
+// The transfer's notifications ride the same queue as the response that named
+// it: it can be over BEFORE `files.send` returns, in which case the
+// `finished` that would have released the copy arrived while the transfer had
+// no share attached to it yet — and no second one will come.
+test("a transfer that ended before its response still releases the copy", async () => {
+  const fake = await primed({
+    "files.send": async () => {
+      await emit("core:notification", {
+        method: "transfer.started",
+        params: { transfer_id: "t_1", device_id: "d_win", files: [], total: 1 },
+      });
+      await emit("core:notification", {
+        method: "transfer.finished",
+        params: { transfer_id: "t_1" },
+      });
+      return { transfer_id: "t_1" };
+    },
+  });
+  await emit("core:share", PICK);
+  await vi.waitFor(() => expect(store.pendingShare).not.toBeNull());
+
+  await store.sendShare("d_win");
+
+  // Released without waiting for anything else: the notification is long gone.
+  expect(store.transfers[0].status).toBe("finished");
+  expect(fake.discards).toEqual(["s_1"]);
+});
+
+test("a refused send releases the copy right away and says why", async () => {
+  const fake = await primed({
+    "files.send": () => {
+      throw appError("DEVICE_OFFLINE");
+    },
+  });
+  await emit("core:share", PICK);
+  await vi.waitFor(() => expect(store.pendingShare).not.toBeNull());
+
+  await store.sendShare("d_win");
+
+  expect(fake.discards).toEqual(["s_1"]);
+  expect(store.notice).toEqual({ kind: "error", text: "This device is offline." });
+});
+
+test("cancelling the share releases the copy and sends nothing", async () => {
+  const fake = await primed({ "files.send": () => ({ transfer_id: "t_1" }) });
+  await emit("core:share", PICK);
+  await vi.waitFor(() => expect(store.pendingShare).not.toBeNull());
+
+  store.cancelShare();
+
+  expect(store.pendingShare).toBeNull();
+  expect(fake.discards).toEqual(["s_1"]);
+  expect(fake.calls.some((c) => c.method === "files.send")).toBe(false);
+});
+
+test.each([
+  [[{ name: "holiday.jpg", path: "/c/holiday.jpg", size: 2516582 }], "holiday.jpg · 2.4 MiB"],
+  [
+    [
+      { name: "a.pdf", path: "/c/a.pdf", size: 1024 },
+      { name: "b.png", path: "/c/b.png", size: 512 },
+    ],
+    "2 files · 1.5 KiB",
+  ],
+])("a pending share reads as %o → %s", (files, summary) => {
+  expect(shareSummary(files)).toBe(summary);
 });
