@@ -37,7 +37,7 @@ use crate::clipboard::{FillPlan, Origin, ServeMode, Transaction};
 use crate::connector::IoStream;
 use crate::datachannel;
 use crate::dataplane::{self, PeerAddr};
-use crate::state::AppState;
+use crate::state::{AppState, ConnId};
 
 /// Budget for opening a stream to the source (resolution + iroh handshake).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -198,38 +198,77 @@ fn build_remote_tx(state: &AppState, peer_node_id: &str, first: &Value) -> Optio
 const PUSH_CHUNK: usize = 64 * 1024;
 
 /// Broadcasts a materialized copy: a `clip_push` to every online device,
-/// carrying the announce metadata then the inline blobs. Fire-and-forget like
-/// `propagate` (best-effort — an offline device simply misses the clip; it
-/// re-learns nothing, exactly as a missed announce). `blobs` is the per-format
-/// bytes; sharing them across the per-peer tasks is a cheap `Arc` clone.
+/// carrying the announce metadata then the inline blobs. `blobs` is the
+/// per-format bytes; sharing them across the per-peer tasks is a cheap `Arc`
+/// clone.
+///
+/// Returns how many devices the push was launched to — the announce's
+/// `pushed_to`. Unlike `propagate`, this is not fire-and-forget from the
+/// caller's point of view: when the count is non-zero, the fan-out is awaited
+/// and settles into exactly one `clipboard.pushed` notification on the
+/// ANNOUNCING connection (`{tx_id, delivered, failed}`). A materialized copy
+/// comes from a source that is only briefly alive — a phone whose user shared a
+/// snippet and walked away — so "did my devices actually get it?" is the one
+/// question it cannot answer by staying around, and the one an Android share
+/// sheet must answer before it stops holding the process up.
 pub(crate) fn propagate_materialized(
     state: &Arc<AppState>,
     announce: Value,
     blobs: crate::clipboard::MaterializedBlobs,
-) {
+    announcer: ConnId,
+    tx_id: String,
+) -> usize {
     let peers = dataplane::account_peers(state);
     if peers.is_empty() {
-        return;
+        return 0;
     }
     // Only the METADATA frame is bounded by `MAX_FRAME`; the blobs stream
     // separately (capped by `MATERIALIZE_MAX`). An inline announce is tiny, so
-    // this never fires in practice — kept for parity with `propagate`.
+    // this never fires in practice — kept for parity with `propagate`. Reported
+    // as "launched to nobody": nothing left the device, so no report follows.
     let serialized = serde_json::to_vec(&announce).map_or(usize::MAX, |b| b.len());
     if serialized + 64 > dataplane::MAX_FRAME as usize {
         tracing::warn!("clipboard materialized metadata too large to propagate; it stays local");
-        return;
+        return 0;
     }
+    let launched = peers.len();
     let blobs = Arc::new(blobs);
-    for peer in peers {
-        let state = state.clone();
-        let announce = announce.clone();
-        let blobs = blobs.clone();
-        tokio::spawn(async move {
-            if let Err(e) = send_push(&state, &peer, &announce, &blobs).await {
-                tracing::debug!(peer = %peer.node_id, error = %e, "materialized clip not pushed");
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut pushes = tokio::task::JoinSet::new();
+        for peer in peers {
+            let state = state.clone();
+            let announce = announce.clone();
+            let blobs = blobs.clone();
+            pushes.spawn(async move {
+                match send_push(&state, &peer, &announce, &blobs).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::debug!(peer = %peer.node_id, error = %e, "materialized clip not pushed");
+                        false
+                    }
+                }
+            });
+        }
+        let mut delivered = 0usize;
+        let mut failed = 0usize;
+        while let Some(outcome) = pushes.join_next().await {
+            // A push task that panicked counts as a failure, never a delivery:
+            // the report must never over-promise.
+            match outcome {
+                Ok(true) => delivered += 1,
+                Ok(false) | Err(_) => failed += 1,
             }
-        });
-    }
+        }
+        // The announcer may already be gone (that is the whole point of
+        // push-at-copy) — `notify_conn` is then a no-op.
+        state.registry.lock().expect("lock registry").notify_conn(
+            announcer,
+            "clipboard.pushed",
+            &json!({ "tx_id": tx_id, "delivered": delivered, "failed": failed }),
+        );
+    });
+    launched
 }
 
 /// Source half of a `clip_push`: opens a stream, writes the announce frame
@@ -237,6 +276,12 @@ pub(crate) fn propagate_materialized(
 /// `formats` order, then waits for the receiver's ack and closes. The receiver
 /// knows each blob's length from `formats[].size` (made exact at the announce),
 /// so no per-blob header is needed.
+///
+/// The ack is REQUIRED here (unlike `send_announce`, which discards it): it is
+/// what makes `delivered` in the push report mean "a device has the bytes"
+/// rather than "we wrote into a void". A peer too old to know `clip_push`
+/// abandons the stream without acking, and is reported as a failure instead of
+/// silently passing for a delivery.
 async fn send_push(
     state: &Arc<AppState>,
     peer: &PeerAddr,
@@ -270,7 +315,20 @@ async fn send_push(
             datachannel::write_msg(&mut stream, datachannel::TAG_EOF, &[]).await?;
         }
     }
-    let _ = tokio::time::timeout(ANNOUNCE_ACK_TIMEOUT, dataplane::read_frame(&mut stream)).await;
+    let ack = tokio::time::timeout(ANNOUNCE_ACK_TIMEOUT, dataplane::read_frame(&mut stream))
+        .await
+        .map_err(|_| timed_out("clip_push ack"))??;
+    let acked = serde_json::from_slice::<Value>(&ack)
+        .ok()
+        .and_then(|v| {
+            v.get("type")
+                .and_then(Value::as_str)
+                .map(|t| t == "clip_ack")
+        })
+        .unwrap_or(false);
+    if !acked {
+        return Err(datachannel::unexpected("materialize: no clip_ack"));
+    }
     let _ = stream.shutdown().await;
     Ok(())
 }

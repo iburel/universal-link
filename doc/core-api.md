@@ -278,6 +278,17 @@ Constraints keep it a narrow, safe extension:
   gone offline); a destination that was offline at copy time simply never
   learned the clip, exactly as a missed announce today.
 
+Because the source may vanish the instant the push completes, it has to know
+*when* that is. The announce therefore answers `pushed_to` — how many of the
+account's other devices the fan-out targets — and, when that is non-zero, the
+Core sends exactly one `clipboard.pushed { tx_id, delivered, failed }` on the
+announcing connection once every push has settled. That is the completion
+signal an ephemeral source waits on before exiting, and it is deliberately
+*reporting*, not a guarantee: `pushed_to: 0` means nothing was shared at all,
+`delivered: 0` means no device could be reached, and a device that was offline
+at copy time never learns the clip. A source that does not care may ignore both
+— the local transaction is unaffected.
+
 Supersession and the Core-stop/logout cut drop the cached bytes with the
 transaction, like any other: a materialized clip is deleted (and its bytes
 freed) the moment it is superseded with no active session.
@@ -295,7 +306,8 @@ contract of the backend.
 
 | Direction | Call | Description |
 |---|---|---|
-| component → Core | `clipboard.updated { formats: [{format, size?}], paths?, sensitive?, materialize?, blobs? }` → `{ tx_id }` | announces the local copy: opens the transaction that supersedes the previous one. `paths` mandatory if `files` (the manifest is frozen from them). `formats` may be empty — the clipboard was cleared; it supersedes like any announce (a contentless transaction), and destinations withdraw their promise. Inline `size` is an advisory hint (the content is re-serialized at paste time; the stream up to `EOF` is authoritative, a mismatch is not an error) and is omitted when `sensitive`. `sensitive`: set if the OS confidentiality markers are detected. `materialize: true` makes it a **materialized** transaction (push-at-copy): the caller supplies the inline bytes now as `blobs: { <format>: <base64> }` (one entry per inline format offered, capped), the Core pushes them to the account's online devices, and it also serves the source's own pastes from them — so the caller may exit right after the copy. It excludes `sensitive` and `files` (rejected). The backend keeps the returned `tx_id` mapped to that clipboard generation |
+| component → Core | `clipboard.updated { formats: [{format, size?}], paths?, sensitive?, materialize?, blobs? }` → `{ tx_id, pushed_to? }` | announces the local copy: opens the transaction that supersedes the previous one. `paths` mandatory if `files` (the manifest is frozen from them). `formats` may be empty — the clipboard was cleared; it supersedes like any announce (a contentless transaction), and destinations withdraw their promise. Inline `size` is an advisory hint (the content is re-serialized at paste time; the stream up to `EOF` is authoritative, a mismatch is not an error) and is omitted when `sensitive`. `sensitive`: set if the OS confidentiality markers are detected. `materialize: true` makes it a **materialized** transaction (push-at-copy): the caller supplies the inline bytes now as `blobs: { <format>: <base64> }` (one entry per inline format offered, capped), the Core pushes them to the account's online devices, and it also serves the source's own pastes from them — so the caller may exit right after the copy. It excludes `sensitive` and `files` (rejected). `pushed_to` is returned **only for a materialized announce**: the number of the account's other devices the push was launched to (`0` = no other device known, so nothing was shared), and it promises exactly one `clipboard.pushed` when non-zero. The backend keeps the returned `tx_id` mapped to that clipboard generation |
+| Core → component | notification `clipboard.pushed { tx_id, delivered, failed }` | the outcome of a materialized announce's fan-out, sent to the **announcing connection only** (no topic, no subscription): `delivered + failed == pushed_to`, `delivered` counting the devices that acknowledged the bytes. Exactly one per announce whose `pushed_to` was non-zero, once every push has settled or timed out — a source that must not outlive its share by more than it has to (a phone holding a foreground service up) waits for this and then stops. Nothing to do on receipt: the copy is already the account's current clip, `failed` devices simply never learned it, exactly as a missed announce |
 | Core → component | `clipboard.get_data { tx_id, format, channel_token }` → `{}` | **request** from the Core when a device pastes an inline format: the backend re-reads the OS clipboard, streams the blob over the provider channel opened with `channel_token`, and replies `{}` only after `EOF` — the reply is the completion signal. It replies `CLIP_STALE` *without opening the channel* if it cannot vouch for the `tx_id` generation (the OS clipboard moved on — or this backend instance never knew it); a failure detected mid-stream surfaces as `ERROR` on the channel and mirrors in the reply |
 
 The files never pass through the backend: the Core serves their bytes from the

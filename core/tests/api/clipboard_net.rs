@@ -85,8 +85,8 @@ async fn announce_text(c: &mut TestComponent, text: &str) -> String {
 }
 
 /// Announces a MATERIALIZED (push-at-copy) text clip: the inline bytes travel
-/// with the announce. Returns the `tx_id`.
-async fn announce_text_materialized(c: &mut TestComponent, text: &str) -> String {
+/// with the announce. Returns the whole result (`tx_id` + `pushed_to`).
+async fn announce_materialized(c: &mut TestComponent, text: &str) -> Value {
     let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
     c.request(
         "clipboard.updated",
@@ -97,7 +97,13 @@ async fn announce_text_materialized(c: &mut TestComponent, text: &str) -> String
         }),
     )
     .await
-    .expect("clipboard.updated")["tx_id"]
+    .expect("clipboard.updated")
+}
+
+/// The `tx_id` of a materialized announce — the common case, where the fan-out
+/// report is not what is under test.
+async fn announce_text_materialized(c: &mut TestComponent, text: &str) -> String {
+    announce_materialized(c, text).await["tx_id"]
         .as_str()
         .expect("tx_id")
         .to_string()
@@ -543,6 +549,10 @@ async fn a_materialized_copy_is_served_from_the_destination_cache() {
     assert_eq!(note["tx_id"], json!(tx));
     assert_eq!(note["formats"], json!([{ "format": "text", "size": 14 }]));
 
+    // Consume A's delivery report before the paste, so the silence asserted
+    // below is only about the paste (and so the push is known to have settled).
+    ca.wait_notification("clipboard.pushed").await;
+
     // B pastes: the blob comes from B's OWN cache — no `clip_session` to A, and
     // A's backend is never asked for `clipboard.get_data`.
     let token = open_channel_token(&mut cb, &tx).await;
@@ -643,6 +653,74 @@ async fn materialize_refuses_sensitive_and_files() {
 }
 
 // ---------------------------------------------------------------------------
+// Brick 4 (Android): the materialized push's DELIVERY REPORT. A source that may
+// vanish right after the copy cannot answer "did my devices get it?" by staying
+// around, so the announce answers `pushed_to` and the fan-out settles into one
+// `clipboard.pushed` on the announcing connection.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_materialized_copy_reports_its_delivery() {
+    let server = TestServer::start().await;
+    let (_a, mut ca, _b, mut cb) = connected_pair(&server).await;
+
+    // The announce says up front how many devices the push targets.
+    let result = announce_materialized(&mut ca, "did it land?").await;
+    let tx = result["tx_id"].as_str().expect("tx_id").to_string();
+    assert_eq!(result["pushed_to"], json!(1));
+
+    // B really received it...
+    let note = cb.wait_notification("clipboard.remote_updated").await;
+    assert_eq!(note["tx_id"], json!(tx));
+
+    // ...and the announcer is told so, on its own connection.
+    let report = ca.wait_notification("clipboard.pushed").await;
+    assert_eq!(report["tx_id"], json!(tx));
+    assert_eq!(report["delivered"], json!(1));
+    assert_eq!(report["failed"], json!(0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_materialized_copy_with_no_other_device_reports_nothing_pushed() {
+    let server = TestServer::start().await;
+    let core = TestCore::start_enrolled(&server).await;
+    let mut c = backend(&core).await;
+    subscribe(&mut c).await;
+    wait_server_connected(&mut c, true).await;
+    c.drain().await;
+
+    // The only device on the account: the copy is local-only. `pushed_to: 0` is
+    // the honest answer — a share that reached nobody must not read as success.
+    let result = announce_materialized(&mut c, "shared with nobody").await;
+    assert!(result["tx_id"].is_string());
+    assert_eq!(result["pushed_to"], json!(0));
+
+    // And no report follows: `pushed_to: 0` promises none, so a caller waiting
+    // for one would wait forever.
+    c.assert_silent().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_push_no_peer_acknowledges_is_reported_as_failed() {
+    let server = TestServer::start().await;
+    let (_b, mut cb, raw) = core_with_raw_peer(&server).await;
+
+    // The peer takes the push and drops it without acking — what a Core too old
+    // to know `clip_push` does with the frame.
+    let abandon = tokio::spawn(async move { raw.abandon_next_push().await });
+
+    let result = announce_materialized(&mut cb, "into the void").await;
+    assert_eq!(result["pushed_to"], json!(1));
+    abandon.await.expect("abandon task");
+
+    // Written is not delivered: the report counts it as a failure.
+    let report = cb.wait_notification("clipboard.pushed").await;
+    assert_eq!(report["tx_id"], result["tx_id"]);
+    assert_eq!(report["delivered"], json!(0));
+    assert_eq!(report["failed"], json!(1));
+}
+
+// ---------------------------------------------------------------------------
 // Raw attested peer: forges `clip_announce` frames a legitimate backend never
 // would (a compromised device of the account), to exercise the receiver's
 // convergence and fail-closed validation over the wire.
@@ -718,6 +796,26 @@ impl RawPeer {
             // in flight, then drop the stream → the paster sees the reset.
             let mut scratch = [0u8; 64];
             let _ = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut scratch)).await;
+        }
+    }
+
+    /// Accepts the next incoming stream (the source's `clip_push`), drains it,
+    /// then drops it WITHOUT acking — what a Core too old to know `clip_push`
+    /// does with the frame. Draining first means the source's writes never
+    /// block, so the failure it reports is unambiguously "no ack".
+    async fn abandon_next_push(&self) {
+        if let Ok((_peer, mut stream)) = self.transport.accept().await {
+            let mut scratch = [0u8; 4096];
+            loop {
+                match tokio::time::timeout(Duration::from_millis(500), stream.read(&mut scratch))
+                    .await
+                {
+                    // Data: keep draining. Anything else (EOF, error, or the
+                    // source falling silent to wait for its ack): we are done.
+                    Ok(Ok(n)) if n > 0 => {}
+                    _ => break,
+                }
+            }
         }
     }
 

@@ -62,6 +62,54 @@ export function onCoreNotification(
 }
 
 /**
+ * Progress of a text share from the Android share sheet (gui-mobile/src/
+ * share.rs). MOBILE ONLY: the desktop shell never emits `core:share`, so this
+ * stream is simply always silent there.
+ *
+ * A share always ends on `done` or `error` — never on `sending` — because the
+ * banner it drives would otherwise stay up forever. `done` is the Core's
+ * delivery report and may still say `delivered: 0`: reaching nobody is an
+ * outcome, not an error to swallow.
+ */
+export type ShareStatus =
+  | { phase: "sending"; targets?: number }
+  | { phase: "done"; delivered: number; failed: number }
+  | {
+      phase: "error";
+      reason:
+        | "no_devices"
+        | "too_large"
+        | "refused"
+        | "unconfirmed"
+        | "not_signed_in"
+        | "offline";
+      detail?: string;
+    };
+
+export function onShareStatus(
+  handler: (status: ShareStatus) => void,
+): Promise<UnlistenFn> {
+  return listen<ShareStatus>("core:share", (event) => handler(event.payload));
+}
+
+/**
+ * The last share's retained status, or `null`. Subscribe first, read second —
+ * same contract as {@link connectionStatus}, and for a sharper reason: a share
+ * can COLD-START the app, so the worker publishes its status long before this
+ * webview exists, and a Tauri event only reaches listeners already registered.
+ *
+ * The desktop shell does not implement the command — it can never have a share —
+ * so a rejection there IS the answer "no share surface", not an error.
+ */
+export async function shareStatus(): Promise<ShareStatus | null> {
+  try {
+    return await invoke<ShareStatus | null>("share_status");
+  } catch {
+    return null;
+  }
+}
+
+/**
  * The server + OIDC fields the setup screen collects, mirroring the shell's
  * `ServerConfigForm` (gui/src/bridge.rs). The secret is optional (a conformant
  * PKCE IdP has none); a blank one clears the key on write.

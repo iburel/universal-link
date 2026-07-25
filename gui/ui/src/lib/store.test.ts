@@ -18,7 +18,7 @@ import type {
   SessionState,
 } from "./api";
 import type { ConnectionStatus, CoreError } from "./core";
-import { CoreStore } from "./store.svelte";
+import { CoreStore, shareNotice } from "./store.svelte";
 
 // -- Fixtures ---------------------------------------------------------------
 
@@ -114,6 +114,8 @@ function mockCore(options: {
   methods?: Record<string, Method>;
   /** Run when the shell is queried for its snapshot. */
   onStatusRead?: () => void;
+  /** What the mobile `share_status` snapshot returns (mobile only). */
+  retainedShare?: unknown;
 }): Fake {
   const fake: Fake = {
     calls: [],
@@ -146,6 +148,10 @@ function mockCore(options: {
       }
       if (cmd === "get_server_config") {
         return { server_url: "", oidc_issuer: "", oidc_client_id: "" };
+      }
+      // Mobile-only snapshot: no retained share unless a test says otherwise.
+      if (cmd === "share_status") {
+        return options.retainedShare ?? null;
       }
       if (cmd === "core_request") {
         const { method, params } = payload as {
@@ -229,9 +235,12 @@ test("we subscribe to notifications, then to the connection, then read the snaps
 
   await store.start();
 
-  expect(fake.ipc.slice(0, 3)).toEqual([
+  // Every subscription precedes the snapshot read; `core:share` (mobile only)
+  // comes last because nothing about it feeds a resnapshot.
+  expect(fake.ipc.slice(0, 4)).toEqual([
     "listen:core:notification",
     "listen:core:connection",
+    "listen:core:share",
     "connection_status",
   ]);
 });
@@ -1487,4 +1496,150 @@ test("saveServerConfig surfaces a config the Core rejects", async () => {
   expect(store.notice?.kind).toBe("error");
   // The Core's specific reason is shown (INVALID_CONFIG is not remapped).
   expect(store.notice?.text).toContain("ws://");
+});
+
+// -- Android share sheet (`core:share`, mobile only) -------------------------
+
+// The user has already left the app that shared the text: the banner is the one
+// place they can learn what became of it, so every outcome has to be legible —
+// and "it reached nobody" must not read like a success.
+test.each([
+  [{ phase: "sending" } as const, "info", "Sharing…"],
+  [
+    { phase: "sending", targets: 2 } as const,
+    "info",
+    "Sharing with 2 devices…",
+  ],
+  [
+    { phase: "done", delivered: 1, failed: 0 } as const,
+    "info",
+    "Shared with 1 device.",
+  ],
+  [
+    { phase: "done", delivered: 2, failed: 1 } as const,
+    "info",
+    "Shared with 2 of 3 devices.",
+  ],
+  [
+    { phase: "done", delivered: 0, failed: 1 } as const,
+    "error",
+    "Could not reach your other device.",
+  ],
+  [
+    { phase: "done", delivered: 0, failed: 3 } as const,
+    "error",
+    "Could not reach any of your 3 devices.",
+  ],
+  [
+    { phase: "error", reason: "no_devices" } as const,
+    "error",
+    "No other device on your account — nothing was shared.",
+  ],
+  [
+    { phase: "error", reason: "not_signed_in" } as const,
+    "error",
+    "Sign in to UniversalLink first — nothing was shared.",
+  ],
+  [
+    { phase: "error", reason: "offline" } as const,
+    "error",
+    "Could not reach your account — nothing was shared.",
+  ],
+  [
+    { phase: "error", reason: "too_large" } as const,
+    "error",
+    "That text is too large to share (8 MiB maximum).",
+  ],
+  [
+    { phase: "error", reason: "unconfirmed" } as const,
+    "error",
+    "Shared, but your devices did not confirm receiving it.",
+  ],
+  [
+    { phase: "error", reason: "refused", detail: "no connection" } as const,
+    "error",
+    "Sharing failed: no connection",
+  ],
+  [
+    { phase: "error", reason: "refused" } as const,
+    "error",
+    "Sharing failed.",
+  ],
+])("a share status reads as a banner: %o", (status, kind, text) => {
+  // Sticky: a share reports itself while the user may not have touched the app,
+  // so a resnapshot in between must not expire its feedback.
+  expect(shareNotice(status)).toEqual({ kind, text, sticky: true });
+});
+
+test("a share reports itself in the banner", async () => {
+  mockCore({ status: CONNECTED });
+  await store.start();
+  await vi.waitFor(() => expect(store.primed).toBe(true));
+
+  await emit("core:share", { phase: "sending", targets: 1 });
+  await vi.waitFor(() =>
+    expect(store.notice).toEqual({
+      kind: "info",
+      text: "Sharing with 1 device…",
+      sticky: true,
+    }),
+  );
+
+  await emit("core:share", { phase: "done", delivered: 1, failed: 0 });
+  await vi.waitFor(() =>
+    expect(store.notice).toEqual({
+      kind: "info",
+      text: "Shared with 1 device.",
+      sticky: true,
+    }),
+  );
+});
+
+// A share is usually what COLD-STARTED the app: its status is published before
+// the webview exists, and a Tauri event only reaches listeners already
+// registered. Without the snapshot the user would never learn the outcome of the
+// very share they made.
+test("a share that finished before the UI existed is read from the snapshot", async () => {
+  mockCore({
+    status: CONNECTED,
+    retainedShare: { phase: "done", delivered: 2, failed: 0 },
+  });
+
+  await store.start();
+
+  expect(store.notice).toEqual({
+    kind: "info",
+    text: "Shared with 2 devices.",
+    sticky: true,
+  });
+  // And the priming resnapshot, which runs right after, does not erase it.
+  await vi.waitFor(() => expect(store.primed).toBe(true));
+  expect(store.notice?.text).toBe("Shared with 2 devices.");
+});
+
+// The live event is more recent than the snapshot by construction.
+test("a share event received during the snapshot read wins over the snapshot", async () => {
+  mockCore({
+    status: CONNECTED,
+    retainedShare: { phase: "sending" },
+    onStatusRead: () =>
+      void emit("core:share", { phase: "done", delivered: 1, failed: 0 }),
+  });
+
+  await store.start();
+
+  await vi.waitFor(() =>
+    expect(store.notice?.text).toBe("Shared with 1 device."),
+  );
+});
+
+test("a non-sticky notice is still expired by a resnapshot", async () => {
+  mockCore({ status: CONNECTED });
+  await store.start();
+  await vi.waitFor(() => expect(store.primed).toBe(true));
+
+  store.notice = { kind: "error", text: "an action failed" };
+  await store.resync();
+
+  expect(store.notice).toBeNull();
 });

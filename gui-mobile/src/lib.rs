@@ -11,6 +11,7 @@
 //! Tauri Android tooling (cargo-ndk under the hood), never by the CI jobs.
 
 mod logcat;
+mod share;
 mod tls;
 
 use std::path::Path;
@@ -41,6 +42,9 @@ pub fn run() {
             universallink_gui::connection_status,
             universallink_gui::set_server_config,
             universallink_gui::get_server_config,
+            // Mobile-only: the snapshot of the last share sheet status (the
+            // desktop shell has no share surface at all).
+            share::share_status,
         ])
         .setup(|app| {
             // The app-private data dir is only resolvable here (it needs the
@@ -67,7 +71,14 @@ pub fn run() {
             // uses — pointed at the in-process socket instead of the daemon's.
             tauri::async_runtime::spawn(async move {
                 match boot_core(&data_dir).await {
-                    Ok(client_config) => bridge_loop(handle, client_config).await,
+                    Ok(client_config) => {
+                        // The share sheet's own connection to the Core (it needs
+                        // the announcing role the bridge does not have). Started
+                        // from the bridge's config so both reach the same socket
+                        // with the same token — see `share`.
+                        share::spawn(handle.clone(), &client_config);
+                        bridge_loop(handle, client_config).await
+                    }
                     Err(e) => tracing::error!("embedded Core boot failed: {e:#}"),
                 }
             });
