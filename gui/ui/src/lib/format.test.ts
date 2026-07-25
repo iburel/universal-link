@@ -10,6 +10,7 @@ import {
   relativeTime,
   roleLabel,
   scopeLabel,
+  selfLabel,
   sortDevices,
 } from "./format";
 
@@ -34,11 +35,20 @@ test("relativeTime absorbs the future, the missing, and the unreadable", () => {
 
 test("labels fall back to the raw value when it is unknown", () => {
   expect(platformLabel("macos")).toBe("macOS");
+  expect(platformLabel("android")).toBe("Android");
   expect(platformLabel("haiku")).toBe("haiku");
   expect(roleLabel("clipboard-backend")).toBe("clipboard");
   expect(roleLabel("future-role")).toBe("future-role");
   expect(scopeLabel("files.send")).toBe("Send files");
   expect(scopeLabel("future.scope")).toBe("future.scope");
+});
+
+// The phone runs the SAME view as the desktop, so the self label has to follow
+// the platform rather than the build it is displayed on.
+test("a device names itself after what it is", () => {
+  expect(selfLabel("android")).toBe("this phone");
+  expect(selfLabel("windows")).toBe("this PC");
+  expect(selfLabel("haiku")).toBe("this PC");
 });
 
 test("sortDevices: this PC, then the connected ones, then by name", () => {

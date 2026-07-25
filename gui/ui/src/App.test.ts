@@ -101,6 +101,9 @@ test("the Core status is shown with its API version", () => {
   const app = render(App, { store });
 
   expect(textOf(app)).toContain("Core connected (API v1)");
+  // Outside the <nav>, which the narrow layout turns into a bottom tab bar: put
+  // it back inside and the status line would follow the tabs to the bottom.
+  expect(app.querySelector("nav")?.textContent).not.toContain("Core connected");
 });
 
 // Blocking portal: connected to the account but device not linked to the vault.

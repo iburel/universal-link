@@ -6045,6 +6045,7 @@ dependencies = [
 name = "universallink-gui-mobile"
 version = "0.0.0"
 dependencies = [
+ "android_system_properties",
  "anyhow",
  "base64 0.22.1",
  "serde_json",

@@ -9,10 +9,20 @@ const PLATFORMS: Record<Platform, string> = {
   windows: "Windows",
   macos: "macOS",
   linux: "Linux",
+  android: "Android",
 };
 
 export function platformLabel(platform: string): string {
   return PLATFORMS[platform as Platform] ?? platform;
+}
+
+/**
+ * How a device names ITSELF in the list ("… · this PC"). A phone is not a PC,
+ * and the phrase is also what the revocation warning is built on — a sentence
+ * the user is asked to act on, so it has to name the thing they are holding.
+ */
+export function selfLabel(platform: string): string {
+  return platform === "android" ? "this phone" : "this PC";
 }
 
 const ROLES: Record<string, string> = {

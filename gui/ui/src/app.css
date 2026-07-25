@@ -104,3 +104,13 @@ input {
   border-radius: var(--radius);
   background: var(--bg);
 }
+
+/* Narrow screen = a finger, not a pointer: controls get a tappable height.
+   Only the box grows — the type scale stays the desktop's, since it is the same
+   layout that has to stay readable (see App.svelte for the layout itself). */
+@media (max-width: 600px) {
+  button,
+  input {
+    min-height: 40px;
+  }
+}

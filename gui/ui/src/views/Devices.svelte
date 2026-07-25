@@ -3,7 +3,12 @@
 
 <script lang="ts">
   import type { Device } from "../lib/api";
-  import { platformLabel, relativeTime, sortDevices } from "../lib/format";
+  import {
+    platformLabel,
+    relativeTime,
+    selfLabel,
+    sortDevices,
+  } from "../lib/format";
   import { shareSummary, type CoreStore, type Transfer } from "../lib/store.svelte";
 
   // `now` is a parameter: tests don't have to freeze the clock.
@@ -73,6 +78,22 @@
   function seen(device: Device): string | null {
     return device.online ? null : relativeTime(device.last_seen, now);
   }
+
+  /**
+   * "Windows · this PC · online". Joined here rather than woven out of `{#if}`
+   * blocks in the markup: Svelte trims the whitespace at a block's edges, so
+   * that spelling lost the space BEFORE each separator ("Windows· this PC").
+   */
+  function meta(device: Device): string {
+    const parts = [platformLabel(device.platform)];
+    if (device.is_self) parts.push(selfLabel(device.platform));
+    if (device.online) parts.push("online");
+    else {
+      const last = seen(device);
+      if (last) parts.push(`last seen ${last}`);
+    }
+    return parts.join(" · ");
+  }
 </script>
 
 <section>
@@ -124,12 +145,7 @@
               {:else}
                 <span class="name">{device.name}</span>
               {/if}
-              <span class="meta">
-                {platformLabel(device.platform)}{#if device.is_self}
-                  &middot; this PC{/if}{#if device.online}
-                  &middot; online{:else if seen(device)}
-                  &middot; last seen {seen(device)}{/if}
-              </span>
+              <span class="meta">{meta(device)}</span>
             </div>
 
             <div class="actions">
@@ -153,7 +169,8 @@
               {:else if confirming === device.device_id}
                 <span class="confirm">
                   {#if device.is_self}
-                    Revoking this PC will disconnect it from your account.
+                    Revoking {selfLabel(device.platform)} will disconnect it
+                    from your account.
                   {:else}
                     Revoke {device.name}?
                   {/if}
@@ -307,6 +324,15 @@
     font-weight: 500;
   }
 
+  /* A long device name must not push the row's buttons off a phone screen. The
+     confirmation text is deliberately left out: it is a sentence, and it wraps. */
+  .identity .name,
+  .identity .meta {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .meta,
   .confirm {
     color: var(--muted);
@@ -359,5 +385,20 @@
     background: none;
     padding: 0 0.25rem;
     line-height: 1;
+  }
+
+  /* Phone: a row cannot hold a name, a state AND two buttons side by side —
+     measured on the device, where "Android · this phone · online" came out as
+     "Android · this pho…". The actions take a line of their own, which gives the
+     identity the full width and the buttons a proper tap size. */
+  @media (max-width: 600px) {
+    .row {
+      flex-wrap: wrap;
+    }
+
+    .actions {
+      flex: 1 0 100%;
+      justify-content: flex-end;
+    }
   }
 </style>

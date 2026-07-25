@@ -93,7 +93,12 @@ pub struct Config {
     /// folder. Created at the first incoming transfer.
     pub receive_dir: PathBuf,
     /// Base of the exponential reconnection backoff to the server — doubled at
-    /// each failed attempt, capped. A short value only makes sense in tests.
+    /// each failed attempt, and capped at 64 times itself
+    /// (`session::RECONNECT_MAX_MULTIPLE`). So this single value sets both how
+    /// fast the Core comes back from a blip and how long it may sleep between
+    /// attempts when the network is gone: a daemon on a wired network asks for
+    /// seconds, a phone (whose network goes away whenever the app does) for
+    /// fractions of one, the tests for milliseconds.
     pub reconnect_base_delay: std::time::Duration,
 }
 
