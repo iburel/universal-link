@@ -1,0 +1,11 @@
+{
+  "identifier": "default",
+  "description": "Mobile webview: core API (invoke + events) + opening URLs in a Custom Tab (OIDC loopback flow).",
+  "platforms": ["android"],
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "opener:allow-open-url",
+    "opener:allow-default-urls"
+  ]
+}

@@ -14,7 +14,10 @@ use universallink_ipc_client::{Client, ClientConfig, Event, RequestError};
 /// Managed state: the client only exists once the bridge task is started —
 /// before that, every request is `not_connected` (same fail-closed as before
 /// the first connection is established).
-struct CoreState {
+///
+/// Public so the mobile shell (`gui-mobile`, embedded Core) can `manage` it and
+/// reuse the very same bridge; the desktop binary builds it via `shell`.
+pub struct CoreState {
     client: OnceLock<Client>,
     /// Latest connection snapshot, updated BEFORE the event is emitted:
     /// subscribing then reading the snapshot never misses a state.
@@ -23,6 +26,17 @@ struct CoreState {
     /// (`set_server_config`). The Core only ever READS it — the GUI is the sole
     /// writer, which is why this lives here and not behind the IPC.
     config_dir: PathBuf,
+}
+
+impl CoreState {
+    /// A fresh state pinned to a config directory, before any connection.
+    pub fn new(config_dir: PathBuf) -> CoreState {
+        CoreState {
+            client: OnceLock::new(),
+            connection: Mutex::new(json!({ "status": "connecting" })),
+            config_dir,
+        }
+    }
 }
 
 /// Attaches the Core bridge to a Tauri builder (real or MockRuntime): the
@@ -57,8 +71,9 @@ pub fn shell<R: Runtime>(
 }
 
 /// Lives as long as the client publishes (forever, except `Incompatible` —
-/// the terminal state then stays shown by the snapshot).
-async fn bridge_loop<R: Runtime>(app: AppHandle<R>, config: ClientConfig) {
+/// the terminal state then stays shown by the snapshot). Public so the mobile
+/// shell can start it after spawning the embedded Core.
+pub async fn bridge_loop<R: Runtime>(app: AppHandle<R>, config: ClientConfig) {
     let (client, mut events) = universallink_ipc_client::spawn(config);
     let _ = app.state::<CoreState>().client.set(client);
     while let Some(event) = events.recv().await {
@@ -109,7 +124,7 @@ fn connection_snapshot(event: &Event) -> Option<Value> {
 /// A command's error: faithful relay of `RequestError`, serialized for the
 /// frontend.
 #[derive(Clone, serde::Serialize)]
-struct CommandError {
+pub struct CommandError {
     kind: &'static str,
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -144,7 +159,7 @@ impl From<RequestError> for CommandError {
 }
 
 #[tauri::command]
-async fn core_request(
+pub async fn core_request(
     state: State<'_, CoreState>,
     method: String,
     params: Option<Value>,
@@ -159,7 +174,7 @@ async fn core_request(
 }
 
 #[tauri::command]
-fn connection_status(state: State<'_, CoreState>) -> Value {
+pub fn connection_status(state: State<'_, CoreState>) -> Value {
     state.connection.lock().expect("snapshot lock").clone()
 }
 
@@ -168,7 +183,7 @@ fn connection_status(state: State<'_, CoreState>) -> Value {
 /// Core re-validates on reload; here we only shuttle strings to/from
 /// `config.json`.
 #[derive(serde::Deserialize, serde::Serialize, Default)]
-struct ServerConfigForm {
+pub struct ServerConfigForm {
     server_url: String,
     oidc_issuer: String,
     oidc_client_id: String,
@@ -183,7 +198,10 @@ struct ServerConfigForm {
 /// (`device_name`, `receive_dir`, `relay_url`) are preserved. The Core never
 /// writes this file — the GUI is the sole writer.
 #[tauri::command]
-fn set_server_config(state: State<'_, CoreState>, config: ServerConfigForm) -> Result<(), String> {
+pub fn set_server_config(
+    state: State<'_, CoreState>,
+    config: ServerConfigForm,
+) -> Result<(), String> {
     write_server_config(&state.config_dir, &config).map_err(|e| e.to_string())
 }
 
@@ -191,7 +209,7 @@ fn set_server_config(state: State<'_, CoreState>, config: ServerConfigForm) -> R
 /// (empty if the file is absent/unreadable). Local app, local file: the secret
 /// round-trips so an edit does not force the user to re-type it.
 #[tauri::command]
-fn get_server_config(state: State<'_, CoreState>) -> ServerConfigForm {
+pub fn get_server_config(state: State<'_, CoreState>) -> ServerConfigForm {
     read_server_config(&state.config_dir).unwrap_or_default()
 }
 

@@ -13,9 +13,21 @@
 //! production config.
 
 mod bridge;
+// `supervise` spawns an EXTERNAL Core, registers autostart and records launch
+// targets — all desktop-only. The mobile shell (`gui-mobile`) embeds the Core
+// in-process and never touches it; and it does not compile on Android (its
+// inner helpers are gated per desktop OS). So the module — and the binary that
+// uses it — is desktop-only.
+#[cfg(not(target_os = "android"))]
 mod supervise;
 
-pub use bridge::shell;
+// The bridge is reused verbatim by the mobile shell (`gui-mobile`): same
+// commands, same connection relay, over the embedded Core's socket.
+pub use bridge::{
+    CommandError, CoreState, ServerConfigForm, bridge_loop, connection_status, core_request,
+    get_server_config, set_server_config, shell,
+};
+#[cfg(not(target_os = "android"))]
 pub use supervise::{
     bundled_core_path, record_launch_target, register_autostart, spawn_core, stabilize_core_path,
 };
