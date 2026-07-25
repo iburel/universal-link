@@ -1012,13 +1012,32 @@ impl Conn {
             let net = cb.network_announce_of(&tx_id);
             (tx_id, net)
         };
+        // A materialized announce also reports its fan-out: `pushed_to` says how
+        // many devices the push was launched to, and a non-zero count promises
+        // exactly one `clipboard.pushed` on THIS connection once they settle. A
+        // source that vanishes right after the copy has no other way to learn
+        // whether its share landed — and zero devices must not read as success.
+        let materialized = materialized_blobs.is_some();
+        let mut pushed_to = 0;
         if let Some(net) = net {
             match materialized_blobs {
-                Some(blobs) => crate::clipnet::propagate_materialized(&self.state, net, blobs),
+                Some(blobs) => {
+                    pushed_to = crate::clipnet::propagate_materialized(
+                        &self.state,
+                        net,
+                        blobs,
+                        self.conn_id,
+                        tx_id.clone(),
+                    );
+                }
                 None => crate::clipnet::propagate(&self.state, net),
             }
         }
-        Ok(json!({ "tx_id": tx_id }))
+        if materialized {
+            Ok(json!({ "tx_id": tx_id, "pushed_to": pushed_to }))
+        } else {
+            Ok(json!({ "tx_id": tx_id }))
+        }
     }
 
     /// The `clipboard` topic's snapshot method: the current global clip (or `{}`

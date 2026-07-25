@@ -30,6 +30,18 @@
                 <!-- AndroidTV support -->
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
+
+            <!-- Share sheet: text shared from any app (a snippet, a link) is
+                 copied to the account's clipboard. CATEGORY_DEFAULT is what
+                 makes the filter match an implicit ACTION_SEND. The activity is
+                 singleTask, so a share into the running app arrives at
+                 onNewIntent and a cold one at onCreate — MainActivity handles
+                 both. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
         </activity>
 
         <service

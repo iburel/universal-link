@@ -52,16 +52,104 @@ import {
   getServerConfig,
   onConnectionChanged,
   onCoreNotification,
+  onShareStatus,
   setServerConfig,
+  shareStatus,
   type ConnectionStatus,
   type CoreNotification,
   type ServerConfigInput,
+  type ShareStatus,
 } from "./core";
 import { humanize, isCoreError, isInvalidParams } from "./errors";
 
 export interface Notice {
   kind: "info" | "error";
   text: string;
+  /**
+   * Survives a resnapshot. For a message that is NOT the last action's feedback:
+   * a share reports itself while the user may not have touched the app at all,
+   * so a snapshot arriving in between says nothing about it and must not expire
+   * it. Cleared like any other by the next action or by dismissing it.
+   */
+  sticky?: boolean;
+}
+
+const devices = (n: number) => `${n} device${n === 1 ? "" : "s"}`;
+
+/**
+ * What a share's progress reads like in the banner (Android share sheet; see
+ * {@link ShareStatus}). Kept honest on purpose: a share that reached none of
+ * the account's devices says so, because the user has already walked away from
+ * the app that shared it and will not find out any other way.
+ */
+export function shareNotice(status: ShareStatus): Notice {
+  return { ...shareText(status), sticky: true };
+}
+
+function shareText(status: ShareStatus): Notice {
+  switch (status.phase) {
+    case "sending":
+      return {
+        kind: "info",
+        text: status.targets
+          ? `Sharing with ${devices(status.targets)}…`
+          : "Sharing…",
+      };
+    case "done": {
+      const { delivered, failed } = status;
+      if (delivered === 0) {
+        return {
+          kind: "error",
+          text: `Could not reach ${failed === 1 ? "your other device" : `any of your ${devices(failed)}`}.`,
+        };
+      }
+      return {
+        kind: "info",
+        text:
+          failed === 0
+            ? `Shared with ${devices(delivered)}.`
+            : `Shared with ${delivered} of ${devices(delivered + failed)}.`,
+      };
+    }
+    case "error":
+      switch (status.reason) {
+        // The Core reached its device directory and this account has no OTHER
+        // device — the only case where "no other device" is a fact, because the
+        // phone waits for the directory before announcing.
+        case "no_devices":
+          return {
+            kind: "error",
+            text: "No other device on your account — nothing was shared.",
+          };
+        case "not_signed_in":
+          return {
+            kind: "error",
+            text: "Sign in to UniversalLink first — nothing was shared.",
+          };
+        case "offline":
+          return {
+            kind: "error",
+            text: "Could not reach your account — nothing was shared.",
+          };
+        case "too_large":
+          return {
+            kind: "error",
+            text: "That text is too large to share (8 MiB maximum).",
+          };
+        case "unconfirmed":
+          return {
+            kind: "error",
+            text: "Shared, but your devices did not confirm receiving it.",
+          };
+        case "refused":
+          return {
+            kind: "error",
+            text: status.detail
+              ? `Sharing failed: ${status.detail}`
+              : "Sharing failed.",
+          };
+      }
+  }
 }
 
 /** A file within a transfer (the `transfer.started` manifest). */
@@ -168,8 +256,22 @@ export class CoreStore {
         this.#setConnection(s);
       }),
     );
+    // Android share sheet only — always silent on the desktop. It borrows the
+    // action banner (as a sticky notice), so a share reports itself wherever the
+    // user happens to be, including behind the onboarding portals.
+    this.#unlisten.push(
+      await onShareStatus((s) => {
+        this.notice = shareNotice(s);
+      }),
+    );
     const snapshot = await connectionStatus();
     if (!this.#sawConnectionEvent) this.#setConnection(snapshot);
+    // A share is usually what STARTED the app, so its status was published
+    // before this webview existed: read the retained one, having subscribed
+    // above so a newer status cannot be missed. A live event wins — it is more
+    // recent than the snapshot by construction.
+    const share = await shareStatus();
+    if (share && !this.notice?.sticky) this.notice = shareNotice(share);
   }
 
   stop(): void {
@@ -266,8 +368,11 @@ export class CoreStore {
     this.components = components.status === "fulfilled" ? components.value : [];
     this.primed = true;
     // A fresh snapshot expires any earlier message: without this, the error
-    // from a missed resnapshot survives the recovery and lies to the user.
-    this.notice = null;
+    // from a missed resnapshot survives the recovery and lies to the user. A
+    // STICKY one survives: it reports something the snapshot says nothing about
+    // (a share), and the priming resnapshot alone would otherwise erase the
+    // feedback of the very share that started the app.
+    if (!this.notice?.sticky) this.notice = null;
 
     const buffered = this.#buffer ?? [];
     this.#buffer = null;
