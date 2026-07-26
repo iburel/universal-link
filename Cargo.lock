@@ -7139,8 +7139,8 @@ dependencies = [
  "universallink-core",
  "universallink-ipc-client",
  "universallink-test-support",
- "windows 0.61.3",
- "windows-core 0.61.2",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
  "windows-sys 0.61.2",
  "xcb",
 ]
@@ -7285,7 +7285,7 @@ dependencies = [
 name = "universallink-tray"
 version = "0.3.0"
 dependencies = [
- "png 0.17.16",
+ "png 0.18.1",
  "serde_json",
  "tao",
  "tokio",
