@@ -55,10 +55,17 @@ libc = "0.2"
 #   files clip is promised as an `IDataObject` whose `FileContents` are pulled on
 #   demand through one `IStream` per file. Implementing COM interfaces needs
 #   vtables (`#[implement]`), which `windows-sys` does not generate — hence the
-#   typed crate here. `windows-core` MUST be a DIRECT dependency: the
-#   `#[implement]` macro expands to `::windows_core::…` paths (same 0.61.2 the
-#   `windows` crate resolves). Pinned 0.61 to reuse the 0.61.3 already in the
-#   workspace lock (via tao/tauri on Windows) — no version bump, no new package.
+#   typed crate here. `windows-core` MUST be a DIRECT dependency, and MUST MOVE
+#   IN LOCKSTEP with `windows`: the `#[implement]` macro expands to
+#   `::windows_core::…` paths, so if the two resolve to different majors the
+#   vtables we hand-write are built against one `windows_core::Interface` while
+#   `windows` expects the other — 28 compile errors, all of the shape
+#   "the trait bound `IDataObject: windows_core::Interface` is not satisfied".
+#   (That is exactly what dependabot's windows-only 0.61 -> 0.62 bump produced.)
+#   0.62 is not a new package in the tree either: the lock already carried
+#   windows/windows-core 0.62.2 via netwatch and wmi (the iroh closure), so this
+#   moves us ONTO the version already there rather than adding one. 0.61.3 stays
+#   behind for tao/tauri, which pin it themselves.
 # `image` (png feature only) decodes/encodes PNG so DIB-only sources (Snipping
 # Tool, Paint) round-trip via `CF_DIBV5`. Non-Windows targets never pull these.
 [target.'cfg(windows)'.dependencies]
@@ -70,8 +77,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Memory",
     "Win32_UI_WindowsAndMessaging",
 ] }
-windows-core = "0.61"
-windows = { version = "0.61", features = [
+windows-core = "0.62"
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",                 # IDataObject_Impl vtable references GDI types
     "Win32_System_Com",                   # IDataObject/IEnumFORMATETC/IStream, FORMATETC, STGMEDIUM, TYMED…

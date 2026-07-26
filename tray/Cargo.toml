@@ -26,8 +26,10 @@ path = "src/main.rs"
 
 [dependencies]
 # Decodes the embedded tray icon (8-bit RGBA PNG) to the raw RGBA `tray-icon`
-# wants.
-png = "0.17"
+# wants. 0.18 made two API changes that `load_icon` accounts for: the decoder
+# needs a Seek source (hence the Cursor) and output_buffer_size returns an
+# Option.
+png = "0.18"
 # Request params (`system.shutdown`, `session.status`) and reading the
 # session payloads.
 serde_json = "1"

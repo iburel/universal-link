@@ -176,10 +176,16 @@ async fn brain(cmd_rx: mpsc::Receiver<UiCommand>, proxy: EventLoopProxy<UserEven
 /// The embedded tray icon (8-bit RGBA PNG) decoded to raw RGBA.
 fn load_icon() -> Icon {
     const PNG: &[u8] = include_bytes!("../icons/tray-32.png");
-    let mut reader = png::Decoder::new(PNG)
+    // Cursor, not the slice itself: png 0.18's Decoder requires Seek, which
+    // `&[u8]` does not implement. Cursor<&[u8]> is BufRead + Seek and copies
+    // nothing — it just carries a position into the embedded bytes.
+    let mut reader = png::Decoder::new(std::io::Cursor::new(PNG))
         .read_info()
         .expect("tray icon header");
-    let mut buf = vec![0; reader.output_buffer_size()];
+    // Also 0.18: output_buffer_size returns None when the size would overflow
+    // usize. This icon is 32x32 and baked into the binary, so that is a
+    // build-time impossibility — treated like the other expects here.
+    let mut buf = vec![0; reader.output_buffer_size().expect("tray icon buffer size")];
     let info = reader.next_frame(&mut buf).expect("tray icon pixels");
     buf.truncate(info.buffer_size());
     Icon::from_rgba(buf, info.width, info.height).expect("tray icon rgba")
