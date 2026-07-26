@@ -7352,7 +7352,7 @@ dependencies = [
 name = "universallink-tray"
 version = "0.3.0"
 dependencies = [
- "png 0.17.16",
+ "png 0.18.1",
  "serde_json",
  "tao",
  "tokio",
