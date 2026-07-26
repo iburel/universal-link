@@ -32,7 +32,7 @@ buildscript {
         // `Project.exec`, which buildSrc/.../BuildTask.kt uses, and that file is the
         // one file `cargo tauri android init` force-rewrites on every run
         // (tauri-cli src/mobile/android/project.rs) — so it cannot be patched here.
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.2.21")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.4.10")
     }
 }
 
