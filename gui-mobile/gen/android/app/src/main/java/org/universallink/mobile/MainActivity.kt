@@ -3,6 +3,7 @@ package org.universallink.mobile
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
@@ -10,6 +11,7 @@ import android.view.View
 import androidx.activity.enableEdgeToEdge
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.graphics.Insets
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 
@@ -60,33 +62,77 @@ class MainActivity : TauriActivity() {
      * page's viewport. What is left over shows the window background (the DayNight
      * theme's), within a shade of the page's own — the page never draws there.
      *
-     * Two things had to be learnt on the device for this to work at all:
-     * - the insets are read off the WINDOW, not off the dispatch chain, because
-     *   AppCompat's decor (`FitWindowsLinearLayout`, `fitsSystemWindows=true`)
-     *   consumes the system-window insets before any listener here sees them;
-     * - and they go on the content view rather than on the webview, whose own
-     *   padding it renders straight through (padding applied, nothing moved).
+     * Three things had to be learnt on the device for this to work at all:
+     * - a listener on the WEBVIEW never fires, because AppCompat's decor
+     *   (`FitWindowsLinearLayout`, `fitsSystemWindows=true`) consumes the
+     *   system-window insets before anything below it is asked;
+     * - the padding goes on the content view rather than on the webview, whose own
+     *   padding it renders straight through (padding applied, nothing moved);
+     * - and the values must come from the WINDOW's own dispatch, at the top of the
+     *   chain where nothing has consumed them yet, NOT from polling
+     *   `getRootWindowInsets` off a layout pass. That last one is what broke
+     *   landscape: after a rotation (the activity is not recreated —
+     *   `android:configChanges` covers orientation) a layout pass can still read
+     *   the PRE-rotation insets, and since the only guard here is "does this differ
+     *   from the current padding", the last read wins with nothing to correct it.
+     *   The result was portrait-shaped padding on a landscape window: the page ran
+     *   under the left cutout and under the right-hand navigation bar (the sidebar
+     *   labels came out as "evices", "pprovals"), with a dead 132px band along the
+     *   bottom.
      *
-     * Driven by layout so it follows a rotation, and idempotent so the layout that
-     * `setPadding` itself triggers cannot loop.
+     * So the decor view's `onApplyWindowInsets` is the source of truth, and it
+     * cannot be stale: the framework hands us the new insets. The layout pass still
+     * re-applies them, because a layout can happen without a dispatch (the webview
+     * arriving, the keyboard, a resize), but it replays the REMEMBERED value rather
+     * than re-reading — so once a dispatch has been seen, the polling path that
+     * caused the bug is gone for good. Polling remains only to seed the very first
+     * layout, which may precede any dispatch.
+     *
+     * Idempotent by comparison, so the layout that `setPadding` itself triggers
+     * cannot loop.
      */
     private fun insetContentFromSystemBars() {
         val content = findViewById<View>(android.R.id.content) ?: return
-        val fit = {
-            val safe = ViewCompat.getRootWindowInsets(content)?.getInsets(
-                WindowInsetsCompat.Type.systemBars() or
-                    WindowInsetsCompat.Type.displayCutout(),
-            )
-            if (safe != null &&
-                (content.paddingLeft != safe.left || content.paddingTop != safe.top ||
-                    content.paddingRight != safe.right || content.paddingBottom != safe.bottom)
+        // The last insets the framework handed us. Null until the first dispatch.
+        var dispatched: Insets? = null
+        val apply = { safe: Insets ->
+            if (content.paddingLeft != safe.left || content.paddingTop != safe.top ||
+                content.paddingRight != safe.right || content.paddingBottom != safe.bottom
             ) {
                 Log.i(TAG, "insetting the content view: $safe")
                 content.setPadding(safe.left, safe.top, safe.right, safe.bottom)
             }
         }
-        content.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> fit() }
-        fit()
+        val safeOf = { insets: WindowInsetsCompat ->
+            insets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout(),
+            )
+        }
+
+        // Observe at the decor view, above AppCompat's decor, and pass the insets on
+        // to the default implementation — this watches the dispatch, it does not
+        // intercept it.
+        ViewCompat.setOnApplyWindowInsetsListener(window.decorView) { v, insets ->
+            dispatched = safeOf(insets)
+            dispatched?.let(apply)
+            ViewCompat.onApplyWindowInsets(v, insets)
+        }
+        content.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            val safe = dispatched ?: ViewCompat.getRootWindowInsets(content)?.let(safeOf)
+            safe?.let(apply)
+        }
+        ViewCompat.getRootWindowInsets(content)?.let(safeOf)?.let(apply)
+    }
+
+    /**
+     * A rotation does not recreate this activity (`android:configChanges`), so ask
+     * for a fresh inset dispatch rather than waiting to be told — see
+     * [insetContentFromSystemBars] for what went wrong when the padding was left to
+     * whatever a post-rotation layout pass happened to read.
+     */
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        findViewById<View>(android.R.id.content)?.let { ViewCompat.requestApplyInsets(it) }
     }
 
     override fun onNewIntent(intent: Intent) {
