@@ -83,3 +83,38 @@ updates:
         update-types:
           - minor
           - patch
+    # The Android build toolchain is capped, and NOT because we prefer old
+    # versions: each of the three is blocked by something in the Tauri templates
+    # that we do not get to edit. Without these entries the same three
+    # unmergeable pull requests come back every month.
+    #
+    # Expressed as update-types rather than version ranges on purpose. The Kotlin
+    # cap is the reason: 2.3 is a MINOR from the 2.2.21 we pin, so it would be
+    # swept into the `gradle` group above (minor + patch) and quietly break the
+    # build again inside an otherwise routine PR — an ignore keyed on major
+    # versions would not have caught it. Ignores are applied before grouping, so
+    # these hold for the group as well as for individual PRs.
+    ignore:
+      # Patches of 2.2.x only. From 2.3 the Kotlin plugin makes
+      # `kotlinOptions { jvmTarget = "..." }` a hard error, and that construct
+      # lives not only in gui-mobile/gen/android/app/build.gradle.kts (ours to
+      # fix) but in the Gradle scripts of tauri and tauri-plugin-opener, which
+      # Gradle reads out of ~/.cargo/registry. Lift when a published tauri has
+      # migrated those to the compilerOptions DSL.
+      - dependency-name: "org.jetbrains.kotlin:kotlin-gradle-plugin"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
+      # 8.x only. AGP 9 requires Gradle >= 9.5, which we cannot take (below), and
+      # then still fails on buildSrc/.../BuildTask.kt.
+      - dependency-name: "com.android.tools.build:gradle"
+        update-types:
+          - version-update:semver-major
+      # 8.x only. Gradle 9 removed `Project.exec`, which BuildTask.kt calls — and
+      # that file is the ONE file `cargo tauri android init` force-rewrites on
+      # every run (tauri-cli src/mobile/android/project.rs), which CI does on
+      # every run, so patching it here is not an option. Lift when a published
+      # tauri emits an ExecOperations-based BuildTask.
+      - dependency-name: "gradle-wrapper"
+        update-types:
+          - version-update:semver-major
