@@ -57,15 +57,20 @@ rust {
     rootDirRel = "../../../"
 }
 
+// These raise the Kotlin floor: activity, lifecycle-process and webkit declare
+// kotlin-stdlib 2.1.20, so the Kotlin plugin in ../build.gradle.kts has to be
+// >= 2.0 to read their metadata at all — see the ceiling documented there.
+// compileSdk 36 also becomes a hard floor here (activity 1.13.0 and the
+// androidx.core 1.18.0 it pulls both require it); we are already at 36.
 dependencies {
-    implementation("androidx.webkit:webkit:1.14.0")
+    implementation("androidx.webkit:webkit:1.16.0")
     implementation("androidx.appcompat:appcompat:1.7.1")
-    implementation("androidx.activity:activity-ktx:1.10.1")
-    implementation("com.google.android.material:material:1.12.0")
-    implementation("androidx.lifecycle:lifecycle-process:2.10.0")
+    implementation("androidx.activity:activity-ktx:1.13.0")
+    implementation("com.google.android.material:material:1.14.0")
+    implementation("androidx.lifecycle:lifecycle-process:2.11.0")
     testImplementation("junit:junit:4.13.2")
-    androidTestImplementation("androidx.test.ext:junit:1.1.4")
-    androidTestImplementation("androidx.test.espresso:espresso-core:3.5.0")
+    androidTestImplementation("androidx.test.ext:junit:1.3.0")
+    androidTestImplementation("androidx.test.espresso:espresso-core:3.7.0")
 }
 
 apply(from = "tauri.build.gradle.kts")
