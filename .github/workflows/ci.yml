@@ -10,8 +10,12 @@ on:
 permissions:
   contents: read
 
-# A new push on a PR cancels the previous run; main always runs to completion,
-# so a reference build is never interrupted.
+# A new push on a PR cancels the previous run. On main it does not, but that is
+# weaker than "every commit on main gets a reference build": GitHub keeps at most
+# ONE run pending per concurrency group and cancels the previously pending one, so
+# merging several pull requests in quick succession leaves the intermediate
+# commits unbuilt. What is guaranteed is that the LATEST state of main is built —
+# which is the state that matters.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
@@ -305,9 +309,17 @@ jobs:
       # it is machine-specific: it holds ABSOLUTE paths into ~/.cargo/registry.
       # Same for app/tauri.properties (the versionCode), app/proguard-tauri.pro,
       # app/src/main/assets/tauri.conf.json and the whole generated/ Kotlin
-      # (WryActivity, RustWebView, …). `init` writes them and — verified — leaves
-      # every tracked file untouched: our MainActivity, build.gradle.kts,
-      # manifest, resources and Kotlin sources are not regenerated.
+      # (WryActivity, RustWebView, …).
+      #
+      # What `init` does to files that already exist, exactly (the rule is in
+      # tauri-cli, src/mobile/android/project.rs): it FORCE-REWRITES one — the
+      # buildSrc BuildTask.kt — and skips every other. So our MainActivity,
+      # build.gradle.kts, manifest, resources and Kotlin sources are safe, and
+      # BuildTask.kt is a no-op only because we have never modified it. That one
+      # exception is not a detail: it is why the Android build cannot move to
+      # Gradle 9, which removed the `Project.exec` that BuildTask.kt calls — any
+      # local patch would be erased right here, on every run. See the version caps
+      # in .github/dependabot.yml.
       - name: Generate the Gradle project
         working-directory: gui-mobile
         run: cargo tauri android init --skip-targets-install
