@@ -15,7 +15,7 @@ base64 = "0.22"
 # workspace must stay aligned, otherwise resolution fails (ed25519-dalek major 3
 # does not unify between the stable `3.0.0` and the RC). To be bumped once iroh
 # moves to the stable 3.0.0.
-ed25519-dalek = { version = "=3.0.0-rc.0", features = ["rand_core"] }
+ed25519-dalek = { version = "=3.0.0", features = ["rand_core"] }
 # Encoding/decoding of OIDC query strings and form bodies.
 form_urlencoded = "1"
 futures-util = "0.3"
