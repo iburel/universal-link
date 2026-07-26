@@ -10,7 +10,11 @@
 # aarch64-linux-android via the Tauri Android tooling (cargo-ndk under the
 # hood), never by the native CI jobs — so it perturbs neither the workspace
 # build (`cargo build --workspace --all-targets`) nor the workspace's
-# cargo-deny run. It still path-depends on the workspace crates.
+# cargo-deny run. It still path-depends on the workspace crates, so a change
+# there can break the phone app without any native job noticing; CI covers that
+# with an `android` job of its own (clippy for the phone's triple, then the
+# release APK), which is also the only place the Kotlin under gen/android is
+# compiled at all.
 #
 # The exclusion buys that isolation at the price of a SECOND lockfile, and the
 # two have since diverged: no new crate NAME enters the tree (every dependency

@@ -1,15 +1,21 @@
 version: 2
 
-# Versions are pinned (action SHAs, toolchain, Cargo.lock, package-lock.json):
-# without this file, nothing would flag that a pinned version has become
-# outdated or vulnerable. Monthly cadence and grouped updates, to receive one
-# pull request per lockfile rather than one per dependency.
+# Versions are pinned everywhere (action SHAs, toolchain, Cargo.lock,
+# package-lock.json, the Android plugins): without this file, nothing would flag
+# that a pinned version has become outdated or vulnerable. Monthly cadence and
+# grouped updates, to receive one pull request per set rather than one per
+# dependency.
 #
-# One entry per pinned set, and there are four: the workflow action SHAs, then
-# the three lockfiles (the workspace's Cargo.lock, gui-mobile's own, and the
-# frontend's package-lock.json). A set left out here is refreshed by nobody:
-# GitHub's security alerts are the one channel this file does not govern, and
-# they report a published advisory, not a version that has merely gone stale.
+# One entry per pinned set, and there are five: the workflow action SHAs, the
+# three lockfiles (the workspace's Cargo.lock, gui-mobile's own, and the
+# frontend's package-lock.json), and the Android app's Gradle dependencies. A set
+# left out here is refreshed by nobody: GitHub's security alerts are the one
+# channel this file does not govern, and they report a published advisory, not a
+# version that has merely gone stale.
+#
+# One pinned set is out of reach entirely: the Android SDK platform, build-tools
+# and NDK versions, which live in .github/workflows/ci.yml. Dependabot has no
+# ecosystem for them, so they are bumped by hand.
 updates:
   - package-ecosystem: github-actions
     directory: /
@@ -57,6 +63,22 @@ updates:
       interval: monthly
     groups:
       npm:
+        patterns: ["*"]
+        update-types:
+          - minor
+          - patch
+
+  # The Gradle side of the Android app: the Android Gradle Plugin, the Kotlin
+  # plugin, androidx and material, pinned across gui-mobile/gen/android's two
+  # build files and its buildSrc. Unlike the sets above there is no lockfile here
+  # — the versions are literals in build.gradle.kts, which is exactly why nothing
+  # would report them going stale.
+  - package-ecosystem: gradle
+    directory: /gui-mobile/gen/android
+    schedule:
+      interval: monthly
+    groups:
+      gradle:
         patterns: ["*"]
         update-types:
           - minor

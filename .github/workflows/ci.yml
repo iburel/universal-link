@@ -194,6 +194,139 @@ jobs:
       - name: Build GUI (webview)
         run: cargo build -p universallink-gui --features webview --locked
 
+  # The Android app. Nothing else in this file compiles it: `gui-mobile` is
+  # EXCLUDED from the workspace (root Cargo.toml), so `--workspace` never reaches
+  # its Rust, and its Kotlin is seen by no job at all — a change in `gui`, `core`,
+  # `client` or `daemon` could break the phone app and leave this workflow green.
+  #
+  # Its own job rather than a leg of the matrix above: a different target triple
+  # (so nothing to share with the matrix's compilation cache), a whole extra
+  # toolchain (JDK, Android SDK/NDK, Gradle), and it only ever runs on Linux.
+  android:
+    name: android
+    runs-on: ubuntu-latest
+    # Cold, this compiles the tauri + iroh tree for aarch64-linux-android and
+    # builds two cargo tools from source. Same 45 min as the matrix.
+    timeout-minutes: 45
+    env:
+      # The NDK the app was developed and device-validated against, pinned like
+      # every other version in this file: the runner image ships whichever NDK it
+      # ships, and that moves from one image release to the next. This is a
+      # pinned set dependabot cannot refresh — it has no Android-SDK ecosystem —
+      # so it is bumped by hand.
+      NDK_VERSION: "26.3.11579264"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: "1.97.0"
+          target: aarch64-linux-android
+          components: clippy
+          rustflags: ""
+          # `gui-mobile` is its own cargo workspace with its own target/; the
+          # default (`. -> target`) would cache the workspace's, which this job
+          # never writes to. `~/.tools` holds the two cargo-installed binaries
+          # below — a deliberately separate --root, so the cache never carries
+          # rustup's own shims in ~/.cargo/bin.
+          cache-workspaces: "gui-mobile -> target"
+          cache-directories: "~/.tools"
+
+      # AGP 8.11 needs JDK 17+; 21 is what the app is developed against. Before
+      # the SDK step, which runs sdkmanager — itself a Java program.
+      #
+      # Deliberately WITHOUT `cache: gradle`: a Gradle cache runs to hundreds of
+      # megabytes, the repository's cache budget is shared, and evicting the
+      # matrix jobs' compilation caches would cost far more than the one or two
+      # minutes Gradle spends fetching AGP and androidx here.
+      - name: Java
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # Installing a component the image already carries is a no-op, so pinning
+      # costs nothing beyond the NDK download.
+      - name: Android SDK components
+        run: |
+          # sdkmanager is not on PATH on the runner; take the newest cmdline-tools.
+          SDKMANAGER="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | tail -1)"
+          yes | "$SDKMANAGER" --licenses > /dev/null
+          "$SDKMANAGER" --install "platforms;android-36" "build-tools;36.0.0" "ndk;$NDK_VERSION"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: gui/ui/package-lock.json
+
+      # The build, not just `npm ci`, and it has to come before the Rust steps:
+      # gui-mobile's generate_context! resolves `frontendDist`
+      # (../gui/ui/dist-mobile) AT COMPILE TIME and its proc macro panics if the
+      # directory is absent — which it is on a checkout, dist-mobile being
+      # generated. The tauri CLI would produce it from `beforeBuildCommand`, but
+      # the clippy step below does not go through the CLI. The CLI reruns this
+      # later; it is cheap (seconds) and idempotent.
+      - name: Frontend
+        working-directory: gui/ui
+        shell: bash
+        run: |
+          npm ci
+          npm run build:mobile
+
+      # cargo-installed rather than fetched by an action: taiki-e/install-action
+      # (already pinned above for nextest) lists neither of these among the tools
+      # it can supply. `~/.tools` is cached by the toolchain step, and
+      # `cargo install` exits 0 with "already installed" on a hit, so on a warm
+      # cache this step costs an index refresh.
+      #
+      # cargo-ndk serves the clippy step alone: it exports the NDK's clang and ar
+      # for the target, which the build scripts of the tree need (`ring` compiles
+      # asm for aarch64). The tauri CLI drives Gradle and, more importantly,
+      # generates the Gradle inputs that a checkout does not carry (below).
+      - name: Android build tools
+        run: |
+          cargo install cargo-ndk --version "^4.1" --locked --root ~/.tools
+          cargo install tauri-cli --version "^2.0" --locked --root ~/.tools
+          echo "$HOME/.tools/bin" >> "$GITHUB_PATH"
+
+      # The only pass that lints gui-mobile's own Rust, and the only one that even
+      # COMPILES the `target_os = "android"` arms of the workspace crates
+      # (`paths`, `daemon::config`) — the matrix above cannot reach either.
+      - name: Clippy (aarch64-linux-android)
+        working-directory: gui-mobile
+        run: cargo ndk -t arm64-v8a clippy --locked -- -D warnings
+
+      # A committed gen/android is NOT self-sufficient. `settings.gradle` does
+      # `apply from: 'tauri.settings.gradle'`, and that file is gitignored because
+      # it is machine-specific: it holds ABSOLUTE paths into ~/.cargo/registry.
+      # Same for app/tauri.properties (the versionCode), app/proguard-tauri.pro,
+      # app/src/main/assets/tauri.conf.json and the whole generated/ Kotlin
+      # (WryActivity, RustWebView, …). `init` writes them and — verified — leaves
+      # every tracked file untouched: our MainActivity, build.gradle.kts,
+      # manifest, resources and Kotlin sources are not regenerated.
+      - name: Generate the Gradle project
+        working-directory: gui-mobile
+        run: cargo tauri android init --skip-targets-install
+
+      # The RELEASE variant, deliberately, not `--debug`:
+      #   * it is the shipping configuration, and the only one R8 runs on
+      #     (isMinifyEnabled is set on that buildType alone), so it is the only
+      #     one that exercises app/proguard-rules.pro;
+      #   * a debug APK weighs 810 MiB against release's 36, all Rust symbols.
+      # It builds UNSIGNED — the signing key belongs to release.yml — so nothing
+      # is uploaded here. This step is a gate, not a producer.
+      #
+      # `--target aarch64`: the default is all FOUR ABIs, i.e. four Rust builds
+      # where every modern phone uses one. `--apk`: the default also emits an AAB,
+      # which only the Play Store consumes.
+      - name: Build the APK (release, unsigned)
+        working-directory: gui-mobile
+        run: cargo tauri android build --apk --target aarch64
+
   # Dependency policy: security advisories, duplicates, crate provenance,
   # licenses. A separate job rather than a matrix step — the dependency
   # graph does not depend on the platform, and the action is a Docker
