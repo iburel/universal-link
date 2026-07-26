@@ -206,7 +206,21 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # All four checks, `licenses` included: the allow-list is in deny.toml.
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      - name: Dependency policy (workspace)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
           command-arguments: advisories bans sources licenses
+
+      # The mobile shell is excluded from the workspace (gui-mobile/Cargo.toml), so
+      # the step above — which reads ./Cargo.toml — never sees its lockfile, and
+      # that lockfile is NOT a subset of the workspace one: it resolved ~80 crates
+      # to higher versions, plus a `syn 3` the workspace does not carry. Those
+      # versions were therefore audited by nobody. Same deny.toml, so a single
+      # policy governs both trees.
+      - name: Dependency policy (mobile shell)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          command-arguments: advisories bans sources licenses
+          manifest-path: ./gui-mobile/Cargo.toml

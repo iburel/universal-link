@@ -1,9 +1,15 @@
 version: 2
 
-# Versions are pinned (action SHAs, toolchain, Cargo.lock): without this
-# file, nothing would flag that a pinned version has become outdated or
-# vulnerable. Monthly cadence and grouped updates, to receive two pull
-# requests per month rather than one per dependency.
+# Versions are pinned (action SHAs, toolchain, Cargo.lock, package-lock.json):
+# without this file, nothing would flag that a pinned version has become
+# outdated or vulnerable. Monthly cadence and grouped updates, to receive one
+# pull request per lockfile rather than one per dependency.
+#
+# One entry per pinned set, and there are four: the workflow action SHAs, then
+# the three lockfiles (the workspace's Cargo.lock, gui-mobile's own, and the
+# frontend's package-lock.json). A set left out here is refreshed by nobody:
+# GitHub's security alerts are the one channel this file does not govern, and
+# they report a published advisory, not a version that has merely gone stale.
 updates:
   - package-ecosystem: github-actions
     directory: /
@@ -22,6 +28,35 @@ updates:
       # pull request: a major update requires porting the code, and a batch of
       # four that fails does not tell which one is at fault.
       cargo:
+        patterns: ["*"]
+        update-types:
+          - minor
+          - patch
+
+  # The mobile shell is EXCLUDED from the workspace (see gui-mobile/Cargo.toml),
+  # so it carries its OWN Cargo.lock, which the `/` entry above never reads. That
+  # lock is not a subset of the workspace one either: it resolved later, and it
+  # already sits ahead of it (higher versions of ~80 crates, plus a `syn 3` the
+  # workspace does not carry). Without this entry it drifts alone.
+  - package-ecosystem: cargo
+    directory: /gui-mobile
+    schedule:
+      interval: monthly
+    groups:
+      cargo-mobile:
+        patterns: ["*"]
+        update-types:
+          - minor
+          - patch
+
+  # The frontend lockfile, which no entry covered: postcss sat seven patch
+  # releases behind, on a HIGH advisory, before a security alert surfaced it.
+  - package-ecosystem: npm
+    directory: /gui/ui
+    schedule:
+      interval: monthly
+    groups:
+      npm:
         patterns: ["*"]
         update-types:
           - minor

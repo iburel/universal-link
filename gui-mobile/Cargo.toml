@@ -9,9 +9,18 @@
 # EXCLUDED from the workspace (see the root Cargo.toml): built only for
 # aarch64-linux-android via the Tauri Android tooling (cargo-ndk under the
 # hood), never by the native CI jobs — so it perturbs neither the workspace
-# build (`cargo build --workspace --all-targets`) nor cargo-deny. It still
-# path-depends on the workspace crates. All its deps are already in the lock
-# (via `gui`, `daemon`, and `client`), so no new crate enters the tree.
+# build (`cargo build --workspace --all-targets`) nor the workspace's
+# cargo-deny run. It still path-depends on the workspace crates.
+#
+# The exclusion buys that isolation at the price of a SECOND lockfile, and the
+# two have since diverged: no new crate NAME enters the tree (every dependency
+# below already came in via `gui`, `daemon` or `client`), but this lock resolved
+# later and sits ahead of the workspace one — higher versions of ~80 crates,
+# plus a `syn 3` the workspace does not carry. Those versions are audited by a
+# cargo-deny step of their own (ci.yml, "Dependency policy (mobile shell)") and
+# refreshed by a dependabot entry of their own (.github/dependabot.yml); an
+# advisory here would otherwise have been reported by nothing but GitHub's
+# security alerts.
 [package]
 name = "universallink-gui-mobile"
 version = "0.0.0"

@@ -41,6 +41,12 @@ allow = [
 ]
 
 [advisories]
+# This list is evaluated against TWO trees (ci.yml runs the checks once for the
+# workspace and once for gui-mobile/Cargo.toml, the workspace-excluded mobile
+# shell), so an entry that is right for one is reported as
+# `advisory-not-detected` on the other — a warning, not a failure. On the mobile
+# tree those are RUSTSEC-2023-0071 (no server) and the two quick-xml ones (no X11
+# clipboard backend). Do not "fix" them by deleting the entries.
 ignore = [
   # Marvin attack: timing side channel on RSA **private**-key
   # operations. The advisory carries `patched = []` — no fix exists, and
@@ -70,9 +76,13 @@ ignore = [
   # same gtk3-rs family/blocker) on purpose: it is a function-scoped "unsound"
   # advisory that cargo-deny does not surface — adding it here would suppress
   # nothing and would trigger an "advisory-not-detected" warning. Only dependabot
-  # reports it; closed on the dependabot side (risk accepted). The glib 0.20 fix
-  # is unreachable: gtk 0.18 requires glib ^0.18, locked by tauri v2 (GTK3)
-  # until the GTK4 migration.
+  # reports it, and it files ONE alert PER LOCKFILE, so the same advisory came
+  # back for gui-mobile/Cargo.lock; both are dismissed as tolerable risk. The
+  # glib 0.20 fix is unreachable: gtk 0.18 requires glib ^0.18, locked by tauri
+  # v2 (GTK3) until the GTK4 migration. On the mobile tree the crate is not even
+  # compiled — `cargo tree --target aarch64-linux-android -i glib` finds nothing,
+  # the GTK3 stack being Linux-gated; a lockfile is target-agnostic, dependabot
+  # is not target-aware.
   # proc-macro-error, maintainer unreachable — via glib-macros (gtk3-rs):
   { id = "RUSTSEC-2024-0370", reason = "pulled in by glib-macros, same gtk3-rs chain as above" },
   # paste (proc macro, archived by its author) — via netlink-packet-core ←
