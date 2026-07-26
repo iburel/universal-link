@@ -43,7 +43,7 @@ universallink-ipc-client = { path = "../client" }
 [target.'cfg(target_os = "linux")'.dependencies]
 xcb = { version = "1", features = ["xfixes"] }
 mio = { version = "1", features = ["os-poll", "os-ext"] }
-fuser = { version = "0.16", default-features = false }
+fuser = { version = "0.18", default-features = false }
 libc = "0.2"
 
 # Windows clipboard backend (Windows only): the synchronous delayed-render
