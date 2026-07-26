@@ -35,15 +35,22 @@ universallink-ipc-client = { path = "../client" }
 # selection loop. Same stack the private POC uses — `xcb` (an FFI binding to the
 # system libxcb) with the XFixes extension for selection-owner notifications, and
 # `mio` (os-poll + os-ext for the eventfd-backed `Waker`) to pump the X socket fd
-# and the command queue on the main thread. `fuser` (default-features = false, so
-# NO libfuse C dependency — it mounts via the setuid `fusermount3`/`fusermount`
-# binary at runtime, keeping the CI build free of libfuse-dev) serves a remote
-# files clip as an on-demand FUSE tree; `libc` supplies the errno/uid constants
-# the FUSE callbacks need. Non-Linux targets never pull these.
+# and the command queue on the main thread. `fuser` serves a remote files clip as
+# an on-demand FUSE tree, with NO libfuse C dependency: it mounts via the setuid
+# `fusermount3`/`fusermount` binary at runtime, keeping the CI build free of
+# libfuse-dev. What buys that is NOT enabling the `libfuse` feature, which then
+# makes the build script select `fuser_mount_impl="pure-rust"` on Linux. Note
+# `default` has been empty since well before 0.18, so `default-features = false`
+# is not what carries the guarantee; it stays as a statement of intent and as
+# insurance should a future release re-populate `default`. (0.18 does move
+# `pkg-config` from an optional dep of the `libfuse` feature to an unconditional
+# build-dep, which is why it appears in the lock — its code path stays
+# unreachable on Linux without the feature.) `libc` supplies the errno/uid
+# constants the FUSE callbacks need. Non-Linux targets never pull these.
 [target.'cfg(target_os = "linux")'.dependencies]
 xcb = { version = "1", features = ["xfixes"] }
 mio = { version = "1", features = ["os-poll", "os-ext"] }
-fuser = { version = "0.16", default-features = false }
+fuser = { version = "0.18", default-features = false }
 libc = "0.2"
 
 # Windows clipboard backend (Windows only): the synchronous delayed-render
@@ -136,9 +143,13 @@ universallink-test-support = { path = "../test-support" }
 
 # Live-X round-trip tests (tests/x11.rs) drive a SECOND X client (a requestor
 # and a selection owner) against the real backend under Xvfb. Linux-only, and
-# only the core `x` protocol is needed on the test side.
+# only the core `x` protocol is needed on the test side. `libc` gives the live
+# FUSE tests (tests/linux_files.rs) the errno constants they compare a real
+# syscall failure against (EROFS, EIO) — already a dependency of this crate on
+# Linux, so no new package.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 xcb = { version = "1", features = ["xfixes"] }
+libc = "0.2"
 
 # Live Windows-clipboard round-trip tests (tests/windows.rs) play the copying /
 # pasting application against the real backend, driving the OS clipboard directly
