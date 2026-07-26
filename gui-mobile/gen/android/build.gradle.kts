@@ -4,7 +4,7 @@ buildscript {
         mavenCentral()
     }
     dependencies {
-        classpath("com.android.tools.build:gradle:8.11.0")
+        classpath("com.android.tools.build:gradle:9.3.1")
         // 2.2.21 and NOT NEWER. This is a ceiling, not a preference.
         //
         // Why it moved off the template's 1.9.25 at all: the androidx artifacts in
