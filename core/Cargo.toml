@@ -11,11 +11,20 @@ anyhow = "1"
 base64 = "0.22"
 # Device identity (= iroh identity): generated on first startup
 # (`rand_core`) and used to sign proofs of possession.
-# Pinned to the exact RC that iroh-base 1.0.2 locks (`=3.0.0-rc.0`): the whole
-# workspace must stay aligned, otherwise resolution fails (ed25519-dalek major 3
-# does not unify between the stable `3.0.0` and the RC). To be bumped once iroh
-# moves to the stable 3.0.0.
-ed25519-dalek = { version = "=3.0.0-rc.0", features = ["rand_core"] }
+#
+# This used to be `=3.0.0-rc.0`, an EXACT pin, because iroh-base locked that
+# release candidate and a caret requirement does not match a pre-release: the two
+# would not unify. iroh has since moved on — iroh-base asks for
+# `>=3.0.0-rc.0, <4.0.0` — so the exact pin has lost its reason to exist and goes
+# back to an ordinary requirement, which lets a 3.0.x patch through without a
+# manual bump. Keep it identical in server and test-support.
+#
+# The seed this crate reads and writes is PERSISTED (see identity.rs) and the
+# account key is DERIVED FROM THE RECOVERY CODE (account_key.rs), so a change in
+# `to_bytes`/`from_bytes` semantics would strand every enrolled device and
+# invalidate every code ever issued. The round-trip tests cannot see that — both
+# ends move together — so there are fixed vectors in account_key.rs instead.
+ed25519-dalek = { version = "3", features = ["rand_core"] }
 # Encoding/decoding of OIDC query strings and form bodies.
 form_urlencoded = "1"
 futures-util = "0.3"

@@ -13,8 +13,8 @@ publish = false
 axum = "0.8"
 # PKCE code_challenge verification (S256) on the fake OIDC side.
 base64 = "0.22"
-# `=3.0.0-rc.0`: aligned with the iroh-base 1.0.2 pin (see core/Cargo.toml).
-ed25519-dalek = { version = "=3.0.0-rc.0", features = ["rand_core"] }
+# Aligned with core/Cargo.toml, which explains why this is no longer an exact pin.
+ed25519-dalek = { version = "3", features = ["rand_core"] }
 # Parsing of query strings (authorize, token) and of the test browser.
 form_urlencoded = "1"
 futures-util = "0.3"

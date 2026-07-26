@@ -332,6 +332,49 @@ mod tests {
         hex::encode(key.verifying_key().to_bytes())
     }
 
+    /// Fixed vectors, deliberately, where everything else here round-trips.
+    ///
+    /// A recovery code is the ONLY copy of the account key, and a device's seed
+    /// is persisted (identity.rs). So the mapping from code to AK_pub, and the
+    /// signature over an attestation, must never move: a change would strand
+    /// every enrolled device and invalidate every code ever handed out. The
+    /// round-trip tests below cannot notice such a change, because both ends of
+    /// the round trip move together — which is exactly what happened when
+    /// `ed25519-dalek` went from `3.0.0-rc.0` to `3.0.0` and the whole suite
+    /// stayed green. These values were computed under the RC and must survive
+    /// every future bump; if one of them ever fails, the answer is not to update
+    /// the constant.
+    #[test]
+    fn the_derivation_matches_its_published_vectors() {
+        let code = encode_code(&[0x42u8; CODE_ENTROPY]);
+        assert_eq!(code, "89144GJ-289144G-J289144-GJ28A80");
+
+        let ak = account_key_from_code(&code).expect("valid code");
+        assert_eq!(
+            public_hex(&ak),
+            "048907521bf4e62f9c8291e067adfef7e37be87cbd3f6c89944b91cb2f589101",
+        );
+        assert_eq!(
+            attest(&ak, &a_node_id()),
+            "bed950f5621357e89d478daf60bbbf5fbd4730068aba44c041fd2c6435a752c0\
+             bfb1df9596e721ad82344ccf2f42caf7a782024078cd02c88d073beca6fb4109",
+        );
+    }
+
+    /// The seed a device persists, likewise pinned: `SigningKey::to_bytes` is
+    /// what identity.rs writes to disk and `from_bytes` is what reads it back, so
+    /// the public key derived from a known seed is a compatibility contract with
+    /// every installation in the field, not an implementation detail.
+    #[test]
+    fn a_persisted_seed_still_yields_its_published_public_key() {
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        assert_eq!(key.to_bytes(), [7u8; 32]);
+        assert_eq!(
+            hex::encode(key.verifying_key().to_bytes()),
+            "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+        );
+    }
+
     #[test]
     fn a_generated_code_round_trips_to_a_stable_key() {
         let code = generate_recovery_code();

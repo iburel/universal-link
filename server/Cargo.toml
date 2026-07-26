@@ -8,9 +8,8 @@ publish = false
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
-# `=3.0.0-rc.0`: aligned with the iroh-base 1.0.2 pin (see core/Cargo.toml) —
-# the workspace unifies ed25519-dalek major 3 on this RC.
-ed25519-dalek = "=3.0.0-rc.0"
+# Aligned with core/Cargo.toml, which explains why this is no longer an exact pin.
+ed25519-dalek = "3"
 futures-util = "0.3"
 hex = "0.4"
 humantime = "2"
