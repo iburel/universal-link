@@ -19,27 +19,30 @@
 //!   copy fails cleanly rather than producing a truncated file. [`FileFetcher`]
 //!   returns fewer bytes than asked only at genuine EOF.
 //!
-//! Unprivileged, no C link: `fuser` is built `default-features = false` (no
-//! libfuse), mounting through the setuid `fusermount3`/`fusermount` helper.
-//! Unmount is lazy (`MNT_DETACH`): dropping [`FuseMount`] detaches at once even
-//! with a `read()` in flight, so it never stalls the X11 thread.
+//! Unprivileged, no C link: `fuser` is built without its `libfuse` feature, so
+//! its build script selects the pure-Rust mount path and mounts through the
+//! setuid `fusermount3`/`fusermount` helper. Unmount is lazy (`MNT_DETACH`):
+//! dropping [`FuseMount`] detaches at once even with a `read()` in flight, so it
+//! never stalls the X11 thread.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use fuser::consts::FOPEN_DIRECT_IO;
 use fuser::{
-    BackgroundSession, FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEntry, ReplyOpen, Request,
+    BackgroundSession, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
+    Generation, INodeNo, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory,
+    ReplyEntry, ReplyOpen, Request,
 };
 
 use crate::backend::{FileFetcher, RemoteFile};
 use crate::files::{self, FileTree, NodeKind};
 
-/// The FUSE root inode must be what the tree calls its root.
-const _: () = assert!(files::ROOT_INO == fuser::FUSE_ROOT_ID);
+/// The FUSE root inode must be what the tree calls its root. `fuser` no longer
+/// exports `FUSE_ROOT_ID`; the same 1 is now `INodeNo::ROOT`, whose field is
+/// public and therefore still readable in a const assert.
+const _: () = assert!(files::ROOT_INO == INodeNo::ROOT.0);
 
 /// Attribute/entry cache lifetime handed to the kernel. The clip is immutable
 /// while mounted, so a generous TTL avoids repeated `getattr` with no risk of
@@ -82,6 +85,11 @@ impl FuseMount {
     /// Mounts a FUSE filesystem exposing `files`, served on demand by `fetcher`.
     /// `Err` if the manifest yields no usable root (empty or all-malformed), if
     /// the mountpoint cannot be created, or if the mount itself fails.
+    ///
+    /// BLOCKS the calling thread for one kernel round-trip: `fuser` now performs
+    /// the `FUSE_INIT` handshake inside the mount call rather than on the
+    /// background thread, so a handshake failure surfaces here as `Err` instead
+    /// of dying silently after we have already returned success.
     pub fn mount(
         files: &[RemoteFile],
         fetcher: Arc<dyn FileFetcher>,
@@ -97,18 +105,32 @@ impl FuseMount {
         let mountpoint = unique_mount_dir()?;
         let fs = ClipboardFs::new(tree, fetcher);
         // RO + hardening: the tree comes from a remote peer, so no setuid/dev/exec
-        // and no atime writes. No `AllowOther`: only the mounting user (the one
-        // pasting) may traverse it.
-        let options = [
-            MountOption::FSName("universallink".to_string()),
-            MountOption::Subtype("universallink-clip".to_string()),
-            MountOption::RO,
-            MountOption::NoSuid,
-            MountOption::NoDev,
-            MountOption::NoExec,
-            MountOption::NoAtime,
-        ];
-        let session = match fuser::spawn_mount2(fs, &mountpoint, &options) {
+        // and no atime writes. The other three `Config` fields stay at their
+        // defaults, and each default is load-bearing:
+        // - `acl: SessionACL::Owner` — only the mounting user (the one pasting)
+        //   may traverse the tree. This replaces the `AllowOther`/`AllowRoot`
+        //   mount options, which no longer exist as `MountOption` variants; the
+        //   default is the restrictive end, so omitting it is the safe choice.
+        // - `n_threads: None` — read as 1, i.e. ONE dispatch loop, which is what
+        //   makes the `&self` callbacks below serial (see `ClipboardFs`).
+        // - `clone_fd: false` — a single `/dev/fuse` fd, as before.
+        // `Config` is `#[non_exhaustive]`, so it cannot be built with a struct
+        // literal — not even with `..Default::default()`, which is why the
+        // default is mutated in place inside a block instead.
+        let config = {
+            let mut config = Config::default();
+            config.mount_options = vec![
+                MountOption::FSName("universallink".to_string()),
+                MountOption::Subtype("universallink-clip".to_string()),
+                MountOption::RO,
+                MountOption::NoSuid,
+                MountOption::NoDev,
+                MountOption::NoExec,
+                MountOption::NoAtime,
+            ];
+            config
+        };
+        let session = match fuser::spawn_mount(fs, &mountpoint, &config) {
             Ok(session) => session,
             Err(e) => {
                 let _ = std::fs::remove_dir(&mountpoint);
@@ -136,7 +158,17 @@ impl Drop for FuseMount {
         // (the common case: no read in flight → instant unmount). If it is still
         // busy, hand the removal to a detached thread so the caller (the X11
         // event loop) is never stalled while the kernel finalizes the lazy
-        // unmount. Never panic in Drop.
+        // unmount. Dropping the session drops both the mount and the join
+        // handle; the handle DETACHES rather than joins, and the unmount is a
+        // plain `umount2(MNT_DETACH)` — reached because an unprivileged
+        // `umount(2)` always answers EPERM — so neither half waits on the event
+        // loop or on a child process. (Only if `MNT_DETACH` itself failed would
+        // `fuser` fall back to fork/exec'ing the setuid helper and waiting for
+        // it, which is why this says "does not block" and not "is a syscall".)
+        // Nothing HERE panics; `fuser`'s unmount does probe the device with
+        // `poll(2)` and panic if that syscall fails, but that is neither new in
+        // 0.18 nor reachable except on ENOMEM — process-death territory a
+        // `catch_unwind` here would not meaningfully improve.
         drop(self.session.take());
         let mp = std::mem::take(&mut self.mountpoint);
         if std::fs::remove_dir(&mp).is_err() {
@@ -168,9 +200,24 @@ fn unique_mount_dir() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
-/// The FUSE filesystem of one clip. `fuser` calls its methods on a single
-/// session thread in `&mut self`, serially, so no locking is needed. Reads are
-/// stateless (keyed by `file_id`), so a file handle can equal the inode.
+/// The FUSE filesystem of one clip. Reads are stateless (keyed by `file_id`),
+/// so a file handle can equal the inode.
+///
+/// Concurrency: the callbacks take `&self` and `Filesystem` requires
+/// `Send + Sync + 'static`, so the type system NO LONGER proves exclusive
+/// access — it did while they took `&mut self`. Nothing here needs it to: every
+/// field is read-only for the mount's whole life. What is worth knowing is that
+/// the callbacks are nevertheless still SERIAL, because the mount leaves
+/// `Config::n_threads` unset (read as one dispatch loop) and each request is
+/// handled inline on it. So raising `n_threads` would be safe for this struct
+/// but would let N kernel reads fire N concurrent blocking pulls through the
+/// [`FileFetcher`] seam — the Core-side transaction, not this type, is what
+/// would need re-examining first.
+///
+/// A slow pull therefore blocks every other request on the same mount —
+/// `getattr`, `lookup`, `readdir` for sibling files all queue behind it. That is
+/// not a consequence of the move to `fuser` 0.18: the dispatch has always been
+/// inline, and the `n_threads` escape hatch has existed since 0.17.
 struct ClipboardFs {
     tree: FileTree,
     fetcher: Arc<dyn FileFetcher>,
@@ -204,7 +251,7 @@ impl ClipboardFs {
             NodeKind::File => (FileType::RegularFile, 0o444, 1),
         };
         Some(FileAttr {
-            ino,
+            ino: INodeNo(ino),
             size,
             blocks: size.div_ceil(512),
             atime: self.time,
@@ -224,79 +271,77 @@ impl ClipboardFs {
 }
 
 impl Filesystem for ClipboardFs {
-    fn lookup(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
-        name: &std::ffi::OsStr,
-        reply: ReplyEntry,
-    ) {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &std::ffi::OsStr, reply: ReplyEntry) {
         match self
             .tree
-            .lookup(parent, name)
+            .lookup(parent.0, name)
             .and_then(|ino| self.attr(ino))
         {
-            Some(attr) => reply.entry(&TTL, &attr, 0),
-            None => reply.error(libc::ENOENT),
+            // Generation 0: inodes are never recycled here (the manifest is
+            // frozen for the mount's whole life), so one generation suffices.
+            Some(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            None => reply.error(Errno::ENOENT),
         }
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        match self.attr(ino) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        match self.attr(ino.0) {
             Some(attr) => reply.attr(&TTL, &attr),
-            None => reply.error(libc::ENOENT),
+            None => reply.error(Errno::ENOENT),
         }
     }
 
-    fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         // Files only. `FOPEN_DIRECT_IO`: no page cache / readahead, so the
         // kernel forwards the application's reads directly — each becomes one
         // on-demand pull. The file handle can equal the inode: reads carry the
         // `file_id`, so no per-open state is needed.
-        match self.tree.attr(ino) {
-            Some((NodeKind::File, _)) => reply.opened(ino, FOPEN_DIRECT_IO),
-            Some((NodeKind::Dir, _)) => reply.error(libc::EISDIR),
-            None => reply.error(libc::ENOENT),
+        match self.tree.attr(ino.0) {
+            Some((NodeKind::File, _)) => {
+                reply.opened(FileHandle(ino.0), FopenFlags::FOPEN_DIRECT_IO)
+            }
+            Some((NodeKind::Dir, _)) => reply.error(Errno::EISDIR),
+            None => reply.error(Errno::ENOENT),
         }
     }
 
     fn read(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let Some(file_id) = self.tree.file_id(ino) else {
-            reply.error(libc::EIO);
+        let Some(file_id) = self.tree.file_id(ino.0) else {
+            reply.error(Errno::EIO);
             return;
         };
         // One pull returns the whole requested range (or the EOF-truncated part)
         // — no manual fill loop. Any pull failure is a clean `EIO`, never a
-        // silent truncation.
-        match self
-            .fetcher
-            .read(file_id, offset.max(0) as u64, u64::from(size))
-        {
+        // silent truncation. No clamping of `offset`: it arrives as a `u64`
+        // because `fuser` itself validates the kernel's `off_t` and rejects a
+        // negative one with an errno before ever reaching this callback.
+        match self.fetcher.read(file_id, offset, u64::from(size)) {
             Ok(bytes) => reply.data(&bytes),
-            Err(_) => reply.error(libc::EIO),
+            Err(_) => reply.error(Errno::EIO),
         }
     }
 
     fn readdir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        let ino = ino.0;
         let Some(children) = self.tree.children(ino) else {
-            reply.error(libc::ENOTDIR);
+            reply.error(Errno::ENOTDIR);
             return;
         };
         let parent = self.tree.parent(ino).unwrap_or(ino);
@@ -314,7 +359,7 @@ impl Filesystem for ClipboardFs {
             entries.push((*child, kind, std::ffi::OsString::from(name)));
         }
         for (i, (e_ino, e_kind, e_name)) in entries.into_iter().enumerate().skip(offset as usize) {
-            if reply.add(e_ino, (i + 1) as i64, e_kind, &e_name) {
+            if reply.add(INodeNo(e_ino), (i + 1) as u64, e_kind, &e_name) {
                 break;
             }
         }
