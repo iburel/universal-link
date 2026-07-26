@@ -18,7 +18,7 @@ humantime = "2"
 # otherwise the crate compiles but panics on the first encode/decode. `rust_crypto`
 # is pure Rust — `aws_lc_rs` would require cmake, a C compiler, and NASM on
 # the Windows runners, which have none of them.
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 rand = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
