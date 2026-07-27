@@ -4,6 +4,68 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-07-27
+
+An Android client: from the system share sheet, send text to the account's
+clipboard or a file to one device you pick. It ships as a signed `.apk` next to
+the three desktop installers.
+
+### Added
+
+- **Android client** (arm64, Android 7.0 or newer) — the desktop UI verbatim,
+  driven by a Core embedded in the app's own process (Android has nowhere to
+  supervise a separate daemon from), with the same OIDC login, device enrollment
+  and account join as a PC. Two gestures, both from the share sheet:
+  - **Share text** — it is copied to every other device of the account, ready to
+    paste, and the app reports how many of them actually received it.
+  - **Share a file** — the app asks which device, then the file lands there,
+    tracked and cancellable like a desktop drag-and-drop.
+  - A foreground service runs only while there is work to protect — a transfer, a
+    share waiting for its destination, a round-trip through the browser — and not
+    merely because the app is open.
+- **Materialized clipboard transactions** — a clipboard source the OS may kill
+  the moment it is done (a phone) cannot answer a pull at paste time. Such a copy
+  pushes its bytes to the account's online devices instead, each caches them, and
+  the paste is served locally, so the source may vanish immediately. Inline
+  payloads only and capped at 8 MiB, never files, never content the OS marks
+  sensitive — those stay pull-at-paste, as does every desktop copy, which is
+  byte-identical to before.
+
+### Changed
+
+- **Server** — `android` is accepted as a device platform at enrollment. A
+  deployment still on 0.3.0 refuses a phone.
+- **Every device needs 0.4.0 to receive a phone's clipboard share**: a peer that
+  does not know the push stream drops it, and the phone reports that device as
+  failed rather than assuming success.
+- The reconnection backoff is capped at 64x the base delay instead of a flat 60 s
+  — a phone loses its network whenever the app stops running, and a share
+  arriving after a while in a pocket used to wait out a 30 s tick and give up.
+  It asks for a 200 ms base and comes back in about 13 s; the desktop Core's own
+  cap moves from 60 s to 64 s, which changes nothing in practice.
+- CI compiles the Android app on every push — clippy for its own target triple,
+  then the release APK, the configuration R8 runs on. `gui-mobile` sits outside
+  the workspace, so until now nothing built its Rust and nothing at all compiled
+  its Kotlin.
+- Dependencies: `jsonwebtoken` 11, `fuser` 0.18 (the FUSE tree that serves a
+  received files clip on Linux), `png` 0.18, `windows` 0.62, `ed25519-dalek`
+  3.0.0 final with its exact pin dropped, along with the routine Rust, npm,
+  Gradle and Actions updates and a build-time `postcss` advisory.
+
+### Known limitations
+
+- Desktop installers remain unsigned (milestone 1); the OS shows a first-launch
+  warning. The Android APK *is* signed, because Android will not install or
+  upgrade an app otherwise — with the project's own self-issued key, so it is a
+  sideload and not a Play Store listing.
+- The phone shares, it does not receive: it never writes to the Android
+  clipboard, and a file sent to it lands in the app's private storage, which
+  nothing yet opens.
+- Aggressive power management can still end the app: on the test device, swiping
+  it out of Recents kills the process even with the foreground service running.
+- No context-menu integration yet.
+- Account key rotation is not implemented.
+
 ## [0.3.0] - 2026-07-23
 
 Shared clipboard across your devices, and folder support for transfers. The
@@ -112,6 +174,7 @@ Linux, macOS, and Windows.
 - Flat transfers only (no directory trees).
 - Account key rotation is not implemented.
 
+[0.4.0]: https://github.com/iburel/universal-link/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/iburel/universal-link/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/iburel/universal-link/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/iburel/universal-link/releases/tag/v0.1.0
