@@ -25,10 +25,10 @@ buildscript {
         // those. Bisected: 2.3.21 red, 2.2.21 green, and 2.2.21 is the newest
         // published 2.2.x.
         //
-        // AGP stays 8.11.0 and the wrapper stays 8.14.3 on purpose; KGP 2.2.x is
-        // tested against Gradle 7.6.3-8.14 and AGP 7.3.1-8.11.1, so this is inside
-        // the supported window with nothing else to move. Going to AGP 9 / Gradle 9
-        // is a different and currently IMPOSSIBLE change: Gradle 9 removed
+        // AGP and the Gradle wrapper stay on 8.x on purpose (dependabot moves them
+        // within that major — .github/dependabot.yml caps both), and KGP 2.2.21
+        // configures against them without a compatibility warning. Going to AGP 9 /
+        // Gradle 9 is a different and currently IMPOSSIBLE change: Gradle 9 removed
         // `Project.exec`, which buildSrc/.../BuildTask.kt uses, and that file is the
         // one file `cargo tauri android init` force-rewrites on every run
         // (tauri-cli src/mobile/android/project.rs) — so it cannot be patched here.

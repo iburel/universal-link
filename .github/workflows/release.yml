@@ -1,9 +1,11 @@
 name: Release
 
-# On a `v*` tag: builds the installers and publishes a Release (as a draft, to
-# review before publishing). On `workflow_dispatch`: builds and uploads the
-# installers as run ARTIFACTS, without publishing anything — to test the chain
-# end to end before laying down a real tag.
+# On a `v*` tag: builds the three desktop installers and the Android APK, and
+# publishes a Release (as a draft, to review before publishing). On
+# `workflow_dispatch`: builds and uploads them as run ARTIFACTS, without publishing
+# anything — to test the chain end to end before laying down a real tag. That dry
+# run exercises the signing key too, so a broken keystore secret is caught without
+# a tag to delete.
 on:
   push:
     tags: ["v*"]
@@ -185,5 +187,229 @@ jobs:
             - **macOS**: "unverified developer" → System Settings → Privacy & Security → "Open anyway".
             - **Windows**: SmartScreen "Windows protected your PC" → "More info" → "Run anyway".
             - **Linux** (AppImage): `chmod +x UniversalLink_*.AppImage`, then run it. If it fails to start with a `libfuse.so.2` error, install FUSE 2 (`sudo apt install libfuse2`, or your distro's equivalent). The tray icon additionally needs `libayatana-appindicator3` (`sudo apt install libayatana-appindicator3-1`) and a StatusNotifierItem host — on GNOME, the AppIndicator extension.
+            - **Android** (`.apk`, **arm64 only** — a 32-bit-only phone will refuse it with `INSTALL_FAILED_NO_MATCHING_ABIS`): this one *is* signed, with the project's own key, because Android will not install or upgrade an app otherwise. That key is self-issued, so your phone still asks you to allow installs from whatever app you downloaded it with, and Play Protect may offer to scan it. Sideload only: it is not on the Play Store. Requires Android 7.0 or newer.
 
             On first launch, the app installs the background service (per-user, no admin) and opens a setup screen: enter your UniversalLink server address and its OpenID Connect client (nothing is baked into the build). It then connects.
+
+  # The Android client, in a job of its own rather than a fourth leg of the matrix
+  # above: it shares not one step with it (no sidecars — the mobile app embeds the
+  # Core in-process — and no desktop bundler) and needs a toolchain none of the
+  # three do. ci.yml's `android` job builds this same APK UNSIGNED on every push as
+  # a gate; this job is the shipping artifact, and the only place the signing key is
+  # ever used.
+  apk:
+    name: android-arm64
+    runs-on: ubuntu-latest
+    # Deliberately without the Rust cache (see the toolchain step), so this is a
+    # cold compile of the tauri + iroh tree plus tauri-cli from source. ci.yml's
+    # equivalent fits in 45 even cold; the margin is here because a release must
+    # not fail on a timeout.
+    timeout-minutes: 60
+    env:
+      # Pinned exactly as in ci.yml, for the same reason: the runner image ships
+      # whichever NDK it ships, and that moves between image releases. Dependabot
+      # has no Android-SDK ecosystem, so this is bumped by hand — keep the two
+      # workflows in step.
+      NDK_VERSION: "26.3.11579264"
+      # The build-tools that supplies apksigner, pinned for the same reason and
+      # ALSO because the fingerprint check below parses its output: the runner image
+      # ships its own, newer build-tools, and the two do not print the same thing
+      # (36.0.0 says "Signer #1 certificate SHA-256 digest:", the image's says
+      # "V3.0 Signer: certificate SHA-256 digest:" and knows a v3.2 scheme).
+      BUILD_TOOLS_VERSION: "36.0.0"
+      # The ONE certificate allowed to sign a UniversalLink release, recorded from
+      # the first run that used the key (RSA 4096, self-issued). A certificate is
+      # public — it ships inside every copy of the APK — so this is not a secret;
+      # it is a pin. It exists to catch what a signature check alone cannot: a
+      # different key that verifies perfectly well. An APK signed by another key
+      # cannot upgrade an installed app, so shipping one silently strands every
+      # existing user, and the only recovery is uninstall-and-lose-your-data.
+      #
+      # Rotating the key means editing this line, which is the point: that is an
+      # event worth a deliberate decision and a release note, not a rebuild.
+      EXPECTED_CERT_SHA256: "016ca96e825ec128c78824711373694343638f847e89e8a2954257ec24e5c49b"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # FIRST, before spending 40 minutes: `cargo tauri android build` rewrites
+      # app/tauri.properties from gui-mobile/tauri.conf.json's OWN `version` on
+      # every run (tauri-cli, src/mobile/android/mod.rs::generate_tauri_properties)
+      # and derives versionCode = major*1000000 + minor*1000 + patch from it. The
+      # git tag is never consulted. So a v0.4.0 tag cut while that file still reads
+      # 0.3.0 ships versionCode 3000 a second time, and Android refuses an APK whose
+      # versionCode is not strictly GREATER than the installed one: the release would
+      # look perfectly fine and be uninstallable for everyone who already has the
+      # app. gui-mobile/tauri.conf.json carries its own version, separate from
+      # gui/tauri.conf.json — bumping one and not the other is the easy mistake.
+      - name: The mobile version matches the tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          conf="$(jq -r .version gui-mobile/tauri.conf.json)"
+          if [ "$tag" != "$conf" ]; then
+            echo "::error::tag $GITHUB_REF_NAME vs gui-mobile/tauri.conf.json version $conf. Bump that file, or the APK ships the previous release's versionCode and cannot be installed over it."
+            exit 1
+          fi
+
+      - name: Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: "1.97.0"
+          target: aarch64-linux-android
+          rustflags: ""
+          # No Rust cache on purpose. This workflow runs on a tag, i.e. a handful of
+          # times a year, while ci.yml's caches are what every push depends on — and
+          # the repository's 10 GiB cache budget is shared and already evicts under
+          # pressure. A fresh multi-hundred-megabyte entry here would buy ten minutes
+          # once and cost a cold matrix on the next push.
+          cache: false
+
+      # AGP needs JDK 17+; 21 is what the app is developed against. Before the SDK
+      # step, which runs sdkmanager — itself a Java program.
+      - name: Java
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Android SDK components
+        run: |
+          # sdkmanager is not on PATH on the runner; take the newest cmdline-tools.
+          SDKMANAGER="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | tail -1)"
+          yes | "$SDKMANAGER" --licenses > /dev/null
+          "$SDKMANAGER" --install "platforms;android-36" "build-tools;$BUILD_TOOLS_VERSION" "ndk;$NDK_VERSION"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: gui/ui/package-lock.json
+
+      # Must precede the Rust build: gui-mobile's generate_context! resolves
+      # `frontendDist` (../gui/ui/dist-mobile) AT COMPILE TIME and its proc macro
+      # panics if the directory is absent — which it is on a checkout, dist-mobile
+      # being generated. `build:mobile` is the relative-base variant the webview
+      # needs; the desktop `build` above is a different output directory.
+      - name: Frontend
+        working-directory: gui/ui
+        shell: bash
+        run: |
+          npm ci
+          npm run build:mobile
+
+      # Only tauri-cli here, unlike ci.yml which also installs cargo-ndk: cargo-ndk
+      # serves ci.yml's clippy step alone (it exports the NDK's clang and ar for a
+      # bare `cargo` invocation). This job never runs clippy, and the CLI configures
+      # the Android linkers itself before driving Gradle.
+      - name: tauri-cli
+        run: cargo install tauri-cli --version "^2.0" --locked
+
+      # A committed gen/android is NOT self-sufficient: settings.gradle applies
+      # tauri.settings.gradle, which is gitignored because it holds ABSOLUTE paths
+      # into ~/.cargo/registry. Same for app/tauri.properties, app/proguard-tauri.pro,
+      # app/src/main/assets/tauri.conf.json and the generated Kotlin. Of the files
+      # that already exist this FORCE-REWRITES exactly one, buildSrc's BuildTask.kt,
+      # and skips every other — see the version caps in .github/dependabot.yml.
+      - name: Generate the Gradle project
+        working-directory: gui-mobile
+        run: cargo tauri android init --skip-targets-install
+
+      # Into RUNNER_TEMP and not the workspace: nothing that globs the checkout —
+      # an artifact upload, a bundler, a future step — can then pick the key up.
+      # `base64 -d` fails loudly on a truncated secret, which is the failure mode of
+      # a hand-copied value.
+      - name: Decode the signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::ANDROID_KEYSTORE_BASE64 is not set. A release APK must be signed: an unsigned one cannot be installed, and one signed by a different key cannot upgrade an installed app."
+            exit 1
+          fi
+          printf %s "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          test -s "$RUNNER_TEMP/release.jks"
+
+      # The RELEASE variant: the shipping configuration, and the only one R8 runs on
+      # (isMinifyEnabled is set on that buildType alone). `--target aarch64` because
+      # the default is all FOUR ABIs, i.e. four Rust builds where every modern phone
+      # uses one. `--apk` because the default also emits an AAB, which only the Play
+      # Store consumes.
+      #
+      # The four variables are what app/build.gradle.kts reads to populate
+      # signingConfigs; passwords stay in the process environment and are never
+      # written to disk. Absent them the build would succeed and produce an
+      # *-unsigned.apk, which is why the next step checks rather than trusts.
+      - name: Build the signed APK
+        working-directory: gui-mobile
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/release.jks
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: cargo tauri android build --apk --target aarch64
+
+      # The two checks that cannot be satisfied by accident: the archive verifies
+      # (`apksigner verify` exits non-zero otherwise), and it verifies under the key
+      # we mean — see EXPECTED_CERT_SHA256 above. The full --print-certs output is
+      # echoed either way, so a mismatch is diagnosable from the log alone.
+      #
+      # The digest is read off every "certificate SHA-256 digest:" line, whatever
+      # prefix the tool puts in front of it, and deduplicated: one signer under
+      # several schemes collapses to one value, while two DIFFERENT signers leave two
+      # and fail the comparison. `public key SHA-256 digest:` lines are a different
+      # thing and deliberately not matched.
+      #
+      # No `--min-sdk-version`: apksigner reads minSdkVersion out of the APK's own
+      # manifest (measured — it verifies the v1-less APK without the flag). Passing
+      # 24 by hand would pin the floor here instead, and go on passing if the
+      # manifest ever moved BELOW 24, where the disabled v1 scheme starts mattering.
+      - name: Verify the signature
+        run: |
+          apk=gui-mobile/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk
+          if [ ! -f "$apk" ]; then
+            echo "::error::no signed APK at $apk — an unsigned build lands beside it as app-universal-release-unsigned.apk, so the signing configuration did not take effect"
+            ls -l "$(dirname "$apk")" || true
+            exit 1
+          fi
+          certs="$("$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/apksigner" verify --verbose --print-certs "$apk")"
+          echo "$certs"
+          got="$(printf '%s\n' "$certs" | sed -n 's/.*certificate SHA-256 digest: \([0-9a-f]\{64\}\).*/\1/p' | sort -u)"
+          if [ "$got" != "$EXPECTED_CERT_SHA256" ]; then
+            echo "::error::signed by [$got], expected [$EXPECTED_CERT_SHA256]. A different key verifies just as well and cannot upgrade an installed app — check ANDROID_KEYSTORE_BASE64/ANDROID_KEY_ALIAS, or update EXPECTED_CERT_SHA256 in this workflow if the key was rotated on purpose."
+            exit 1
+          fi
+
+      # Named like the desktop bundles (UniversalLink_<version>_<arch>.<ext>) rather
+      # than shipped as Gradle's app-universal-release.apk, which says nothing to
+      # someone looking at a downloads folder. A move, not a copy: what gets uploaded
+      # is then byte-for-byte the file the step above verified, and the directory
+      # cannot end up holding two APKs for a glob to choose between.
+      - name: Name the APK
+        id: named
+        run: |
+          version="$(jq -r .version gui-mobile/tauri.conf.json)"
+          dir=gui-mobile/gen/android/app/build/outputs/apk/universal/release
+          out="$dir/UniversalLink_${version}_arm64.apk"
+          mv "$dir/app-universal-release.apk" "$out"
+          echo "path=$out" >> "$GITHUB_OUTPUT"
+
+      - name: Run artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: universallink-android-arm64
+          path: ${{ steps.named.outputs.path }}
+          if-no-files-found: error
+
+      # No `body:` here on purpose, unlike the matrix job: action-gh-release
+      # overwrites the release body with whatever it is given, and the Android
+      # paragraph lives in the matrix job's copy. Whichever job lands second would
+      # otherwise erase the other's notes.
+      - name: Publish to the Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          draft: true
+          files: ${{ steps.named.outputs.path }}
+          fail_on_unmatched_files: true

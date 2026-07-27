@@ -21,3 +21,13 @@ config.json
 *.pem
 *.key
 !device.key.example
+# The Android release signing key, and the password file the Tauri template would
+# read it through. Not rotatable in practice — an APK signed by another key cannot
+# upgrade an installed one, so a leaked key is leaked for the life of the app.
+# release.yml gets it from a repository secret; it has no business in the tree, and
+# gui-mobile/gen/android/.gitignore covers only its own subtree.
+*.jks
+*.p12
+*.keystore
+keystore.properties
+key.properties
