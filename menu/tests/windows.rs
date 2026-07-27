@@ -35,6 +35,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use universallink_menu::channel::{self, Request, Response};
+use universallink_menu::os::windows::registry::Key;
 use universallink_menu::os::windows::{Cascade, SendTo, verb_command_line};
 use universallink_menu::{HelperCommand, MenuSurface, Target};
 
@@ -288,6 +289,59 @@ async fn the_real_shell_shows_the_cascade_and_forgets_it_when_it_goes() {
         "the shell ignored the cascade: {before} items, then {with}"
     );
     assert_eq!(after, before, "the cascade outlived its removal");
+}
+
+/// The stale-artifact sweep, against the container the shell really reads instead of
+/// a test root — where the sweep enumerates keys that are not ours to touch.
+///
+/// Measured on this machine rather than assumed, because it corrects the obvious
+/// guess: `HKCU\Software\Classes\*\shell` is EMPTY on a real install, and `HKLM`'s
+/// holds three verbs, none of them a cascade. The per-user classes hive is all but
+/// ours alone — the machine's hundreds of verbs live under `HKLM`, which this
+/// component never writes. So a neighbour to spare has to be planted, as does the
+/// artifact an older version would have left: a marker and a name we no longer write,
+/// spelled out here rather than built from the crate's constants, because a literal is
+/// exactly what it would be on an upgraded machine.
+#[tokio::test]
+#[ignore = "needs a real Windows session: it enumerates and writes the user's real shortcut menu"]
+async fn a_cascade_from_a_previous_version_is_swept_from_the_real_registry() {
+    const STALE: &str = "UniversalLinkSendPrevious";
+    const THEIRS: &str = "UniversalLinkNotOurs";
+
+    let shell = format!(r"{CLASSES}\*\shell");
+    let parent = Key::create(&shell).expect("the shell key for files");
+
+    let stale = Key::create(&format!(r"{shell}\{STALE}")).expect("create");
+    stale
+        .set_string("UniversalLinkGenerated", "universallink-menu:generated")
+        .expect("set the marker an older version would have written");
+    stale
+        .set_string("MUIVerb", "Send with UniversalLink")
+        .expect("set");
+    let theirs = Key::create(&format!(r"{shell}\{THEIRS}")).expect("create");
+    theirs.set_string("MUIVerb", "Someone else's").expect("set");
+
+    let mut cascade = Cascade::files(CLASSES, helper(&probe_channel()));
+    let applied = cascade.apply(&[target()]);
+    let swept = Key::open(&format!(r"{shell}\{STALE}"))
+        .expect("open")
+        .is_none();
+    let spared = Key::open(&format!(r"{shell}\{THEIRS}"))
+        .expect("open")
+        .is_some();
+    cascade.apply(&[]).expect("clear");
+    // Still spared by the sweep that runs when there is nothing to offer — and both
+    // plants gone before any assertion, so a panic leaves nothing on a real machine.
+    let spared_when_empty = Key::open(&format!(r"{shell}\{THEIRS}"))
+        .expect("open")
+        .is_some();
+    parent.delete_subtree(STALE).expect("clean up");
+    parent.delete_subtree(THEIRS).expect("clean up");
+
+    applied.expect("apply");
+    assert!(swept, "the previous version's cascade survived a render");
+    assert!(spared, "a verb without our marker was swept");
+    assert!(spared_when_empty, "the same, on the way out");
 }
 
 /// The Send to surface, in the folder the shell really reads — and the entries of

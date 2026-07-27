@@ -21,8 +21,9 @@ Written in **Rust** (a Cargo workspace) with a **Tauri / Svelte** interface.
 >   [Deploy the server](doc/server-deployment.md).
 > - **No packaging, no autostart, no installer** on the Core/GUI side. The Core
 >   is launched from a terminal.
-> - **No official background component exists yet** (no tray, no clipboard
->   manager, no context menu). The GUI is the only usable component today.
+> - **The background components are in**: the tray/notifier, the shared clipboard
+>   and the "send to PC X" context menu are implemented and spawned by the Core,
+>   so the GUI is no longer the only usable component.
 > - **Inbound** drag-and-drop works (drop a file onto a device's card → send);
 >   **outbound** drag (from the app to the desktop) is not there yet.
 >
@@ -45,7 +46,7 @@ Written in **Rust** (a Cargo workspace) with a **Tauri / Svelte** interface.
 | iroh data plane (E2E-encrypted QUIC, NAT traversal, relays) | ✅ implemented |
 | Server deployment (Docker image + Caddy auto-TLS, env, persisted directory) | 🟡 deployable; real bring-up = next milestone |
 | **Packaging / autostart / installers** | ❌ upcoming |
-| **Tray, shared clipboard, context menu** | ❌ upcoming |
+| Tray / notifier, shared clipboard, "send to PC X" context menu | ✅ implemented |
 | **Outbound drag-and-drop** | ❌ upcoming |
 
 The design details (and what is deliberately deferred) live in
@@ -306,8 +307,6 @@ Log level: `UNIVERSALLINK_LOG=debug` (not `RUST_LOG`).
 - **Server: deployable behind auto-TLS** (Docker image + Caddy, cf.
   [deployment](doc/server-deployment.md)), but the **image is not published**
   and the **real bring-up is not yet validated** (see the status at the top).
-- **No background component**: no shared clipboard, no "send to PC X" context
-  menu, no tray icon. The interface is the only component.
 - **Outbound drag-and-drop** is absent (only inbound works).
 - **Flat transfers**: every path must be a regular file (directory trees are a
   tracked follow-up).

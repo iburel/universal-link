@@ -36,10 +36,11 @@
 //! the desktop runs on click. KIO escapes the `&` mnemonic itself
 //! (`createActionForService`), so the label must NOT be pre-escaped for that.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::{MARKER, label_of, remove_if_present, write_if_changed};
+use super::{MARKER, label_of, sweep, write_if_changed};
 use crate::surface::{HelperCommand, MenuSurface, Target};
 
 /// Distinctive on purpose: KIO deduplicates service menus by FILE NAME across
@@ -57,14 +58,19 @@ const MODE: u32 = 0o755;
 
 /// The KDE ServiceMenu surface.
 pub struct ServiceMenu {
+    /// The directory KIO reads. Kept because the sweep's scope is the whole of it,
+    /// not just the one name this version writes.
+    dir: PathBuf,
     path: PathBuf,
     helper: HelperCommand,
 }
 
 impl ServiceMenu {
     pub fn new(data_home: &Path, helper: HelperCommand) -> ServiceMenu {
+        let dir = data_home.join("kio").join("servicemenus");
         ServiceMenu {
-            path: data_home.join("kio").join("servicemenus").join(FILE_NAME),
+            path: dir.join(FILE_NAME),
+            dir,
             helper,
         }
     }
@@ -82,13 +88,24 @@ impl MenuSurface for ServiceMenu {
     }
 
     fn apply(&mut self, targets: &[Target]) -> io::Result<()> {
-        if targets.is_empty() {
-            // Removed, not emptied: a file with no action is still one KIO opens
-            // and parses on every right click, and "no manager, no trace" is the
-            // rule.
-            return remove_if_present(&self.path);
+        let mut keep = HashSet::new();
+        if !targets.is_empty() {
+            write_if_changed(&self.path, &desktop_file(&self.helper, targets), MODE)?;
+            keep.insert(FILE_NAME);
         }
-        write_if_changed(&self.path, &desktop_file(&self.helper, targets), MODE)
+
+        // With nothing to offer, our file is simply not in `keep` and the sweep
+        // removes it: removed, not emptied, because a file with no action is still
+        // one KIO opens and parses on every right click, and "no manager, no trace"
+        // is the rule.
+        //
+        // The sweep covers the whole directory, which is the only way an artifact of
+        // ours under a name this version no longer writes ever leaves a user's menu
+        // — KIO deduplicates service menus by FILE NAME, so a rename would leave the
+        // old one being read for ever. The directory itself is never removed: it is
+        // shared with whatever service menus the distribution installed.
+        sweep(&self.dir, &keep)?;
+        Ok(())
     }
 }
 
@@ -406,5 +423,36 @@ mod tests {
         assert!(!path.exists(), "the entry outlived the target list");
         // And doing it again is not an error: the startup render always does.
         surface.apply(&[]).expect("apply empty twice");
+    }
+
+    /// The stale-artifact rule, on the surface where it bites hardest: KIO reads
+    /// EVERY `.desktop` in this directory and deduplicates them by file name, so a
+    /// file we wrote under a name this version no longer uses is a second submenu
+    /// listing devices from whenever it was written. It goes, whether or not we have
+    /// anything to offer right now — and the file next to it, which we did not write,
+    /// stays under any name at all.
+    #[test]
+    fn an_artifact_of_ours_under_an_older_name_is_swept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut surface = ServiceMenu::new(dir.path(), helper());
+        let servicemenus = dir.path().join("kio").join("servicemenus");
+        std::fs::create_dir_all(&servicemenus).expect("mkdir");
+
+        let stale = servicemenus.join("universallink-menu.desktop");
+        std::fs::write(&stale, desktop_file(&helper(), &[target("d_old", "Ghost")]))
+            .expect("write the older name");
+        let theirs = servicemenus.join("universallink-send.desktop.orig");
+        std::fs::write(&theirs, "[Desktop Entry]\nName=Theirs\n").expect("write");
+
+        surface.apply(&[target("d_1", "PC A")]).expect("apply");
+        assert!(!stale.exists(), "the older name survived a render");
+        assert!(surface.path().exists(), "our own entry must be there");
+
+        surface.apply(&[]).expect("apply empty");
+        assert!(theirs.exists(), "someone else's service menu was deleted");
+        assert!(
+            servicemenus.exists(),
+            "the directory is shared with the distribution's own service menus"
+        );
     }
 }

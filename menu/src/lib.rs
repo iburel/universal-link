@@ -48,6 +48,23 @@
 //! Every OS now has a surface, so [`os::create`] reports [`os::Unsupported`] only on
 //! a platform this project does not ship to.
 //!
+//! Brick 5 is the last, and it is one rule: **the marker is the authority, the
+//! container is the scope**. Every surface drops what it wrote by enumerating the
+//! container its reader reads — a directory, a `shell` key — and deleting whatever
+//! carries our marker, rather than unlinking the names this version happens to
+//! write. So renaming an artifact heals itself on the next startup, and no list of
+//! retired names has to be kept in step with the code: the four packaging lists
+//! below are the standing demonstration of what becomes of a list nothing
+//! cross-checks. This is worth a rule because none of those containers is ours
+//! alone, and a stale artifact in one is not dormant — it is a live menu entry,
+//! frozen on the device list of the day it was written, whose clicks the manager
+//! refuses one by one. KIO reads every `.desktop` in its directory and deduplicates
+//! them by FILE NAME, so a rename is precisely what leaves a second entry behind;
+//! Explorer reads every subkey of `shell`; Nautilus reads `scripts/` itself as a
+//! menu as well as our submenu inside it. The boundary is directories: one carries
+//! no marker, so ours is removed only when a sweep leaves it empty, and someone
+//! else's is never inferred to be ours from what happens to be inside it.
+//!
 //! Brick 4 is where the escaping obligation got its fourth answer, and the first that
 //! is TWO answers at once: the command line is a shell script *inside* a plist
 //! string, so brick 2's single-quoting runs first and XML escaping wraps it. It also

@@ -39,7 +39,7 @@ use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::{MARKER, is_ours, label_of, remove_if_present, write_if_changed};
+use super::{MARKER, label_of, sweep, write_if_changed};
 use crate::surface::{HelperCommand, MenuSurface, Target};
 
 /// Our own submenu under Nautilus's "Scripts".
@@ -73,38 +73,28 @@ impl Scripts {
     }
 
     /// Deletes every entry of ours that is not in `keep`, then the directory
-    /// itself if nothing is left.
+    /// itself if nothing is left — and finally anything of ours one level up.
     ///
     /// This is what makes the surface absolute rather than incremental: a device
     /// that went offline, a device that was renamed, an entry left by a previous
     /// version. Anything WITHOUT our marker is left strictly alone — enumerating a
     /// directory and deleting from it is how someone else's file gets destroyed.
     fn prune(&self, keep: &HashSet<&str>) -> io::Result<()> {
-        let entries = match std::fs::read_dir(&self.dir) {
-            Ok(entries) => entries,
-            // Nothing was ever written, or the whole directory is already gone.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e),
-        };
-        let mut left = 0;
-        for entry in entries {
-            let entry = entry?;
-            let name = entry.file_name();
-            if name.to_str().is_some_and(|name| keep.contains(name)) {
-                left += 1;
-                continue;
-            }
-            let path = entry.path();
-            if entry.file_type().is_ok_and(|kind| kind.is_file()) && is_ours(&path) {
-                remove_if_present(&path)?;
-            } else {
-                left += 1;
-            }
-        }
-        if left == 0 {
+        let swept = sweep(&self.dir, keep)?;
+        if swept.left == 0 {
             // An empty directory shows no submenu, so this is cosmetic — but "no
             // manager, no trace" is easier to trust when it is literal.
             let _ = std::fs::remove_dir(&self.dir);
+        }
+
+        // `scripts/` itself, where a version that did not use a submenu would have
+        // put its entries: Nautilus reads every file there too, so one of ours left
+        // behind is a live menu item frozen on an old device list. Our own directory
+        // is a directory, so the sweep counts it and leaves it be — as it does the
+        // user's own scripts and their own subdirectories, which carry no marker and
+        // are therefore never anyone's to delete but theirs.
+        if let Some(scripts) = self.dir.parent() {
+            sweep(scripts, &HashSet::new())?;
         }
         Ok(())
     }
@@ -534,6 +524,34 @@ mod tests {
             "a stale entry survived: {:?}",
             dir.path()
         );
+    }
+
+    /// The stale-artifact rule one level up: Nautilus reads `scripts/` itself as a
+    /// menu too, so an entry we wrote there before the submenu existed is a live item
+    /// frozen on an old device list. It goes; the user's own script and their own
+    /// folder next to it do not, whatever they are called.
+    #[test]
+    fn an_entry_of_ours_from_a_flat_layout_is_swept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut surface = Scripts::new(dir.path(), helper());
+        let scripts = surface.dir().parent().expect("scripts/").to_path_buf();
+        std::fs::create_dir_all(&scripts).expect("mkdir");
+
+        let stale = scripts.join("Send to Ghost (UniversalLink)");
+        std::fs::write(&stale, format!("#!/bin/sh\n# {MARKER}\nexec /nowhere\n")).expect("write");
+        let theirs = scripts.join("their own script");
+        std::fs::write(&theirs, "#!/bin/sh\necho mine\n").expect("write");
+        let their_folder = scripts.join("Their folder");
+        std::fs::create_dir(&their_folder).expect("mkdir");
+
+        surface.apply(&[target("d_1", "PC A")]).expect("apply");
+        assert!(!stale.exists(), "a flat entry of ours survived a render");
+        assert!(surface.dir().join("PC A").exists(), "our entry is missing");
+
+        surface.apply(&[]).expect("apply empty");
+        assert!(theirs.exists(), "someone else's script was deleted");
+        assert!(their_folder.exists(), "someone else's folder was deleted");
+        assert!(!surface.dir().exists(), "our own directory should be gone");
     }
 
     fn listing(dir: &Path) -> Vec<String> {

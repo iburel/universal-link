@@ -117,6 +117,45 @@ impl Cascade {
             None => Ok(()),
         }
     }
+
+    /// Deletes every OTHER verb under the same `shell` key that carries our marker.
+    ///
+    /// The child sweep's rule, one level up. The shell reads every subkey of `shell`,
+    /// so a cascade of ours under a name this version no longer writes is not
+    /// dormant: it is a live submenu, frozen on the device list of the day it was
+    /// written, whose every click the manager refuses. Sweeping by marker instead of
+    /// by expected name is what makes renaming [`VERB`] self-healing on upgrade, and
+    /// it needs no list of retired names — the kind of list nothing cross-checks.
+    ///
+    /// A verb without the marker is left alone whatever it is called, which is the
+    /// same rule as [`Cascade::ours`]: these are the user's keys, not ours. Rare
+    /// company, measured: `HKCU\Software\Classes\*\shell` is empty on a real install
+    /// (`tests/windows.rs`) — a machine's verbs live under `HKLM`, which this
+    /// component never writes — but a program that registers a per-user verb exists,
+    /// and the sweep must be safe beside it.
+    fn sweep_older_verbs(&self, keep: Option<&str>) -> io::Result<()> {
+        let Some(parent) = Key::open(&self.parent)? else {
+            // No `shell` key at all — nothing was ever written under this class.
+            return Ok(());
+        };
+        for name in parent.subkeys()? {
+            if keep == Some(name.as_str()) {
+                continue;
+            }
+            // A sibling we cannot even open counts as not ours, rather than failing
+            // the whole render: these keys are not ours, and one of them being
+            // unreadable must cost a stale key at worst, never the entries
+            // themselves. Same call as `is_ours` on Linux, for the same reason.
+            let marked = Key::open(&format!(r"{}\{name}", self.parent))
+                .ok()
+                .flatten()
+                .is_some_and(|key| key.string(MARKER_VALUE).as_deref() == Some(MARKER));
+            if marked {
+                parent.delete_subtree(&name)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl MenuSurface for Cascade {
@@ -126,7 +165,8 @@ impl MenuSurface for Cascade {
 
     fn apply(&mut self, targets: &[Target]) -> io::Result<()> {
         if targets.is_empty() {
-            return self.remove();
+            self.remove()?;
+            return self.sweep_older_verbs(None);
         }
         if !self.ours()? {
             return Err(io::Error::other(format!(
@@ -165,7 +205,10 @@ impl MenuSurface for Cascade {
                 children.delete_subtree(&name)?;
             }
         }
-        Ok(())
+
+        // And one level up, where only a previous VERSION of us can have left
+        // something: our own verb is kept, anything else of ours goes.
+        self.sweep_older_verbs(Some(VERB))
     }
 }
 
@@ -340,6 +383,55 @@ mod tests {
             value(&format!(r"{key}\shell\theirs"), "MUIVerb"),
             "Someone else's",
             "a foreign entry was destroyed"
+        );
+    }
+
+    /// The stale-artifact rule: the shell reads every subkey of `shell`, so a cascade
+    /// we wrote under a name this version no longer uses is a live submenu listing
+    /// whatever devices were online when it was written. It goes on the next render —
+    /// and the verb beside it that carries no marker stays, which is the only reason
+    /// enumerating the user's `shell` key is safe.
+    ///
+    /// Both renders, because the empty one is not the lesser case: `apply(&[])` is what
+    /// runs at startup, and on a machine with nothing online it is the only render of
+    /// the whole session.
+    #[test]
+    fn a_cascade_of_ours_under_an_older_name_is_swept() {
+        let root = TestRoot::new("stale");
+        let shell = format!(r"{}\*\shell", root.classes());
+        let older = format!(r"{shell}\UniversalLinkSend");
+        let plant = || {
+            let stale = Key::create(&older).expect("create");
+            stale.set_string(MARKER_VALUE, MARKER).expect("set");
+            stale.set_string("MUIVerb", "Ghost").expect("set");
+            // A child, to prove the whole subtree goes and not just the key.
+            Key::create(&format!(r"{older}\shell\000-d_old")).expect("create");
+        };
+        let theirs = Key::create(&format!(r"{shell}\SomeoneElseSend")).expect("create");
+        theirs.set_string("MUIVerb", "Theirs").expect("set");
+        let mut cascade = Cascade::files(root.classes(), helper());
+
+        plant();
+        cascade.apply(&[]).expect("startup render");
+        assert!(absent(&older), "the older name survived the startup render");
+
+        plant();
+        cascade.apply(&[target("d_aaa", "PC-A")]).expect("apply");
+        assert!(
+            absent(&older),
+            "the older name survived a render with a list"
+        );
+        assert!(
+            !absent(&format!(r"{shell}\UniversalLink")),
+            "our own verb must not be swept with it"
+        );
+
+        cascade.apply(&[]).expect("clear");
+        assert!(absent(&format!(r"{shell}\UniversalLink")));
+        assert_eq!(
+            value(&format!(r"{shell}\SomeoneElseSend"), "MUIVerb"),
+            "Theirs",
+            "a verb without our marker is never ours to delete"
         );
     }
 

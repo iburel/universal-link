@@ -28,10 +28,18 @@
 //! on a KDE session, a file manager installed after us, `$XDG_CURRENT_DESKTOP`
 //! unset under a bare window manager).
 //!
-//! **Nothing we did not write is ever deleted.** The scripts directory is
-//! enumerated and pruned, which is the only way an absolute surface can drop an
-//! entry whose device is gone; every artifact therefore carries [`MARKER`] and
-//! the pruning skips anything without it.
+//! **Nothing we did not write is ever deleted.** Both directories are enumerated
+//! and pruned, which is the only way an absolute surface can drop an entry whose
+//! device is gone; every artifact therefore carries [`MARKER`] and the pruning
+//! skips anything without it.
+//!
+//! **The marker is the authority, the container is the scope** ([`sweep`]). A
+//! surface removes marked files by enumerating the whole directory its reader
+//! reads, not by unlinking the names this version writes — so an artifact left by
+//! a version that named things differently is swept on the next startup instead of
+//! sitting in a menu for ever. KIO makes the point plainest: it deduplicates
+//! service menus by FILE NAME, so renaming ours would leave the old file being
+//! read on every right click.
 //!
 //! **An identical write is skipped.** Nautilus watches the scripts directory and
 //! rebuilds its menu when it changes, and the orchestrator re-applies the current
@@ -48,6 +56,7 @@
 mod scripts;
 mod servicemenu;
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -166,6 +175,52 @@ pub(crate) fn is_ours(path: &Path) -> bool {
         return false;
     }
     head.windows(MARKER.len()).any(|w| w == MARKER.as_bytes())
+}
+
+/// What one directory's sweep left behind.
+pub(crate) struct Swept {
+    /// Entries that stayed: files that are not ours, and directories.
+    pub(crate) left: usize,
+}
+
+/// Removes every file directly in `dir` that carries [`MARKER`] and whose name is
+/// not in `keep`.
+///
+/// The scope is the CONTAINER, not the names this version happens to write. Both
+/// file managers read every file in the directory they look at, so an artifact of
+/// ours under a name we no longer write is not dormant — it is a live menu entry,
+/// frozen on the device list of the day it was written, whose clicks the manager
+/// then refuses (`NO_SUCH_TARGET`) because they name devices that may be long
+/// gone. Sweeping by marker rather than by expected name is what makes renaming an
+/// artifact self-healing on upgrade, and it is why no list of retired names has to
+/// be kept in step with the code — the kind of list nothing cross-checks.
+///
+/// Directories are counted and never removed. A directory carries no marker, and
+/// deciding it is ours from what is inside it would eventually delete a folder of
+/// the user's own scripts.
+pub(crate) fn sweep(dir: &Path, keep: &HashSet<&str>) -> io::Result<Swept> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // Nothing was ever written here, or the directory is already gone.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Swept { left: 0 }),
+        Err(e) => return Err(e),
+    };
+    let mut swept = Swept { left: 0 };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_str().is_some_and(|name| keep.contains(name)) {
+            swept.left += 1;
+            continue;
+        }
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_file()) && is_ours(&path) {
+            remove_if_present(&path)?;
+        } else {
+            swept.left += 1;
+        }
+    }
+    Ok(swept)
 }
 
 /// The label a surface shows for `name`, trimmed.
@@ -320,6 +375,52 @@ mod tests {
             !is_ours(&path),
             "the marker must be looked for in the head, not the whole file"
         );
+    }
+
+    /// The sweep's whole contract: our marked files go unless they are wanted,
+    /// everything else stays and is counted — because that count is what decides
+    /// whether a directory of ours may be removed.
+    #[test]
+    fn the_sweep_removes_our_files_and_counts_what_it_must_leave() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ours = |name: &str| {
+            std::fs::write(dir.path().join(name), format!("#!/bin/sh\n# {MARKER}\n"))
+                .expect("write")
+        };
+        ours("wanted");
+        ours("an older name");
+        std::fs::write(dir.path().join("theirs"), "#!/bin/sh\necho mine\n").expect("write");
+        std::fs::create_dir(dir.path().join("their folder")).expect("mkdir");
+
+        let swept = sweep(dir.path(), &HashSet::from(["wanted"])).expect("sweep");
+        assert_eq!(listing(dir.path()), ["their folder", "theirs", "wanted"]);
+        assert_eq!(
+            swept.left, 3,
+            "a directory and a foreign file both keep a directory alive"
+        );
+
+        // And with nothing wanted, only what is not ours is left.
+        let swept = sweep(dir.path(), &HashSet::new()).expect("sweep");
+        assert_eq!(listing(dir.path()), ["their folder", "theirs"]);
+        assert_eq!(swept.left, 2);
+    }
+
+    /// A directory that was never written to is not an error: `apply(&[])` runs at
+    /// every startup, usually with nothing to sweep.
+    #[test]
+    fn sweeping_a_directory_that_is_not_there_is_success() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let swept = sweep(&dir.path().join("never"), &HashSet::new()).expect("absent is fine");
+        assert_eq!(swept.left, 0);
+    }
+
+    fn listing(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     #[test]
