@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **"Send to PC X" from the file manager's context menu** — right-click a
+  selection of files or a folder, pick one of your PCs, and it is on its way: no
+  window to open, no drag. The entries are the account's live device list, so one
+  appears only for a device that is online, attested and reachable, and they all
+  disappear while the Core has no server connection — the menu never offers a
+  destination it cannot reach. Per desktop:
+  - **Windows** — a `UniversalLink ▸ PC` submenu in the classic shortcut menu, for
+    a file selection and for a folder, plus one entry per device under "Send to".
+  - **Linux** — an entry in Dolphin's menu (KDE ServiceMenu) and a submenu of
+    Nautilus scripts.
+  - **macOS** — one entry per device in Finder's **Services** submenu. Whether it
+    also appears in the inline "Quick Actions" row is a system setting (General →
+    Login Items & Extensions → Finder), not something the app can decide.
+
+  A click sends the whole selection as a single transfer, tracked in the tray and
+  the app like any other. Folders go as folders. A phone is never offered as a
+  destination: a file dropped into its private storage is a file nothing on it can
+  open.
+
 ## [0.4.0] - 2026-07-27
 
 An Android client: from the system share sheet, send text to the account's
@@ -174,6 +197,7 @@ Linux, macOS, and Windows.
 - Flat transfers only (no directory trees).
 - Account key rotation is not implemented.
 
+[Unreleased]: https://github.com/iburel/universal-link/compare/v0.4.0...HEAD
 [0.4.0]: https://github.com/iburel/universal-link/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/iburel/universal-link/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/iburel/universal-link/compare/v0.1.0...v0.2.0

@@ -1,0 +1,100 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
+
+[package]
+name = "universallink-menu"
+version = "0.4.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+# The contextual-menu component: the manager the Core supervises (role
+# `menu-backend`), plus the click helper the OS launches. One binary, two modes
+# — the manager keeps the list of reachable devices and rewrites the per-OS menu
+# surfaces; `--send` is what a menu entry actually invokes, and it only talks to
+# the manager over a private local channel (never to the Core: a process the
+# shell starts with attacker-influenced argv must not hold Core credentials).
+#
+# lib + bin, like the tray and the clipboard backend: the OS-agnostic
+# orchestrator (target computation, the local channel, the exit conditions)
+# lives in the lib and is frozen by tests/api/ against a real Core. All three
+# platforms have a surface: KDE ServiceMenus + Nautilus scripts on Linux, the
+# shortcut-menu cascade + "Send to" on Windows, and one Automator workflow per
+# device in ~/Library/Services on macOS. That last one needs no dependency —
+# AppKit is reached through a single `extern "C"` for NSUpdateDynamicServices.
+
+[[bin]]
+name = "universallink-menu"
+path = "src/main.rs"
+
+[dependencies]
+# Request params (`files.send`, `devices.list`), the device records, and the
+# local channel's line protocol.
+serde_json = "1"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-std",
+    "io-util",
+    "net",
+    "sync",
+    "time",
+] }
+universallink-ipc-client = { path = "../client" }
+# Resolves the local channel's path the same way for the manager (which binds
+# it) and the helper (which the shell starts with no UNIVERSALLINK_* in its
+# environment, so it can only rediscover the path by convention).
+universallink-paths = { path = "../paths" }
+
+# Peer verification (uid) on the local channel: the same level-1 check the
+# Core's IPC applies. Mirrors core/src/transport.rs.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Named-pipe DACL (the current user's SID) + client pid for the local channel,
+# again mirroring core/src/transport.rs, plus the registry calls the shortcut-menu
+# cascade is made of (brick 3). Same crate and version as the Core and the
+# clipboard backend already pull, so no new package in the lock.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+] }
+# The "Send to" surface writes `.lnk` files, and a `.lnk` is a COM object
+# (`ShellLink` + `IShellLinkW` + `IPersistFile`) — vtable calls, which `windows-sys`
+# does not generate. Hence the typed crate for that one surface, at the SAME version
+# the clipboard backend already pulls (see its Cargo.toml on why `windows` and
+# `windows-core` must move in lockstep): no new package enters the lock, only a new
+# edge to one that is already there.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",          # RPC_E_CHANGED_MODE (the apartment already set otherwise)
+    "Win32_System_Com",          # CoInitializeEx/CoCreateInstance/IPersistFile/STGM
+    "Win32_UI_Shell",            # ShellLink/IShellLinkW, SHGetKnownFolderPath/FOLDERID_SendTo
+    "Win32_Storage_FileSystem",  # IShellLinkW::GetPath takes a WIN32_FIND_DATAW out-param
+] }
+
+[dev-dependencies]
+tempfile = "3"
+# `test-util` for the click batching: it is a timing component (a quiet window and
+# a hard cap), and virtual time proves what it does deterministically instead of
+# racing real sleeps against a loaded CI runner. Test-only, and it adds no package
+# to the lock — the feature is internal to tokio.
+tokio = { version = "1", features = ["full", "test-util"] }
+universallink-core = { path = "../core" }
+# The integration suite runs the manager against a REAL Core connected to a
+# REAL server, so a harness device can be enrolled, brought online, and given a
+# valid account attestation — the only way to exercise target computation and a
+# click on genuine device records rather than hand-written JSON.
+universallink-server = { path = "../server" }
+universallink-test-support = { path = "../test-support" }
+
+# `CommandLineToArgvW`: the REAL parser every program the shell starts uses, as the
+# oracle for the command lines we write into a registry verb and into a shortcut —
+# not a second implementation of the quoting rules, but the implementation. Test
+# only; the surfaces themselves never parse a command line.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell"] }

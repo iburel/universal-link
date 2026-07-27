@@ -268,7 +268,9 @@ serve for arbitration: a single active clipboard backend — the exclusive
   click launches a small helper that forwards `(target, paths[])`.
   Examples: Send to (`.lnk` in `shell:sendto`), the classic Windows menu
   (`HKCU\Software\Classes\*\shell`), KDE ServiceMenus (`.desktop` in
-  `~/.local/share/kio/servicemenus/`), Nautilus scripts, Thunar actions.
+  `~/.local/share/kio/servicemenus/`), Nautilus scripts, Thunar actions, macOS
+  Services (an Automator `.workflow` bundle in `~/Library/Services`, which Finder
+  shows in its Services submenu).
 - **Family B — static registration, dynamic content**: the surface requires an
   artifact loaded into a host process, registered once at install time; the OS
   queries it when the menu opens. The dynamism lives in the handler: hide/show
@@ -276,6 +278,35 @@ serve for arbitration: a single active clipboard backend — the exclusive
   Examples: the Windows 11 main menu (`IExplorerCommand` COM DLL packaged
   MSIX/sparse, signed), FinderSync (appex in the signed bundle), in-process
   Nautilus extension.
+
+### What v1 implements
+
+Family A only, on all three desktops (`menu/`, one binary in two modes):
+
+| OS | Surfaces |
+|---|---|
+| Linux | a KDE ServiceMenu for Dolphin, plus one Nautilus script per device in a submenu of its own |
+| Windows | the classic menu's cascade, twice (`*` for files, `Directory` for folders), plus one "Send to" shortcut per device |
+| macOS | one Automator `.workflow` per device in `~/Library/Services` |
+
+Family B is deferred for one reason: both an `IExplorerCommand` COM DLL and a
+FinderSync appex must be **signed** and registered at install time, and milestone
+1 ships unsigned installers. Nothing about family A blocks them — the local
+channel already answers the `targets` pull they need.
+
+Two rules the implementation adds to the contract below:
+
+- **A click never carries a credential.** The entry's command line starts a small
+  courier that talks only to the manager over a private local socket, and holds no
+  Core token of its own: the IPC token is the GUI's whole root of trust, so giving
+  it to a process the shell starts with an influenceable `argv` would turn every
+  writable registry key or `.desktop` file into a Core capability.
+- **The marker is the authority, the container is the scope.** Every artifact
+  carries a marker, and a surface prunes by enumerating the container its reader
+  reads (a directory, a `shell` key) and deleting what is marked — never by
+  unlinking the names the current version writes. That way an artifact left by an
+  older version is swept at the next startup instead of staying in the menu for
+  ever, and nothing unmarked is ever deleted.
 
 ### A backend's contract (validity criteria)
 

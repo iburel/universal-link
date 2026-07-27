@@ -205,9 +205,9 @@ async fn run_once(
 
 /// The deployment's official components, looked up next to the Core binary.
 /// The tray is registered on every platform; the clipboard backend is registered
-/// on Linux (X11), Windows, and macOS. The contextual menu will come and register
-/// here too. A missing executable is ignored (with a word in the log) — a Core
-/// without a tray is still a working Core.
+/// on Linux (X11), Windows, and macOS; the contextual menu on Linux only so far.
+/// A missing executable is ignored (with a word in the log) — a Core without a
+/// tray is still a working Core.
 ///
 /// The tray is granted `system.shutdown` (its Quit stops the whole Core) on top
 /// of `session.read` (its status icon); it requests only what each of its
@@ -250,6 +250,34 @@ pub fn official_components() -> Vec<ChildSpec> {
             "clipboard.write",
             "transfers.read",
         ],
+    ));
+    // The contextual menu, on the platforms where it has a surface: Linux (KDE
+    // ServiceMenus + Nautilus scripts), Windows and macOS. Registering it where it
+    // has none would relaunch a process that exits immediately, for ever. It reads
+    // the session (an entry must not be offered while the Core is offline: the
+    // directory it serves from cache would have us point at unreachable devices),
+    // the devices, and sends on a click.
+    #[cfg(target_os = "linux")]
+    official.push((
+        "universallink-menu",
+        "menu-backend",
+        &["session.read", "devices.read", "files.send"],
+    ));
+    // Windows (brick 3): the same rights, for the classic shortcut menu's cascade
+    // and the "Send to" shortcuts.
+    #[cfg(target_os = "windows")]
+    official.push((
+        "universallink-menu",
+        "menu-backend",
+        &["session.read", "devices.read", "files.send"],
+    ));
+    // macOS (brick 4): the same rights again, for the Automator workflows in
+    // `~/Library/Services` that Finder shows as Quick Actions.
+    #[cfg(target_os = "macos")]
+    official.push((
+        "universallink-menu",
+        "menu-backend",
+        &["session.read", "devices.read", "files.send"],
     ));
 
     let Some(dir) = std::env::current_exe()

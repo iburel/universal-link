@@ -18,6 +18,13 @@
 //! `secrets.json` (keyring fallback) and `config.json`. The single-instance
 //! lock, for its part, lives next to the socket (`core.sock.lock`): it is the
 //! socket it protects — see `universallink_core::transport`.
+//!
+//! One component listens too, and so appears here: the contextual-menu manager
+//! (`menu.sock` / `universallink-menu-…`, next to the Core's own). It is the
+//! only endpoint a process discovers with NOTHING from us in its environment —
+//! the click helper is started by the file manager, which passes it neither
+//! `UNIVERSALLINK_IPC_PATH` nor anything else — so it has to be a convention
+//! rather than a hand-off.
 
 use std::path::PathBuf;
 
@@ -28,6 +35,10 @@ pub struct Endpoint {
     /// regenerated here at every startup — re-read on every attempt by the
     /// client.
     pub config_dir: PathBuf,
+    /// Where the contextual-menu manager listens for its click helpers (UDS
+    /// socket or named pipe name). Protected like the Core's own: the private
+    /// runtime folder plus a peer check on unix, an owner-only DACL on Windows.
+    pub menu_channel: PathBuf,
 }
 
 impl Endpoint {
@@ -105,11 +116,11 @@ fn endpoint_from(env: &dyn Fn(&str) -> Option<String>) -> Option<Endpoint> {
     let config = xdg("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| xdg("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    let runtime = PathBuf::from(runtime).join("universallink");
     Some(Endpoint {
-        ipc_path: PathBuf::from(runtime)
-            .join("universallink")
-            .join("core.sock"),
+        ipc_path: runtime.join("core.sock"),
         config_dir: config.join("universallink"),
+        menu_channel: runtime.join("menu.sock"),
     })
 }
 
@@ -122,6 +133,7 @@ fn endpoint_from(env: &dyn Fn(&str) -> Option<String>) -> Option<Endpoint> {
         .join("UniversalLink");
     Some(Endpoint {
         ipc_path: dir.join("core.sock"),
+        menu_channel: dir.join("menu.sock"),
         config_dir: dir,
     })
 }
@@ -140,6 +152,7 @@ fn endpoint_from(env: &dyn Fn(&str) -> Option<String>) -> Option<Endpoint> {
     Some(Endpoint {
         ipc_path: PathBuf::from(format!(r"\\.\pipe\universallink-core-{domain}-{user}")),
         config_dir: PathBuf::from(appdata).join("UniversalLink"),
+        menu_channel: PathBuf::from(format!(r"\\.\pipe\universallink-menu-{domain}-{user}")),
     })
 }
 
@@ -219,6 +232,12 @@ mod tests {
             e.token_path(),
             PathBuf::from("/home/u/.config-custom/universallink/ipc-token")
         );
+        // The menu manager listens in the same private runtime folder as the
+        // Core: the click helper resolves it from the environment alone.
+        assert_eq!(
+            e.menu_channel,
+            PathBuf::from("/run/user/1000/universallink/menu.sock")
+        );
 
         // Without XDG_CONFIG_HOME: ~/.config. Without XDG_RUNTIME_DIR: refusal.
         let e = endpoint_from(&env_of(&[
@@ -272,6 +291,10 @@ mod tests {
             e.token_path(),
             PathBuf::from("/Users/u/Library/Application Support/UniversalLink/ipc-token")
         );
+        assert_eq!(
+            e.menu_channel,
+            PathBuf::from("/Users/u/Library/Application Support/UniversalLink/menu.sock")
+        );
         assert!(endpoint_from(&env_of(&[])).is_none());
     }
 
@@ -293,6 +316,12 @@ mod tests {
         assert_eq!(
             e.token_path(),
             PathBuf::from(r"C:\Users\iwan\AppData\Roaming\UniversalLink\ipc-token")
+        );
+        // Per-user for the same reason as the Core's pipe — the namespace is
+        // machine-global.
+        assert_eq!(
+            e.menu_channel,
+            PathBuf::from(r"\\.\pipe\universallink-menu-PC-IWAN-iwan")
         );
         // An indispensable variable absent or empty: refusal.
         assert!(

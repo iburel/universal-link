@@ -309,9 +309,14 @@ fn stage_core_copy(src: &Path, data_home: &Path) -> std::io::Result<PathBuf> {
 /// (`official_components`). Inside an AppImage they sit next to the bundled Core
 /// on the ephemeral mount; the durable copy must carry them too, or the
 /// supervisor won't find them once we run from the copy. This list grows as
-/// components are added (tray, clipboard backend, and the contextual menu next).
+/// components are added; nothing cross-checks it against `official_components`, and
+/// a sidecar missing from it is simply never launched on a real Linux install.
 #[cfg(target_os = "linux")]
-const STAGED_SIDECARS: &[&str] = &["universallink-tray", "universallink-clipboard"];
+const STAGED_SIDECARS: &[&str] = &[
+    "universallink-tray",
+    "universallink-clipboard",
+    "universallink-menu",
+];
 
 /// Copies each sidecar next to the durable Core (best-effort). A sidecar absent
 /// from this build is skipped; a copy failure is logged but not fatal — a Core
@@ -523,7 +528,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn staging_sidecars_brings_the_tray_and_the_clipboard_next_to_the_core() {
+    fn staging_sidecars_brings_every_supervised_component_next_to_the_core() {
         let tmp = tempfile::tempdir().expect("tempdir");
         // Mimic the bundled layout: the Core and its sidecars side by side, as
         // on the AppImage mount.
@@ -538,21 +543,27 @@ mod tests {
         let data_home = tmp.path().join("data");
         stage_sidecars(&core, &data_home);
 
-        // Every declared sidecar lands next to the durable Core — the clipboard
-        // backend included, which is the whole point (a bundled-but-unstaged
-        // clipboard would never be launched by the supervisor).
+        // Every declared sidecar lands next to the durable Core.
         for bin in STAGED_SIDECARS {
             let dest = data_home.join("universallink").join(bin);
             assert!(dest.exists(), "{bin} must be staged next to the Core");
             assert_eq!(std::fs::read(&dest).expect("read"), bin.as_bytes());
         }
-        assert!(
-            data_home
-                .join("universallink")
-                .join("universallink-clipboard")
-                .exists(),
-            "the clipboard backend must be staged"
-        );
+        // And the list itself names every component the Core's supervisor launches
+        // on Linux. The loop above cannot catch a name being DROPPED from it, which
+        // is the failure that matters: a sidecar bundled in the AppImage but not
+        // staged is never found next to the durable Core, so it silently never runs
+        // — logged at INFO as "component absent" and nothing else.
+        for expected in [
+            "universallink-tray",
+            "universallink-clipboard",
+            "universallink-menu",
+        ] {
+            assert!(
+                STAGED_SIDECARS.contains(&expected),
+                "{expected} is launched by the supervisor but never staged"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

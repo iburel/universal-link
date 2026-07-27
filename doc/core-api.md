@@ -78,9 +78,11 @@ only through these two paths, never via the prompt.
 | `system.shutdown` | `system.shutdown` — stops the whole Core (the tray's Quit) |
 
 Verification: per method and per topic. Example profiles — menu manager:
-`devices.read + files.send`; tray: `session.read + devices.read +
-transfers.read`; clipboard manager: `devices.read + clipboard.read +
-clipboard.write`.
+`session.read + devices.read + files.send` (`session.read` is what tells it the
+Core is actually connected to the server: the directory cache is served offline
+too, so without it the menu would offer targets that cannot be reached); tray:
+`session.read + devices.read + transfers.read`; clipboard manager:
+`devices.read + clipboard.read + clipboard.write`.
 
 ## Subscribing to events
 
