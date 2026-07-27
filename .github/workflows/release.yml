@@ -211,6 +211,23 @@ jobs:
       # has no Android-SDK ecosystem, so this is bumped by hand — keep the two
       # workflows in step.
       NDK_VERSION: "26.3.11579264"
+      # The build-tools that supplies apksigner, pinned for the same reason and
+      # ALSO because the fingerprint check below parses its output: the runner image
+      # ships its own, newer build-tools, and the two do not print the same thing
+      # (36.0.0 says "Signer #1 certificate SHA-256 digest:", the image's says
+      # "V3.0 Signer: certificate SHA-256 digest:" and knows a v3.2 scheme).
+      BUILD_TOOLS_VERSION: "36.0.0"
+      # The ONE certificate allowed to sign a UniversalLink release, recorded from
+      # the first run that used the key (RSA 4096, self-issued). A certificate is
+      # public — it ships inside every copy of the APK — so this is not a secret;
+      # it is a pin. It exists to catch what a signature check alone cannot: a
+      # different key that verifies perfectly well. An APK signed by another key
+      # cannot upgrade an installed app, so shipping one silently strands every
+      # existing user, and the only recovery is uninstall-and-lose-your-data.
+      #
+      # Rotating the key means editing this line, which is the point: that is an
+      # event worth a deliberate decision and a release note, not a rebuild.
+      EXPECTED_CERT_SHA256: "016ca96e825ec128c78824711373694343638f847e89e8a2954257ec24e5c49b"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -260,7 +277,7 @@ jobs:
           # sdkmanager is not on PATH on the runner; take the newest cmdline-tools.
           SDKMANAGER="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | tail -1)"
           yes | "$SDKMANAGER" --licenses > /dev/null
-          "$SDKMANAGER" --install "platforms;android-36" "build-tools;36.0.0" "ndk;$NDK_VERSION"
+          "$SDKMANAGER" --install "platforms;android-36" "build-tools;$BUILD_TOOLS_VERSION" "ndk;$NDK_VERSION"
           echo "NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
 
       - name: Node
@@ -333,12 +350,16 @@ jobs:
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: cargo tauri android build --apk --target aarch64
 
-      # The one check that cannot be satisfied by accident. `apksigner verify` exits
-      # non-zero unless the archive verifies, and --print-certs puts the signing
-      # certificate's SHA-256 in the log: compare it against the fingerprint of the
-      # key you meant to use (`keytool -list -v`) the first time, and any later
-      # release whose fingerprint differs is a key swap, not a rebuild. A certificate
-      # is public information — it ships inside every copy of the APK.
+      # The two checks that cannot be satisfied by accident: the archive verifies
+      # (`apksigner verify` exits non-zero otherwise), and it verifies under the key
+      # we mean — see EXPECTED_CERT_SHA256 above. The full --print-certs output is
+      # echoed either way, so a mismatch is diagnosable from the log alone.
+      #
+      # The digest is read off every "certificate SHA-256 digest:" line, whatever
+      # prefix the tool puts in front of it, and deduplicated: one signer under
+      # several schemes collapses to one value, while two DIFFERENT signers leave two
+      # and fail the comparison. `public key SHA-256 digest:` lines are a different
+      # thing and deliberately not matched.
       #
       # No `--min-sdk-version`: apksigner reads minSdkVersion out of the APK's own
       # manifest (measured — it verifies the v1-less APK without the flag). Passing
@@ -352,8 +373,13 @@ jobs:
             ls -l "$(dirname "$apk")" || true
             exit 1
           fi
-          APKSIGNER="$(ls "$ANDROID_HOME"/build-tools/*/apksigner | tail -1)"
-          "$APKSIGNER" verify --verbose --print-certs "$apk"
+          certs="$("$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/apksigner" verify --verbose --print-certs "$apk")"
+          echo "$certs"
+          got="$(printf '%s\n' "$certs" | sed -n 's/.*certificate SHA-256 digest: \([0-9a-f]\{64\}\).*/\1/p' | sort -u)"
+          if [ "$got" != "$EXPECTED_CERT_SHA256" ]; then
+            echo "::error::signed by [$got], expected [$EXPECTED_CERT_SHA256]. A different key verifies just as well and cannot upgrade an installed app — check ANDROID_KEYSTORE_BASE64/ANDROID_KEY_ALIAS, or update EXPECTED_CERT_SHA256 in this workflow if the key was rotated on purpose."
+            exit 1
+          fi
 
       # Named like the desktop bundles (UniversalLink_<version>_<arch>.<ext>) rather
       # than shipped as Gradle's app-universal-release.apk, which says nothing to
