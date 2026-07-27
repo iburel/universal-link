@@ -359,6 +359,48 @@ mod tests {
         );
     }
 
+    /// A batch's window belongs to that batch. When one device's burst goes out,
+    /// another device's unfinished one must not be dragged along with it — the
+    /// couriers still to come for it would then form a second transfer, which is the
+    /// very thing this module exists to prevent.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_is_not_dragged_out_by_another_devices_window() {
+        let recorder = Recorder::new(accepted());
+        let (clicks, _task) = Clicks::spawn_with(
+            Duration::from_millis(250),
+            Duration::from_secs(2),
+            recorder.seam(),
+        );
+
+        let mut couriers = tokio::task::JoinSet::new();
+        let mut click = |device: &'static str, file: &'static str, at: u64| {
+            let clicks = clicks.clone();
+            couriers.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(at)).await;
+                clicks.submit(device.into(), paths(&[file])).await
+            });
+        };
+        // d_a's window closes at 250 ms. d_b is still receiving couriers then — its
+        // own closes at 550 ms — and its second file belongs in the same batch.
+        click("d_a", "/a.txt", 0);
+        click("d_b", "/b1.txt", 200);
+        click("d_b", "/b2.txt", 300);
+        couriers.join_all().await;
+
+        let batches: Vec<(String, Vec<String>)> = recorder
+            .sent()
+            .into_iter()
+            .map(|(device, paths)| (device, names(&paths)))
+            .collect();
+        let for_b: Vec<&Vec<String>> = batches
+            .iter()
+            .filter(|(device, _)| device == "d_b")
+            .map(|(_, files)| files)
+            .collect();
+        assert_eq!(for_b.len(), 1, "d_b's batch was split: {batches:?}");
+        assert_eq!(for_b[0], &["/b1.txt", "/b2.txt"]);
+    }
+
     /// The window is extended by every courier, so without the cap a long enough
     /// stream of them would hold the transfer for ever. The user clicked: the files
     /// have to go.
@@ -415,8 +457,18 @@ mod tests {
         let big: Vec<PathBuf> = (0..MAX_BATCH_PATHS)
             .map(|i| PathBuf::from(format!("/f{i}.txt")))
             .collect();
-        // The window is an hour, so nothing but the ceiling can have sent this.
+        // The window is an hour, so nothing but the ceiling can have sent this —
+        // and the assertion has to be on the CLOCK, not just on the outcome: with
+        // virtual time tokio advances the clock by itself as soon as everything is
+        // idle, so a batch that waited out the whole hour would otherwise look
+        // exactly like one that never waited.
+        let start = Instant::now();
         assert_eq!(clicks.submit("d_1".into(), big).await, accepted());
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "the full batch waited for its window instead of going at once: {:?}",
+            start.elapsed()
+        );
         assert_eq!(recorder.sent().len(), 1);
         assert_eq!(recorder.sent()[0].1.len(), MAX_BATCH_PATHS);
     }

@@ -365,6 +365,48 @@ mod tests {
         );
     }
 
+    /// The arguments of a shortcut are a command line too, and a live test injects a
+    /// channel path into them — a pipe name that can hold a space. Production passes
+    /// none, so this is the only case where the quoting here is load-bearing, and the
+    /// real parser is what says whether it worked.
+    #[test]
+    fn an_injected_channel_survives_the_shortcut_arguments() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let helper = HelperCommand {
+            program: PathBuf::from(r"C:\ul\menu.exe"),
+            extra_args: vec!["--channel".into(), r"\\.\pipe\ul menu live".into()],
+        };
+        let mut surface = SendTo::new(dir.path(), helper);
+        surface.apply(&[target("d_aaa", "PC-A")]).expect("apply");
+
+        let link = read_shortcut(&dir.path().join("PC-A (UniversalLink).lnk")).expect("readable");
+        assert_eq!(
+            parse_command_line(&format!(r#""{}" {}"#, link.target, link.arguments)),
+            [
+                r"C:\ul\menu.exe",
+                "--channel",
+                r"\\.\pipe\ul menu live",
+                "--send",
+                "d_aaa",
+                "--"
+            ]
+        );
+    }
+
+    /// A device with no usable name still needs an entry, and a distinct one: the
+    /// fallback is its id.
+    #[test]
+    fn a_device_whose_name_leaves_nothing_falls_back_to_its_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut surface = SendTo::new(dir.path(), helper());
+        surface
+            .apply(&[target("d_1111", "   "), target("d_2222", "...")])
+            .expect("apply");
+
+        assert!(dir.path().join("d_1111 (UniversalLink).lnk").exists());
+        assert!(dir.path().join("d_2222 (UniversalLink).lnk").exists());
+    }
+
     /// The folder can be open in Explorer, and the applier re-applies the list it
     /// already rendered whenever it cannot prove nothing changed.
     #[test]
@@ -466,7 +508,10 @@ mod tests {
     }
 
     /// And the case that is Windows' alone: the file system does not distinguish
-    /// `PC` from `pc`, so two labels that differ only in case are still one file.
+    /// `PC` from `pc`, so two labels that differ only in case are still one file —
+    /// and BOTH must be disambiguated, not just whichever came second. An entry
+    /// named after its sibling's existence would change name depending on which of
+    /// the two is online.
     #[test]
     fn names_that_differ_only_in_case_are_still_two_entries() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -475,7 +520,7 @@ mod tests {
             .apply(&[target("d_1111", "PC"), target("d_2222", "pc")])
             .expect("apply");
 
-        let files: Vec<String> = entries(dir.path())
+        let mut files: Vec<String> = entries(dir.path())
             .expect("entries")
             .iter()
             .map(|p| {
@@ -485,10 +530,14 @@ mod tests {
                     .into_owned()
             })
             .collect();
+        files.sort();
         assert_eq!(
-            files.len(),
-            2,
-            "one device overwrote the other's entry: {files:?}"
+            files,
+            [
+                "PC (1111) (UniversalLink).lnk",
+                "pc (2222) (UniversalLink).lnk"
+            ],
+            "the two entries must be symmetrical, and there must be two"
         );
     }
 
