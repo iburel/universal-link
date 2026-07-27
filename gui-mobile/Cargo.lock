@@ -5990,7 +5990,7 @@ dependencies = [
 
 [[package]]
 name = "universallink-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6010,7 +6010,7 @@ dependencies = [
 
 [[package]]
 name = "universallink-daemon"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "gethostname",
@@ -6032,7 +6032,7 @@ dependencies = [
 
 [[package]]
 name = "universallink-gui"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -6068,7 +6068,7 @@ dependencies = [
 
 [[package]]
 name = "universallink-ipc-client"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde_json",
  "tokio",
@@ -6076,7 +6076,7 @@ dependencies = [
 
 [[package]]
 name = "universallink-paths"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "untrusted"
