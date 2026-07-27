@@ -5,10 +5,11 @@
 //!
 //! Linux (brick 2) has a KDE ServiceMenu for Dolphin and Nautilus scripts; Windows
 //! (brick 3) has the classic `HKCU\…\shell` cascade — twice, for files and for
-//! folders — and one "Send to" shortcut per device. macOS (Quick Actions in
-//! `~/Library/Services`) lands in the brick after. Each is family A — an artifact
-//! on disk or in the registry that a normal process rewrites, whose command line
-//! starts our `--send` helper.
+//! folders — and one "Send to" shortcut per device; macOS (brick 4) has one
+//! Automator workflow per device in `~/Library/Services`, which Finder shows among
+//! its Quick Actions and services. Each is family A — an artifact on disk or in the
+//! registry that a normal process rewrites, whose command line starts our `--send`
+//! helper.
 //!
 //! The family-B surfaces (the Windows 11 main menu's `IExplorerCommand` COM DLL,
 //! a FinderSync appex) are deliberately out of scope: both require a SIGNED,
@@ -24,6 +25,8 @@
 
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(target_os = "macos")]
+pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
@@ -72,13 +75,20 @@ pub fn create(helper: HelperCommand) -> Result<Vec<Box<dyn MenuSurface>>, Unsupp
         })?;
         Ok(linux::surfaces(&data_home, helper))
     }
+    #[cfg(target_os = "macos")]
+    {
+        let services = macos::services_dir().ok_or_else(|| {
+            Unsupported::new("HOME is not set: nowhere to write a workflow the system would read")
+        })?;
+        Ok(macos::surfaces(&services, helper))
+    }
     #[cfg(target_os = "windows")]
     {
         // Nothing to resolve up front: the registry root is fixed, and the Send to
         // folder is asked for by the surface itself.
         Ok(windows::surfaces(helper))
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = helper;
         Err(Unsupported::new(
@@ -132,7 +142,21 @@ mod tests {
         );
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    /// And macOS: one surface, because a single `NSSendFileTypes` of `public.item`
+    /// covers files and folders alike (measured — see [`macos`]), where Windows needs
+    /// a cascade for each.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_offers_the_services_surface() {
+        let surfaces = create(helper(std::path::PathBuf::from(
+            "/Applications/UniversalLink.app/universallink-menu",
+        )))
+        .expect("surfaces");
+        let names: Vec<&str> = surfaces.iter().map(|s| s.name()).collect();
+        assert_eq!(names, ["macos-services"]);
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     #[test]
     fn a_platform_without_a_surface_says_so() {
         assert!(create(helper(std::path::PathBuf::from("/opt/menu"))).is_err());

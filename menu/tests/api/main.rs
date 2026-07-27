@@ -8,6 +8,9 @@ mod clicks;
 /// The real desktop artifacts, and the command lines the file managers run.
 #[cfg(target_os = "linux")]
 mod linux;
+/// Same, for the Automator workflows the Services menu runs.
+#[cfg(target_os = "macos")]
+mod macos;
 mod manager;
 mod support;
 /// Same, for the registry cascade and the "Send to" shortcuts.

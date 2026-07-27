@@ -41,9 +41,22 @@
 //! Brick 1 was the manager, the channel and the seam; brick 2 the Linux surfaces
 //! ([`os::linux`]: KDE ServiceMenus for Dolphin, Nautilus scripts); brick 3 the
 //! Windows ones ([`os::windows`]: the classic shortcut menu's cascade, for files and
-//! for folders, plus one "Send to" shortcut per device). All are frozen by
-//! `tests/api/` against a real Core — down to running the courier binary from the
-//! command line the artifacts actually carry. Brick 4 adds the macOS Quick Actions.
+//! for folders, plus one "Send to" shortcut per device); brick 4 the macOS one
+//! ([`os::macos`]: one Automator workflow per device in `~/Library/Services`, shown
+//! in Finder's Services submenu). All are frozen by `tests/api/` against a real Core
+//! — down to running the courier from the command line the artifacts actually carry.
+//! Every OS now has a surface, so [`os::create`] reports [`os::Unsupported`] only on
+//! a platform this project does not ship to.
+//!
+//! Brick 4 is where the escaping obligation got its fourth answer, and the first that
+//! is TWO answers at once: the command line is a shell script *inside* a plist
+//! string, so brick 2's single-quoting runs first and XML escaping wraps it. It also
+//! contributed the only surface whose label the system itself resolves by — two
+//! devices with one name are not merely confusing there, they are ambiguous to macOS
+//! — and the only one that TELLS the OS it changed (`NSUpdateDynamicServices`), which
+//! buys immediacy rather than correctness: macOS follows the directory by itself in
+//! about seven seconds, and those are seconds in which a menu offers an entry whose
+//! click does nothing.
 //!
 //! Brick 3 is also where a click stopped being one process. The Windows classic menu
 //! invokes a verb ONCE PER SELECTED FILE, so one gesture arrives as a burst of
@@ -61,8 +74,8 @@
 //!   started that way may have no standard handles at all — where `println!` panics.
 //!
 //! Brick 2 is where the component stopped being inert, so the four packaging
-//! obligations are DONE for Linux and Windows, and each remaining brick has to
-//! extend them, or it ships a surface nothing launches:
+//! obligations below are DONE for all three platforms — a surface that skips one
+//! ships as something nothing launches:
 //! 1. the tuple in `official_components()` (`daemon/src/supervisor.rs`) — add the
 //!    `#[cfg(target_os = …)]` push for the new platform;
 //! 2. three things in `.github/workflows/release.yml` — the `cargo build` step,
@@ -75,8 +88,10 @@
 //!    done: the GUI copies the Core out of the AppImage mount and the supervisor
 //!    then looks for siblings next to that copy, so a sidecar missing from this
 //!    list is never launched on a real Linux install;
-//! 4. any build-time system library, in BOTH `ci.yml` and `release.yml`. Linux
-//!    needed none — its surfaces are plain files under `$XDG_DATA_HOME`.
+//! 4. any build-time system library, in BOTH `ci.yml` and `release.yml`. None of the
+//!    three needed one: Linux writes plain files under `$XDG_DATA_HOME`, Windows uses
+//!    the registry and COM, and macOS links AppKit — a framework every macOS has, and
+//!    nothing a runner has to install.
 //!
 //! Nothing cross-checks those lists — a component absent from an installer is
 //! logged at INFO and silently does nothing.

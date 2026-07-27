@@ -17,9 +17,11 @@ publish = false
 #
 # lib + bin, like the tray and the clipboard backend: the OS-agnostic
 # orchestrator (target computation, the local channel, the exit conditions)
-# lives in the lib and is frozen by tests/api/ against a real Core. The Linux
-# surfaces (KDE ServiceMenus for Dolphin, Nautilus scripts) are in; the Windows
-# cascade + Send to and the macOS Quick Actions land in the next bricks.
+# lives in the lib and is frozen by tests/api/ against a real Core. All three
+# platforms have a surface: KDE ServiceMenus + Nautilus scripts on Linux, the
+# shortcut-menu cascade + "Send to" on Windows, and one Automator workflow per
+# device in ~/Library/Services on macOS. That last one needs no dependency —
+# AppKit is reached through a single `extern "C"` for NSUpdateDynamicServices.
 
 [[bin]]
 name = "universallink-menu"

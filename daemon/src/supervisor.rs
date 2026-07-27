@@ -251,12 +251,12 @@ pub fn official_components() -> Vec<ChildSpec> {
             "transfers.read",
         ],
     ));
-    // The contextual menu, on the platforms where it has a surface — Linux for
-    // now (KDE ServiceMenus + Nautilus scripts), Windows and macOS with the bricks
-    // after it. Registering it where it has none would relaunch a process that
-    // exits immediately, for ever. It reads the session (an entry must not be
-    // offered while the Core is offline: the directory it serves from cache would
-    // have us point at unreachable devices), the devices, and sends on a click.
+    // The contextual menu, on the platforms where it has a surface: Linux (KDE
+    // ServiceMenus + Nautilus scripts), Windows and macOS. Registering it where it
+    // has none would relaunch a process that exits immediately, for ever. It reads
+    // the session (an entry must not be offered while the Core is offline: the
+    // directory it serves from cache would have us point at unreachable devices),
+    // the devices, and sends on a click.
     #[cfg(target_os = "linux")]
     official.push((
         "universallink-menu",
@@ -266,6 +266,14 @@ pub fn official_components() -> Vec<ChildSpec> {
     // Windows (brick 3): the same rights, for the classic shortcut menu's cascade
     // and the "Send to" shortcuts.
     #[cfg(target_os = "windows")]
+    official.push((
+        "universallink-menu",
+        "menu-backend",
+        &["session.read", "devices.read", "files.send"],
+    ));
+    // macOS (brick 4): the same rights again, for the Automator workflows in
+    // `~/Library/Services` that Finder shows as Quick Actions.
+    #[cfg(target_os = "macos")]
     official.push((
         "universallink-menu",
         "menu-backend",
