@@ -38,15 +38,30 @@
 //!
 //! # Bricks
 //!
-//! Brick 1 was the manager, the channel and the seam; brick 2 is the Linux
-//! surfaces ([`os::linux`]: KDE ServiceMenus for Dolphin, Nautilus scripts). Both
-//! are frozen by `tests/api/` against a real Core — the Linux part down to running
-//! the courier binary from the command line the artifacts actually carry. Bricks 3
-//! and 4 add the Windows (`HKCU\…\shell` cascade + Send to) and macOS (Quick
-//! Actions) surfaces.
+//! Brick 1 was the manager, the channel and the seam; brick 2 the Linux surfaces
+//! ([`os::linux`]: KDE ServiceMenus for Dolphin, Nautilus scripts); brick 3 the
+//! Windows ones ([`os::windows`]: the classic shortcut menu's cascade, for files and
+//! for folders, plus one "Send to" shortcut per device). All are frozen by
+//! `tests/api/` against a real Core — down to running the courier binary from the
+//! command line the artifacts actually carry. Brick 4 adds the macOS Quick Actions.
 //!
-//! Brick 2 is also where the component stopped being inert, so the four
-//! packaging obligations are now DONE for Linux and each remaining brick has to
+//! Brick 3 is also where a click stopped being one process. The Windows classic menu
+//! invokes a verb ONCE PER SELECTED FILE, so one gesture arrives as a burst of
+//! couriers; `clicks` batches them into a single `files.send` (and the batching runs
+//! on every platform, so every CI job exercises it). The other two things that brick
+//! taught the component:
+//! - **the escaping obligation has a third answer.** A registry value is a counted
+//!   string, so nothing can break out of one — but the shell reads `&` in a label as
+//!   a mnemonic and a leading `@` as a resource reference, and it substitutes field
+//!   codes (`%1`, `%V`) in a command line before any program sees it. And on the same
+//!   platform, the "Send to" label is a FILE NAME again, which is the Nautilus
+//!   answer with Windows' rules. See [`os::windows`].
+//! - **the courier is a GUI-subsystem binary** (`main.rs`): a console-subsystem
+//!   process started by Explorer flashes a console window at every click, and one
+//!   started that way may have no standard handles at all — where `println!` panics.
+//!
+//! Brick 2 is where the component stopped being inert, so the four packaging
+//! obligations are DONE for Linux and Windows, and each remaining brick has to
 //! extend them, or it ships a surface nothing launches:
 //! 1. the tuple in `official_components()` (`daemon/src/supervisor.rs`) — add the
 //!    `#[cfg(target_os = …)]` push for the new platform;
@@ -80,6 +95,7 @@
 
 pub mod applier;
 pub mod channel;
+mod clicks;
 mod orchestrator;
 pub mod os;
 pub mod surface;

@@ -14,6 +14,20 @@
 //!   desktop by hand, and the same request a future family-B shim will make.
 //!
 //! All the testable logic lives in the lib; this is wiring.
+//!
+//! # Why this is a GUI-subsystem binary on Windows
+//!
+//! Because a click starts it. Explorer launches a verb's command line with no
+//! console of its own, so a console-subsystem process gets a brand-new console —
+//! and a black window flashes on screen at every single click. The supervised
+//! components do not have this problem (they inherit the Core's windowless
+//! console); a process the shell starts does.
+//!
+//! The consequence is that this process may have NO standard handles at all, and
+//! `println!` panics when it cannot write. Hence [`say`] and [`note`] below: a
+//! courier's job is to deliver a click, not to report on it.
+
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -37,6 +51,25 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const ROLE: &str = "menu-backend";
 const SCOPES: [&str; 3] = ["session.read", "devices.read", "files.send"];
 const TOPICS: [&str; 2] = ["session", "devices"];
+
+/// Writes a line to standard output, or nowhere. See the module header: a process
+/// the shell started may have no standard handles, and `println!` panics on a write
+/// it cannot do.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+
+/// Same, for standard error — which is where the supervisor collects a component's
+/// log, and where a hand-run courier reports a refusal.
+macro_rules! note {
+    ($($arg:tt)*) => {{
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
 
 enum Mode {
     Manager,
@@ -66,7 +99,7 @@ fn main() {
         match arg.into_string() {
             Ok(arg) => args.push(arg),
             Err(bad) => {
-                eprintln!(
+                note!(
                     "[universallink-menu] argument is not valid UTF-8: {}",
                     bad.display()
                 );
@@ -77,8 +110,8 @@ fn main() {
     let args = match parse_args(&args) {
         Ok(args) => args,
         Err(message) => {
-            eprintln!("[universallink-menu] {message}");
-            eprintln!("{USAGE}");
+            note!("[universallink-menu] {message}");
+            note!("{USAGE}");
             std::process::exit(2);
         }
     };
@@ -162,7 +195,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                 i = args.len();
             }
             "--help" | "-h" => {
-                println!("{USAGE}");
+                say!("{USAGE}");
                 std::process::exit(0);
             }
             other => return Err(format!("unexpected argument: {other}")),
@@ -194,7 +227,7 @@ async fn courier(args: Args) -> i32 {
     let path = match channel_path(args.channel) {
         Ok(path) => path,
         Err(message) => {
-            eprintln!("[universallink-menu] {message}");
+            note!("[universallink-menu] {message}");
             return 1;
         }
     };
@@ -204,12 +237,12 @@ async fn courier(args: Args) -> i32 {
             let paths = match absolute_paths(paths) {
                 Ok(paths) => paths,
                 Err(message) => {
-                    eprintln!("[universallink-menu] {message}");
+                    note!("[universallink-menu] {message}");
                     return 1;
                 }
             };
             if paths.is_empty() {
-                eprintln!("[universallink-menu] nothing to send");
+                note!("[universallink-menu] nothing to send");
                 return 1;
             }
             Request::Send { device_id, paths }
@@ -218,21 +251,21 @@ async fn courier(args: Args) -> i32 {
     };
     match channel::request(&path, &request).await {
         Ok(Response::Accepted { transfer_id }) => {
-            println!("{transfer_id}");
+            say!("{transfer_id}");
             0
         }
         Ok(Response::Targets(targets)) => {
             for target in targets {
-                println!("{}\t{}\t{}", target.device_id, target.name, target.platform);
+                say!("{}\t{}\t{}", target.device_id, target.name, target.platform);
             }
             0
         }
         Ok(Response::Failed { error }) => {
-            eprintln!("[universallink-menu] refused: {error}");
+            note!("[universallink-menu] refused: {error}");
             1
         }
         Err(message) => {
-            eprintln!("[universallink-menu] {message}");
+            note!("[universallink-menu] {message}");
             1
         }
     }
@@ -276,7 +309,7 @@ fn absolute_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, String> {
 
 async fn manager(channel_override: Option<PathBuf>) -> i32 {
     let Ok(ipc_path) = std::env::var(IPC_PATH_ENV) else {
-        eprintln!(
+        note!(
             "[universallink-menu] {IPC_PATH_ENV} is not set: the manager is launched by the Core"
         );
         return 1;
@@ -284,14 +317,14 @@ async fn manager(channel_override: Option<PathBuf>) -> i32 {
     let program = match std::env::current_exe() {
         Ok(program) => program,
         Err(e) => {
-            eprintln!("[universallink-menu] cannot resolve our own path: {e}");
+            note!("[universallink-menu] cannot resolve our own path: {e}");
             return 1;
         }
     };
     let path = match channel_path(channel_override.clone()) {
         Ok(path) => path,
         Err(message) => {
-            eprintln!("[universallink-menu] {message}");
+            note!("[universallink-menu] {message}");
             return 1;
         }
     };
@@ -310,7 +343,7 @@ async fn manager(channel_override: Option<PathBuf>) -> i32 {
         Err(e) => {
             // Not a failure: this platform has no surface yet (or no desktop).
             // Exiting 0 tells the supervisor we are done, not broken.
-            eprintln!("[universallink-menu] {e}");
+            note!("[universallink-menu] {e}");
             return 0;
         }
     };
@@ -318,11 +351,11 @@ async fn manager(channel_override: Option<PathBuf>) -> i32 {
     let listener = match channel::bind(&path) {
         Ok(listener) => listener,
         Err(channel::BindError::AlreadyRunning) => {
-            eprintln!("[universallink-menu] another manager already owns the local channel");
+            note!("[universallink-menu] another manager already owns the local channel");
             return 0;
         }
         Err(e) => {
-            eprintln!("[universallink-menu] {e}");
+            note!("[universallink-menu] {e}");
             return 1;
         }
     };
@@ -337,7 +370,7 @@ async fn manager(channel_override: Option<PathBuf>) -> i32 {
     match stdin.read_line(&mut token).await {
         Ok(_) if !token.trim().is_empty() => {}
         _ => {
-            eprintln!("[universallink-menu] no spawn token on standard input");
+            note!("[universallink-menu] no spawn token on standard input");
             return 1;
         }
     }

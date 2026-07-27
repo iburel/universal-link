@@ -3,11 +3,12 @@
 
 //! Per-OS surface construction.
 //!
-//! Linux is here (brick 2): a KDE ServiceMenu for Dolphin and Nautilus scripts.
-//! Windows (the classic `HKCU\…\shell` cascade + Send to) and macOS (Quick
-//! Actions in `~/Library/Services`) land in the bricks after it. Each is family A
-//! — an artifact on disk or in the registry that a normal process rewrites, whose
-//! command line starts our `--send` helper.
+//! Linux (brick 2) has a KDE ServiceMenu for Dolphin and Nautilus scripts; Windows
+//! (brick 3) has the classic `HKCU\…\shell` cascade — twice, for files and for
+//! folders — and one "Send to" shortcut per device. macOS (Quick Actions in
+//! `~/Library/Services`) lands in the brick after. Each is family A — an artifact
+//! on disk or in the registry that a normal process rewrites, whose command line
+//! starts our `--send` helper.
 //!
 //! The family-B surfaces (the Windows 11 main menu's `IExplorerCommand` COM DLL,
 //! a FinderSync appex) are deliberately out of scope: both require a SIGNED,
@@ -23,6 +24,8 @@
 
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(target_os = "windows")]
+pub mod windows;
 
 use crate::surface::{HelperCommand, MenuSurface};
 
@@ -51,25 +54,31 @@ impl std::error::Error for Unsupported {}
 /// together: they render the same target list, and one failing does not silence
 /// the others.
 pub fn create(helper: HelperCommand) -> Result<Vec<Box<dyn MenuSurface>>, Unsupported> {
+    // A menu entry is a command line kept on disk: a path that cannot be written as
+    // text cannot be named in one, and writing it lossily would bake in a command
+    // line pointing at a file that does not exist — a menu whose every entry fails
+    // silently. Refused up front instead, once, rather than by each surface on every
+    // apply.
+    if helper.program.to_str().is_none() {
+        return Err(Unsupported::new(format!(
+            "our own path is not valid UTF-8, so no menu entry can name it: {}",
+            helper.program.display()
+        )));
+    }
     #[cfg(target_os = "linux")]
     {
-        // A menu entry is a line of text in a `.desktop` file: a path that is not
-        // valid UTF-8 cannot be written into one, and writing it lossily would
-        // bake in a command line pointing at a file that does not exist — a menu
-        // whose every entry fails silently. Refused up front instead, once, rather
-        // than by each surface on every apply.
-        if helper.program.to_str().is_none() {
-            return Err(Unsupported::new(format!(
-                "our own path is not valid UTF-8, so no menu entry can name it: {}",
-                helper.program.display()
-            )));
-        }
         let data_home = linux::data_home().ok_or_else(|| {
             Unsupported::new("neither XDG_DATA_HOME nor HOME is set: nowhere to write a menu entry")
         })?;
         Ok(linux::surfaces(&data_home, helper))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        // Nothing to resolve up front: the registry root is fixed, and the Send to
+        // folder is asked for by the surface itself.
+        Ok(windows::surfaces(helper))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = helper;
         Err(Unsupported::new(
@@ -103,7 +112,27 @@ mod tests {
         assert_eq!(names, ["kde-servicemenu", "nautilus-scripts"]);
     }
 
-    #[cfg(not(target_os = "linux"))]
+    /// Same, for Windows: three surfaces, and the Send to one is only there when
+    /// its folder resolves — which on any real session it does.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_offers_both_cascades_and_send_to() {
+        let surfaces = create(helper(std::path::PathBuf::from(
+            r"C:\Program Files\UL\universallink-menu.exe",
+        )))
+        .expect("surfaces");
+        let names: Vec<&str> = surfaces.iter().map(|s| s.name()).collect();
+        assert_eq!(
+            names,
+            [
+                "windows-cascade-files",
+                "windows-cascade-folders",
+                "windows-send-to"
+            ]
+        );
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     #[test]
     fn a_platform_without_a_surface_says_so() {
         assert!(create(helper(std::path::PathBuf::from("/opt/menu"))).is_err());
@@ -112,7 +141,7 @@ mod tests {
     /// A menu entry is a line of text: our own path has to be expressible in one.
     /// Refused here rather than written lossily, which would bake in a command line
     /// naming a file that does not exist — every click failing, silently.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn a_program_path_that_is_not_utf8_is_refused() {
         use std::os::unix::ffi::OsStrExt;

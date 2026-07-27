@@ -50,20 +50,38 @@ universallink-paths = { path = "../paths" }
 libc = "0.2"
 
 # Named-pipe DACL (the current user's SID) + client pid for the local channel,
-# again mirroring core/src/transport.rs. Same crate and version as the Core and
-# the clipboard backend already pull, so no new package in the lock.
+# again mirroring core/src/transport.rs, plus the registry calls the shortcut-menu
+# cascade is made of (brick 3). Same crate and version as the Core and the
+# clipboard backend already pull, so no new package in the lock.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_System_Pipes",
+    "Win32_System_Registry",
     "Win32_System_Threading",
+] }
+# The "Send to" surface writes `.lnk` files, and a `.lnk` is a COM object
+# (`ShellLink` + `IShellLinkW` + `IPersistFile`) — vtable calls, which `windows-sys`
+# does not generate. Hence the typed crate for that one surface, at the SAME version
+# the clipboard backend already pulls (see its Cargo.toml on why `windows` and
+# `windows-core` must move in lockstep): no new package enters the lock, only a new
+# edge to one that is already there.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",          # RPC_E_CHANGED_MODE (the apartment already set otherwise)
+    "Win32_System_Com",          # CoInitializeEx/CoCreateInstance/IPersistFile/STGM
+    "Win32_UI_Shell",            # ShellLink/IShellLinkW, SHGetKnownFolderPath/FOLDERID_SendTo
+    "Win32_Storage_FileSystem",  # IShellLinkW::GetPath takes a WIN32_FIND_DATAW out-param
 ] }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["full"] }
+# `test-util` for the click batching: it is a timing component (a quiet window and
+# a hard cap), and virtual time proves what it does deterministically instead of
+# racing real sleeps against a loaded CI runner. Test-only, and it adds no package
+# to the lock — the feature is internal to tokio.
+tokio = { version = "1", features = ["full", "test-util"] }
 universallink-core = { path = "../core" }
 # The integration suite runs the manager against a REAL Core connected to a
 # REAL server, so a harness device can be enrolled, brought online, and given a
@@ -71,3 +89,10 @@ universallink-core = { path = "../core" }
 # click on genuine device records rather than hand-written JSON.
 universallink-server = { path = "../server" }
 universallink-test-support = { path = "../test-support" }
+
+# `CommandLineToArgvW`: the REAL parser every program the shell starts uses, as the
+# oracle for the command lines we write into a registry verb and into a shortcut —
+# not a second implementation of the quoting rules, but the implementation. Test
+# only; the surfaces themselves never parse a command line.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell"] }

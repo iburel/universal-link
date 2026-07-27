@@ -132,6 +132,10 @@ pub mod error {
     pub const NO_SUCH_TARGET: &str = "NO_SUCH_TARGET";
     /// The manager has no usable connection to the Core.
     pub const CORE_UNREACHABLE: &str = "CORE_UNREACHABLE";
+    /// The manager is shutting down: the click arrived while it was tearing its
+    /// entries down. Answered rather than left hanging, so the courier exits now
+    /// instead of waiting out its own timeout.
+    pub const STOPPING: &str = "STOPPING";
 }
 
 impl Request {

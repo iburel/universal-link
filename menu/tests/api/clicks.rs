@@ -4,6 +4,8 @@
 //! What happens when a menu entry is clicked: the courier's request, and
 //! everything the manager refuses.
 
+use std::path::PathBuf;
+
 use serde_json::json;
 use universallink_menu::channel::{Response, error};
 
@@ -62,6 +64,77 @@ async fn a_click_sends_exactly_the_selected_files_to_exactly_the_clicked_device(
         TransferWatcher::manifest_names(&started),
         ["notes.txt", "b.txt"],
         "the manifest must be exactly the selection"
+    );
+}
+
+/// One gesture must be ONE transfer, and this is the test that says so with the
+/// real binary: five couriers started at once, each carrying a single file, which is
+/// exactly what the Windows classic shortcut menu does with a five-file selection.
+/// Without the batching this would be five transfers — five notifications and five
+/// history entries on the receiving PC for one right click.
+///
+/// It runs everywhere on purpose. The behaviour it protects is Windows', but the
+/// suite that exercises it is the Linux one, and on Windows it also happens to be
+/// the only test that puts several couriers on the named pipe at once — the case
+/// where a single listening instance means the losers must wait and retry.
+#[tokio::test]
+async fn one_gesture_is_one_transfer_even_when_the_shell_starts_a_process_per_file() {
+    let server = TestServer::start().await;
+    let core = TestCore::start(&server).await;
+    let code = login(&core).await;
+    let mut watcher = TransferWatcher::connect(&core).await;
+    let manager = Manager::start(&core).await;
+
+    let peer = server.attested_peer(&code, "PC-B", "linux").await;
+    manager.await_targets(&[&peer.device_id]).await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let files: Vec<PathBuf> = (0..5)
+        .map(|i| a_file(dir.path(), &format!("f{i}.txt")))
+        .collect();
+
+    let mut couriers = tokio::task::JoinSet::new();
+    for file in &files {
+        let channel = manager.channel_path().to_path_buf();
+        let device_id = peer.device_id.clone();
+        let file = file.clone();
+        couriers.spawn(async move { run_courier(&channel, &device_id, &[file]).await });
+    }
+
+    // Every courier must succeed, and they must all be told the same transfer —
+    // the one their gesture produced.
+    let mut ids = Vec::new();
+    for output in couriers.join_all().await {
+        assert!(
+            output.status.success(),
+            "a courier failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        ids.push(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    }
+    assert_eq!(ids.len(), 5);
+    assert!(
+        ids.iter().all(|id| *id == ids[0] && id.starts_with("t_")),
+        "the couriers of one gesture must report one transfer: {ids:?}"
+    );
+
+    let started = watcher.started().await;
+    assert_eq!(started["transfer_id"].as_str(), Some(ids[0].as_str()));
+    assert_eq!(started["device_id"].as_str(), Some(peer.device_id.as_str()));
+    let mut names = TransferWatcher::manifest_names(&started);
+    names.sort();
+    assert_eq!(
+        names,
+        ["f0.txt", "f1.txt", "f2.txt", "f3.txt", "f4.txt"],
+        "every selected file must be in the one manifest"
+    );
+
+    // And nothing else was started: the other four clicks did not each become a
+    // transfer of their own.
+    assert_eq!(
+        watcher.another_within(SILENCE_WINDOW).await,
+        None,
+        "one gesture produced more than one transfer"
     );
 }
 

@@ -7247,6 +7247,7 @@ dependencies = [
  "universallink-paths",
  "universallink-server",
  "universallink-test-support",
+ "windows 0.62.2",
  "windows-sys 0.61.2",
 ]
 

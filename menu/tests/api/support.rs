@@ -567,6 +567,26 @@ impl TransferWatcher {
         wait_notification(&mut self.events, "transfer.started").await
     }
 
+    /// Whether ANOTHER `transfer.started` shows up within `window`. What proves a
+    /// gesture did not become several transfers — an assertion no shape of a reply
+    /// could make.
+    pub async fn another_within(&mut self, window: Duration) -> Option<Value> {
+        let deadline = tokio::time::Instant::now() + window;
+        loop {
+            match tokio::time::timeout_at(deadline, self.events.recv()).await {
+                Ok(Some(Event::Notification { method, params }))
+                    if method == "transfer.started" =>
+                {
+                    return Some(params);
+                }
+                // A failure notification is expected here: the harness peer is not
+                // a real data-plane endpoint.
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => return None,
+            }
+        }
+    }
+
     /// The basenames the Core froze into the manifest, in order.
     pub fn manifest_names(started: &Value) -> Vec<String> {
         started["files"]
@@ -609,6 +629,33 @@ pub async fn try_raw_exchange(path: &Path, line: &str) -> Option<String> {
         _ if !reply.is_empty() => Some(reply),
         _ => None,
     }
+}
+
+/// Runs the REAL courier binary, exactly as a menu entry invokes it: the same
+/// executable, the same argument grammar, pointed at this manager's channel.
+///
+/// `tokio::process`, never `std::process`: these tests run on a single-threaded
+/// runtime, and blocking it would stop the in-process manager from ever answering
+/// the courier it is waiting for.
+pub async fn run_courier(
+    channel: &Path,
+    device_id: &str,
+    paths: &[PathBuf],
+) -> std::process::Output {
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_universallink-menu"));
+    command
+        .arg("--channel")
+        .arg(channel)
+        .arg("--send")
+        .arg(device_id)
+        .arg("--");
+    for path in paths {
+        command.arg(path);
+    }
+    tokio::time::timeout(RESPONSE_TIMEOUT, command.output())
+        .await
+        .expect("the courier did not finish in time")
+        .expect("the courier could not be started")
 }
 
 /// A file the harness can legitimately ask to send.

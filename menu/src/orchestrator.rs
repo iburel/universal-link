@@ -21,6 +21,7 @@
 //! request is therefore never queued behind a 10 s request timeout.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,6 +30,7 @@ use tokio::sync::{mpsc, watch};
 use universallink_ipc_client::{Client, Event, RequestError};
 
 use crate::channel::{self, Listener, Request, Response, Stream, error};
+use crate::clicks::Clicks;
 use crate::surface::{MenuSurface, Target};
 use crate::targets::Directory;
 
@@ -414,6 +416,14 @@ async fn serve(
     client: Client,
     mut targets: watch::Receiver<Arc<[Target]>>,
 ) {
+    // One gesture must be one transfer, whatever number of processes the shell
+    // chose to start for it — see `clicks`. The batching task lives exactly as
+    // long as this loop and the courier tasks it spawns: when they are gone,
+    // nobody is waiting on a batch.
+    let (clicks, _batching) = Clicks::spawn(Arc::new(move |device_id, paths| {
+        let client = client.clone();
+        Box::pin(async move { send_files(&client, device_id, paths).await })
+    }));
     let mut couriers = tokio::task::JoinSet::new();
     loop {
         // Bounded concurrency: a Windows multi-select can start one process per
@@ -429,7 +439,7 @@ async fn serve(
             _ = stopped => return,
             accepted = listener.accept() => match accepted {
                 Ok(stream) => {
-                    couriers.spawn(handle(stream, client.clone(), targets.clone()));
+                    couriers.spawn(handle(stream, clicks.clone(), targets.clone()));
                 }
                 Err(e) => {
                     eprintln!("[universallink-menu] cannot accept a click: {e}");
@@ -441,9 +451,9 @@ async fn serve(
 }
 
 /// Serves one courier: read its request, answer it, hang up.
-async fn handle(mut stream: Stream, client: Client, targets: watch::Receiver<Arc<[Target]>>) {
+async fn handle(mut stream: Stream, clicks: Clicks, targets: watch::Receiver<Arc<[Target]>>) {
     let response = match channel::read_request(&mut stream).await {
-        Ok(request) => act(request, &client, &targets).await,
+        Ok(request) => act(request, &clicks, &targets).await,
         Err(code) => Response::failed(code),
     };
     channel::write_response(&mut stream, &response).await;
@@ -451,7 +461,7 @@ async fn handle(mut stream: Stream, client: Client, targets: watch::Receiver<Arc
 
 async fn act(
     request: Request,
-    client: &Client,
+    clicks: &Clicks,
     targets: &watch::Receiver<Arc<[Target]>>,
 ) -> Response {
     match request {
@@ -463,30 +473,36 @@ async fn act(
             if !targets.borrow().iter().any(|t| t.device_id == device_id) {
                 return Response::failed(error::NO_SUCH_TARGET);
             }
-            let mut list = Vec::with_capacity(paths.len());
-            for path in &paths {
-                match path.to_str() {
-                    Some(path) => list.push(path),
-                    None => return Response::failed(error::NON_UTF8_PATH),
-                }
+            // Checked HERE, per courier, and not once the batch is assembled: a
+            // path this process cannot express must cost its own click and not
+            // the whole gesture's.
+            if paths.iter().any(|path| path.to_str().is_none()) {
+                return Response::failed(error::NON_UTF8_PATH);
             }
-            let params = json!({ "device_id": device_id, "paths": list });
-            match client.request("files.send", params).await {
-                Ok(result) => match result["transfer_id"].as_str() {
-                    Some(transfer_id) => Response::Accepted {
-                        transfer_id: transfer_id.to_string(),
-                    },
-                    None => Response::failed(error::BAD_REQUEST),
-                },
-                // The Core's own application code, relayed verbatim: the courier
-                // logs it, and a human reading the log sees DEVICE_OFFLINE
-                // rather than a code we invented.
-                Err(RequestError::Rpc(e)) => Response::Failed {
-                    error: e.data_code.unwrap_or_else(|| format!("RPC_{}", e.code)),
-                },
-                Err(_) => Response::failed(error::CORE_UNREACHABLE),
-            }
+            clicks.submit(device_id, paths).await
         }
+    }
+}
+
+/// One `files.send`, for a whole batch of clicks.
+async fn send_files(client: &Client, device_id: String, paths: Vec<PathBuf>) -> Response {
+    // Every path was checked for this on the way in.
+    let list: Vec<&str> = paths.iter().filter_map(|path| path.to_str()).collect();
+    let params = json!({ "device_id": device_id, "paths": list });
+    match client.request("files.send", params).await {
+        Ok(result) => match result["transfer_id"].as_str() {
+            Some(transfer_id) => Response::Accepted {
+                transfer_id: transfer_id.to_string(),
+            },
+            None => Response::failed(error::BAD_REQUEST),
+        },
+        // The Core's own application code, relayed verbatim: the courier logs it,
+        // and a human reading the log sees DEVICE_OFFLINE rather than a code we
+        // invented.
+        Err(RequestError::Rpc(e)) => Response::Failed {
+            error: e.data_code.unwrap_or_else(|| format!("RPC_{}", e.code)),
+        },
+        Err(_) => Response::failed(error::CORE_UNREACHABLE),
     }
 }
 

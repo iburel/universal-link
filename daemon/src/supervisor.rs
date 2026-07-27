@@ -263,6 +263,14 @@ pub fn official_components() -> Vec<ChildSpec> {
         "menu-backend",
         &["session.read", "devices.read", "files.send"],
     ));
+    // Windows (brick 3): the same rights, for the classic shortcut menu's cascade
+    // and the "Send to" shortcuts.
+    #[cfg(target_os = "windows")]
+    official.push((
+        "universallink-menu",
+        "menu-backend",
+        &["session.read", "devices.read", "files.send"],
+    ));
 
     let Some(dir) = std::env::current_exe()
         .ok()
