@@ -267,7 +267,11 @@ pub(crate) fn entries(dir: &Path) -> io::Result<Vec<PathBuf>> {
 // ---------------------------------------------------------------------------
 
 /// A `HKEY_CURRENT_USER` subkey, closed when dropped.
-pub(crate) mod registry {
+///
+/// Public for the test suites: the integration one reads back the command line a
+/// cascade wrote and hands it to the shell's own parser, and it needs to sweep the
+/// root it wrote under. Nothing outside this module uses it in production.
+pub mod registry {
     use std::io;
 
     use windows_sys::Win32::Foundation::{

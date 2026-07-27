@@ -10,3 +10,6 @@ mod clicks;
 mod linux;
 mod manager;
 mod support;
+/// Same, for the registry cascade and the "Send to" shortcuts.
+#[cfg(target_os = "windows")]
+mod windows;
