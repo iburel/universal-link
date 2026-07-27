@@ -1,0 +1,9 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
+
+//! Integration suite of the contextual-menu manager, against a real Core and a
+//! real server. One binary so the modules share the harness (see `support`).
+
+mod clicks;
+mod manager;
+mod support;

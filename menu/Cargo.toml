@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
+
+[package]
+name = "universallink-menu"
+version = "0.4.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+# The contextual-menu component: the manager the Core supervises (role
+# `menu-backend`), plus the click helper the OS launches. One binary, two modes
+# — the manager keeps the list of reachable devices and rewrites the per-OS menu
+# surfaces; `--send` is what a menu entry actually invokes, and it only talks to
+# the manager over a private local channel (never to the Core: a process the
+# shell starts with attacker-influenced argv must not hold Core credentials).
+#
+# lib + bin, like the tray and the clipboard backend: the OS-agnostic
+# orchestrator (target computation, the local channel, the exit conditions)
+# lives in the lib and is frozen by tests/api/ against a real Core; the per-OS
+# surfaces land in later bricks (Linux ServiceMenus/Nautilus, Windows cascade +
+# Send to, macOS Quick Actions).
+
+[[bin]]
+name = "universallink-menu"
+path = "src/main.rs"
+
+[dependencies]
+# Request params (`files.send`, `devices.list`), the device records, and the
+# local channel's line protocol.
+serde_json = "1"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-std",
+    "io-util",
+    "net",
+    "sync",
+    "time",
+] }
+universallink-ipc-client = { path = "../client" }
+# Resolves the local channel's path the same way for the manager (which binds
+# it) and the helper (which the shell starts with no UNIVERSALLINK_* in its
+# environment, so it can only rediscover the path by convention).
+universallink-paths = { path = "../paths" }
+
+# Peer verification (uid) on the local channel: the same level-1 check the
+# Core's IPC applies. Mirrors core/src/transport.rs.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Named-pipe DACL (the current user's SID) + client pid for the local channel,
+# again mirroring core/src/transport.rs. Same crate and version as the Core and
+# the clipboard backend already pull, so no new package in the lock.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+universallink-core = { path = "../core" }
+# The integration suite runs the manager against a REAL Core connected to a
+# REAL server, so a harness device can be enrolled, brought online, and given a
+# valid account attestation — the only way to exercise target computation and a
+# click on genuine device records rather than hand-written JSON.
+universallink-server = { path = "../server" }
+universallink-test-support = { path = "../test-support" }
