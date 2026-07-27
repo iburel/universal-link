@@ -396,11 +396,27 @@ pub struct Manager {
 
 impl Manager {
     /// Starts the manager against `core`, with the role and scopes the real
-    /// binary asks for.
+    /// binary asks for, rendering onto a [`FakeSurface`] only.
     pub async fn start(core: &TestCore) -> Manager {
+        Manager::start_with(core, |_| Vec::new()).await
+    }
+
+    /// Starts the manager against `core` with the surfaces `surfaces` builds from
+    /// the channel path it will listen on — which is what a surface needs, since a
+    /// generated artifact has to point a courier at THIS manager.
+    ///
+    /// A [`FakeSurface`] is always appended LAST, so [`Manager::await_targets`]
+    /// stays the synchronization point even for real surfaces: the applier drives
+    /// them in order, so by the time the fake has recorded a list the others have
+    /// already written it to disk.
+    pub async fn start_with(
+        core: &TestCore,
+        surfaces: impl FnOnce(&Path) -> Vec<Box<dyn MenuSurface>>,
+    ) -> Manager {
         let renders = Renders::default();
         let channel_path = channel_path_for(core.dir());
         let listener = channel::bind(&channel_path).expect("bind the local channel");
+        let mut surfaces = surfaces(&channel_path);
 
         let (client, events) = universallink_ipc_client::spawn(ClientConfig {
             ipc_path: core.ipc_path(),
@@ -416,7 +432,7 @@ impl Manager {
         });
 
         let (stop_tx, stop_rx) = oneshot::channel();
-        let surfaces: Vec<Box<dyn MenuSurface>> = vec![Box::new(FakeSurface(renders.clone()))];
+        surfaces.push(Box::new(FakeSurface(renders.clone())));
         let task = tokio::spawn(universallink_menu::run(
             client,
             events,

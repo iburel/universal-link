@@ -34,6 +34,11 @@ pub struct Target {
 pub struct HelperCommand {
     /// Absolute path to our own executable — an entry written into the registry
     /// or a `.desktop` file outlives our process, so it cannot rely on `PATH`.
+    ///
+    /// In production this is `current_exe()`, which on a Linux install is the
+    /// DURABLE copy the GUI staged next to the Core (`STAGED_SIDECARS`), not the
+    /// one on the AppImage's ephemeral mount — an entry naming that mount would
+    /// stop working the moment the app closed.
     pub program: PathBuf,
     /// Inserted before `--send`. Empty in production; a test passes
     /// `--channel <path>` here.

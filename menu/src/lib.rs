@@ -38,25 +38,35 @@
 //!
 //! # Bricks
 //!
-//! This is brick 1: the manager, the channel, and the seam, frozen by
-//! `tests/api/` against a real Core. Bricks 2-4 add the surfaces (Linux, Windows,
-//! macOS). **Each of those must also**, or it ships a binary nothing launches:
-//! 1. add the tuple to `official_components()` (`daemon/src/supervisor.rs`);
-//! 2. add three things to `.github/workflows/release.yml` — the `cargo build`
-//!    step, the `cp` into `gui/binaries` with the target-triple suffix, and the
+//! Brick 1 was the manager, the channel and the seam; brick 2 is the Linux
+//! surfaces ([`os::linux`]: KDE ServiceMenus for Dolphin, Nautilus scripts). Both
+//! are frozen by `tests/api/` against a real Core — the Linux part down to running
+//! the courier binary from the command line the artifacts actually carry. Bricks 3
+//! and 4 add the Windows (`HKCU\…\shell` cascade + Send to) and macOS (Quick
+//! Actions) surfaces.
+//!
+//! Brick 2 is also where the component stopped being inert, so the four
+//! packaging obligations are now DONE for Linux and each remaining brick has to
+//! extend them, or it ships a surface nothing launches:
+//! 1. the tuple in `official_components()` (`daemon/src/supervisor.rs`) — add the
+//!    `#[cfg(target_os = …)]` push for the new platform;
+//! 2. three things in `.github/workflows/release.yml` — the `cargo build` step,
+//!    the `cp` into `gui/binaries` with the target-triple suffix, and the
 //!    `externalBin` entry in the `--config` JSON (NOT in `gui/tauri.conf.json`:
 //!    tauri validates sidecar existence at compile time and would break every
-//!    plain `cargo build`);
-//! 3. add the binary to `STAGED_SIDECARS` (`gui/src/supervise.rs`) — on Linux the
-//!    GUI copies the Core out of the AppImage mount and the supervisor then looks
-//!    for siblings next to that copy, so a sidecar missing from this list is
-//!    never launched on a real Linux install;
-//! 4. add any build-time system library to BOTH `ci.yml` and `release.yml`.
+//!    plain `cargo build`). All three are in place and platform-agnostic, so a
+//!    new surface needs nothing here;
+//! 3. the binary in `STAGED_SIDECARS` (`gui/src/supervise.rs`) — Linux only, and
+//!    done: the GUI copies the Core out of the AppImage mount and the supervisor
+//!    then looks for siblings next to that copy, so a sidecar missing from this
+//!    list is never launched on a real Linux install;
+//! 4. any build-time system library, in BOTH `ci.yml` and `release.yml`. Linux
+//!    needed none — its surfaces are plain files under `$XDG_DATA_HOME`.
 //!
 //! Nothing cross-checks those lists — a component absent from an installer is
 //! logged at INFO and silently does nothing.
 //!
-//! And one obligation that is theirs alone, because escaping has no
+//! And one obligation that stays theirs alone, because escaping has no
 //! format-independent answer: **quote the device NAME for the artifact's own
 //! syntax**. The id baked into the command line is ours (`d_<hex>`, minted by the
 //! server), but the label comes from `devices.rename` — a PC renamed
@@ -64,6 +74,9 @@
 //! broken `Exec=` line in a `.desktop` file, or a mangled registry value. The
 //! label is deliberately NOT sanitized centrally: a legitimate name contains
 //! apostrophes and spaces, and mangling it would corrupt what the user sees.
+//! Brick 2 shows the two answers a surface can give — escaping, where the format
+//! has an escape (Dolphin's `Name=`), and sanitizing, where it has none because
+//! the label IS a file name (Nautilus).
 
 pub mod applier;
 pub mod channel;

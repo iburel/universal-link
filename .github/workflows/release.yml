@@ -141,6 +141,16 @@ jobs:
       - name: Build the clipboard backend (sidecar)
         run: cargo build -p universallink-clipboard --bin universallink-clipboard --release --locked
 
+      # The contextual menu, a fourth sidecar: it writes the "send to PC X" entries
+      # into the file managers' own menus and answers the click. Built and bundled
+      # on all three platforms even though only Linux has a surface today (the
+      # Windows and macOS ones are the next bricks) — on those two it is registered
+      # nowhere, so nothing launches it, and keeping the matrix uniform beats a
+      # per-OS externalBin list. No build-time system library of its own: the
+      # surfaces are plain files under $XDG_DATA_HOME.
+      - name: Build the contextual menu (sidecar)
+        run: cargo build -p universallink-menu --bin universallink-menu --release --locked
+
       # Tauri expects each sidecar named with the target triple, next to the GUI.
       - name: Stage the sidecars
         shell: bash
@@ -152,6 +162,8 @@ jobs:
              "gui/binaries/universallink-tray-${{ matrix.triple }}${{ matrix.bin_ext }}"
           cp "target/release/universallink-clipboard${{ matrix.bin_ext }}" \
              "gui/binaries/universallink-clipboard-${{ matrix.triple }}${{ matrix.bin_ext }}"
+          cp "target/release/universallink-menu${{ matrix.bin_ext }}" \
+             "gui/binaries/universallink-menu-${{ matrix.triple }}${{ matrix.bin_ext }}"
 
       # `externalBin` is injected HERE (and not in tauri.conf.json) so that the
       # `cargo build`/clippy runs in ci.yml don't require the sidecar to be
@@ -161,7 +173,7 @@ jobs:
         shell: bash
         run: |
           cargo tauri build --features webview --bundles ${{ matrix.bundles }} \
-            --config '{"bundle":{"externalBin":["binaries/universallink-core","binaries/universallink-tray","binaries/universallink-clipboard"]}}'
+            --config '{"bundle":{"externalBin":["binaries/universallink-core","binaries/universallink-tray","binaries/universallink-clipboard","binaries/universallink-menu"]}}'
 
       # Always: retrievable from the run (tests the chain without a tag).
       - name: Run artifact

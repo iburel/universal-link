@@ -17,9 +17,9 @@ publish = false
 #
 # lib + bin, like the tray and the clipboard backend: the OS-agnostic
 # orchestrator (target computation, the local channel, the exit conditions)
-# lives in the lib and is frozen by tests/api/ against a real Core; the per-OS
-# surfaces land in later bricks (Linux ServiceMenus/Nautilus, Windows cascade +
-# Send to, macOS Quick Actions).
+# lives in the lib and is frozen by tests/api/ against a real Core. The Linux
+# surfaces (KDE ServiceMenus for Dolphin, Nautilus scripts) are in; the Windows
+# cascade + Send to and the macOS Quick Actions land in the next bricks.
 
 [[bin]]
 name = "universallink-menu"

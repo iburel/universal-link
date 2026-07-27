@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
 
-//! Per-OS surface construction. The real surfaces land one brick per platform:
-//! Linux (KDE ServiceMenus for Dolphin + Nautilus scripts), Windows (the classic
-//! `HKCU\…\shell` cascade + Send to), macOS (Quick Actions in
-//! `~/Library/Services`). Each is family A — an artifact on disk or in the
-//! registry that a normal process rewrites, whose command line starts our
-//! `--send` helper.
+//! Per-OS surface construction.
+//!
+//! Linux is here (brick 2): a KDE ServiceMenu for Dolphin and Nautilus scripts.
+//! Windows (the classic `HKCU\…\shell` cascade + Send to) and macOS (Quick
+//! Actions in `~/Library/Services`) land in the bricks after it. Each is family A
+//! — an artifact on disk or in the registry that a normal process rewrites, whose
+//! command line starts our `--send` helper.
 //!
 //! The family-B surfaces (the Windows 11 main menu's `IExplorerCommand` COM DLL,
 //! a FinderSync appex) are deliberately out of scope: both require a SIGNED,
@@ -14,21 +15,33 @@
 //! They will plug into the manager through the local channel's `targets` pull,
 //! which is why that request already exists.
 //!
-//! Until a platform has a surface, [`create`] reports [`Unsupported`] and `main`
-//! exits cleanly. The component is deliberately NOT registered in the Core's
-//! supervisor while that is the case: a child that exits immediately would be
-//! restarted forever (backing off to one launch a minute), so registration comes
-//! per platform with its surface.
+//! Where [`create`] reports [`Unsupported`], `main` exits 0 at once: there is
+//! nothing this process could do, and nothing for the supervisor to restart. The
+//! component is therefore registered in `official_components()` only on the
+//! platforms that have a surface — a child that exits immediately would otherwise
+//! be relaunched for ever, backing off to one launch a minute.
+
+#[cfg(target_os = "linux")]
+pub mod linux;
 
 use crate::surface::{HelperCommand, MenuSurface};
 
-/// No menu surface is available on this platform yet.
+/// No menu surface could be built here. Not a failure: the caller exits 0.
+///
+/// It carries its reason as text because nothing matches on it — it reaches the
+/// supervisor's log and stops there.
 #[derive(Debug)]
-pub struct Unsupported;
+pub struct Unsupported(String);
+
+impl Unsupported {
+    pub(crate) fn new(reason: impl Into<String>) -> Unsupported {
+        Unsupported(reason.into())
+    }
+}
 
 impl std::fmt::Display for Unsupported {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "no contextual-menu surface on this platform yet")
+        f.write_str(&self.0)
     }
 }
 
@@ -37,6 +50,74 @@ impl std::error::Error for Unsupported {}
 /// Builds the platform's menu surfaces. Every surface a platform has is returned
 /// together: they render the same target list, and one failing does not silence
 /// the others.
-pub fn create(_helper: HelperCommand) -> Result<Vec<Box<dyn MenuSurface>>, Unsupported> {
-    Err(Unsupported)
+pub fn create(helper: HelperCommand) -> Result<Vec<Box<dyn MenuSurface>>, Unsupported> {
+    #[cfg(target_os = "linux")]
+    {
+        // A menu entry is a line of text in a `.desktop` file: a path that is not
+        // valid UTF-8 cannot be written into one, and writing it lossily would
+        // bake in a command line pointing at a file that does not exist — a menu
+        // whose every entry fails silently. Refused up front instead, once, rather
+        // than by each surface on every apply.
+        if helper.program.to_str().is_none() {
+            return Err(Unsupported::new(format!(
+                "our own path is not valid UTF-8, so no menu entry can name it: {}",
+                helper.program.display()
+            )));
+        }
+        let data_home = linux::data_home().ok_or_else(|| {
+            Unsupported::new("neither XDG_DATA_HOME nor HOME is set: nowhere to write a menu entry")
+        })?;
+        Ok(linux::surfaces(&data_home, helper))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = helper;
+        Err(Unsupported::new(
+            "no contextual-menu surface on this platform yet",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn helper(program: std::path::PathBuf) -> HelperCommand {
+        HelperCommand {
+            program,
+            extra_args: vec![],
+        }
+    }
+
+    /// The wiring, not the paths: this reads the real environment, so it only
+    /// constructs the surfaces (it never applies them, which would rewrite the
+    /// developer's own menus). What it pins is that both Linux surfaces are
+    /// reachable from `main` — the surfaces themselves are tested against a
+    /// temporary data home.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_offers_both_surfaces() {
+        let surfaces =
+            create(helper(std::path::PathBuf::from("/opt/universallink-menu"))).expect("surfaces");
+        let names: Vec<&str> = surfaces.iter().map(|s| s.name()).collect();
+        assert_eq!(names, ["kde-servicemenu", "nautilus-scripts"]);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_platform_without_a_surface_says_so() {
+        assert!(create(helper(std::path::PathBuf::from("/opt/menu"))).is_err());
+    }
+
+    /// A menu entry is a line of text: our own path has to be expressible in one.
+    /// Refused here rather than written lossily, which would bake in a command line
+    /// naming a file that does not exist — every click failing, silently.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_program_path_that_is_not_utf8_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let bad = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b"/opt/caf\xe9/menu"));
+        assert!(create(helper(bad)).is_err());
+    }
 }

@@ -5,5 +5,8 @@
 //! real server. One binary so the modules share the harness (see `support`).
 
 mod clicks;
+/// The real desktop artifacts, and the command lines the file managers run.
+#[cfg(target_os = "linux")]
+mod linux;
 mod manager;
 mod support;
