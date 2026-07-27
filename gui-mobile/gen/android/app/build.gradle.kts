@@ -13,6 +13,37 @@ val tauriProperties = Properties().apply {
     }
 }
 
+// Release signing. The keystore and its passwords come from the ENVIRONMENT, never
+// from a file in the tree: release.yml decodes the keystore out of a repository
+// secret into the runner's temp directory (outside the checkout, so no artifact
+// glob can reach it) and exports these four variables. The Tauri template's
+// `keystore.properties` convention is the alternative, and it is worse — it puts
+// the store password in plaintext inside gen/android, gitignored but still on disk
+// and one `git add -f` away from being published.
+//
+// `providers.environmentVariable` and NOT `System.getenv`: the latter reads the
+// GRADLE DAEMON's environment, i.e. whichever client happened to start it. Build
+// once without the variables and the daemon caches their absence, so exporting them
+// and rebuilding would keep quietly producing an unsigned APK. The provider is
+// resolved against this build's own environment and is a tracked build input.
+val signingEnv = listOf(
+    "ANDROID_KEYSTORE_PATH",
+    "ANDROID_KEYSTORE_PASSWORD",
+    "ANDROID_KEY_ALIAS",
+    "ANDROID_KEY_PASSWORD",
+).associateWith { providers.environmentVariable(it).orNull?.takeIf { v -> v.isNotEmpty() } }
+
+// Half a configuration is a misconfiguration, and it MUST NOT degrade to an
+// unsigned build: a mistyped secret name in the workflow would otherwise sail
+// through and ship an unsigned APK. Fail at configuration time instead.
+val signRelease = signingEnv.values.any { it != null }
+if (signRelease) {
+    val missing = signingEnv.filterValues { it == null }.keys
+    require(missing.isEmpty()) {
+        "Release signing is half-configured: set all four of ${signingEnv.keys}, missing $missing"
+    }
+}
+
 android {
     compileSdk = 36
     namespace = "org.universallink.mobile"
@@ -23,6 +54,28 @@ android {
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
+    }
+    signingConfigs {
+        if (signRelease) {
+            create("release") {
+                val keystore = file(signingEnv.getValue("ANDROID_KEYSTORE_PATH")!!)
+                require(keystore.isFile) {
+                    "ANDROID_KEYSTORE_PATH does not point at a file: $keystore"
+                }
+                storeFile = keystore
+                storePassword = signingEnv.getValue("ANDROID_KEYSTORE_PASSWORD")
+                keyAlias = signingEnv.getValue("ANDROID_KEY_ALIAS")
+                keyPassword = signingEnv.getValue("ANDROID_KEY_PASSWORD")
+                // minSdk is 24, which is exactly where the v1 (JAR) scheme stops
+                // being consulted — so keeping it buys nothing and costs: v1 is the
+                // scheme Janus (CVE-2017-13156) attacks, because it signs entries
+                // rather than the file, letting a DEX blob be prepended to a
+                // still-"valid" APK. v2 and v3 cover the archive as a whole.
+                enableV1Signing = false
+                enableV2Signing = true
+                enableV3Signing = true
+            }
+        }
     }
     buildTypes {
         getByName("debug") {
@@ -37,6 +90,13 @@ android {
             }
         }
         getByName("release") {
+            // Left unset when the signing environment is absent — every local build
+            // and ci.yml's release-APK gate. AGP then names the output
+            // `app-universal-release-unsigned.apk` instead of
+            // `app-universal-release.apk`, which is what release.yml's signature
+            // check keys off. It does NOT fall back to the debug key: that fallback
+            // exists for the `debug` buildType alone.
+            if (signRelease) signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = true
             proguardFiles(
                 *fileTree(".") { include("**/*.pro") }
