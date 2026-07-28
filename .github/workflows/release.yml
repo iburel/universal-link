@@ -143,11 +143,12 @@ jobs:
 
       # The contextual menu, a fourth sidecar: it writes the "send to PC X" entries
       # into the file managers' own menus and answers the click. Built and bundled
-      # on all three platforms even though only Linux has a surface today (the
-      # Windows and macOS ones are the next bricks) — on those two it is registered
-      # nowhere, so nothing launches it, and keeping the matrix uniform beats a
-      # per-OS externalBin list. No build-time system library of its own: the
-      # surfaces are plain files under $XDG_DATA_HOME.
+      # on all three platforms, each of which has a surface of its own: KDE
+      # ServiceMenus and Nautilus scripts under $XDG_DATA_HOME, the classic shortcut
+      # menu's cascade plus "Send to" shortcuts under HKCU, Automator workflows in
+      # ~/Library/Services. No build-time system library of its own either: every
+      # surface is a file or a registry value written at runtime, and the Win32 calls
+      # for the shortcuts come from crates the lock already carries.
       - name: Build the contextual menu (sidecar)
         run: cargo build -p universallink-menu --bin universallink-menu --release --locked
 

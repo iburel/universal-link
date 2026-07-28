@@ -205,7 +205,7 @@ async fn run_once(
 
 /// The deployment's official components, looked up next to the Core binary.
 /// The tray is registered on every platform; the clipboard backend is registered
-/// on Linux (X11), Windows, and macOS; the contextual menu on Linux only so far.
+/// on Linux (X11), Windows, and macOS, and so is the contextual menu.
 /// A missing executable is ignored (with a word in the log) — a Core without a
 /// tray is still a working Core.
 ///
@@ -272,7 +272,8 @@ pub fn official_components() -> Vec<ChildSpec> {
         &["session.read", "devices.read", "files.send"],
     ));
     // macOS (brick 4): the same rights again, for the Automator workflows in
-    // `~/Library/Services` that Finder shows as Quick Actions.
+    // `~/Library/Services` that Finder shows in its Services submenu (the inline
+    // Quick Actions row is a bonus the user enables, see `menu::os::macos`).
     #[cfg(target_os = "macos")]
     official.push((
         "universallink-menu",
