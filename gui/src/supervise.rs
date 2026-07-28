@@ -145,6 +145,97 @@ pub fn stabilize_core_path(bundled: &Path) -> PathBuf {
     bundled.to_path_buf()
 }
 
+/// Is `entry` the bundle directory itself, or something inside it?
+///
+/// Compared as a path prefix and not as a substring, so a NEIGHBOURING mount —
+/// `/tmp/.mount_Univer0002` while we are `/tmp/.mount_Univer0001` — is not
+/// mistaken for ours.
+#[cfg(target_os = "linux")]
+fn inside(entry: &str, appdir: &str) -> bool {
+    entry == appdir || entry.starts_with(&format!("{appdir}/"))
+}
+
+/// What to change in the environment of a child that must NOT run against the
+/// AppImage's bundled libraries: `(name, Some(value))` to set, `(name, None)`
+/// to remove. Only the entries that need changing are returned.
+///
+/// linuxdeploy's `AppRun` points a dozen variables at `$APPDIR` so the bundled
+/// GTK finds its own everything — `LD_LIBRARY_PATH`, `GIO_EXTRA_MODULES`,
+/// `GDK_PIXBUF_MODULE_FILE`, `GTK_PATH`, `XDG_DATA_DIRS`, `PATH`… A child that
+/// inherits those loads the bundle's libraries, and the Core we spawn is the
+/// staged copy: it lives OUTSIDE the mount and links against the host's.
+///
+/// Measured, not theorised: on a Debian 13 desktop the tray dlopens the host's
+/// `libayatana-appindicator3.so.1`, which pulls `libayatana-ido3` and wants
+/// `g_once_init_leave_pointer` — a glib 2.80 symbol the bundle's glib (from the
+/// 22.04 build host) does not carry. The dlopen fails, the tray panics, and the
+/// supervisor restarts it about once a second for the rest of the session. The
+/// same mismatch stops the host's gvfs gio module from loading.
+///
+/// The rule is about VALUES, not names: drop every entry that lives under
+/// `$APPDIR`, keep the host's, remove a variable that had nothing else in it.
+/// So there is no list of variable names to keep in step with linuxdeploy's
+/// hooks, and a variable naming no path — `GTK_THEME`, `GDK_BACKEND` — is left
+/// exactly as it is. Empty entries go too: they are the seam of the hook's own
+/// concatenation, and an empty entry in `PATH` means "the current directory".
+///
+/// This applies whether the Core runs from the staged copy or (staging having
+/// failed) from the mount itself: the Core links against no bundled library
+/// either way, and neither do the components it spawns.
+#[cfg(target_os = "linux")]
+fn env_without_bundle_paths<I>(vars: I, appdir: &str) -> Vec<(String, Option<String>)>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    // The runtime's own markers: they describe a bundle the child is not in.
+    // Nothing outside this module reads them.
+    const MARKERS: [&str; 4] = ["APPDIR", "APPIMAGE", "ARGV0", "OWD"];
+
+    let appdir = appdir.trim_end_matches('/');
+    if appdir.is_empty() {
+        return Vec::new(); // not inside an AppImage: nothing to undo
+    }
+    let mut changes = Vec::new();
+    for (name, value) in vars {
+        if MARKERS.contains(&name.as_str()) {
+            changes.push((name, None));
+            continue;
+        }
+        if !value.contains(appdir) {
+            continue; // the bundle never touched this one
+        }
+        let kept: Vec<&str> = value
+            .split(':')
+            .filter(|e| !e.is_empty() && !inside(e, appdir))
+            .collect();
+        if kept.is_empty() {
+            changes.push((name, None));
+        } else {
+            let joined = kept.join(":");
+            if joined != value {
+                changes.push((name, Some(joined)));
+            }
+        }
+    }
+    changes
+}
+
+/// Applies [`env_without_bundle_paths`] to `cmd`. Split from the computation so
+/// a test can read the wiring back off the command (`Command::get_envs`) instead
+/// of mutating the process environment to observe it.
+#[cfg(target_os = "linux")]
+fn scrub_bundle_env<I>(cmd: &mut std::process::Command, vars: I, appdir: &str)
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    for (name, value) in env_without_bundle_paths(vars, appdir) {
+        match value {
+            Some(v) => cmd.env(name, v),
+            None => cmd.env_remove(name),
+        };
+    }
+}
+
 /// Launches the Core in the background. Non-blocking and non-fatal: if the
 /// binary is missing (dev build without a bundle) or the spawn fails, the GUI
 /// starts anyway and will display the connection state.
@@ -156,9 +247,14 @@ pub fn spawn_core(core_path: &Path) {
         );
         return;
     }
-    // `mut` required only to set a creation flag on Windows.
-    #[cfg_attr(not(windows), allow(unused_mut))]
+    // `mut`: `spawn` takes `&mut self`, and both blocks below configure `cmd`.
     let mut cmd = std::process::Command::new(core_path);
+    // Inside an AppImage, hand the child an environment scrubbed of the
+    // bundle's library paths — see `env_without_bundle_paths`.
+    #[cfg(target_os = "linux")]
+    if let Some(appdir) = std::env::var("APPDIR").ok().filter(|d| !d.is_empty()) {
+        scrub_bundle_env(&mut cmd, std::env::vars(), &appdir);
+    }
     // No console window flashing when the GUI launches the Core.
     #[cfg(windows)]
     {
@@ -612,5 +708,213 @@ mod tests {
 
         assert_eq!(dest1, dest2);
         assert_eq!(std::fs::read(&dest2).expect("read"), b"new-and-longer");
+    }
+
+    /// The environment linuxdeploy's `AppRun` actually hands us, copied off a
+    /// running 0.5.0 AppImage on a Debian 13 desktop, with the mount point
+    /// replaced by `APPDIR`. Values verbatim, trailing slashes and empty
+    /// entries included — those are what the rule has to survive.
+    #[cfg(target_os = "linux")]
+    fn measured_appimage_env(appdir: &str) -> Vec<(String, String)> {
+        [
+            ("APPDIR", appdir.to_string()),
+            ("APPIMAGE", "/home/iwan/Applications/UniversalLink_0.5.0_amd64.AppImage".into()),
+            ("ARGV0", "/home/iwan/Applications/UniversalLink_0.5.0_amd64.AppImage".into()),
+            ("OWD", "/home/iwan".into()),
+            ("LD_LIBRARY_PATH", format!("{appdir}/usr/lib/:{appdir}/usr/lib/x86_64-linux-gnu/:{appdir}/lib64/:")),
+            ("PATH", format!("{appdir}/usr/bin/:{appdir}/usr/sbin/:{appdir}/bin/:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin")),
+            ("XDG_DATA_DIRS", format!("{appdir}/usr/share/:{appdir}/usr/share:/usr/share:")),
+            ("GTK_PATH", format!("{appdir}//usr/lib/x86_64-linux-gnu/gtk-3.0:/usr/lib64/gtk-3.0:/usr/lib/x86_64-linux-gnu/gtk-3.0")),
+            ("GIO_EXTRA_MODULES", format!("{appdir}/usr/lib/x86_64-linux-gnu/gio/modules")),
+            ("GDK_PIXBUF_MODULE_FILE", format!("{appdir}//usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache")),
+            ("GSETTINGS_SCHEMA_DIR", format!("{appdir}/usr/share/glib-2.0/schemas/:{appdir}//usr/share/glib-2.0/schemas")),
+            ("GTK_DATA_PREFIX", appdir.to_string()),
+            ("GTK_EXE_PREFIX", format!("{appdir}//usr")),
+            // Named no path: the rule must not reinterpret these. `GTK_THEME`
+            // and `DISPLAY` even LOOK like colon lists.
+            ("GTK_THEME", "Adwaita:light".into()),
+            ("GDK_BACKEND", "x11".into()),
+            ("DISPLAY", ":0".into()),
+            ("HOME", "/home/iwan".into()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_bundle_paths_go_and_the_host_paths_stay() {
+        let appdir = "/tmp/.mount_UniverLEHiHn";
+        let changes: std::collections::HashMap<String, Option<String>> =
+            env_without_bundle_paths(measured_appimage_env(appdir), appdir)
+                .into_iter()
+                .collect();
+
+        // Mixed variables keep the host's entries, in order, and lose the
+        // bundle's — plus the empty entry the hook's concatenation left behind
+        // (in `PATH` an empty entry means "the current directory").
+        assert_eq!(
+            changes["PATH"].as_deref(),
+            Some("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin")
+        );
+        assert_eq!(changes["XDG_DATA_DIRS"].as_deref(), Some("/usr/share"));
+        assert_eq!(
+            changes["GTK_PATH"].as_deref(),
+            Some("/usr/lib64/gtk-3.0:/usr/lib/x86_64-linux-gnu/gtk-3.0")
+        );
+
+        // A variable that pointed at nothing but the bundle is removed, not
+        // emptied: an empty `LD_LIBRARY_PATH` is not the same as none.
+        for gone in [
+            "LD_LIBRARY_PATH",
+            "GIO_EXTRA_MODULES",
+            "GDK_PIXBUF_MODULE_FILE",
+            "GSETTINGS_SCHEMA_DIR",
+            "GTK_DATA_PREFIX",
+            "GTK_EXE_PREFIX",
+            // The runtime's markers describe a bundle the child is not in.
+            "APPDIR",
+            "APPIMAGE",
+            "ARGV0",
+            "OWD",
+        ] {
+            assert_eq!(changes.get(gone), Some(&None), "{gone} must be removed");
+        }
+
+        // Untouched: not returned at all, so the child inherits them as they are.
+        for kept in ["GTK_THEME", "GDK_BACKEND", "DISPLAY", "HOME"] {
+            assert!(
+                !changes.contains_key(kept),
+                "{kept} names no bundle path and must be left alone"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_command_carries_the_removals_and_the_rewrites() {
+        // The computation above is only half of it: a variable has to be
+        // REMOVED from the child's environment, not set to the empty string,
+        // and the command is where that distinction is made. Read back off the
+        // command itself, so the process environment is never touched.
+        let appdir = "/tmp/.mount_UniverLEHiHn";
+        let mut cmd = std::process::Command::new("/bin/true");
+        scrub_bundle_env(&mut cmd, measured_appimage_env(appdir), appdir);
+
+        let wired: std::collections::HashMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+
+        assert_eq!(wired["LD_LIBRARY_PATH"], None, "removed, not emptied");
+        assert_eq!(wired["APPDIR"], None);
+        assert_eq!(
+            wired["XDG_DATA_DIRS"].as_deref(),
+            Some("/usr/share"),
+            "rewritten to the host's entries"
+        );
+        // What was left alone is absent from the command: the child inherits it.
+        assert!(!wired.contains_key("GTK_THEME"));
+        assert!(!wired.contains_key("HOME"));
+    }
+
+    /// The whole path, for real: `spawn_core` launches a child that reports the
+    /// environment it was actually given.
+    ///
+    /// The two tests above stop at the `Command`; this one is the only place
+    /// that proves the scrub is wired into the spawn at all — and it is worth
+    /// the awkwardness, because the bug it guards against was a spawn that
+    /// silently passed everything on.
+    ///
+    /// `set_var` is process-wide, hence `unsafe` in edition 2024. It is sound
+    /// here: `cargo-nextest`, which is what CI runs, gives every test its own
+    /// process, and no other test in this crate reads these variables (only
+    /// `APPIMAGE`, which this test deliberately leaves alone).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_spawned_child_really_gets_the_scrubbed_environment() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let core = tmp.path().join("universallink-core");
+        let reported = tmp.path().join("child-env.txt");
+        std::fs::write(&core, format!("#!/bin/sh\nenv > {}\n", reported.display()))
+            .expect("write the stand-in Core");
+        set_executable(&core).expect("chmod +x");
+
+        let appdir = "/tmp/.mount_UniverTEST";
+        unsafe {
+            std::env::set_var("APPDIR", appdir);
+            std::env::set_var("LD_LIBRARY_PATH", format!("{appdir}/usr/lib:"));
+            std::env::set_var("XDG_DATA_DIRS", format!("{appdir}/usr/share:/usr/share:"));
+        }
+
+        spawn_core(&core);
+
+        // The child is a shell: give it a moment, but do not sleep a fixed
+        // second for nothing.
+        let mut dumped = String::new();
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(&reported)
+                && s.contains('\n')
+            {
+                dumped = s;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            !dumped.is_empty(),
+            "the stand-in Core never reported its environment"
+        );
+
+        let lines: Vec<&str> = dumped.lines().collect();
+        assert!(
+            !lines.iter().any(|l| l.starts_with("APPDIR=")),
+            "APPDIR reached the child: {dumped}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.starts_with("LD_LIBRARY_PATH=")),
+            "the bundle's library path reached the child: {dumped}"
+        );
+        assert!(
+            lines.contains(&"XDG_DATA_DIRS=/usr/share"),
+            "the host's data dir should survive alone: {dumped}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_neighbouring_mount_is_not_taken_for_ours() {
+        // Two AppImages running at once: ours, and someone else's whose mount
+        // point starts with the same characters. A substring test would strip
+        // the other one's paths out of the child's environment.
+        let ours = "/tmp/.mount_Univer0001";
+        let vars = vec![(
+            "LD_LIBRARY_PATH".to_string(),
+            format!("{ours}/usr/lib:/tmp/.mount_Univer0002/usr/lib:/usr/lib"),
+        )];
+        let changes = env_without_bundle_paths(vars, ours);
+        assert_eq!(
+            changes,
+            vec![(
+                "LD_LIBRARY_PATH".to_string(),
+                Some("/tmp/.mount_Univer0002/usr/lib:/usr/lib".to_string())
+            )]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn outside_an_appimage_nothing_changes() {
+        // No `APPDIR` to strip means no bundle: not even the markers are
+        // touched, so a dev run or a native package spawns the Core with the
+        // environment it was given.
+        assert!(env_without_bundle_paths(measured_appimage_env("/x"), "").is_empty());
+        assert!(env_without_bundle_paths(measured_appimage_env("/x"), "/").is_empty());
     }
 }
