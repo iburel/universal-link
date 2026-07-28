@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Linux, AppImage: the tray icon could vanish for a whole session.** The Core
+  the app launches runs from a copy that lives *outside* the AppImage, but it
+  inherited the bundle's library paths — so on a distribution newer than the
+  build host, the tray failed to load the system's app-indicator library and the
+  supervisor restarted it about once a second until logout. The Core, and the
+  components it spawns in turn, now get an environment cleared of the bundle's
+  paths while keeping the host's. Measured on Debian 13, where the tray stays up
+  again. Only the case where the app itself starts the Core was affected: a Core
+  started by autostart at login never had the problem.
+
 ## [0.5.0] - 2026-07-28
 
 Right click → send to another machine, from the file manager's own menu, on all
@@ -230,6 +244,7 @@ Linux, macOS, and Windows.
 - Flat transfers only (no directory trees).
 - Account key rotation is not implemented.
 
+[Unreleased]: https://github.com/iburel/universal-link/compare/v0.5.0...HEAD
 [0.5.0]: https://github.com/iburel/universal-link/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/iburel/universal-link/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/iburel/universal-link/compare/v0.2.0...v0.3.0
