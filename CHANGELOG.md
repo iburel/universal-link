@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **The app shows which version it is** — at the foot of its sidebar, and on the
+  screen that asks you to update, the one place where the question always comes
+  up. It is the interface's version: on Linux the background Core runs from a
+  copy the app refreshes when it starts, so between an upgrade and the next
+  launch an autostarted Core can still be the previous one.
+
 ### Fixed
 
 - **Linux, AppImage: the tray icon could vanish for a whole session.** The Core

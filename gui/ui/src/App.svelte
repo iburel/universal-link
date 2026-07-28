@@ -6,6 +6,7 @@
 
   import { installFileDrop } from "./lib/dragdrop";
   import type { CoreStore } from "./lib/store.svelte";
+  import { appVersion } from "./lib/version";
   import Account from "./views/Account.svelte";
   import Approvals from "./views/Approvals.svelte";
   import Devices from "./views/Devices.svelte";
@@ -76,6 +77,9 @@
       This Core speaks version {store.connection.api_version} of the local API;
       this interface speaks version 1. Please update UniversalLink.
     </p>
+    <!-- This screen asks the user to update, and no navigation reaches it: the
+         version has to be here too, it is the first thing anyone will ask for. -->
+    <p class="version">UniversalLink {appVersion}</p>
   </div>
 {:else if needsServerSetup}
   <ServerSetup {store} firstRun />
@@ -144,6 +148,11 @@
         <ServerSetup {store} />
       {/if}
     </main>
+
+    <!-- Last in the reading order, at the foot of the sidebar on screen: it is
+         chrome, not content. Outside the <nav> for the same reason as the
+         connection line above. -->
+    <p class="version">UniversalLink {appVersion}</p>
   </div>
 {/if}
 
@@ -151,10 +160,11 @@
   .app {
     display: grid;
     grid-template-columns: 180px 1fr;
-    grid-template-rows: auto 1fr;
+    grid-template-rows: auto 1fr auto;
     grid-template-areas:
       "core main"
-      "nav main";
+      "nav main"
+      "version main";
     height: 100%;
   }
 
@@ -170,9 +180,10 @@
     grid-area: main;
   }
 
-  /* Two cells, one sidebar: they share its skin. */
+  /* Three cells, one sidebar: they share its skin. */
   .core,
-  nav {
+  nav,
+  .app > .version {
     background: var(--nav);
     border-right: 1px solid var(--line);
   }
@@ -227,6 +238,22 @@
 
   .core.connected .dot {
     background: var(--ok);
+  }
+
+  /* Sidebar footer: the nav above it grows, this stays at the bottom of the
+     window. Its own line, and not a suffix to the connection status, because the
+     two numbers would read as one — the product's version is not the local
+     API's. */
+  .app > .version {
+    grid-area: version;
+    /* No top padding: the nav cell's own bottom padding is the gap. */
+    margin: 0;
+    padding: 0 0.75rem 0.75rem;
+  }
+
+  .version {
+    font-size: 0.75rem;
+    color: var(--muted);
   }
 
   main {
@@ -290,13 +317,27 @@
     }
 
     .core,
-    nav {
+    nav,
+    .app > .version {
       border-right: none;
     }
 
     .core {
       padding: 0.35rem 0.75rem;
       border-bottom: 1px solid var(--line);
+    }
+
+    /* The tab bar is at the bottom and a thumb is on it: a footer underneath
+       would be wasted height in the one place where height is scarce. The version
+       joins the top strip instead, right-aligned in the SAME cell as the
+       connection status — nothing overlaps, the longest status ("Core connected
+       (API v1)") and the version together stay well inside the 360 dp this
+       layout targets. */
+    .app > .version {
+      grid-area: core;
+      justify-self: end;
+      align-self: center;
+      padding: 0.35rem 0.75rem;
     }
 
     nav {
