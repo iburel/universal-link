@@ -4,7 +4,11 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] - 2026-07-28
+
+Right click → send to another machine, from the file manager's own menu, on all
+three desktops. It needed no new Core API: one more component, shipped inside the
+installers, riding the device list and `files.send` that were already there.
 
 ### Added
 
@@ -26,6 +30,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the app like any other. Folders go as folders. A phone is never offered as a
   destination: a file dropped into its private storage is a file nothing on it can
   open.
+
+### Changed
+
+- All three installers carry a fourth sidecar, the contextual-menu component,
+  next to the Core, the tray and the clipboard backend. On Linux it is staged out
+  of the AppImage like the others, so a Core started by autostart still finds it
+  once that ephemeral mount is gone.
+- The README and `doc/` are back in step with what ships: how to install it and
+  the real asset names instead of a "no packaging yet" status, the Android client
+  and the contextual menu in the architecture, autostart described per OS, and the
+  OIDC `client_secret` a Google client does need — three documents disagreed about
+  that one.
+
+### Known limitations
+
+- Desktop installers remain unsigned (milestone 1), which is also what keeps the
+  two richer menu integrations out of reach: the Windows 11 **main** context menu
+  (an `IExplorerCommand` COM DLL) and a Finder extension both have to be signed
+  and registered at install time. On Windows 11 the entries are therefore in the
+  classic menu, behind **Show more options** (or Shift+F10).
+- A menu manager that *crashes* leaves its entries behind until the supervisor
+  restarts it, and a click on a stale one fails silently. A clean shutdown removes
+  them, and so does every startup.
+- The phone shares, it does not receive, and is never offered as a menu
+  destination.
+- Aggressive power management can still end the Android app: on the test device,
+  swiping it out of Recents kills the process even with the foreground service
+  running.
+- Account key rotation is not implemented.
 
 ## [0.4.0] - 2026-07-27
 
@@ -197,7 +230,7 @@ Linux, macOS, and Windows.
 - Flat transfers only (no directory trees).
 - Account key rotation is not implemented.
 
-[Unreleased]: https://github.com/iburel/universal-link/compare/v0.4.0...HEAD
+[0.5.0]: https://github.com/iburel/universal-link/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/iburel/universal-link/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/iburel/universal-link/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/iburel/universal-link/compare/v0.1.0...v0.2.0
