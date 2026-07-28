@@ -15,8 +15,9 @@ Instead, use one of the following private channels:
 - **Email**: `iwan.burel@gmail.com`.
 
 Please include enough detail to reproduce the issue: affected component
-(server, Core daemon, GUI, data plane), version or commit, environment, and a
-proof of concept if you have one.
+(server, Core daemon, data plane, GUI, tray, clipboard backend, contextual-menu
+manager, Android app), version or commit, environment, and a proof of concept if
+you have one.
 
 We will acknowledge your report as soon as we can, keep you informed while we
 investigate, and credit you in the release notes once a fix ships — unless you
@@ -35,6 +36,15 @@ that undermine any of them are especially valuable:
   (*fail-closed*).
 - **Local IPC trust.** The Core exposes a local JSON-RPC API guarded by a
   per-startup token; only authorized local components should reach it.
+- **A shell integration carries no credential.** The contextual menu's entries are
+  files and registry values the user can rewrite, and the shell starts their
+  command line with an influenceable `argv`. What it starts is a courier that
+  holds no Core token: it only reaches its own manager over a private local
+  channel. A path from a writable menu artifact to a Core capability is a finding.
+- **Confidentiality markers are honored end to end.** A copy the OS marks
+  confidential (a password manager's) is announced without a size hint, is never
+  pushed to the account's devices ahead of a paste, and is re-marked on the
+  machine it is pasted on so that clipboard history and cloud sync skip it.
 
 ## Supported versions
 

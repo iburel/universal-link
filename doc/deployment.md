@@ -132,12 +132,39 @@ included).
 server. The URL scheme decides, and nothing else: a `wss://` URL is never served in
 cleartext.
 
+## Autostart
+
+The Core starts at session login, per user, with no privileges. It does not
+install that itself: the **GUI** registers it at launch (and re-registers it,
+idempotently, at every launch), pointing at a durable path:
+
+| | Mechanism |
+|---|---|
+| Linux | an XDG autostart `.desktop` in `~/.config/autostart` |
+| macOS | a LaunchAgent in `~/Library/LaunchAgents` (`RunAtLoad`; `KeepAlive` only on a *crash*, so the redundant instance that exits 0 starts no loop) |
+| Windows | a value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` |
+
+The current session is already covered by the direct spawn — autostart takes over
+from the next login on.
+
+On **Linux** the installed form is an AppImage, whose mount is ephemeral: a path
+inside it is dead the moment the app closes. The GUI therefore copies the Core
+**and its sidecars** into `$XDG_DATA_HOME/universallink/` and registers *that*
+copy. The list of sidecars to copy is in `gui/src/supervise.rs`
+(`STAGED_SIDECARS`) — one absent from it is simply never launched on a real Linux
+install.
+
 ## Supervised components
 
 The Core launches the official components installed next to its binary, restarts
 them when they fall (capped exponential backoff, reset once the child has stood up),
 and takes them with it when it stops. A missing component is ignored: a Core without
 a tray is still a Core that works.
+
+Three of them ship (`daemon/src/supervisor.rs`, `official_components`), each with
+its own scopes: `universallink-tray`, `universallink-clipboard` (a per-OS
+backend, on all three desktops) and `universallink-menu` (the contextual menu).
+The GUI is not in that list — the user launches it.
 
 The contract of a supervised component:
 
@@ -170,14 +197,12 @@ instance lock is released. A second signal during shutdown exits immediately.
 
 ## Accepted limitations (v1)
 
-- **No autostart.** It will come with the packaging, which will give the binary a
-  stable install path.
-- **Windows without a console.** A Core started by a graphical autostart receives
-  none of the events above: it will have to be given a message-only window
-  (`WM_QUERYENDSESSION`) or turned into a real service. Today it is launched from a
-  terminal.
-- **No official component exists yet**, so the supervisor's table is empty in
-  production. It is exercised end-to-end by the daemon's test suite, with a dummy
-  component that genuinely speaks the protocol.
+- **Windows without a console.** The graphical autostart is how the Core starts on
+  a real install, and such a process receives **none** of the events above: at
+  logout it is terminated instead of stopping cleanly. The children still die with
+  it (the Job object closes with the process), and a component's stale OS
+  artifacts are swept at the next startup, so what is lost is the orderly
+  goodbye, not the cleanup. The fix is a message-only window
+  (`WM_QUERYENDSESSION`) or a real service.
 - **The keyring choice is frozen at startup**: if the secrets agent comes up after
   the Core, we stay on the file fallback until the next launch.

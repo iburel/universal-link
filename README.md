@@ -2,59 +2,111 @@
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 
-Link the PCs (Windows, macOS, Linux) of a single user to transfer files and
-content between them, **end-to-end encrypted** — the server never sees the data,
-and does not even decide on its own who belongs to the account.
+Link the machines of a single user — Windows, macOS, Linux, and an Android phone
+— to move files and content between them, **end-to-end encrypted**: the server
+never sees the data, and does not even decide on its own who belongs to the
+account.
 
 Written in **Rust** (a Cargo workspace) with a **Tauri / Svelte** interface.
 
-> ### Status: milestone 1, pre-packaging
->
-> The foundation is built and green in CI on all three OSes, but the project
-> **is not yet software you install and that just works.** In particular:
->
-> - **The server deploys behind automatic TLS.** A Docker image and a Caddy
->   stack are provided in [`deploy/`](deploy/); the image builds, starts,
->   **persists its directory to disk** (enrollments survive a restart), and the
->   certificate is obtained automatically. **What's left**: the first real
->   bring-up (Google login, two real machines) and a published image — see
->   [Deploy the server](doc/server-deployment.md).
-> - **No packaging, no autostart, no installer** on the Core/GUI side. The Core
->   is launched from a terminal.
-> - **The background components are in**: the tray/notifier, the shared clipboard
->   and the "send to PC X" context menu are implemented and spawned by the Core,
->   so the GUI is no longer the only usable component.
-> - **Inbound** drag-and-drop works (drop a file onto a device's card → send);
->   **outbound** drag (from the app to the desktop) is not there yet.
->
-> In other words: a **developer** can build everything, test everything,
-> explore the interface, and make the pieces talk to each other. Actually
-> linking two PCs additionally requires providing the three missing pieces
-> below (OIDC client, server, TLS).
+## What it does
 
-## What works today
+- **Right click → send to another machine.** Pick a selection of files or a folder
+  in Explorer, Finder, Dolphin or Nautilus, choose one of your machines, and it is
+  on its way — no window to open, no drag. Only machines that are online, attested
+  and reachable are listed, and the entries disappear entirely while there is no
+  server connection: the menu never offers a destination it cannot reach.
+- **A clipboard shared across your machines.** Copy on one, paste on another:
+  text, images, files, whole folders. The payload crosses the network only when
+  you actually paste, straight between the two machines. A copy the OS marks as
+  confidential — a password manager's — stays marked on the way: it is announced
+  without even a size, and the machine you paste on flags it in turn, so its
+  clipboard history and cloud sync leave it alone too.
+- **Drag files onto a machine's card.** The app lists your machines and their
+  state; drop files or a folder on one to send it. Receipt on the other side is
+  automatic — these are your own devices.
+- **Share from your phone.** From Android's share sheet: text goes to the
+  account's clipboard, ready to paste anywhere, and a file goes to the one machine
+  you pick.
+
+## Install
+
+Installers are published on the [Releases](https://github.com/iburel/universal-link/releases)
+page, built by CI from the tag:
+
+| | Asset | |
+|---|---|---|
+| **Windows** | `UniversalLink_<v>_x64-setup.exe` | NSIS, per-user — no admin rights |
+| **macOS** | `UniversalLink_<v>_aarch64.dmg` | Apple Silicon |
+| **Linux** | `UniversalLink_<v>_amd64.AppImage` | `chmod +x`, then run |
+| **Android** | `UniversalLink_<v>_arm64.apk` | arm64 only, Android 7.0 or newer |
+
+**The desktop builds are not code-signed** (milestone 1), so the OS warns on
+first launch: on macOS, "unverified developer" → System Settings → Privacy &
+Security → *Open anyway*; on Windows, SmartScreen → *More info* → *Run anyway*.
+The Linux AppImage needs FUSE 2 (`sudo apt install libfuse2`) and, for the tray
+icon, `libayatana-appindicator3` plus a StatusNotifierItem host (on GNOME, the
+AppIndicator extension). The **Android APK is signed**, with the project's own
+key — Android installs nothing otherwise — which makes it a sideload, not a Play
+Store listing.
+
+On first launch the app installs the background service (per-user, no admin),
+registers it to start at login, and opens a setup screen. **Nothing is baked into
+the build**: it asks for your server's address and its OpenID Connect client,
+which means the one thing you must provide yourself is a server — see
+[Set up a real link](#set-up-a-real-link-between-your-machines).
+
+## Status
+
+Milestone 1: it installs and works on all four platforms, and it is **not yet
+signed**. CI is green on the three desktops and builds the Android app on every
+push. The path everything rests on — a real OIDC login against a deployed server,
+two machines attesting each other, transfers both ways — has been through a real
+bring-up, not just an in-memory test.
+
+> What is still missing:
+>
+> - **Nothing on the desktop is code-signed or notarized.** First launch shows an
+>   OS warning (see above). This also keeps two richer OS integrations out of
+>   reach: the Windows 11 main context menu and a Finder extension both require a
+>   signed, install-time-registered artifact.
+> - **You host the server yourself**, and the image is not published to a
+>   registry: you build it from [`deploy/`](deploy/).
+> - **Outbound drag** — from the app back onto the desktop — is not implemented.
+>   Inbound is.
+> - **The phone shares, it does not receive**: nothing writes to the Android
+>   clipboard, and a file sent to the phone lands where nothing yet opens it.
+> - **Account key rotation** is not implemented.
+
+### What works today
 
 | Capability | State |
 |---|---|
-| Build and test the whole workspace (3 OSes) | ✅ green in CI |
-| Explore the UI without installing anything (fake Core, browser) | ✅ `npm run dev` |
-| Core: startup, local IPC, config, logging, OS keyring, clean shutdown | ✅ implemented |
+| Windows / macOS / Linux client: installer, autostart, background Core | ✅ implemented |
+| Android client: share text to the clipboard, a file to one machine | ✅ signed APK |
 | OIDC login (authorization code + PKCE, browser → loopback) | ✅ implemented |
 | Device enrollment and directory (`devices.list` / `rename` / `revoke`) | ✅ implemented |
-| Account attachment (create / join via recovery code) | ✅ implemented |
-| File send (drop onto a device's card) + automatic receipt | ✅ implemented |
+| Account attachment (create / join via recovery code) + peer attestation | ✅ implemented |
+| Send files **and folders**: drag onto a card, context menu, phone share | ✅ implemented |
+| Shared clipboard: text, images, files, folders | ✅ implemented |
+| Context menu "send to machine X" (Explorer, Finder, Dolphin, Nautilus) | ✅ implemented |
+| Tray / notifier | ✅ implemented |
 | iroh data plane (E2E-encrypted QUIC, NAT traversal, relays) | ✅ implemented |
-| Server deployment (Docker image + Caddy auto-TLS, env, persisted directory) | 🟡 deployable; real bring-up = next milestone |
-| **Packaging / autostart / installers** | ❌ upcoming |
-| Tray / notifier, shared clipboard, "send to PC X" context menu | ✅ implemented |
+| Server: Docker image + Caddy auto-TLS, persisted directory, real bring-up | ✅ deployable, validated |
+| Explore the UI without installing anything (fake Core, browser) | ✅ `npm run dev` |
+| **Code signing / notarization** (and the integrations that need it) | ❌ upcoming |
+| **Published server image** | ❌ you build it |
 | **Outbound drag-and-drop** | ❌ upcoming |
+| **Receiving on the phone** | ❌ upcoming |
+| **Account key rotation** | ❌ upcoming |
 
 The design details (and what is deliberately deferred) live in
 [`doc/`](doc/): [architecture](doc/architecture.md),
 [Core API](doc/core-api.md), [server API](doc/server-api.md),
 [server deployment](doc/server-deployment.md),
 [first link](doc/first-link.md),
-[Core deployment](doc/deployment.md).
+[Core deployment](doc/deployment.md). Release by release:
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Architecture at a glance
 
@@ -64,114 +116,45 @@ The design details (and what is deliberately deferred) live in
                       └─────┬──────┘  (CONTROL plane — blind to the data)
           ┌─────────────────┼─────────────────┐
      ┌────┴────┐       ┌────┴────┐       ┌────┴────┐
-     │  PC A   │◄─────►│  PC B   │       │  PC C   │
+     │  PC A   │◄─────►│  PC B   │       │  Phone  │
      │ (Core)  │ iroh  │ (Core)  │       │ (Core)  │
      └─────────┘ P2P   └─────────┘       └─────────┘
               (direct, else relayed — data end-to-end encrypted)
 ```
 
-On each PC, a **Core** (session daemon) holds the server session, the device
+On each machine, a **Core** (session daemon) holds the server session, the device
 identity (its iroh key) and transfers, and exposes a **local IPC API**
-(JSON-RPC 2.0 over a Unix socket / named pipe) to components — including the
-GUI. The server is removed from the trust decision about *who belongs to the
-account*: an **account key** derived from a recovery code (never known to the
-server) attests each device, and a peer refuses any device whose attestation
-does not verify (*fail-closed*).
+(JSON-RPC 2.0 over a Unix socket / named pipe) to components — the tray, the
+clipboard backend, the context-menu manager, and the GUI. On a desktop the Core
+is its own process, supervising those components; on Android it is embedded in
+the app's process, since a phone has nowhere to supervise a daemon.
 
-## Prerequisites
+The server is removed from the trust decision about *who belongs to the account*:
+an **account key** derived from a recovery code (never known to the server)
+attests each device, and a peer refuses any device whose attestation does not
+verify (*fail-closed*).
 
-Identical to the toolchain pinned by CI
-([`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
+## Set up a real link between your machines
 
-- **Rust 1.97.0** (exact version; `rustup toolchain install 1.97.0`).
-- **Node.js 24** (to build the interface).
-- **A C compiler** (native build chain: `gcc`/`clang` on Linux, Xcode Command
-  Line Tools on macOS, MSVC Build Tools on Windows) — required by the native
-  dependencies (iroh, rustls/`ring`). Present by default on most development
-  machines.
-- **Linux only** — the webview headers, which Tauri links even without running
-  the rendering engine:
-  ```
-  sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev
-  ```
-  Without `sudo` (WSL, locked-down machine), a build Docker image is provided:
-  ```
-  docker build -t ul-build docker/ul-build/
-  docker run --rm -v "$PWD":/work -w /work ul-build cargo build -p universallink-gui --features webview --locked
-  ```
-
-The **Core** builds without the webview — only the GUI binary needs it. (Only
-the `universallink-core` *library*, the target of the multi-OS cross-check, is
-pure Rust with no C compiler; the Core binary itself links iroh and rustls just
-like the interface.)
-
-## Build from source
-
-```sh
-git clone https://github.com/iburel/UniversalLink.git
-cd UniversalLink
-
-# 1. Web interface (produces gui/ui/dist, embedded into the GUI binary)
-cd gui/ui
-npm ci
-npm run build
-cd ../..
-
-# 2. The Core and the rest of the workspace (without the GUI, which has its
-#    own features)
-cargo build --workspace --lib --bins --locked
-
-# 3. The real interface binary (system webview)
-cargo build -p universallink-gui --features webview --locked
-```
-
-`--locked` fails if `Cargo.lock` is stale instead of silently resolving other
-versions — keep it.
-
-## Run the test suite
-
-This is what guarantees everything stays consistent, including the server ↔
-Core and Core ↔ interface protocols (exercised end-to-end, in memory):
-
-```sh
-# Interface
-cd gui/ui && npm run check && npm test && cd ../..
-
-# Rust (capped parallelism: some tests depend on timing windows)
-cargo test --workspace --locked -- --test-threads=2
-```
-
-## Try the interface without installing anything
-
-The fastest way to see all the screens (login, account attachment, devices,
-approvals): an in-memory **fake Core**, in a browser, with no daemon or webview.
-
-```sh
-cd gui/ui
-npm ci        # if not already done
-npm run dev   # http://localhost:1420
-```
-
-The fake Core ([`gui/ui/src/dev/fake-core.ts`](gui/ui/src/dev/fake-core.ts))
-answers the same IPC calls as the real Core: you can "connect", "create an
-account" and see the recovery code, "join", list fictitious devices — all
-without a network. This branch is dropped from the production bundle.
-
-## Set up a real link between two PCs
-
-This is where the "milestone 1" status shows. The happy-path code exists and is
-tested, but **three pieces must be provided by you** before two PCs actually see
-each other. None of them is turnkey yet.
+Two pieces have to exist before your machines can see each other, and neither is
+turnkey: an **OIDC client** and a **server**. Installing the app gets you as far
+as its setup screen; that screen asks for exactly these two.
 
 ### Piece 1 — an OIDC client
 
-The server authenticates accounts via **OIDC**; the reference issuer is
-**Google** (`accounts.google.com`). You need a **public** OIDC client (PKCE, no
-*client secret*), its `client_id`, and the issuer URL.
+The server authenticates accounts via **OIDC**; the reference issuer is **Google**
+(`accounts.google.com`). You need a client that does **authorization code + PKCE
+with a loopback redirect**: its `client_id`, the issuer URL, and — if your IdP
+demands one at the token exchange, as Google's installed-app clients do — its
+`client_secret`. The Core sends the secret only if you configure one; for an
+installed application that value is not confidential (it ships inside every copy
+of the app), which is why it lives in a config file rather than a keyring.
 
 > ⚠️ On Google, create a client of type **"Desktop app"**, **not "Web
-> application"**: the latter requires a `client_secret` that the Core does not
-> send (login would fail at the code exchange). Step by step:
+> application"**. A web client's redirect URIs must all be registered in advance,
+> and the Core redirects to `http://127.0.0.1:<port chosen at runtime>` — which
+> such a client rejects (`redirect_uri_mismatch`) in the browser, before the code
+> exchange is even reached. Step by step:
 > [Deploy the server, step 1](doc/server-deployment.md#step-1--register-a-google-oidc-client).
 
 ### Piece 2 — a running server
@@ -191,6 +174,7 @@ Optional settings (with their defaults): `UNIVERSALLINK_SERVER_STATE`
 deployment), `UNIVERSALLINK_HEARTBEAT_SECS` (30),
 `UNIVERSALLINK_HEARTBEAT_MAX_MISSED` (2), `UNIVERSALLINK_NONCE_TTL_SECS` (60),
 `UNIVERSALLINK_FRESH_TOKEN_MAX_AGE_SECS` (300),
+`UNIVERSALLINK_JWKS_REFRESH_MIN_SECS` (60),
 `UNIVERSALLINK_MAX_REQUESTS_PER_MINUTE` (120; `0` = unlimited); log level via
 `UNIVERSALLINK_LOG`. On an incomplete or invalid config, the server **refuses to
 start** and logs every error at once.
@@ -211,14 +195,17 @@ docker compose up -d --build
 
 ### Piece 3 — `config.json` on each PC
 
-The Core reads a `config.json` in its config directory (see
-[Where the files live](#where-the-files-live)). It never writes it itself.
+The installed app's **first-run screen writes this file for you** — this section
+is what it writes, and the path to take on a machine you drive from a terminal
+(development, a headless box). The Core reads it in its config directory (see
+[Where the files live](#where-the-files-live)) and never writes it itself.
 
 ```json
 {
   "server_url": "wss://your-server.example.com/ws",
   "oidc_issuer": "https://accounts.google.com",
   "oidc_client_id": "…apps.googleusercontent.com",
+  "oidc_client_secret": "only-if-your-IdP-demands-one",
   "device_name": "Living-room laptop",
   "relay_url": "https://your-iroh-relay.example",
   "receive_dir": "/home/you/Downloads"
@@ -228,30 +215,35 @@ The Core reads a `config.json` in its config directory (see
 - `server_url`, `oidc_issuer`, `oidc_client_id`: **required** together (a
   half-filled file is flagged as a problem). `server_url` must be `ws://` or
   `wss://`; `oidc_issuer`, `http(s)://`.
+- `oidc_client_secret`: optional. A conformant PKCE IdP has none; Google's
+  installed-app clients do, and the working reference setup sets it. Not
+  confidential for an installed app — it ships with the client.
 - `device_name`: optional (default: the hostname). A plain display label.
 - `relay_url`: optional — a self-hosted iroh relay; without it, the public n0
   relays are used.
 - `receive_dir`: optional — where received files land; without it,
   `<Downloads>/UniversalLink`.
 
-No secret in this file (the OIDC client is public). Each of the variables
-`UNIVERSALLINK_SERVER_URL`, `UNIVERSALLINK_OIDC_ISSUER`,
-`UNIVERSALLINK_OIDC_CLIENT_ID`, `UNIVERSALLINK_DEVICE_NAME`,
-`UNIVERSALLINK_RELAY_URL`, `UNIVERSALLINK_RECEIVE_DIR` overrides the file (for
-development). **The Core always starts**, even with no config or a broken one:
+Each of the variables `UNIVERSALLINK_SERVER_URL`, `UNIVERSALLINK_OIDC_ISSUER`,
+`UNIVERSALLINK_OIDC_CLIENT_ID`, `UNIVERSALLINK_OIDC_CLIENT_SECRET`,
+`UNIVERSALLINK_DEVICE_NAME`, `UNIVERSALLINK_RELAY_URL`,
+`UNIVERSALLINK_RECEIVE_DIR` overrides the file (for development); one that is
+defined but empty overrides nothing. **The Core always starts**, even with no config or a broken one:
 it logs the issue, and the interface says what is wrong.
 
 ### Piece 4 — launch, connect, attach, send
 
-On **each** PC:
+On **each** machine. Steps 1 and 2 are what the installed app does by itself;
+from source, run them by hand:
 
-1. **Launch the Core** from a terminal:
+1. **Launch the Core**:
    ```sh
    cargo run --bin universallink-core --locked
    ```
    (or the built executable, `target/debug/universallink-core`). It writes an
    `ipc-token` in its config directory, regenerated at every startup: this is
-   the root of trust the interface will read.
+   the root of trust the interface will read. It also spawns the background
+   components it finds next to itself — tray, clipboard, context menu.
 
 2. **Launch the interface** (the real binary, not the browser mode):
    ```sh
@@ -264,24 +256,127 @@ On **each** PC:
    On first login the device enrolls in the directory.
 
 4. **Attach the device to the account** (a blocking portal after login):
-   - on the **first** PC: "This is my first device" → a **recovery code** is
+   - on the **first** machine: "This is my first device" → a **recovery code** is
      displayed. This is the **only copy** of the account's private key: write it
      down offline. Then "Continue".
    - on the **others**: "I already have a device on this account" → enter that
      same code. The **safety number** shown on the Account screen must be
-     **identical** on all your PCs — compare it visually (a mismatch betrays a
-     wrong code or a substitution).
+     **identical** everywhere — compare it visually (a mismatch betrays a wrong
+     code or a substitution).
 
    Without this attachment, every send fails *fail-closed*: it is the account
    attestation that authorizes a peer, not its mere presence in the directory.
 
-5. **Send**: once two PCs are connected, attested, and online, open the
-   **Devices** screen and **drag files directly onto the target device's card**
-   (which must be online). The target is determined by where you drop: dropping
-   outside an eligible card (empty space, offline device, or your own PC) does
-   nothing — there is no picker. Receipt is automatic (v1: these are your own
-   devices); files land in `receive_dir`. **v1: flat files** (no directory
-   trees).
+5. **Send**: once two machines are connected, attested and online, any of the
+   three gestures works — the file manager's context menu, a copy/paste through
+   the shared clipboard, or the **Devices** screen, where you **drag files
+   directly onto the target machine's card**. In the app the target is where you
+   drop: dropping outside an eligible card (empty space, offline device, or your
+   own machine) does nothing — there is no picker. Receipt is automatic; files
+   land in `receive_dir`, and a folder arrives as a folder.
+
+## Build from source
+
+### Prerequisites
+
+Identical to the toolchain pinned by CI
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
+
+- **Rust 1.97.0** (exact version; `rustup toolchain install 1.97.0` — or just let
+  [`rust-toolchain.toml`](rust-toolchain.toml) do it).
+- **Node.js 24** (to build the interface).
+- **A C compiler** (native build chain: `gcc`/`clang` on Linux, Xcode Command
+  Line Tools on macOS, MSVC Build Tools on Windows) — required by the native
+  dependencies (iroh, rustls/`ring`). Present by default on most development
+  machines.
+- **Linux only** — the webview headers, which Tauri links even without running
+  the rendering engine, and the X11 libraries the clipboard backend links:
+  ```
+  sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+                          libxcb1-dev libxcb-xfixes0-dev
+  ```
+  Without `sudo` (WSL, locked-down machine), a build Docker image is provided:
+  ```
+  docker build -t ul-build docker/ul-build/
+  docker run --rm -v "$PWD":/work -w /work ul-build cargo build -p universallink-gui --features webview --locked
+  ```
+
+The **Core** builds without the webview — only the GUI binary needs it. (Only
+the `universallink-core` *library*, the target of the multi-OS cross-check, is
+pure Rust with no C compiler; the Core binary itself links iroh and rustls just
+like the interface.)
+
+The Android app lives outside the workspace, in [`gui-mobile/`](gui-mobile/), and
+needs its own toolchain (Android SDK/NDK, `cargo-tauri`); the `android` job of
+`ci.yml` is the reference.
+
+### Build
+
+```sh
+git clone https://github.com/iburel/universal-link.git
+cd universal-link
+
+# 1. Web interface (produces gui/ui/dist, embedded into the GUI binary)
+cd gui/ui
+npm ci
+npm run build
+cd ../..
+
+# 2. The Core, the background components, and the rest of the workspace
+#    (without the GUI, which has its own features)
+cargo build --workspace --lib --bins --locked
+
+# 3. The real interface binary (system webview)
+cargo build -p universallink-gui --features webview --locked
+```
+
+`--locked` fails if `Cargo.lock` is stale instead of silently resolving other
+versions — keep it.
+
+### Run the test suite
+
+This is what guarantees everything stays consistent, including the server ↔
+Core and Core ↔ interface protocols (exercised end-to-end, in memory):
+
+```sh
+# Interface
+cd gui/ui && npm run check && npm test && cd ../..
+
+# Rust — exactly what CI runs
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo nextest run --workspace --locked --profile ci
+cargo test --workspace --doc --locked   # nextest does not run doctests
+```
+
+Two things about that `nextest` line:
+
+- **`--profile ci` is not decoration.** It carries the test groups that serialize
+  the tests driving a per-session global — the X `CLIPBOARD` selection, the
+  `NSPasteboard`, the Win32 clipboard, a FUSE mount — and the heavy
+  cross-reactor IPC tests. Without it, those tests fight each other and fail for
+  reasons that have nothing to do with your change. The why is written out in
+  [`.config/nextest.toml`](.config/nextest.toml).
+- **On Linux the clipboard tests need an X display.** Headless (CI, WSL without
+  a desktop): `Xvfb :99 -screen 0 1280x1024x24 &` then `export DISPLAY=:99`.
+
+`cargo test --workspace` still works, but it cannot express those groups.
+
+### Try the interface without installing anything
+
+The fastest way to see all the screens (login, account attachment, devices,
+approvals): an in-memory **fake Core**, in a browser, with no daemon or webview.
+
+```sh
+cd gui/ui
+npm ci        # if not already done
+npm run dev   # http://localhost:1420
+```
+
+The fake Core ([`gui/ui/src/dev/fake-core.ts`](gui/ui/src/dev/fake-core.ts))
+answers the same IPC calls as the real Core: you can "connect", "create an
+account" and see the recovery code, "join", list fictitious devices — all
+without a network. This branch is dropped from the production bundle.
 
 ## Where the files live
 
@@ -293,25 +388,37 @@ Placed by the Core, per user (see [`doc/deployment.md`](doc/deployment.md)):
 | config directory | `~/.config/universallink` | `~/Library/Application Support/UniversalLink` | `%APPDATA%\UniversalLink` |
 | logs | `~/.local/state/universallink/logs` | `~/Library/Logs/UniversalLink` | `%LOCALAPPDATA%\UniversalLink\logs` |
 
-The config directory holds `config.json` (written by you), `ipc-token` (0600,
-regenerated at every startup), `device.key` (0600, the device's iroh identity),
-`account-key.json` (the account's public key + attestation, *not a secret*,
-absent until the device has joined the account), and `session.json` (present ⟺
-a session is open). `secrets.json` (0600, cleartext secret at rest) only appears
-as a **fallback**, on a machine where no OS keyring is reachable.
+The config directory holds `config.json` (written by the setup screen or by you),
+`ipc-token` (0600, regenerated at every startup), `device.key` (0600, the
+device's iroh identity), `account-key.json` (the account's public key + this
+device's attestation, *not a secret*, absent until the device has joined the
+account), and `session.json` (present ⟺ a session is open). `secrets.json` (0600,
+cleartext secret at rest) only appears as a **fallback**, on a machine where no
+OS keyring is reachable.
+
+On Android everything lives in the app's private storage, and goes with the app
+when it is uninstalled.
 
 Log level: `UNIVERSALLINK_LOG=debug` (not `RUST_LOG`).
 
 ## Accepted limitations (v1)
 
-- **Server: deployable behind auto-TLS** (Docker image + Caddy, cf.
-  [deployment](doc/server-deployment.md)), but the **image is not published**
-  and the **real bring-up is not yet validated** (see the status at the top).
+- **Unsigned desktop builds** (milestone 1): a first-launch OS warning, and no
+  Windows 11 main-menu integration or Finder extension, both of which require a
+  signed artifact registered at install time.
+- **The server is yours to host**: Docker image + Caddy auto-TLS are provided
+  (cf. [deployment](doc/server-deployment.md)), but the **image is not
+  published** to any registry.
 - **Outbound drag-and-drop** is absent (only inbound works).
-- **Flat transfers**: every path must be a regular file (directory trees are a
-  tracked follow-up).
-- **Windows without a console**: a Core launched by a graphical autostart would
-  not receive shutdown events — for now, it is launched from a terminal.
+- **The phone shares, it does not receive**, and aggressive power management can
+  still end the app — on the test device, swiping it out of Recents kills the
+  process even with the foreground service running.
+- **Windows session end**: a Core started by the graphical autostart has no
+  console, so it gets none of the shutdown events and is terminated at logout
+  instead of stopping cleanly. Its components die with it (they hang off a Job
+  object), and anything they left in the shell is swept at the next startup — so
+  the residual is a missing goodbye, not a leak. The fix is a message-only
+  window (`WM_QUERYENDSESSION`) or a real service.
 - **Account key rotation** is not implemented (v1 refuses to replace an existing
   key).
 
@@ -323,9 +430,10 @@ Log level: `UNIVERSALLINK_LOG=debug` (not `RUST_LOG`).
 - [`doc/server-api.md`](doc/server-api.md) — the server API.
 - [`doc/server-deployment.md`](doc/server-deployment.md) — hosting the server
   (Docker, Caddy, Google OIDC client).
-- [`doc/first-link.md`](doc/first-link.md) — the first end-to-end bring-up (two
+- [`doc/first-link.md`](doc/first-link.md) — bringing up a link end to end (two
   machines, real Google login, transfer) and its troubleshooting.
 - [`doc/deployment.md`](doc/deployment.md) — the Core running locally.
+- [`CHANGELOG.md`](CHANGELOG.md) — what each release added.
 
 ## License
 
