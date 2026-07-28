@@ -7133,7 +7133,7 @@ dependencies = [
 
 [[package]]
 name = "universallink-clipboard"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "block2",
  "fuser",
@@ -7157,7 +7157,7 @@ dependencies = [
 
 [[package]]
 name = "universallink-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7180,7 +7180,7 @@ dependencies = [
 
 [[package]]
 name = "universallink-daemon"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "gethostname",
@@ -7206,7 +7206,7 @@ dependencies = [
 
 [[package]]
 name = "universallink-gui"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7224,7 +7224,7 @@ dependencies = [
 
 [[package]]
 name = "universallink-ipc-client"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -7236,7 +7236,7 @@ dependencies = [
 
 [[package]]
 name = "universallink-menu"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "libc",
  "serde_json",
@@ -7253,11 +7253,11 @@ dependencies = [
 
 [[package]]
 name = "universallink-paths"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "universallink-server"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -7278,7 +7278,7 @@ dependencies = [
 
 [[package]]
 name = "universallink-server-daemon"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -7291,7 +7291,7 @@ dependencies = [
 
 [[package]]
 name = "universallink-test-support"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -7310,7 +7310,7 @@ dependencies = [
 
 [[package]]
 name = "universallink-tray"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "png 0.18.1",
  "serde_json",
