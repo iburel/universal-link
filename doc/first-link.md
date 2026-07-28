@@ -1,24 +1,23 @@
 # First link — end-to-end bring-up (macOS + Windows)
 
-This document describes the **first real bring-up**: linking a Mac and a Windows
-PC to *your* deployed server, with a real Google login, all the way to transferring
-a file in both directions. It is the project's "building block 4".
+This document brings a link up end to end: two machines — a Mac and a Windows PC
+here — against *your* deployed server, with a real Google login, all the way to
+transferring a file in both directions. It was the project's "building block 4",
+and it stays the runbook for the first link of a fresh deployment.
 
-> **What "first" honestly means.** Every piece of the path (server, config,
-> login/enrollment, account key, P2P transfer) is wired and tested *in isolation* —
-> but the whole thing has **never** run against a real Google on two real machines:
-> the tests use a fake OIDC issuer in cleartext (see
-> [`doc/server-deployment.md`](server-deployment.md), section "State"). This
-> bring-up **is** that first validation. There is **no known blocker in the code**;
-> expect, on the other hand, to flush out real-world things that no test covers:
-> Google token responses, the server's retrieval of the JWKS keys, TLS, clock
-> drift, iroh relay reachability. When something breaks, it is not necessarily a
-> bug — it is the point of this step.
+> **This bring-up has been done.** It was written before the first real trial and
+> kept afterwards, because what it walks through is exactly what breaks: the test
+> suite uses a fake OIDC issuer in cleartext, so nothing in it exercises Google's
+> token responses, the server's JWKS retrieval, TLS, clock drift or iroh relay
+> reachability. Those are what this document is for — as a first bring-up of *your*
+> deployment, and as the troubleshooting map when a link will not come up.
 
-> **No installer for now.** On each machine you compile the Core and the GUI **from
-> source**, write `config.json` **by hand**, and launch **two foreground
-> processes** (the Core then the GUI). Packaging (installers, autostart) is a later
-> building block.
+> **This is the from-source path.** There are installers now
+> ([README, Install](../README.md#install)), and on an installed machine the
+> first-run screen writes `config.json` and the Core starts at login — most of the
+> steps below then have nothing to do. Follow them when you build from source, on a
+> machine you drive from a terminal, or when you want the two processes in the
+> foreground with their logs in front of you.
 
 ## The two pitfalls that sink a first attempt
 
@@ -32,12 +31,13 @@ Check them *before* starting — their symptoms are misleading:
    **after** going through the browser, in the form of an opaque `OIDC_INVALID`.
 
 2. **The Google OAuth client must be of type "Desktop app".** The Core uses a
-   **loopback** redirect on a dynamic port and sends **no** `client_secret` (public
-   client + PKCE, [`core/src/login.rs`](../core/src/login.rs)). A "Web application"
-   client is incompatible with both: it rejects the dynamic loopback redirect
-   (`redirect_uri_mismatch` error in the browser, *before* the code exchange even)
-   and/or requires a `client_secret` at the exchange. Only "Desktop app" accepts
-   this flow. Detail in
+   **loopback** redirect on a dynamic port, with PKCE
+   ([`core/src/login.rs`](../core/src/login.rs)). A "Web application" client
+   registers its redirect URIs in advance and therefore rejects that dynamic
+   loopback (`redirect_uri_mismatch` in the browser, *before* the code exchange
+   even). Only "Desktop app" accepts this flow. Its `client_secret`, on the other
+   hand, you keep: put it in `config.json` as `oidc_client_secret` — the Core sends
+   it at the exchange when it is set. Detail in
    [step 1 of the server doc](server-deployment.md#step-1--register-a-google-oidc-client).
 
 *(The Linux `XDG_RUNTIME_DIR` pitfall from the general doc does not concern you:
@@ -97,8 +97,8 @@ devices only see each other under **a single** account.
 ### 1.1 Build
 
 ```sh
-git clone https://github.com/iburel/UniversalLink.git
-cd UniversalLink
+git clone https://github.com/iburel/universal-link.git
+cd universal-link
 
 # a) the web UI (produces gui/ui/dist, embedded in the binary)
 cd gui/ui && npm ci && npm run build && cd ../..
@@ -127,19 +127,24 @@ Location of the config folder:
 | macOS | `~/Library/Application Support/UniversalLink/` |
 | Windows | `%APPDATA%\UniversalLink\` |
 
-Contents of `config.json` (the first three keys are **mandatory together**):
+Contents of `config.json` (`server_url`, `oidc_issuer` and `oidc_client_id` are
+**mandatory together**):
 
 ```json
 {
   "server_url": "wss://your-server.example.com/ws",
   "oidc_issuer": "https://accounts.google.com",
   "oidc_client_id": "xxxxxxxx.apps.googleusercontent.com",
+  "oidc_client_secret": "GOCSPX-…",
   "device_name": "Living-room Mac"
 }
 ```
 
 - `server_url` must start with `wss://` (or `ws://`) and point to `/ws`.
 - `oidc_issuer` / `oidc_client_id`: **exactly** the server's values (pitfall #1).
+- `oidc_client_secret` is optional and belongs on the **client** only (the server
+  never sees it): the Google Desktop-app secret, sent at the token exchange. Not a
+  secret in the usual sense — it ships with any installed app.
 - `device_name` is optional (default: the hostname) — it is a display label, not an
   identity.
 - Also optional: `relay_url` (self-hosted iroh relay; otherwise the n0 public
@@ -237,7 +242,7 @@ space, an offline device, or your own PC) does nothing.
 **Expected**: A shows `transfer.started` then `transfer.finished`; the file lands in
 B's `receive_dir` (by default `<Downloads>/UniversalLink` —
 `~/Downloads/UniversalLink` on Mac, `%USERPROFILE%\Downloads\UniversalLink` on
-Windows). **v1: flat files**, no folder tree.
+Windows). A folder can be dropped too, and arrives as a folder.
 
 ### 3.2 B → A
 
@@ -280,8 +285,8 @@ Sources: [`core/src/login.rs`](../core/src/login.rs),
 
 ### "Both devices are online but the transfer stalls"
 
-This is the most likely friction point, and it is **unproven in the real world**: the
-iroh data plane is in a **minimal** preset — **automatic discovery is disabled** (no
+This is the most likely friction point, and the reason is worth knowing: the iroh
+data plane is in a **minimal** preset — **automatic discovery is disabled** (no
 LAN/DNS), so the two peers **meet via the relay**. The relay then remains the
 fallback channel; NAT traversal (hole-punching) stays active and a **direct route**
 can form after the rendezvous. Without a configured `relay_url`, it is the **n0**
@@ -319,15 +324,19 @@ To start from scratch on a machine: stop the Core, delete `account-key.json`
 then resume at login. Beware: deleting `account-key.json` **everywhere** without
 having the recovery code cuts you off from the account.
 
-## What is not there yet
+## How this differs from an installed machine
 
-- **No installer or autostart**: everything is manual, two foreground processes. On
-  Windows, the Core only receives the shutdown/logoff signals if it has a **console
-  attached** ([`daemon/src/main.rs`](../daemon/src/main.rs)) — irrelevant for a
-  manual launch, to be handled at packaging time.
-- **Real Google path not yet proven**: this document *is* the first trial. Record
-  here any deviation observed.
-- **Relay not proven in the real world** (see above).
+- **Nothing starts by itself**: two foreground processes per machine, launched by
+  hand. An installed machine gets autostart instead (see
+  [`doc/deployment.md`](deployment.md)).
+- The background components, on the other hand, you do get: the Core spawns the
+  tray, the clipboard backend and the contextual menu when it finds them **next to
+  its own binary**, and `cargo build --workspace --bins` puts all four in the same
+  `target/` folder. Copy the Core somewhere on its own and it starts alone.
+- On Windows, a Core launched this way *does* have a console, so it receives the
+  shutdown/logoff signals — the one case where the manual path is better behaved
+  than the installed one
+  ([`daemon/src/main.rs`](../daemon/src/main.rs)).
 
 See also: [README, Part 4](../README.md#piece-4--launch-connect-attach-send),
 [`doc/deployment.md`](deployment.md) (Core reference),

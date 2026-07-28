@@ -12,10 +12,10 @@ environment — see [`server-daemon/src/config.rs`](../server-daemon/src/config.
 for the source of truth and [`server-api.md`](server-api.md) for the protocol.
 
 > **State of this building block.** The artifacts below (Docker image, Caddy stack,
-> systemd unit) are written and the image builds and starts. What has **not yet**
-> been validated end-to-end: a real Google login against a deployed server, on two
-> real machines. That is the next building block. There is also no image published
-> to a registry: you build it yourself.
+> systemd unit) are not merely written: this is how the project's own deployment
+> runs, and the whole path has been validated against it — a real Google login,
+> enrollment, devices attesting one another, transfers in both directions. What is
+> still missing is an image **published to a registry**: you build it yourself.
 
 ## What the server sees (threat model)
 
@@ -47,15 +47,17 @@ In other words: host it like a sensitive metadata directory, not like a data sto
 ## Step 1 — Register a Google OIDC client
 
 The server delegates authentication to an OIDC IdP; the reference issuer is
-**Google**. The Core does an **authorization code + PKCE, public client** flow (it
-sends **no `client_secret`** — see [`core/src/login.rs`](../core/src/login.rs)).
-Hence the **critical** point:
+**Google**. The Core does an **authorization code + PKCE** flow with a **loopback
+redirect**, and sends a `client_secret` at the token exchange only if one is
+configured ([`core/src/login.rs`](../core/src/login.rs)). Hence the **critical**
+point:
 
 > **The OAuth client must be of type "Desktop app", never "Web application".** A
-> Google "Web application" client **requires** the `client_secret` at the code
-> exchange, **even with PKCE** — the exchange would then fail with
-> `client_secret is missing`. A "Desktop app" client, on the other hand, treats the
-> secret as **optional**: the PKCE-without-secret flow goes through.
+> web client's redirect URIs must all be registered in advance, and this flow
+> redirects to `http://127.0.0.1:<port chosen at runtime>`: Google turns that down
+> with `redirect_uri_mismatch` **in the browser**, before the code exchange is even
+> attempted. A "Desktop app" client is the one that accepts a dynamic loopback
+> port.
 
 In the [Google Cloud console](https://console.cloud.google.com/):
 
@@ -72,14 +74,19 @@ In the [Google Cloud console](https://console.cloud.google.com/):
 3. **Credentials → Create credentials → OAuth client ID**:
    - application type: **Desktop app**;
    - give it a name.
-4. Retrieve the **`client_id`** (`…apps.googleusercontent.com`). The `client_secret`
-   shown **is not used** by UniversalLink.
+4. Retrieve the **`client_id`** (`…apps.googleusercontent.com`), and **keep the
+   `client_secret`** Google shows you: with Google, the reference deployment sets
+   it on each client (`oidc_client_secret` in `config.json`). An IdP that wants no
+   secret simply gets none. For an installed application it is not confidential —
+   it ships inside every copy of the app, and PKCE is what actually protects the
+   exchange.
 
 The **loopback** (`http://127.0.0.1:<port>/callback`) is handled automatically for
 "Desktop app" clients: the port is dynamic, you have no redirect URL to register.
 
-*(Another OIDC IdP — Auth0, Keycloak, Entra… — is fine if it exposes a **public**
-client (PKCE, no secret) and the discovery endpoint
+*(Another OIDC IdP — Auth0, Keycloak, Entra… — is fine if it exposes a client
+doing PKCE on a loopback redirect (with or without a secret) and the discovery
+endpoint
 `/.well-known/openid-configuration`. Then fill in its issuer instead.)*
 
 ## Step 2 — Deploy with Docker Compose + Caddy (recommended)
@@ -186,9 +193,6 @@ key rotation, but no more often than this),
 ## What is not (yet) there
 
 - **No published image** on a registry: you build it yourself.
-- **Real bring-up not validated**: the nominal path (Google login, two machines) is
-  tested in memory, but not yet proven against a real deployment — that is the next
-  building block.
 - **No graceful shutdown of axum**: `docker stop` / `SIGTERM` cuts the in-flight
   connections dead (the clients reconnect) — acceptable for a control plane.
 - **A single node**: the full-snapshot JSON persistence targets a single server.

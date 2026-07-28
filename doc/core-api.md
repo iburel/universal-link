@@ -3,9 +3,11 @@
 > Specification of the API between the Core and the components (official and
 > third-party). Complements [architecture.md](architecture.md) and
 > [server-api.md](server-api.md).
-> Status: phase-1 design, pre-implementation — the exact schemas will be frozen
-> with the code. This API is **the project's extension point**: a component is
-> any artifact capable of speaking this protocol.
+> Status: implemented. The four official components (GUI, tray, clipboard
+> backend, context-menu manager) all speak it, and their test suites exercise
+> these shapes against a real Core — that is what freezes them. This API is
+> **the project's extension point**: a component is any artifact capable of
+> speaking this protocol.
 
 ## Principles
 
@@ -146,7 +148,7 @@ payloads as on the server side.
 
 | Method | Description |
 |---|---|
-| `files.send { device_id, paths[] }` | → `{ transfer_id }`. Fire-and-forget: the Core reads the disk and streams via iroh, tracking goes through the events. **v1: flat files** — each path must be a regular file, a folder, or a missing path → `-32602` (directory trees are a follow-up building block) |
+| `files.send { device_id, paths[] }` | → `{ transfer_id }`. Fire-and-forget: the Core reads the disk and streams via iroh, tracking goes through the events. A path may be a regular file **or a folder**: a folder is walked into a tree manifest (the same walk the clipboard uses, empty directories included) and arrives as a folder. A missing path or a name that cannot be represented on the wire → `-32602`; a manifest over the cap → `MANIFEST_TOO_LARGE` |
 | `files.cancel { transfer_id }` | cancels an outgoing OR incoming transfer |
 
 `device_id` is resolved by the directory, **C7 attestation verified before any

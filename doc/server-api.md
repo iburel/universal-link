@@ -1,8 +1,9 @@
 # UniversalLink — Server public API
 
 > Specification of the API between the Core and the Server. Complements
-> [architecture.md](architecture.md). Status: phase-1 design, pre-implementation —
-> the exact schemas will be frozen with the code.
+> [architecture.md](architecture.md). Status: implemented — the Core and the server
+> both speak it, and the shapes below are exercised end to end (in memory) by the
+> test suite, which is what freezes them.
 
 ## Scope
 
@@ -83,7 +84,7 @@ The central object, carried by `devices.list` and every notification:
 {
   "device_id": "d_7f3a…",
   "name": "Office-PC",
-  "platform": "windows | macos | linux",
+  "platform": "windows | macos | linux | android",
   "node_id": "<iroh public key>",
   "relay_url": "https://relay.example/…",
   "attestation": "<hex signature, or null>",
@@ -104,6 +105,10 @@ The central object, carried by `devices.list` and every notification:
   `node_id`, which is stable).
 - `status`: an optional free field, reserved for extensibility (idle, busy…). v1
   defines no value for it.
+- `platform` is a **closed set**: `auth.enroll` refuses anything else with a
+  plain JSON-RPC `invalid params`. It is therefore a compatibility surface — a
+  server older than a client's platform rejects that client outright (a 0.3.0
+  server, which predates `android`, refuses a phone).
 
 ### Account attestation (C7)
 
@@ -152,7 +157,10 @@ connection with a new one (the others see a simple `device.online`, no
 offline/online flap) and revocation (`device.removed` is authoritative, alone).
 
 A revoked device is not notified by message: its connection is closed with the
-reason `DEVICE_REVOKED`, and any re-authentication fails.
+reason `DEVICE_REVOKED`, and any re-authentication fails. The server closes a
+connection with one of three reasons: `DEVICE_REVOKED`, `REPLACED` (one device =
+at most one connection, so authenticating a new one closes the previous) and
+`HEARTBEAT_LOST`.
 
 ## Connection lifecycle
 
@@ -172,8 +180,8 @@ reason `DEVICE_REVOKED`, and any re-authentication fails.
 
 ## Errors
 
-Standard JSON-RPC error codes, plus application codes in `error.data.code` (list
-to be fleshed out at implementation time):
+Standard JSON-RPC error codes, plus the application codes in `error.data.code`
+— the implemented set:
 
 | Code | Meaning |
 |---|---|

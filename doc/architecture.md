@@ -1,18 +1,21 @@
 # UniversalLink — Overall architecture (Phase 1)
 
-> Summary document from the initial design phase. Describes the major building
-> blocks and the decisions that have been settled.
+> Summary document from the initial design phase, kept in step with what has been
+> built since: where it says **built**, the code is in the tree and under test.
+> Describes the major building blocks and the decisions that have been settled.
 
 ## Goal
 
-Link a single user's PCs (macOS, Windows, Linux) to transfer files and content
-in several ways:
+Link a single user's machines — macOS, Windows, Linux, and an Android phone that
+shares to them — to transfer files and content in several ways:
 
-- Shared clipboard (copy on one PC, paste on another)
-- Contextual menu ("right click → send to PC X")
-- Drag and drop (via the GUI)
-- Shared folder
-- Remote filesystem exposure
+- Shared clipboard (copy on one machine, paste on another) — **built**
+- Contextual menu ("right click → send to PC X") — **built**
+- Drag and drop, via the GUI, onto a device's card — **built** (inbound only:
+  dragging *out* of the app is not implemented)
+- Shared folder, in the sense of a folder kept in sync between machines — not
+  built. *Sending* a folder is, and is part of transfers.
+- Remote filesystem exposure — not built
 
 Written in **Rust**.
 
@@ -162,9 +165,36 @@ Central daemon, launched automatically at session login.
 | Component | Launch | Role |
 |---|---|---|
 | **Tray / notifier** | spawned by the Core | Minimal always-present surface: status icon, native notifications (session expired, pending approval…), "open the GUI" / "open the browser" actions. It is the Core's doorbell. |
-| **Clipboard manager** | spawned by the Core | Per-OS backends to read/write the clipboard and be notified of changes. Handles the "blocking paste" for the duration of the download. Protocol specified in [core-api.md](core-api.md) (`clipboard.*`, transactions); the per-OS backend internals are still to design. |
+| **Clipboard manager** | spawned by the Core | Per-OS backends to read/write the clipboard and be notified of changes (X11 with ICCCM INCR on Linux, the Win32 clipboard and OLE `IDataObject` on Windows, `NSPasteboard` with an `NSFilePresenter` on macOS). Handles the "blocking paste" for the duration of the download, and honors the OS's confidentiality markers in both directions. Protocol specified in [core-api.md](core-api.md) (`clipboard.*`, transactions). |
 | **Contextual menu manager** | spawned by the Core | Per-contextual-menu-surface backends. See the dedicated section. |
 | **GUI** | launched by the user (or via the tray) | Displays the PCs and their states, drag and drop, list of transfers, settings, approval of third-party components. Never required for nominal operation. |
+
+### The phone (Android)
+
+A fourth client, and the one that bends the model — for a reason that is Android's,
+not ours: **there is nowhere on a phone to supervise a separate daemon.** So the
+Core is linked *into the app's own process*, and the app still reaches it the
+normal way — a Unix socket, the same JSON-RPC, the same [core-api.md](core-api.md)
+— rather than through a bespoke in-process API. The gain is that the desktop's
+Svelte UI runs there verbatim: on Android it is a component of a local Core, like
+everywhere else. What follows from that:
+
+- **It shares, it does not receive.** Two gestures, both from the system share
+  sheet: text to the account's clipboard, a file to one machine the user picks.
+- **A phone cannot answer a pull.** The desktop clipboard is pull-at-paste: the
+  source serves the bytes when a peer pastes. Android may kill the process the
+  moment the share sheet is dismissed, so a source that must not be asked later
+  pushes instead — a **materialized** transaction (inline payloads only, capped,
+  never files, never content marked sensitive; detail in
+  [core-api.md](core-api.md)). It is additive: every desktop copy is unchanged.
+- A **foreground service** is held only while something must survive the app going
+  to the background (a transfer, a share waiting for its destination, a round trip
+  through the browser), not merely because the app is open. Its absence would cost
+  the network itself: some OEM builds cut outbound sockets in the background.
+
+The phone's TLS trust comes from `webpki-roots` rather than the platform verifier
+the desktop uses — reaching Android's trust store means crossing into Kotlin, and
+the deviation is confined to the mobile shell.
 
 ### Third-party components
 
@@ -179,8 +209,10 @@ Security).
 
 - **macOS / Linux**: Unix domain socket in a private user folder
   (`$XDG_RUNTIME_DIR/universallink/core.sock` on Linux).
-- **Windows**: named pipe `\\.\pipe\universallink-<sid>` with a DACL restricted
-  to the current user.
+- **Windows**: named pipe `\\.\pipe\universallink-core-<USERDOMAIN>-<USERNAME>`
+  with a DACL restricted to the current user's SID. The name carries the domain as
+  well as the user: a local `john` and a domain `CORP\john` are two different
+  users with the same `USERNAME`.
 - localhost TCP is excluded (accessible to every account on the machine, no peer
   identity, firewall prompts).
 - The Core verifies the **peer credentials** of every connection: `SO_PEERCRED`

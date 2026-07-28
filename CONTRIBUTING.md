@@ -12,18 +12,28 @@ commands. In short:
 # Frontend
 cd gui/ui && npm ci && npm run check && npm test && cd ../..
 
-# Rust workspace (capped parallelism: some tests rely on timing windows)
+# Rust workspace
 cargo build --workspace --lib --bins --locked
-cargo test --workspace --locked -- --test-threads=2
+cargo nextest run --workspace --locked --profile ci
+cargo test --workspace --doc --locked   # nextest does not run doctests
 ```
+
+`--profile ci` matters: it carries the groups that serialize the tests driving a
+per-session OS resource (the X `CLIPBOARD` selection, the pasteboard, the Win32
+clipboard) and the heavy cross-reactor IPC ones — the reasoning is written out in
+[`.config/nextest.toml`](.config/nextest.toml). On Linux, the clipboard tests need
+an X display; headless, `Xvfb :99 …` and `DISPLAY=:99`.
 
 Please make sure the whole workspace builds and all tests pass before opening
 a pull request.
 
 ## Coding conventions
 
-- Rust is formatted with `cargo fmt` and must be clippy-clean
-  (`cargo clippy --workspace --all-targets`).
+- Rust is formatted with `cargo fmt --all` and must be clippy-clean
+  (`cargo clippy --workspace --all-targets --locked -- -D warnings`). CI checks
+  both, with the toolchain pinned by
+  [`rust-toolchain.toml`](rust-toolchain.toml) — a different rustfmt reformats
+  other people's lines.
 - The codebase is written and commented in **English**. Comments explain the
   *why*, not the *what*; match the density and tone of the surrounding code.
 - Keep changes focused and self-contained.
