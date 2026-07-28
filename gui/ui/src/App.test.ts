@@ -13,6 +13,7 @@ import {
   textOf,
 } from "./lib/harness";
 import { CoreStore } from "./lib/store.svelte";
+import { appVersion } from "./lib/version";
 
 let store: CoreStore;
 
@@ -104,6 +105,29 @@ test("the Core status is shown with its API version", () => {
   // Outside the <nav>, which the narrow layout turns into a bottom tab bar: put
   // it back inside and the status line would follow the tabs to the bottom.
   expect(app.querySelector("nav")?.textContent).not.toContain("Core connected");
+});
+
+test("the app shows its own version", () => {
+  // Not compared against a written-down number, which would need editing at
+  // every release: what can actually break is the build-time substitution (a
+  // `define` that never fires leaves the string "undefined").
+  expect(appVersion).toMatch(/^\d+\.\d+\.\d+/);
+
+  store.primed = true;
+  store.session = { logged_in: false, server_connected: false };
+  const app = render(App, { store });
+
+  expect(textOf(app)).toContain(`UniversalLink ${appVersion}`);
+  // Same reason as the connection line: inside the <nav> it would become a
+  // fifth item of the narrow layout's bottom tab bar.
+  expect(app.querySelector("nav")?.textContent).not.toContain("UniversalLink");
+
+  // And on the screen that asks the user to update, which no navigation reaches.
+  cleanup();
+  store.connection = { status: "incompatible", api_version: 9 };
+  expect(textOf(render(App, { store }))).toContain(
+    `UniversalLink ${appVersion}`,
+  );
 });
 
 // Blocking portal: connected to the account but device not linked to the vault.

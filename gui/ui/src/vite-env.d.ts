@@ -3,3 +3,6 @@
 
 /// <reference types="svelte" />
 /// <reference types="vite/client" />
+
+/** The app's version, substituted at build time by `vite.config.ts`. */
+declare const __APP_VERSION__: string;

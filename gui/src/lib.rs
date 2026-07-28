@@ -50,3 +50,27 @@ pub const GUI_SCOPES: [&str; 7] = [
 /// Topics subscribed to by the official GUI. The `component.pending`
 /// notifications have no topic: they follow the `gui` role.
 pub const GUI_TOPICS: [&str; 3] = ["session", "devices", "transfers"];
+
+#[cfg(test)]
+mod tests {
+    /// The interface displays a version, and it can only take it from
+    /// `ui/package.json` (substituted into the bundle by `vite.config.ts`): a
+    /// webview has no way to read this crate's. So the two have to be bumped
+    /// together — and a release bumps fifteen files by hand. This is what catches
+    /// the one that was forgotten, before the app claims a version it is not.
+    #[test]
+    fn the_interface_and_this_binary_report_the_same_version() {
+        let package_json = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/package.json");
+        let ui: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&package_json).expect("ui/package.json is readable"),
+        )
+        .expect("ui/package.json is JSON");
+
+        assert_eq!(
+            ui["version"].as_str(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "gui/ui/package.json and gui/Cargo.toml disagree: the app would \
+             display one version and be another"
+        );
+    }
+}
