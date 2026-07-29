@@ -23,6 +23,10 @@
 //!   then needed to bind the connection to the device (→ online).
 //! - Revocation: the revoked device's connection is closed with a close frame
 //!   whose reason is `DEVICE_REVOKED`.
+//! - Pairing: `pairing_id` prefixed with `p_`; `channel` and `bundle` are opaque
+//!   strings the server relays verbatim; the `pairing.*` notifications go to ONE
+//!   connection (the other party), not to the account; an approved session is a
+//!   one-shot enrollment grant that carries no ID token.
 
 #![allow(dead_code)]
 
@@ -61,6 +65,7 @@ fn base_config(oidc: &FakeOidc) -> Config {
         heartbeat_interval: Duration::from_secs(30),
         heartbeat_max_missed: 2,
         nonce_ttl: Duration::from_secs(60),
+        pairing_ttl: Duration::from_secs(120),
         max_requests_per_minute: None,
     }
 }

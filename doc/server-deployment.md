@@ -24,8 +24,11 @@ To decide knowingly before exposing it:
 - **It sees**: which devices belong to which account (the OIDC `sub`), the name and
   platform of each device, its iroh `node_id`, its account attestation (public),
   and its presence (online / last seen at such a time).
-- **It does not see**: the content of the transfers (E2E, never relayed by it) nor
-  the **account key** (derived from the recovery code, never transmitted).
+- **It does not see**: the content of the transfers (E2E, never relayed by it),
+  nor the **account key** — including while it relays a pairing between two of
+  your devices: the QR code's secret travels by a screen and a camera, and the
+  bundle keyed by it is ciphertext the server carries blind
+  ([server-api.md](server-api.md#pairing)).
 - **It publishes, to anyone**: your OIDC issuer, `client_id` and — if you set one
   — `client_secret`, in its deployment descriptor. That is deliberate and is what
   lets a device be set up from the server's address alone; for an installed
@@ -200,8 +203,9 @@ Required: `UNIVERSALLINK_SERVER_BIND`, `UNIVERSALLINK_OIDC_ISSUER`,
 advertises it in the deployment descriptor, and Google's clients need it at the
 token exchange), `UNIVERSALLINK_SERVER_STATE` (`universallink-directory.json`),
 `UNIVERSALLINK_HEARTBEAT_SECS` (30), `UNIVERSALLINK_HEARTBEAT_MAX_MISSED` (2),
-`UNIVERSALLINK_NONCE_TTL_SECS` (60), `UNIVERSALLINK_FRESH_TOKEN_MAX_AGE_SECS`
-(300), `UNIVERSALLINK_JWKS_REFRESH_MIN_SECS` (60; shortest delay between two
+`UNIVERSALLINK_NONCE_TTL_SECS` (60), `UNIVERSALLINK_PAIRING_TTL_SECS` (120; how
+long a QR code stays claimable — paced by a human walking to another device,
+scanning and confirming), `UNIVERSALLINK_FRESH_TOKEN_MAX_AGE_SECS` (300), `UNIVERSALLINK_JWKS_REFRESH_MIN_SECS` (60; shortest delay between two
 JWKS fetches — the issuer's signing keys are re-fetched on a key-id miss, i.e. a
 key rotation, but no more often than this),
 `UNIVERSALLINK_MAX_REQUESTS_PER_MINUTE` (120; `0` = unlimited),

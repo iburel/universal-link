@@ -29,6 +29,9 @@ pub struct AppState {
     pub config: Config,
     pub oidc: OidcValidator,
     pub registry: Mutex<Registry>,
+    /// Pairings in flight (`pairing::Sessions`), under their own lock: they
+    /// share nothing with the directory, and no path holds both at once.
+    pub pairings: Mutex<crate::pairing::Sessions>,
     /// Durable state persistence: memory store in ephemeral mode (`spawn`),
     /// disk store in deployment (see `server-daemon`).
     store: Arc<dyn DirectoryStore>,
@@ -39,6 +42,7 @@ impl AppState {
         AppState {
             oidc: OidcValidator::new(&config.oidc),
             registry: Mutex::new(Registry::from_durable(initial)),
+            pairings: Mutex::new(crate::pairing::Sessions::new(config.pairing_ttl)),
             config,
             store,
         }
@@ -184,6 +188,19 @@ impl Registry {
             }
         }
     }
+}
+
+/// Notifies ONE connection. Pairing needs this where the account broadcast
+/// cannot help: a joining device is in no account's device list yet, so the only
+/// way to reach it is the connection it is holding open.
+///
+/// Never blocks, for the same reason as `broadcast` — except that here a lost
+/// notification is not made up for by a resync: a party that misses
+/// `pairing.claimed` or `pairing.completed` times out and the human scans again.
+/// A queue that full means the connection is being closed anyway.
+pub fn notify(tx: &Sender<OutMsg>, method: &str, params: Value) {
+    let frame = json!({ "jsonrpc": "2.0", "method": method, "params": params }).to_string();
+    let _ = tx.try_send(OutMsg::Notify(frame));
 }
 
 /// Current timestamp in RFC 3339 UTC (second precision).
