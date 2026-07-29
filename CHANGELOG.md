@@ -18,7 +18,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   which is how the same problem is solved in Chrome and in every Electron app.
   Two things follow: the icon opens the window again, and the second
   "UniversalLink" that sat in the Dock — the tray, wearing the app's name — is
-  gone, as a menu-bar item should be. Windows and Linux were never affected.
+  gone, as a menu-bar item should be. It also stops taking the focus from
+  whatever you are doing when it starts at login. Windows and Linux were never
+  affected.
 
 ## [0.6.0] - 2026-07-29
 
