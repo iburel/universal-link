@@ -1276,6 +1276,12 @@ mod tests {
 
         // Anyone else's key, a tampered byte, a truncation: all the same answer.
         assert!(open(&[0u8; 32], &sealed).is_none(), "wrong key");
+        // Shorter than the nonce it is supposed to start with. A relay we do not
+        // trust chooses this string, so the length has to be checked before it is
+        // split — this is the vector that says so.
+        for tiny in ["", "AAAA", &b64(&[0u8; 23])] {
+            assert!(open(&receiver, tiny).is_none(), "too short: {tiny:?}");
+        }
         let mut raw = unb64(&sealed).expect("base64");
         let last = raw.len() - 1;
         raw[last] ^= 0x01;

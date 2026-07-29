@@ -150,6 +150,15 @@ async fn a_new_device_joins_by_being_confirmed_on_another() {
         "the joiner has no use for its own declaration coming back"
     );
 
+    // The side that RECEIVES never confirms — not even now that it holds a
+    // channel and could seal something on it. Confirming is the giving side's
+    // gesture, and nothing about being claimed changes which side we are on.
+    let err = tc
+        .request("pairing.confirm", json!({ "pairing_id": pairing_id }))
+        .await
+        .expect_err("a joiner does not confirm, claimed or not");
+    assert_eq!(err.app_code(), "PAIRING_STATE");
+
     // The human confirms. The refresh token in the keyring mints the fresh token
     // the server demands — no browser.
     let confirmed = gc
@@ -414,6 +423,163 @@ async fn a_device_that_cannot_vouch_gives_the_session_back() {
     assert_eq!(account["attested"], json!(false));
 }
 
+/// A device enrolled but never attached to the account at all (`attested:
+/// false`): pairing is the way in, and the account must SEE it arrive — an
+/// attestation nobody was told about authorizes nothing on the data plane.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_that_never_joined_the_account_gets_in_by_pairing() {
+    let server = TestServer::start().await;
+    let giver = sponsor(&server).await;
+    let (mut gc, fingerprint) = (giver.c, giver.fingerprint);
+
+    // Enrolled and logged in, with no trust root whatsoever.
+    let switchboard = universallink_test_support::memory_transport::MemorySwitchboard::new();
+    let outsider = TestCore::start_enrolled_on_with_code(&server, &switchboard, None).await;
+    let mut oc = manager(&outsider).await;
+    wait_server_connected(&mut oc, true).await;
+    assert_eq!(status(&mut oc).await["attested"], json!(false));
+    let device_id = own_device_id(&mut oc).await;
+    let seen = gc
+        .request("devices.list", json!({}))
+        .await
+        .expect("devices.list");
+    assert_eq!(
+        find_device(&seen, &device_id)["attestation"],
+        Value::Null,
+        "nothing to verify it by, which is the state this test starts from"
+    );
+
+    let offer = oc
+        .request("pairing.offer", json!({}))
+        .await
+        .expect("pairing.offer");
+    gc.request(
+        "pairing.accept",
+        json!({ "code": offer["code"].as_str().expect("code") }),
+    )
+    .await
+    .expect("pairing.accept");
+    gc.request(
+        "pairing.confirm",
+        json!({ "pairing_id": offer["pairing_id"].as_str().expect("pairing_id") }),
+    )
+    .await
+    .expect("pairing.confirm");
+    oc.wait_notification("pairing.completed").await;
+
+    assert_eq!(status(&mut oc).await["fingerprint"], json!(fingerprint));
+    // Published, not merely kept: the rest of the account can verify it now,
+    // without waiting for it to reconnect.
+    wait_attested(&mut gc, &device_id).await;
+}
+
+/// A sponsor that can no longer read the account key seals nothing — a bundle
+/// under some other key would enroll the newcomer into an account of one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sponsor_that_lost_the_key_seals_nothing() {
+    let server = TestServer::start().await;
+    let giver = sponsor(&server).await;
+    let mut gc = giver.c;
+
+    let taker = TestCore::start_with_server(&server).await;
+    let mut tc = manager(&taker).await;
+    let offer = tc
+        .request("pairing.offer", json!({}))
+        .await
+        .expect("pairing.offer");
+    let pairing_id = offer["pairing_id"]
+        .as_str()
+        .expect("pairing_id")
+        .to_string();
+    gc.request(
+        "pairing.accept",
+        json!({ "code": offer["code"].as_str().expect("code") }),
+    )
+    .await
+    .expect("pairing.accept");
+
+    // Between the scan and the confirmation, the keyring stops holding it.
+    FileSecretStore::new(giver.core.config_dir()).delete("account-key-seed");
+    let err = gc
+        .request("pairing.confirm", json!({ "pairing_id": pairing_id }))
+        .await
+        .expect_err("nothing to vouch with");
+    assert_eq!(err.app_code(), "NO_ACCOUNT_KEY");
+    assert_eq!(
+        status(&mut tc).await["attested"],
+        json!(false),
+        "and the newcomer joined nothing at all"
+    );
+}
+
+/// Confirming before anyone has scanned is refused HERE, without the server
+/// being asked: there is no one to seal the account key for, so nothing is
+/// sealed and nothing leaves this machine.
+#[tokio::test(flavor = "multi_thread")]
+async fn confirming_too_early_never_reaches_the_server() {
+    let server = TestServer::start().await;
+    let giver = sponsor(&server).await;
+    let mut gc = giver.c;
+
+    let offer = gc
+        .request("pairing.offer", json!({}))
+        .await
+        .expect("pairing.offer");
+    // With the rendezvous gone, anything that had to ask the server would say so.
+    server.cut();
+    let err = gc
+        .request(
+            "pairing.confirm",
+            json!({ "pairing_id": offer["pairing_id"].as_str().expect("pairing_id") }),
+        )
+        .await
+        .expect_err("nobody has scanned");
+    assert_eq!(
+        err.app_code(),
+        "PAIRING_STATE",
+        "a local refusal, not a round trip: SERVER_UNREACHABLE would mean the \
+         bundle had already been sealed and sent"
+    );
+}
+
+/// A cancellation names the pairing it means. A dialog that closes late must not
+/// take down the pairing that replaced the one it was showing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_cancellation_settles_nothing() {
+    let server = TestServer::start().await;
+    let giver = sponsor(&server).await;
+    let mut gc = giver.c;
+
+    let taker = TestCore::start_with_server(&server).await;
+    let mut tc = manager(&taker).await;
+    let offer = tc
+        .request("pairing.offer", json!({}))
+        .await
+        .expect("pairing.offer");
+    let pairing_id = offer["pairing_id"]
+        .as_str()
+        .expect("pairing_id")
+        .to_string();
+    gc.request(
+        "pairing.accept",
+        json!({ "code": offer["code"].as_str().expect("code") }),
+    )
+    .await
+    .expect("pairing.accept");
+
+    gc.request(
+        "pairing.cancel",
+        json!({ "pairing_id": "p_somewhere_else" }),
+    )
+    .await
+    .expect("cancelling something else is not an error");
+    // The live one is untouched, and still confirmable.
+    gc.request("pairing.confirm", json!({ "pairing_id": pairing_id }))
+        .await
+        .expect("the pairing must have survived a cancellation meant for another");
+    tc.wait_notification("pairing.completed").await;
+}
+
 /// A confirmation whose refresh token is gone goes through the browser, exactly
 /// like a revocation's — and the pairing still lands.
 #[tokio::test(flavor = "multi_thread")]
@@ -521,6 +687,34 @@ async fn an_abandoned_code_expires_on_its_own() {
     assert_eq!(offer["expires_in"], 1);
     let failed = c.wait_notification("pairing.failed").await;
     assert_eq!(failed["pairing_id"], offer["pairing_id"]);
+    assert_eq!(failed["reason"], "expired");
+}
+
+/// The side that SCANNED counts the deadline too, and counts the one the server
+/// gave it: it did not create the session, so `pairing.claim`'s answer is the only
+/// place it can learn how much of the TTL is left.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scanned_code_expires_on_the_scanner_too() {
+    let server = TestServer::start_with(|c| c.pairing_ttl = Duration::from_secs(1)).await;
+    let giver = sponsor(&server).await;
+    let mut gc = giver.c;
+
+    let offer = gc
+        .request("pairing.offer", json!({}))
+        .await
+        .expect("pairing.offer");
+    let taker = TestCore::start_with_server(&server).await;
+    let mut tc = manager(&taker).await;
+    tc.request(
+        "pairing.accept",
+        json!({ "code": offer["code"].as_str().expect("code") }),
+    )
+    .await
+    .expect("pairing.accept");
+
+    // Nobody confirms. The scanner gives up on its own — the server never says a
+    // word about a session that timed out.
+    let failed = tc.wait_notification("pairing.failed").await;
     assert_eq!(failed["reason"], "expired");
 }
 
