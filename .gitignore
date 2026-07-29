@@ -8,6 +8,9 @@
 /gui/ui/dist-mobile
 # Sidecar staged at release-build time (workflow); never versioned.
 /gui/binaries
+# The tray's macOS helper bundle, assembled at release-build time from
+# tray/macos/Info.plist and the built binary. Never versioned either.
+/gui/helpers
 # gui-mobile has its own excluded Cargo.lock + target (its deps are already in
 # the workspace lock); build artifacts must never enter the repo.
 /gui-mobile/target

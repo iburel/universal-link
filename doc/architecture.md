@@ -185,6 +185,25 @@ Central daemon, launched automatically at session login.
 | **Contextual menu manager** | spawned by the Core | Per-contextual-menu-surface backends. See the dedicated section. |
 | **GUI** | launched by the user (or via the tray) | Displays the PCs and their states, drag and drop, list of transfers, settings, approval of third-party components. Never required for nominal operation. |
 
+The Core finds them next to itself, and launches whichever ones the build shipped
+(a missing one is a line in the log, not a failure). **The tray on macOS is the one
+exception**: it ships in a nested application bundle of its own,
+`UniversalLink.app/Contents/Frameworks/UniversalLinkTray.app`, and the supervisor
+looks for it there first.
+
+That is not tidiness, it is the only way the app opens. To Launch Services, a
+process started from `Contents/MacOS` *is* the application: it takes the enclosing
+bundle's identifier. The tray owns a status item, so it checks in as a GUI
+application — and from the moment the Core spawned it, `org.universallink.gui` was
+already running. Every `open` of the app then merely activated the tray, which has
+no window, so the Dock icon, the Finder, the Launchpad and the tray's own *Open*
+item all did nothing at all, silently and without an error anywhere. With an
+identifier of its own the tray is no longer mistaken for the application, and
+`LSUIElement` keeps it out of the Dock and the application switcher where a
+menu-bar agent has no business being. Chromium and Electron place their helpers
+the same way. Windows and Linux have no such notion and keep every component
+beside the Core.
+
 ### The phone (Android)
 
 A fourth client, and the one that bends the model — for a reason that is Android's,

@@ -39,17 +39,29 @@ jobs:
       matrix:
         include:
           # macOS Apple Silicon only (milestone 1 scope). macos-14 = arm64.
+          #
+          # `tauri_config` differs here, and only here: the tray is NOT an
+          # `externalBin`, because a binary in `Contents/MacOS` is the application
+          # to Launch Services (see "Assemble the tray's helper app" below). It
+          # ships as a nested bundle instead, placed by `bundle.macOS.files`.
           - os: macos-14
             triple: aarch64-apple-darwin
             bin_ext: ""
             bundles: dmg
             bundle_glob: target/release/bundle/dmg/*.dmg
+            tauri_config: >-
+              {"bundle":{"externalBin":["binaries/universallink-core","binaries/universallink-clipboard","binaries/universallink-menu"],
+              "macOS":{"files":{
+              "Frameworks/UniversalLinkTray.app/Contents/Info.plist":"helpers/UniversalLinkTray.app/Contents/Info.plist",
+              "Frameworks/UniversalLinkTray.app/Contents/MacOS/universallink-tray":"helpers/UniversalLinkTray.app/Contents/MacOS/universallink-tray"}}}}
           # Windows x64.
           - os: windows-latest
             triple: x86_64-pc-windows-msvc
             bin_ext: ".exe"
             bundles: nsis
             bundle_glob: target/release/bundle/nsis/*-setup.exe
+            tauri_config: >-
+              {"bundle":{"externalBin":["binaries/universallink-core","binaries/universallink-tray","binaries/universallink-clipboard","binaries/universallink-menu"]}}
           # Linux x64. Built on 22.04 (NOT ubuntu-latest/24.04): an AppImage
           # links against the build host's glibc, so building on the newer
           # image would refuse to start on Debian 12 / Ubuntu 22.04. 22.04 =
@@ -60,6 +72,8 @@ jobs:
             bin_ext: ""
             bundles: appimage
             bundle_glob: target/release/bundle/appimage/*.AppImage
+            tauri_config: >-
+              {"bundle":{"externalBin":["binaries/universallink-core","binaries/universallink-tray","binaries/universallink-clipboard","binaries/universallink-menu"]}}
     steps:
       # Actions pinned to a SHA (the only immutable reference), as in ci.yml.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -153,6 +167,9 @@ jobs:
         run: cargo build -p universallink-menu --bin universallink-menu --release --locked
 
       # Tauri expects each sidecar named with the target triple, next to the GUI.
+      # All four on every platform, uniformly: on macOS the tray copy staged here
+      # goes unused (it is not in that leg's `externalBin`) and the helper bundle
+      # below takes the binary straight from `target/release` instead.
       - name: Stage the sidecars
         shell: bash
         run: |
@@ -166,15 +183,71 @@ jobs:
           cp "target/release/universallink-menu${{ matrix.bin_ext }}" \
              "gui/binaries/universallink-menu-${{ matrix.triple }}${{ matrix.bin_ext }}"
 
+      # macOS only: the tray does not ride along in `Contents/MacOS` like the other
+      # sidecars — it gets a nested application bundle of its own.
+      #
+      # Why: a process started from `UniversalLink.app/Contents/MacOS` IS the
+      # application as far as Launch Services is concerned, and takes the enclosing
+      # bundle's identifier. The tray owns a status item, so it checks in as a GUI
+      # application — and from the moment the Core spawned it, `org.universallink.gui`
+      # was "already running". Every `open` of the app (the Dock, the Finder, the
+      # Launchpad, and the tray's own Open item) then merely activated the tray, which
+      # has no window: clicking the icon did nothing at all, silently. Its own bundle,
+      # with its own identifier and `LSUIElement`, is the layout Chromium and Electron
+      # helpers have always used. `daemon/src/supervisor.rs` looks for it there first
+      # and falls back to the sibling, so Windows and Linux are untouched.
+      - name: Assemble the tray's helper app (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          helper="gui/helpers/UniversalLinkTray.app/Contents"
+          mkdir -p "$helper/MacOS"
+          cp tray/macos/Info.plist "$helper/Info.plist"
+          # One product, one version: `lsappinfo` shows this bundle's own, and two
+          # numbers for one application would be a puzzle for whoever reads it next.
+          # `Set` fails loudly if a key ever disappears from the plist.
+          version="$(jq -r .version gui/tauri.conf.json)"
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleShortVersionString $version" \
+            -c "Set :CFBundleVersion $version" "$helper/Info.plist"
+          cp target/release/universallink-tray "$helper/MacOS/universallink-tray"
+          # `bundle.macOS.files` copies file by file with `fs::copy`, which keeps the
+          # mode — but a tray that is not executable would only be discovered by a
+          # user whose icon never appears.
+          test -x "$helper/MacOS/universallink-tray"
+
       # `externalBin` is injected HERE (and not in tauri.conf.json) so that the
       # `cargo build`/clippy runs in ci.yml don't require the sidecar to be
       # present: tauri's build script validates its existence at compile time.
+      # The per-OS value lives in the matrix (macOS differs, see above).
       - name: Build the installer
         working-directory: gui
         shell: bash
         run: |
           cargo tauri build --features webview --bundles ${{ matrix.bundles }} \
-            --config '{"bundle":{"externalBin":["binaries/universallink-core","binaries/universallink-tray","binaries/universallink-clipboard","binaries/universallink-menu"]}}'
+            --config '${{ matrix.tauri_config }}'
+
+      # The gate that keeps the fix above from being undone by accident: the tray
+      # must be in the helper bundle, executable, and NOWHERE else. A copy left in
+      # `Contents/MacOS` would take the application's identity back the moment the
+      # supervisor's first candidate went missing.
+      - name: The tray really is a helper app (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          app=target/release/bundle/macos/UniversalLink.app
+          helper="$app/Contents/Frameworks/UniversalLinkTray.app"
+          if [ ! -x "$helper/Contents/MacOS/universallink-tray" ]; then
+            echo "::error::no executable tray in $helper"
+            ls -lR "$app/Contents" || true
+            exit 1
+          fi
+          if [ -e "$app/Contents/MacOS/universallink-tray" ]; then
+            echo "::error::the tray is ALSO in Contents/MacOS, where it takes the application's Launch Services identity: clicking the app icon would open nothing"
+            exit 1
+          fi
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$helper/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :LSUIElement" "$helper/Contents/Info.plist"
 
       # Always: retrievable from the run (tests the chain without a tag).
       - name: Run artifact

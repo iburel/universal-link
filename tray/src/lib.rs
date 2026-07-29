@@ -187,7 +187,14 @@ fn open_gui() {
             return;
         }
     };
-    // macOS: `open` activates an existing instance rather than duplicating it.
+    // macOS: `open` activates an existing instance rather than duplicating it —
+    // which is what we want, and which only holds because this process is not
+    // itself registered as that application. It ships in a bundle of its own
+    // (`Contents/Frameworks/UniversalLinkTray.app`, see
+    // `daemon::supervisor::helper_bundle_program`); a tray running from
+    // `Contents/MacOS` *is* `org.universallink.gui` to Launch Services, and this
+    // `open` would then activate us and raise no window at all.
+    //
     // Elsewhere: run the recorded target directly. Detached from our standard
     // input (the supervisor's token pipe) so the GUI does not inherit it.
     let mut command = if cfg!(target_os = "macos") {

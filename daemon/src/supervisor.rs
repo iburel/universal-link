@@ -23,7 +23,7 @@
 //! would leave an activation token alive until the Core stops — one more with
 //! each restart.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -203,7 +203,8 @@ async fn run_once(
     stopped
 }
 
-/// The deployment's official components, looked up next to the Core binary.
+/// The deployment's official components, looked up next to the Core binary — or,
+/// for the tray, in the helper bundle described by `helper_bundle_program`.
 /// The tray is registered on every platform; the clipboard backend is registered
 /// on Linux (X11), Windows, and macOS, and so is the contextual menu.
 /// A missing executable is ignored (with a word in the log) — a Core without a
@@ -292,11 +293,10 @@ pub fn official_components() -> Vec<ChildSpec> {
     official
         .iter()
         .filter_map(|(name, role, scopes)| {
-            let program = dir.join(executable_name(name));
-            if !program.exists() {
+            let Some(program) = component_program(&dir, name) else {
                 tracing::info!(component = name, "component absent: not launched");
                 return None;
-            }
+            };
             Some(ChildSpec {
                 program,
                 args: Vec::new(),
@@ -307,10 +307,148 @@ pub fn official_components() -> Vec<ChildSpec> {
         .collect()
 }
 
+/// Where a component's executable is: in its own helper bundle if the build
+/// ships one, otherwise next to the Core. `None` = this build ships without it.
+fn component_program(dir: &Path, name: &str) -> Option<PathBuf> {
+    helper_bundle_program(dir, name)
+        .into_iter()
+        .chain(std::iter::once(dir.join(executable_name(name))))
+        .find(|program| program.exists())
+}
+
+/// A component that must **not** be attributed to the application bundle it sits
+/// in gets a nested bundle of its own; this is where it lands.
+///
+/// Only the tray, and in practice only on macOS, where the reason is Launch
+/// Services: a process started from `UniversalLink.app/Contents/MacOS` *is* the
+/// application, and takes the enclosing bundle's identifier. The tray owns a
+/// status item, so it checks in as a GUI application — and from the moment the
+/// Core spawned it, `org.universallink.gui` was already running. Every `open` of
+/// the app (the Dock, the Finder, the Launchpad, and the tray's own Open item)
+/// then activated the tray, which has no window, so clicking the icon did
+/// nothing whatsoever. Inside `Contents/Frameworks/UniversalLinkTray.app` the
+/// nearest enclosing bundle is its own: the layout Chromium and Electron helpers
+/// have always used. `tray/macos/Info.plist` is that bundle's identity and
+/// `release.yml` assembles it.
+///
+/// Deliberately not conditional on the platform: the path simply does not exist
+/// on Linux or Windows, where the sidecars sit beside the Core, and one lookup
+/// with one set of tests is worth more here than a `cfg`.
+fn helper_bundle_program(dir: &Path, name: &str) -> Option<PathBuf> {
+    let bundle = match name {
+        "universallink-tray" => "UniversalLinkTray.app",
+        _ => return None,
+    };
+    // `dir` is `Contents/MacOS`; the helper is its sibling under `Contents`. The
+    // executable's name is the bundle's `CFBundleExecutable`, hence no `.exe`
+    // dance: this layout is macOS's alone.
+    Some(
+        dir.parent()?
+            .join("Frameworks")
+            .join(bundle)
+            .join("Contents")
+            .join("MacOS")
+            .join(name),
+    )
+}
+
 fn executable_name(name: &str) -> String {
     if cfg!(windows) {
         format!("{name}.exe")
     } else {
         name.to_string()
+    }
+}
+
+#[cfg(test)]
+mod lookup_tests {
+    use super::{component_program, executable_name};
+
+    /// `Contents/MacOS` with the Core in it, and whatever else the test asks for.
+    fn bundle(dir: &std::path::Path) -> std::path::PathBuf {
+        let macos = dir.join("Contents").join("MacOS");
+        std::fs::create_dir_all(&macos).expect("create Contents/MacOS");
+        macos
+    }
+
+    fn touch(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("create the parent");
+        std::fs::write(path, b"").expect("write the executable");
+    }
+
+    #[test]
+    fn a_component_beside_the_core_is_what_gets_launched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let macos = bundle(tmp.path());
+        let sibling = macos.join(executable_name("universallink-tray"));
+        touch(&sibling);
+
+        assert_eq!(
+            component_program(&macos, "universallink-tray"),
+            Some(sibling)
+        );
+    }
+
+    /// The macOS layout, and the reason this lookup exists: the tray in a bundle
+    /// of its own is preferred to the copy beside the Core, which is the one that
+    /// used to steal the application's Launch Services identity.
+    #[test]
+    fn the_trays_helper_bundle_wins_over_a_copy_beside_the_core() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let macos = bundle(tmp.path());
+        touch(&macos.join(executable_name("universallink-tray")));
+        let helper = tmp
+            .path()
+            .join("Contents/Frameworks/UniversalLinkTray.app/Contents/MacOS/universallink-tray");
+        touch(&helper);
+
+        assert_eq!(
+            component_program(&macos, "universallink-tray"),
+            Some(helper)
+        );
+    }
+
+    /// Nothing else moves: the helper layout is the tray's alone, so a clipboard
+    /// backend is taken from beside the Core even if that path exists.
+    #[test]
+    fn no_other_component_is_looked_for_in_a_helper_bundle() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let macos = bundle(tmp.path());
+        let decoy = tmp.path().join(
+            "Contents/Frameworks/UniversalLinkTray.app/Contents/MacOS/universallink-clipboard",
+        );
+        touch(&decoy);
+
+        assert_eq!(component_program(&macos, "universallink-clipboard"), None);
+
+        let sibling = macos.join(executable_name("universallink-clipboard"));
+        touch(&sibling);
+        assert_eq!(
+            component_program(&macos, "universallink-clipboard"),
+            Some(sibling)
+        );
+    }
+
+    #[test]
+    fn a_component_this_build_does_not_ship_is_not_launched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let macos = bundle(tmp.path());
+
+        assert_eq!(component_program(&macos, "universallink-tray"), None);
+    }
+
+    /// A Core that is not inside a bundle at all (a `cargo run`, and every Linux
+    /// and Windows install) still resolves its components — the helper candidate
+    /// is simply a path that does not exist.
+    #[test]
+    fn a_core_outside_any_bundle_still_finds_its_components() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sibling = tmp.path().join(executable_name("universallink-tray"));
+        touch(&sibling);
+
+        assert_eq!(
+            component_program(tmp.path(), "universallink-tray"),
+            Some(sibling)
+        );
     }
 }
