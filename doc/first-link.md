@@ -221,13 +221,33 @@ Google account, or one Core has not yet received its first directory snapshot.
 
 ### 2.6 Join the account
 
-At the portal, choose **"I already have a device on this account"** and enter the
-**recovery code** from step 1.6.
+At the portal, choose **"I already have a device on this account"**. Two ways in
+from there, and they end in the same place — the same `account-key.json`, the same
+key in the keyring.
 
-**Expected**: the fingerprint displayed on B must be **identical** to the one seen on
-A (compare them visually). Identical fingerprints = same account key on both sides. A
-**different** fingerprint betrays a wrong code or a substitution: B would remain
-*fail-closed* outside the account — re-enter the correct code.
+**Either pair with machine A** (nothing typed). On B press **"Show a code"**: a QR
+code appears with the same string spelled out underneath. On A, Devices screen →
+*Add a device* → **"Enter a code…"**, and paste that line (a PC has no camera; a
+phone would press *Scan a code* and point it at B's screen). A then shows what it is
+about to add — B's name, its platform, and a **six-digit number**. That number must
+be the one B is showing: check it, then **"Add to my account"**. The bundle crosses,
+B installs the key and enrolls by itself.
+
+- If A asks for the browser once more before confirming ("your account has to be
+  confirmed once more"), that is the server wanting a fresh ID token, exactly as for
+  a revocation. Complete the tab and the confirmation resumes on its own.
+- A code lives two minutes and works once. A second attempt needs a new code.
+- If the two numbers **differ**, decline: someone else answered the code — see the
+  threat model in [architecture.md](architecture.md#pairing-a-device).
+
+**Or enter the recovery code** from step 1.6, which still works and is the way in
+when the server is older than pairing (every `pairing.*` then answers `-32601` and
+the buttons say so).
+
+**Expected**, whichever way: the fingerprint displayed on B must be **identical** to
+the one seen on A (compare them visually). Identical fingerprints = same account key
+on both sides. A **different** fingerprint betrays a wrong code, a substitution, or a
+pairing someone else answered: B would remain *fail-closed* outside the account.
 
 > Without this attachment, **every send fails**: it is the account attestation (C7),
 > not mere presence in the directory, that authorizes a peer.

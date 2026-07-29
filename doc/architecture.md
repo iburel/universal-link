@@ -386,3 +386,107 @@ Two rules the implementation adds to the contract below:
 - Subsequent startups: session restored from the cache, zero interaction.
 - Expired session: notification via the tray → click → browser → reconnected. The
   GUI is not required for re-login.
+
+## Pairing a device
+
+A device joins the account by being **confirmed on a device that is already in
+it**: one displays a code, the other reads it (a camera, or the same string
+pasted), a human confirms on the side that gives, and the account key crosses
+sealed. It needs no browser on the joining device and nothing typed. The recovery
+code stays what its name says — the way back when every device is gone
+(principle 3).
+
+Wire protocol: [server-api.md](server-api.md), "Pairing". Local API:
+[core-api.md](core-api.md), `pairing.*`. This section is the threat model those
+two point at.
+
+### The channel
+
+The code carries three things: the session's id, a **128-bit secret**, and the
+public half of an X25519 keypair minted for this one pairing. The reader sends its
+own public half back through the server, and both ends derive the same key —
+HKDF-SHA256, the exchange as keying material, the code's secret as the salt, both
+public keys and the session id bound into the info. What crosses under it (the
+account key's seed) is XChaCha20-Poly1305.
+
+Two halves, and either one alone is worthless:
+
+- a server that records everything lacks the optical secret — it travelled from a
+  screen to a camera, a channel the server is not on;
+- someone who photographs the screen lacks a private key.
+
+So the server relays two opaque strings and can read neither. It is not, however,
+what protects the account here: the optical channel is.
+
+### What the confirmation screen is for
+
+Photographing the screen **and** claiming the session before the legitimate reader
+does work — the server hands a session to whoever claims it first. That is the
+attack this design accepts, and answers with a **confirmation number**: six digits
+derived from the channel key, which only the two ends of one exchange can compute.
+An intruder holds a channel of its own, hence different digits from the ones on the
+device in the user's hand. The name a joining device declares is not that check; it
+is its own to choose.
+
+Both sides show the number, and what is asked of the human differs:
+
+| Side | What it shows | What can stop the pairing |
+|---|---|---|
+| the one that gives (sponsor) | the joining device's name and platform, the number, and "decline if it differs" | its own button: nothing crosses until it is pressed |
+| the one that joins | the number, while it waits | **nothing** — the check is passive |
+
+That asymmetry is the residual risk, and it is worth naming rather than glossing:
+a user who ignores the number on the joining device can be linked into **someone
+else's** account by whoever read the displayed code first — the signal they missed
+being their own device's scan failing with "already claimed". What it costs is a
+device that syncs with a stranger, not an account of theirs that leaks: nothing of
+the user's own account crosses in that direction. And what catches it afterwards is
+the safety number — the fingerprint a paired device displays is derived from the key
+it actually installed, so comparing it against another device's says which account
+this one really joined. The account label shown beside it comes from the sponsor's
+bundle: a label for the interface, never a check.
+
+Gating the joining side as well — a second button, on the number — is the obvious
+hardening and is deliberately not in v1. It would not change the proof (a human who
+clicks without comparing is in the same place), it would add a step to every
+legitimate pairing, and it is the asymmetry Signal's device linking has too. It
+becomes worth revisiting if the passive check turns out to be one nobody reads.
+
+### The fresh token, and what it proves
+
+`pairing.approve` demands an ID token minted no longer than
+`UNIVERSALLINK_FRESH_TOKEN_MAX_AGE_SECS` ago, exactly as `devices.revoke` does.
+What that gate proves is narrower than it looks: the Core mints the token from the
+refresh token in its keyring, browserless and with no human involved
+(`core/src/login.rs::fresh_id_token`). It proves the sponsor's session at the IdP
+is still alive — so cutting the account's access there stops devices from being
+taken in, which is the point — and it says nothing about anyone being at the
+keyboard. The human-presence gate is the confirmation screen; the token is the
+IdP-side kill switch.
+
+### What it widens locally
+
+`pairing.*` and the `pairing` topic ride the `session.manage` scope. A component
+holding it can therefore offer a code, pass it to a remote accomplice and confirm
+the pairing itself, with no human at any point — the token comes from the keyring.
+That is a real widening of what that scope grants, which is why the approval prompt
+now reads "open and close the session, **and link new devices to the account**": it
+is the only place the user is ever told. A dedicated `pairing.manage` scope was
+considered and left out — the only component that needs pairing is the interface,
+which needs `session.manage` anyway, so the split would move the grant without
+narrowing it. It becomes worth doing the day a component wants one without the
+other. Against malware running with the user's rights it changes little either way:
+the same process can read the keyring the key sits in (see the IPC threat model
+above).
+
+### A device that holds no key
+
+Enrolled in the account but holding no account key (`account.status`
+→ `holds_key: false`) is a legitimate state, not a corrupt one: it is where every
+device enrolled before the key was kept at rest sits, and where a device whose
+keyring lost the entry lands. Such a device can **join** — it cannot **sponsor**,
+and it is not offered the gesture. Its two ways out are to be paired *to* by a
+device that does hold the key, or to have the recovery code typed into it once
+(entering the code of the account it is already in changes nothing but the
+keyring). Both go through the same rules, and both refuse a key other than the one
+this device is already attested under.

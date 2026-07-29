@@ -28,6 +28,13 @@ Written in **Rust** (a Cargo workspace) with a **Tauri / Svelte** interface.
 - **Share from your phone.** From Android's share sheet: text goes to the
   account's clipboard, ready to paste anywhere, and a file goes to the one machine
   you pick.
+- **Add a machine by showing it a code.** One of your devices displays a QR code,
+  the new one reads it — the phone with its camera, a PC by pasting the same line —
+  and one confirmation on the machine that is already on the account hands over
+  everything the newcomer needs to be trusted by the others. Both screens show the
+  same six digits, so a code someone read over your shoulder is caught before
+  anything crosses. Nothing to retype: your recovery code goes back to being what
+  its name says, the way back if you ever lose every device.
 
 ## Install
 
@@ -48,7 +55,10 @@ The Linux AppImage needs FUSE 2 (`sudo apt install libfuse2`) and, for the tray
 icon, `libayatana-appindicator3` plus a StatusNotifierItem host (on GNOME, the
 AppIndicator extension). The **Android APK is signed**, with the project's own
 key — Android installs nothing otherwise — which makes it a sideload, not a Play
-Store listing.
+Store listing. It asks for the **camera** the first time you scan a pairing code,
+and for nothing else: the permission is optional, and the scanner is the app's own
+(CameraX + ZXing, no Play Services), so a de-Googled phone reads a code just as
+well.
 
 On first launch the app installs the background service (per-user, no admin),
 registers it to start at login, and opens a setup screen. **Nothing is baked into
@@ -88,6 +98,7 @@ bring-up, not just an in-memory test.
 | OIDC login (authorization code + PKCE, browser → loopback) | ✅ implemented |
 | Device enrollment and directory (`devices.list` / `rename` / `revoke`) | ✅ implemented |
 | Account attachment (create / join via recovery code) + peer attestation | ✅ implemented |
+| Add a device by pairing: show a code, scan or paste it, confirm | ✅ implemented |
 | Send files **and folders**: drag onto a card, context menu, phone share | ✅ implemented |
 | Shared clipboard: text, images, files, folders | ✅ implemented |
 | Context menu "send to machine X" (Explorer, Finder, Dolphin, Nautilus) | ✅ implemented |
@@ -269,10 +280,16 @@ from source, run them by hand:
    - on the **first** machine: "This is my first device" → a **recovery code** is
      displayed. It is your way back if you ever lose every device: write it down
      offline. Then "Continue".
-   - on the **others**: "I already have a device on this account" → enter that
-     same code. The **safety number** shown on the Account screen must be
+   - on the **others**: "I already have a device on this account", and then either
+     way in. **Pairing**, which needs nothing typed: on one of the two machines
+     press *Show a code*, on the other *Scan a code* (a phone, with its camera) or
+     *Enter a code…* (a PC, pasting the line under the QR code) — then check both
+     screens show the same six digits and confirm on the machine that is already on
+     the account. Or the **recovery code**, typed in, which still works and is what
+     a server older than pairing leaves you.
+   - either way, the **safety number** shown on the Account screen must be
      **identical** everywhere — compare it visually (a mismatch betrays a wrong
-     code or a substitution).
+     code, a substitution, or a pairing someone else answered).
 
    Without this attachment, every send fails *fail-closed*: it is the account
    attestation that authorizes a peer, not its mere presence in the directory.
@@ -402,8 +419,10 @@ The config directory holds `config.json` (written by the setup screen or by you)
 `ipc-token` (0600, regenerated at every startup), `device.key` (0600, the
 device's iroh identity), `account-key.json` (the account's public key + this
 device's attestation, *not a secret*, absent until the device has joined the
-account), and `session.json` (present ⟺ a session is open). `secrets.json` (0600,
-cleartext secret at rest) only appears as a **fallback**, on a machine where no
+account), and `session.json` (present ⟺ a session is open). What the OS keyring
+holds is the OIDC refresh token and the account's **private** key — kept at rest
+so this device can vouch for the next one it links. `secrets.json` (0600,
+cleartext secrets at rest) only appears as a **fallback**, on a machine where no
 OS keyring is reachable.
 
 On Android everything lives in the app's private storage, and goes with the app
@@ -430,7 +449,11 @@ Log level: `UNIVERSALLINK_LOG=debug` (not `RUST_LOG`).
   the residual is a missing goodbye, not a leak. The fix is a message-only
   window (`WM_QUERYENDSESSION`) or a real service.
 - **Account key rotation** is not implemented (v1 refuses to replace an existing
-  key).
+  key). It matters more than it used to: every device keeps the account key in its
+  keyring, which is what lets it link the next one, so a device whose storage is
+  read hands over the account key — and rotating it is the answer to that. Until it
+  exists, the manual equivalent is to erase the key on **every** device and start
+  over from a fresh recovery code.
 
 ## Documentation
 
