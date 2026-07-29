@@ -282,6 +282,22 @@ export function installFakeCore(): void {
         return null;
       }
       if (cmd === "get_server_config") return serverConfig;
+      // Mobile-only in production (the desktop shell registers neither), faked
+      // here so the scanning gesture can be walked in a browser: a camera the
+      // page cannot open answers with the code another device would be showing.
+      if (cmd === "scan_supported") return true;
+      if (cmd === "scan_code") {
+        const pairing_id = `p_${"cd34".repeat(8)}`;
+        return new Promise((resolve) =>
+          setTimeout(
+            () =>
+              resolve({
+                code: `UL1:${"A".repeat(22)}:${"B".repeat(43)}:${pairing_id}`,
+              }),
+            1200,
+          ),
+        );
+      }
       if (cmd === "core_request") {
         const { method, params } = payload as {
           method: string;

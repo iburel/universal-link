@@ -9,9 +9,20 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Reading a pairing code off another device's screen (ScanActivity). Asked
+         for at the moment of the gesture, never at startup, and the app works
+         without it: a code can be pasted instead. The alternative that needs no
+         permission at all is Google's code scanner, and ScanBridge says why it was
+         not taken. -->
+    <uses-permission android:name="android.permission.CAMERA" />
 
     <!-- AndroidTV support -->
     <uses-feature android:name="android.software.leanback" android:required="false" />
+    <!-- NOT required: a camera is what one gesture uses, not what the app is for.
+         Declaring it required would keep the app off a device with no camera —
+         which is precisely a device that would pair by pasting the code. -->
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
 
     <application
         android:icon="@mipmap/ic_launcher"
@@ -56,6 +67,17 @@
                 <data android:mimeType="*/*" />
             </intent-filter>
         </activity>
+
+        <!-- The camera, for reading a pairing code (ScanBridge/ScanActivity). Not
+             exported: it is opened by this app alone, from the pairing screens.
+             `configChanges` for the same reason MainActivity has it — a rotation
+             must not recreate the window, which here would report the scan as
+             cancelled and hand the camera back mid-gesture. -->
+        <activity
+          android:name=".ScanActivity"
+          android:exported="false"
+          android:label="@string/scan_title"
+          android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode" />
 
         <service
           android:name=".UlForegroundService"

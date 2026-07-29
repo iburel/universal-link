@@ -35,6 +35,7 @@ pub use crate::dataplane::{
     read_offer, receive_bodies, send_transfer,
 };
 pub use crate::identity::load_or_generate_device_seed;
+pub use crate::pairing::PAYLOAD_TAG as PAIRING_CODE_TAG;
 pub use crate::secrets::{FileSecretStore, SecretStore};
 use crate::state::{AppState, Registry, SessionState, SpawnGrant, Transfers, random_hex};
 

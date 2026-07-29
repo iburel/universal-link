@@ -26,7 +26,10 @@
     store.session?.logged_in === true && store.session.server_connected !== true,
   );
   const disabled = $derived(
-    store.busy || stalled || store.connection.status !== "connected",
+    store.busy ||
+      store.scanning ||
+      stalled ||
+      store.connection.status !== "connected",
   );
 
   async function link() {
@@ -74,6 +77,19 @@
       </div>
     {:else}
       <div class="actions">
+        <!-- The good gesture where it exists (a phone), and the primary one
+             there: pointing a camera at a screen beats reading 105 characters
+             out. Absent everywhere else, camera and all — the shell answers for
+             the device (store.canScan). -->
+        {#if store.canScan}
+          <button
+            class="primary"
+            {disabled}
+            onclick={() => store.scanPairingCode()}
+          >
+            Scan a code
+          </button>
+        {/if}
         <button {disabled} onclick={() => store.showPairingCode()}>
           Show a code
         </button>
@@ -113,8 +129,10 @@
     font-size: 0.8rem;
   }
 
+  /* Three buttons on a phone's width: they wrap rather than overflow. */
   .actions {
     display: flex;
+    flex-wrap: wrap;
     gap: 0.4rem;
   }
 </style>

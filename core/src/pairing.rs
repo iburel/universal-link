@@ -62,7 +62,12 @@ use crate::state::{AppState, ServerCmd};
 /// Version tag of the payload a QR code (or a pasted text code) carries. A
 /// version, not decoration: it is what lets a later scheme be told apart from
 /// this one instead of being half-parsed.
-const PAYLOAD_TAG: &str = "UL1";
+///
+/// Re-exported from the crate root (`PAIRING_CODE_TAG`) for the one caller that
+/// needs it outside the Core: a camera scanner has to know which QR code in its
+/// view is a pairing code, and that question has exactly one right answer per
+/// version of this format.
+pub const PAYLOAD_TAG: &str = "UL1";
 
 /// Bytes of pre-shared secret in the payload. 128 bits: unguessable, and short
 /// enough to keep the QR code small.

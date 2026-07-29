@@ -106,7 +106,25 @@ interface Fake {
   taken: string[];
   /** The keep-alive declarations (mobile only): `kind:on`, in order. */
   holds: string[];
+  /** How many scans were asked for (mobile only). */
+  scans: number;
   methods: Record<string, Method>;
+}
+
+interface MockOptions {
+  status?: ConnectionStatus;
+  methods?: Record<string, Method>;
+  /** Run when the shell is queried for its snapshot. */
+  onStatusRead?: () => void;
+  /** What the mobile `share_status` snapshot returns (mobile only). */
+  retainedShare?: unknown;
+  /**
+   * What the mobile shell answers about its camera. Undefined means the command
+   * is not registered at all — the desktop, where a rejection IS the answer.
+   */
+  scanner?: boolean;
+  /** What the mobile `scan_code` answers, once per call. */
+  scanned?: () => unknown;
 }
 
 type Internals = {
@@ -119,14 +137,7 @@ type Internals = {
   };
 };
 
-function mockCore(options: {
-  status?: ConnectionStatus;
-  methods?: Record<string, Method>;
-  /** Run when the shell is queried for its snapshot. */
-  onStatusRead?: () => void;
-  /** What the mobile `share_status` snapshot returns (mobile only). */
-  retainedShare?: unknown;
-}): Fake {
+function mockCore(options: MockOptions): Fake {
   const fake: Fake = {
     calls: [],
     opened: [],
@@ -135,6 +146,7 @@ function mockCore(options: {
     discards: [],
     taken: [],
     holds: [],
+    scans: 0,
     methods: {
       "session.status": () => SESSION,
       "account.status": () => ATTESTED,
@@ -180,6 +192,15 @@ function mockCore(options: {
       if (cmd === "keep_alive") {
         fake.holds.push(`${args.kind}:${args.on}`);
         return null;
+      }
+      // Mobile-only: the camera. Both commands are ABSENT on the desktop shell,
+      // which is why the default here is to fall through to the rejection below.
+      if (cmd === "scan_supported" && options.scanner !== undefined) {
+        return options.scanner;
+      }
+      if (cmd === "scan_code" && options.scanned) {
+        fake.scans += 1;
+        return options.scanned();
       }
       if (cmd === "core_request") {
         const { method, params } = payload as {
@@ -876,8 +897,11 @@ test("an action while disconnected surfaces the shell's message", async () => {
 // -- Transfers --------------------------------------------------------------
 
 /** A primed, connected store, ready to receive notifications. */
-async function primed(methods?: Record<string, Method>) {
-  const fake = mockCore({ status: CONNECTED, methods });
+async function primed(
+  methods?: Record<string, Method>,
+  over: Omit<MockOptions, "status" | "methods"> = {},
+) {
+  const fake = mockCore({ status: CONNECTED, methods, ...over });
   await store.start();
   await vi.waitFor(() => expect(store.primed).toBe(true));
   return fake;
@@ -2314,4 +2338,131 @@ test("any other refusal is reported without taking the offer away", async () => 
   expect(store.pairing).toBeNull();
   expect(store.pairingSupported).toBe(true);
   expect(store.notice).toEqual({ kind: "error", text: "Server unreachable." });
+});
+
+// The Core says nothing about a code it cannot parse beyond "invalid params",
+// which is not a sentence: the likely cause is a line copied short of its end.
+test("a code the Core cannot read is explained, not relayed", async () => {
+  await primed({
+    "pairing.accept": () => {
+      throw invalidParams("code");
+    },
+  });
+
+  await store.enterPairingCode("UL1:truncated");
+
+  expect(store.pairing).toBeNull();
+  expect(store.pairingSupported).toBe(true);
+  expect(store.notice?.text).toContain("not a complete pairing code");
+});
+
+// -- Pairing: reading a code with the camera (mobile) ------------------------
+
+test("the shell is asked once whether this device can read a code", async () => {
+  await primed(undefined, { scanner: true });
+
+  expect(store.canScan).toBe(true);
+});
+
+// The desktop shell registers no scanner at all, and that rejection IS the
+// answer: no camera gesture is ever offered there.
+test("a shell with no scanner leaves the gesture off", async () => {
+  await primed();
+
+  expect(store.canScan).toBe(false);
+});
+
+// The point of the whole brick: what the camera reads takes exactly the path a
+// pasted code takes, and nothing else.
+test("a scanned code is joined with, like any other", async () => {
+  const fake = await primed(pairingMethods(), {
+    scanner: true,
+    scanned: () => ({ code: "UL1:scanned:key:p_1" }),
+  });
+
+  await store.scanPairingCode();
+
+  expect(fake.scans).toBe(1);
+  expect(fake.calls.find((c) => c.method === "pairing.accept")?.params).toEqual({
+    code: "UL1:scanned:key:p_1",
+  });
+  expect(store.pairing).toMatchObject({ pairing_id: "p_1", phase: "waiting" });
+  expect(store.notice).toBeNull();
+  expect(store.scanning).toBe(false);
+});
+
+// A scan is a human framing a camera, so it must not hold `busy`: that would
+// disarm the rest of the app for a minute, and would make the very
+// `pairing.accept` this gesture exists for return early.
+test("the scan holds its own flag, not the one that guards the Core", async () => {
+  const scan = deferred<unknown>();
+  const fake = await primed(pairingMethods(), {
+    scanner: true,
+    scanned: () => scan.promise,
+  });
+
+  const done = store.scanPairingCode();
+  await flush();
+  expect(store.scanning).toBe(true);
+  expect(store.busy).toBe(false);
+
+  // A second gesture while the camera is up asks for nothing.
+  await store.scanPairingCode();
+  expect(fake.scans).toBe(1);
+
+  scan.resolve({ code: "UL1:scanned:key:p_1" });
+  await done;
+  expect(store.scanning).toBe(false);
+  expect(fake.calls.map((c) => c.method)).toContain("pairing.accept");
+});
+
+test("backing out of the camera says nothing at all", async () => {
+  const fake = await primed(pairingMethods(), {
+    scanner: true,
+    scanned: () => ({ reason: "cancelled" }),
+  });
+
+  await store.scanPairingCode();
+
+  expect(store.notice).toBeNull();
+  expect(store.pairing).toBeNull();
+  expect(fake.calls.map((c) => c.method)).not.toContain("pairing.accept");
+});
+
+test("a refused camera explains itself and names the way round it", async () => {
+  await primed(pairingMethods(), {
+    scanner: true,
+    scanned: () => ({ reason: "denied" }),
+  });
+
+  await store.scanPairingCode();
+
+  expect(store.notice?.text).toContain("paste the code instead");
+  // Refused once is not refused for good: the gesture stays on offer.
+  expect(store.canScan).toBe(true);
+});
+
+// ...whereas a camera that does not exist will not appear: the button goes.
+test("a device with no camera stops being offered one", async () => {
+  await primed(pairingMethods(), {
+    scanner: true,
+    scanned: () => ({ reason: "no_camera" }),
+  });
+
+  await store.scanPairingCode();
+
+  expect(store.canScan).toBe(false);
+  expect(store.notice?.text).toContain("no camera");
+});
+
+// A word from a newer shell than this page: still an answer, still a sentence.
+test("an outcome this page has no word for is still reported", async () => {
+  await primed(pairingMethods(), {
+    scanner: true,
+    scanned: () => ({ reason: "lens_cap" }),
+  });
+
+  await store.scanPairingCode();
+
+  expect(store.notice?.text).toContain("could not be read");
 });

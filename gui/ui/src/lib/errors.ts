@@ -104,3 +104,26 @@ const PAIRING_REASONS: Record<string, string> = {
 export function pairingFailure(reason: string): string {
   return PAIRING_REASONS[reason] ?? `The link failed (${reason}).`;
 }
+
+/**
+ * Why a scan produced no code (gui-mobile/src/scan.rs). `null` is a real answer
+ * and the most common one: a user who backed out of the camera knows they did,
+ * and a banner explaining it to them would be noise.
+ *
+ * Every sentence names the way out, because there always is one — the code can be
+ * pasted, and on the other device the recovery code still works.
+ */
+const SCAN_REASONS: Record<string, string | null> = {
+  cancelled: null,
+  busy: null,
+  denied:
+    "UniversalLink needs the camera to read a code. Allow it in Android settings, or paste the code instead.",
+  no_camera: "This device has no camera — paste the code instead.",
+  failed: "The camera could not be opened. Paste the code instead.",
+};
+
+export function scanFailure(reason: string): string | null {
+  return reason in SCAN_REASONS
+    ? SCAN_REASONS[reason]
+    : "The code could not be read. Paste it instead.";
+}

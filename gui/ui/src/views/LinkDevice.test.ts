@@ -109,6 +109,41 @@ test("a device with no session is not disarmed by a server it has never talked t
   expect(textOf(view)).not.toContain("Waiting for the server");
 });
 
+// The camera gesture exists only where there is a camera, and the shell is what
+// answers that (mobile). It is the PRIMARY one there: pointing a phone at a
+// screen beats reading 105 characters out.
+test("a device with a camera is offered it first", () => {
+  store.canScan = true;
+  const scan = vi.spyOn(store, "scanPairingCode").mockResolvedValue();
+
+  const view = render(LinkDevice, { store, mode: "join" });
+
+  const buttons = [...view.querySelectorAll("button")].map((b) => b.textContent?.trim());
+  expect(buttons).toEqual(["Scan a code", "Show a code", "Enter a code…"]);
+  click(byText(view, "button", "Scan a code"));
+  expect(scan).toHaveBeenCalledOnce();
+});
+
+test("a device with no camera is not offered one", () => {
+  const view = render(LinkDevice, { store, mode: "join" });
+
+  expect(textOf(view)).not.toContain("Scan a code");
+});
+
+// While the camera is up the store holds `scanning`, not `busy` (a scan lasts as
+// long as a human takes). The buttons still have to disarm — a second scanner on
+// top of the first would be two windows fighting over one camera.
+test("a scan under way disarms the gestures", () => {
+  store.canScan = true;
+  store.scanning = true;
+
+  const view = render(LinkDevice, { store, mode: "join" });
+
+  for (const label of ["Scan a code", "Show a code", "Enter a code…"]) {
+    expect(byText(view, "button", label)).toHaveProperty("disabled", true);
+  }
+});
+
 test("the words change with the side, the gestures do not", () => {
   const view = render(LinkDevice, { store, mode: "sponsor" });
   expect(textOf(view)).toContain("Add a device to your account");

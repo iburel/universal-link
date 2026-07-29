@@ -57,6 +57,8 @@ import {
   onConnectionChanged,
   onCoreNotification,
   onShareStatus,
+  scanCode,
+  scanSupported,
   setServerConfig,
   shareStatus,
   shareTaken,
@@ -73,6 +75,7 @@ import {
   isInvalidParams,
   isUnknownMethod,
   pairingFailure,
+  scanFailure,
 } from "./errors";
 import { formatSize } from "./format";
 
@@ -313,6 +316,20 @@ export class CoreStore {
    * offer it, and stop offering it once it is known not to work.
    */
   pairingSupported = $state(true);
+  /**
+   * Whether this device can READ a code with a camera (mobile only — the desktop
+   * shell has no scanner, so it is always false there). Asked once, of the shell:
+   * it answers for the device, not for the platform.
+   */
+  canScan = $state(false);
+  /**
+   * A scanner is up. Its own flag rather than {@link busy}, and that is not a
+   * detail: a scan lasts as long as a human takes to frame a code, and holding
+   * `busy` for that long would disarm every other screen — and worse, would make
+   * the `enterPairingCode` that FOLLOWS the scan do nothing at all
+   * ({@link #startPairing} returns early when busy).
+   */
+  scanning = $state(false);
   /** Why the directory is empty, when the Core refuses to serve it. */
   devicesError = $state<string | null>(null);
   /** The last action's feedback, shown as a banner. */
@@ -389,6 +406,11 @@ export class CoreStore {
     // recent than the snapshot by construction.
     const share = await shareStatus();
     if (share && !this.#sawShareStatus) this.#applyShare(share);
+    // Last, and asked of the SHELL rather than of the Core: whether this device
+    // can read a code with a camera. It cannot change while the app runs (a phone
+    // grows no camera), so unlike `pairingSupported` it is not re-probed on a
+    // reconnection.
+    this.canScan = await scanSupported();
   }
 
   /**
@@ -971,6 +993,36 @@ export class CoreStore {
     });
   }
 
+  /**
+   * Reads the other device's code with the camera (mobile), then joins with it.
+   *
+   * The two halves are deliberately separate: the camera is the shell's business
+   * and the code is the Core's, so a scan that produced nothing goes no further
+   * than a sentence — and a scan that produced a code walks exactly the same path
+   * as one pasted by hand.
+   */
+  async scanPairingCode(): Promise<void> {
+    if (this.scanning || this.busy) return;
+    this.scanning = true;
+    // Cleared on the way in, like every other gesture: the sentence explaining
+    // the last attempt has no business sitting over this one.
+    this.notice = null;
+    let outcome;
+    try {
+      outcome = await scanCode();
+    } finally {
+      this.scanning = false;
+    }
+    if (outcome.code) {
+      await this.enterPairingCode(outcome.code);
+      return;
+    }
+    // A camera that will never work is not offered again; the others may.
+    if (outcome.reason === "no_camera") this.canScan = false;
+    const text = scanFailure(outcome.reason ?? "failed");
+    if (text) this.notice = { kind: "error", text };
+  }
+
   /** A code was read from the other device — scanned, or pasted by hand. */
   enterPairingCode(code: string): Promise<void> {
     const entered = code.trim();
@@ -1011,6 +1063,15 @@ export class CoreStore {
         this.notice = {
           kind: "error",
           text: "Linking by code needs a newer UniversalLink on this device and on the server.",
+        };
+      } else if (isInvalidParams(e)) {
+        // The only parameter either call sends is the code, so this is the Core
+        // saying it cannot read it. Which is worth its own sentence rather than
+        // "invalid params: code": the likely cause is a line copied short of its
+        // end, through a chat window or a text field that trimmed it.
+        this.notice = {
+          kind: "error",
+          text: "That is not a complete pairing code — check that the whole line was copied.",
         };
       } else {
         this.notice = { kind: "error", text: humanize(e) };

@@ -12,6 +12,7 @@
 
 mod keepalive;
 mod logcat;
+mod scan;
 mod share;
 mod tls;
 
@@ -50,6 +51,11 @@ pub fn run() {
             share::share_status,
             share::share_taken,
             share::discard_share,
+            // Mobile-only: reading a pairing code with the camera. The desktop
+            // has no camera in reach of this flow, and the frontend takes the
+            // absence of these commands as the answer (see `scan`).
+            scan::scan_supported,
+            scan::scan_code,
             // Mobile-only: work the frontend has to declare, so the process
             // survives not being the one in front — a round-trip through the
             // browser, a send waiting to be accepted (see `keepalive`).
