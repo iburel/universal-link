@@ -23,23 +23,24 @@
 //! `account-key.json` (public data) — and **keeps AK_priv at rest**, as a seed
 //! in the keyring (`remember` / `recall`).
 //!
-//! Keeping it is a deliberate inversion of this module's first design, which
-//! discarded AK_priv after onboarding. Discarding it made one thing impossible:
-//! a device already in the account could not vouch for a new one, so every
-//! device had to have the recovery code typed into it. Holding the key is what
-//! lets an enrolled device hand the account to another one (the pairing
-//! building block) — the same reason 1Password can sign a new device in from an
-//! old one and we could not.
+//! Keeping it is what makes one thing possible: a device already in the account
+//! can vouch for a new one, so the recovery code does not have to be typed into
+//! every device (the pairing building block — the same reason 1Password can sign
+//! a new device in from an old one).
 //!
-//! What that costs, stated plainly: the account's private key now exists at
-//! rest on every device, under the keyring's protection (OS keyring, or a 0600
-//! file — the same perimeter as `device.key` and the refresh token). Whoever
-//! reads a device's storage reads the account key. Before, they would have
-//! needed the user's recovery code. So a compromised device now means the
-//! ACCOUNT key is compromised, and an AK rotation stops being a nicety: it
-//! becomes the mandatory response. The recovery code, for its part, stops being
-//! the only copy of AK_priv and becomes what its name says — the way back when
-//! every device is gone.
+//! What that costs, stated plainly: the account's private key exists at rest on
+//! every device, under the keyring's protection (OS keyring, or a 0600 file — the
+//! same perimeter as `device.key` and the refresh token). Whoever reads a
+//! device's storage reads the account key, where the user's recovery code would
+//! otherwise have been needed. So a compromised device means the ACCOUNT key is
+//! compromised, and an AK rotation is not a nicety: it is the response. The
+//! recovery code, for its part, is not a copy to be typed everywhere — it is what
+//! its name says, the way back when every device is gone.
+//!
+//! A device that has the account but not the key (a keyring that lost it, or one
+//! that never answered) still works: `ak_pub` is what verifies peers. It simply
+//! cannot vouch, and [`install`] is the one way back — the recovery code, or a
+//! pairing from a device that holds the key.
 //!
 //! The attestation binds the `node_id` alone (a stable crypto identity), not
 //! the `device_id` (an ephemeral label re-minted by the server at each
@@ -232,9 +233,10 @@ pub fn remember(secrets: &dyn crate::SecretStore, ak: &SigningKey) -> std::io::R
 }
 
 /// Re-reads AK_priv from the keyring, for a device that has something to attest.
-/// `None` when it holds nothing usable: a device enrolled before the key was
-/// kept at rest, or a keyring that does not answer. The caller then has to fall
-/// back on asking the user for the recovery code.
+/// `None` when it holds nothing usable — a keyring that does not answer, or one
+/// the seed has been taken out of. The device then has the account but cannot
+/// vouch for another, and the way back in is [`install`]: the recovery code, or a
+/// pairing from a device that does hold the key.
 ///
 /// The seed is checked against `ak_pub_hex` — the account's public key as
 /// persisted in `account-key.json` — and any mismatch answers `None`. That is
@@ -267,45 +269,89 @@ pub enum InstallError {
 }
 
 /// Attests our `node_id` under `ak`, stows AK_priv, persists the root and
-/// installs it in memory — atomically under the lock. The single way in for
-/// every path that joins the account: a typed recovery code (`account.setup` /
-/// `account.join`) or a pairing that handed the seed over.
+/// installs it in memory. The single way in for every path that joins the
+/// account: a typed recovery code (`account.setup` / `account.join`) or a pairing
+/// that handed the seed over.
 ///
 /// A root already there for **another** account key is refused
 /// ([`InstallError::OtherKey`]): replacing it is a rotation, a follow-up building
 /// block, and it is also the surface an attacker would use to re-attest this
 /// device under a key of their choosing — whether they hold `session.manage` or
-/// sponsor a pairing. The **same** account key, however, goes through:
-/// re-deriving the key this device is already attested under proves the caller
-/// has the account, re-attesting is byte-for-byte the same signature (Ed25519 is
-/// deterministic), and the one thing it does change is the keyring. That is the
-/// migration gesture for a device enrolled before the key was kept at rest.
+/// sponsor a pairing. The **same** account key, however, goes through: re-deriving
+/// the key this device is already attested under proves the caller has the
+/// account, re-attesting is byte-for-byte the same signature (Ed25519 is
+/// deterministic), and the one thing it does change is the keyring. That is what
+/// makes this the way back in for a device that has the account but not its key.
 ///
-/// The keyring comes before the root on purpose, and the reason is not
-/// retryability — the same key being accepted, either order retries cleanly. It
-/// is that of the two halves the keyring is the fragile one (a write handed to an
-/// OS service that may refuse it), while the root is the *visible* one: it is
-/// what makes `account.status` answer `attested: true` and what the data plane
-/// verifies peers against. So the fragile half is attempted first, and a device
-/// never claims to have joined the account on the strength of a half-install.
-/// Writing the secret under the lock is the established pattern here
-/// (`session.logout` deletes the refresh token under the session lock) — it is
-/// what `daemon::secrets`' background thread exists for.
+/// **The keyring first, and read back before anything else.** Of the two halves
+/// the keyring is the fragile one (a write handed to an OS service that may
+/// refuse it), while the root is the *visible* one: it is what makes
+/// `account.status` answer `attested: true` and what the data plane verifies
+/// peers against. And a write that returned `Ok` is not a write that landed — on
+/// the desktop it was merely queued (`daemon::secrets`). So the fragile half is
+/// attempted first and then **verified by a read**, which is authoritative and,
+/// the queue being FIFO, cannot answer before the write has been tried. A device
+/// therefore never claims to have joined the account on the strength of a
+/// half-install: `attested` implies the key is really there.
+///
+/// A seed left behind by a refused install is inert: nothing reads it but
+/// `recall`, which checks it against the `ak_pub` of an installed root, and the
+/// next install of any key overwrites it.
+///
+/// The lock is taken twice, deliberately, and never held across the keyring: that
+/// round trip waits on an OS service (seconds, in the bad case) and
+/// `account_root` sits on the data plane's authorization path, so holding it
+/// there would stall every peer check. The first pass refuses another account's
+/// key before any key material is written; the second is the one that counts,
+/// since it is where the root is installed.
 pub(crate) fn install(
     state: &crate::state::AppState,
     ak: &SigningKey,
 ) -> Result<AccountRoot, InstallError> {
     let root = root_for(ak, &state.identity.node_id());
+    refuse_another_key(state, &root)?;
+    stow_and_verify(&*state.secrets, ak, &root.ak_pub)?;
+
     let mut slot = state.account_root.lock().expect("lock account_root");
     if let Some(existing) = slot.as_ref()
         && existing.ak_pub != root.ak_pub
     {
         return Err(InstallError::OtherKey);
     }
-    remember(&*state.secrets, ak).map_err(|_| InstallError::SaveFailed)?;
     save(&state.config_dir, &root).map_err(|_| InstallError::SaveFailed)?;
     *slot = Some(root.clone());
     Ok(root)
+}
+
+/// Stows the key, then **reads it back**: `Ok` only once this device really holds
+/// it. A keyring `set` that returned `Ok` proves nothing on its own — on the
+/// desktop the write was merely queued — and the read is authoritative
+/// ([`recall`] is what checks the stored seed against `ak_pub`, so an answer at
+/// all means the very key we meant). The queue being FIFO, the read cannot come
+/// back before the write has been attempted.
+fn stow_and_verify(
+    secrets: &dyn crate::SecretStore,
+    ak: &SigningKey,
+    ak_pub: &str,
+) -> Result<(), InstallError> {
+    remember(secrets, ak).map_err(|_| InstallError::SaveFailed)?;
+    if recall(secrets, ak_pub).map(|k| k.to_bytes()) != Some(ak.to_bytes()) {
+        tracing::error!("the account key did not reach the keyring: nothing installed");
+        return Err(InstallError::SaveFailed);
+    }
+    Ok(())
+}
+
+/// `OtherKey` if a root is already installed for a different account key.
+fn refuse_another_key(
+    state: &crate::state::AppState,
+    root: &AccountRoot,
+) -> Result<(), InstallError> {
+    let slot = state.account_root.lock().expect("lock account_root");
+    match slot.as_ref() {
+        Some(existing) if existing.ak_pub != root.ak_pub => Err(InstallError::OtherKey),
+        _ => Ok(()),
+    }
 }
 
 fn attest_message(node_id: &str) -> Vec<u8> {
@@ -610,6 +656,36 @@ mod tests {
 
         let other = account_key_from_code(&generate_recovery_code()).unwrap();
         assert_ne!(fingerprint(&public_hex(&other)), Some(fp));
+    }
+
+    /// A keyring that ACCEPTS a write and loses it — which is what an `Ok` from a
+    /// queued write can turn out to mean — must not pass for a device that holds
+    /// the account key. Nothing else can catch this: `set` said yes.
+    #[test]
+    fn a_write_that_never_landed_is_not_an_install() {
+        /// Says yes, keeps nothing.
+        #[derive(Debug)]
+        struct Mute;
+        impl crate::SecretStore for Mute {
+            fn get(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn set(&self, _: &str, _: &str) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn delete(&self, _: &str) {}
+        }
+
+        let ak = account_key_from_code(&generate_recovery_code()).unwrap();
+        assert_eq!(
+            stow_and_verify(&Mute, &ak, &public_hex(&ak)),
+            Err(InstallError::SaveFailed)
+        );
+
+        // And a keyring that keeps what it is given passes, on the same code path.
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = crate::FileSecretStore::new(dir.path());
+        assert_eq!(stow_and_verify(&secrets, &ak, &public_hex(&ak)), Ok(()));
     }
 
     #[test]
