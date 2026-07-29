@@ -235,19 +235,33 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          app=target/release/bundle/macos/UniversalLink.app
+          # Inside the dmg, not in `bundle/macos/UniversalLink.app`: with only the dmg
+          # requested, tauri deletes that intermediate bundle as its last act
+          # ("Cleaning …UniversalLink.app"). Checking the image that actually ships is
+          # the better evidence in any case.
+          dmg="$(ls target/release/bundle/dmg/*.dmg | head -1)"
+          mnt=/tmp/ul-verify-layout
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mnt" > /dev/null
+          app="$mnt/UniversalLink.app"
           helper="$app/Contents/Frameworks/UniversalLinkTray.app"
+          # Collected rather than exited on, so the image is always detached.
+          status=0
           if [ ! -x "$helper/Contents/MacOS/universallink-tray" ]; then
-            echo "::error::no executable tray in $helper"
-            ls -lR "$app/Contents" || true
-            exit 1
+            echo "::error::no executable tray in the helper bundle"
+            ls -lR "$app/Contents" | head -60
+            status=1
           fi
           if [ -e "$app/Contents/MacOS/universallink-tray" ]; then
             echo "::error::the tray is ALSO in Contents/MacOS, where it takes the application's Launch Services identity: clicking the app icon would open nothing"
-            exit 1
+            status=1
           fi
-          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$helper/Contents/Info.plist"
-          /usr/libexec/PlistBuddy -c "Print :LSUIElement" "$helper/Contents/Info.plist"
+          if [ "$status" = 0 ]; then
+            /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$helper/Contents/Info.plist"
+            /usr/libexec/PlistBuddy -c "Print :LSUIElement" "$helper/Contents/Info.plist"
+            ls -l "$helper/Contents/MacOS"
+          fi
+          hdiutil detach "$mnt" > /dev/null
+          exit $status
 
       # Always: retrievable from the run (tests the chain without a tag).
       - name: Run artifact
