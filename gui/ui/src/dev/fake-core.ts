@@ -73,6 +73,8 @@ export function installFakeCore(): void {
   // Persists after logout, like the real root on disk.
   let attested = false;
   let fingerprint: string | null = null;
+  // The account's private key at rest: acquired along with the attestation.
+  let holdsKey = false;
   let devices: Device[] = [];
   let pending: PendingRequest[] = [];
   let components: Component[] = [
@@ -124,18 +126,23 @@ export function installFakeCore(): void {
       return {};
     },
     "session.reload": () => session,
-    "account.status": () => ({ attested, fingerprint }),
+    "account.status": () => ({ attested, fingerprint, holds_key: holdsKey }),
     "account.setup": () => {
       if (attested) throw rpc("ACCOUNT_KEY_SET");
       if (!session.server_connected) throw rpc("SERVER_UNREACHABLE");
       attested = true;
+      holdsKey = true;
       fingerprint = "AB12 CD34 EF56 7890";
       return { recovery_code: "riverbed-lantern-harbor-92", fingerprint };
     },
+    // A code already known to this account goes through and only stows the key
+    // (the real Core refuses a code of ANOTHER account: nothing here models a
+    // second account, so every accepted code is "the same one").
     "account.join": ({ recovery_code }) => {
       if (!session.server_connected) throw rpc("SERVER_UNREACHABLE");
       if (!recovery_code) throw rpc("INVALID_CODE");
       attested = true;
+      holdsKey = true;
       fingerprint = "AB12 CD34 EF56 7890";
       return { fingerprint };
     },

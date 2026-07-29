@@ -18,20 +18,35 @@
 //! attestation is refused: *fail-closed*).
 //!
 //! Chosen provisioning (the "recovery code" model): AK is derived from a
-//! high-entropy code generated on the first device; every device re-derives AK
-//! by entering the same code, signs ITS OWN node_id, persists `ak_pub` + its
-//! attestation (not secrets) and DISCARDS AK_priv — after enrollment no device
-//! holds the account's private key at rest; only the code (in the user's hands)
-//! reconstitutes it.
+//! high-entropy code generated on the first device; every device that joins the
+//! account signs ITS OWN node_id, persists `ak_pub` + its attestation in
+//! `account-key.json` (public data) — and **keeps AK_priv at rest**, as a seed
+//! in the keyring (`remember` / `recall`).
+//!
+//! Keeping it is a deliberate inversion of this module's first design, which
+//! discarded AK_priv after onboarding. Discarding it made one thing impossible:
+//! a device already in the account could not vouch for a new one, so every
+//! device had to have the recovery code typed into it. Holding the key is what
+//! lets an enrolled device hand the account to another one (the pairing
+//! building block) — the same reason 1Password can sign a new device in from an
+//! old one and we could not.
+//!
+//! What that costs, stated plainly: the account's private key now exists at
+//! rest on every device, under the keyring's protection (OS keyring, or a 0600
+//! file — the same perimeter as `device.key` and the refresh token). Whoever
+//! reads a device's storage reads the account key. Before, they would have
+//! needed the user's recovery code. So a compromised device now means the
+//! ACCOUNT key is compromised, and an AK rotation stops being a nicety: it
+//! becomes the mandatory response. The recovery code, for its part, stops being
+//! the only copy of AK_priv and becomes what its name says — the way back when
+//! every device is gone.
 //!
 //! The attestation binds the `node_id` alone (a stable crypto identity), not
 //! the `device_id` (an ephemeral label re-minted by the server at each
 //! enrollment): it survives a re-login and says what matters — "this
 //! cryptographic device is one of ours". Revoking a specific device remains a
-//! server-side directory removal; the "compromised device that keeps the
-//! secret" case is handled by an AK rotation (follow-up building block). The
-//! signed payload is versioned (`ATTEST_DOMAIN`) to make that rotation possible
-//! later.
+//! server-side directory removal. The signed payload is versioned
+//! (`ATTEST_DOMAIN`) to make a rotation possible later.
 
 use std::path::Path;
 
@@ -68,7 +83,8 @@ const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 /// The account's trust root, as persisted and held at runtime. `ak_pub` serves
 /// to VERIFY peers; `attestation` is our own, republished on every
 /// (re)connection (the server keeps it in memory — it forgets it on restart).
-/// AK_priv is NOT here: discarded after setup.
+/// AK_priv is NOT here: this file carries public data only, and the private key
+/// lives in the keyring (`remember` / `recall`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountRoot {
     /// The account's public key (AK_pub), in hex (64 chars).
@@ -125,7 +141,7 @@ pub fn public_hex(ak: &SigningKey) -> String {
 
 /// The trust root to persist for THIS device: AK_pub (to verify peers) + our
 /// attestation over `node_id` (to republish on every connection). AK_priv stays
-/// with the caller, who discards it afterwards.
+/// with the caller, who stows it with `remember`.
 pub fn root_for(ak: &SigningKey, node_id: &str) -> AccountRoot {
     AccountRoot {
         ak_pub: public_hex(ak),
@@ -199,6 +215,45 @@ pub fn save(config_dir: &Path, root: &AccountRoot) -> std::io::Result<()> {
         "attestation": root.attestation,
     });
     std::fs::write(config_dir.join(KEY_FILE), body.to_string())
+}
+
+/// Stows AK_priv in the keyring, as a hex seed — the same shape as `device.key`.
+/// From then on this device can attest another `node_id` without the user
+/// retyping the recovery code; that is the entire reason it is kept.
+///
+/// A failure is reported rather than swallowed: "joined the account but unable
+/// to vouch for anyone" is a state nothing would surface until the user reached
+/// a pairing screen, weeks later. Beware, though, of what an `Ok` is worth: on
+/// the desktop the keyring's `set` queues the write and returns before it is
+/// attempted (`daemon::secrets`), so `Ok` means *accepted*, not *written*. The
+/// authoritative answer is a read-back — which is what `recall` is for.
+pub fn remember(secrets: &dyn crate::SecretStore, ak: &SigningKey) -> std::io::Result<()> {
+    secrets.set(crate::secrets::ACCOUNT_SEED, &hex::encode(ak.to_bytes()))
+}
+
+/// Re-reads AK_priv from the keyring, for a device that has something to attest.
+/// `None` when it holds nothing usable: a device enrolled before the key was
+/// kept at rest, or a keyring that does not answer. The caller then has to fall
+/// back on asking the user for the recovery code.
+///
+/// The seed is checked against `ak_pub_hex` — the account's public key as
+/// persisted in `account-key.json` — and any mismatch answers `None`. That is
+/// not a corruption check: it is what stops the keyring from choosing which key
+/// we sign with. Whoever can write the keyring but not `account-key.json` would
+/// otherwise have us vouch for a device under THEIR account key, and that device
+/// would join THEIR account believing it had joined ours. Fail-closed, like
+/// `verify`.
+pub fn recall(secrets: &dyn crate::SecretStore, ak_pub_hex: &str) -> Option<SigningKey> {
+    let stored = secrets.get(crate::secrets::ACCOUNT_SEED)?;
+    let seed: [u8; 32] = hex::decode(stored).ok()?.try_into().ok()?;
+    let ak = SigningKey::from_bytes(&seed);
+    // Compared as keys, not as strings: the encoding of `ak_pub_hex` is not the
+    // subject, and an unreadable one mismatches — which is the safe answer.
+    if parse_public(ak_pub_hex) != Some(ak.verifying_key()) {
+        tracing::warn!("the stored account seed is not this account's key: ignored");
+        return None;
+    }
+    Some(ak)
 }
 
 fn attest_message(node_id: &str) -> Vec<u8> {
@@ -479,6 +534,70 @@ mod tests {
 
         let other = account_key_from_code(&generate_recovery_code()).unwrap();
         assert_ne!(fingerprint(&public_hex(&other)), Some(fp));
+    }
+
+    #[test]
+    fn a_remembered_key_comes_back_for_its_own_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = crate::FileSecretStore::new(dir.path());
+        let ak = account_key_from_code(&generate_recovery_code()).unwrap();
+        let ak_pub = public_hex(&ak);
+
+        assert!(
+            recall(&secrets, &ak_pub).is_none(),
+            "nothing held until the device joined"
+        );
+        remember(&secrets, &ak).expect("stow the account key");
+        assert_eq!(
+            recall(&secrets, &ak_pub).map(|k| k.to_bytes()),
+            Some(ak.to_bytes()),
+            "the very key, ready to attest another node"
+        );
+
+        // Asked for under ANOTHER account's key: refused. A device holds the key
+        // of one account, and answering here would be answering about a key it
+        // does not have.
+        let other = account_key_from_code(&generate_recovery_code()).unwrap();
+        assert!(recall(&secrets, &public_hex(&other)).is_none());
+    }
+
+    /// The guard that matters: the keyring does not get to choose the key we sign
+    /// with. An attacker able to write it — but not `account-key.json`, which
+    /// pins `ak_pub` — must not have us vouch for a device under their own
+    /// account key.
+    #[test]
+    fn a_substituted_seed_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = crate::FileSecretStore::new(dir.path());
+        let ours = account_key_from_code(&generate_recovery_code()).unwrap();
+        let theirs = account_key_from_code(&generate_recovery_code()).unwrap();
+
+        remember(&secrets, &theirs).expect("stow");
+        assert!(
+            recall(&secrets, &public_hex(&ours)).is_none(),
+            "a seed that does not derive our ak_pub must count as absent"
+        );
+    }
+
+    #[test]
+    fn an_unusable_stored_seed_counts_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = crate::FileSecretStore::new(dir.path());
+        let ak = account_key_from_code(&generate_recovery_code()).unwrap();
+        let ak_pub = public_hex(&ak);
+
+        for junk in ["", "not-hex", "ab", &"ab".repeat(31), &"ab".repeat(33)] {
+            crate::SecretStore::set(&secrets, crate::secrets::ACCOUNT_SEED, junk).expect("stow");
+            assert!(
+                recall(&secrets, &ak_pub).is_none(),
+                "unusable seed accepted: {junk:?}"
+            );
+        }
+
+        // And a valid seed asked for under an unreadable ak_pub: mismatch, so
+        // absent — never "well, the seed parses, good enough".
+        remember(&secrets, &ak).expect("stow");
+        assert!(recall(&secrets, "not-a-key").is_none());
     }
 
     #[test]

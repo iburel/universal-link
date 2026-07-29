@@ -41,11 +41,13 @@ The config folder houses:
 - `device.key` (0600) — the device's Ed25519 seed, generated at first startup.
   This is the iroh identity, and it precedes the login;
 - `account-key.json` — the account's root of trust (C7): the account's PUBLIC key
-  + this device's attestation. **Not secret** (no private key: the account key is
-  reconstituted from the recovery code, with the user). Absent until the device
-  has joined the account (`account.setup`/`join`);
+  + this device's attestation. **Not secret** — no private key in this file.
+  Absent until the device has joined the account (`account.setup`/`join`);
 - `session.json` — present ⟺ a session is open;
-- `secrets.json` (0600) — fallback when no keyring is reachable.
+- `secrets.json` (0600) — fallback when no keyring is reachable. What the keyring
+  holds: the OIDC refresh token, and the account's **private** key
+  (`account-key-seed`) — kept at rest so this device can vouch for a joining one
+  ([architecture.md](architecture.md), principle 3).
 
 ## Configuration
 

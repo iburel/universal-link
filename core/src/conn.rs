@@ -646,18 +646,37 @@ impl Conn {
     /// out-of-band verification, to compare across devices.
     fn account_status(&self) -> Result<Value, RpcErr> {
         self.require_scope("session.read")?;
-        let root = self.state.account_root.lock().expect("lock account_root");
-        let fingerprint = root
+        // Cloned out of the lock: the keyring read below can block (a mute
+        // keyring is only given up on after a timeout), and `account_root` is on
+        // the data plane's authorization path — holding it that long would stall
+        // every peer check.
+        let ak_pub = self
+            .state
+            .account_root
+            .lock()
+            .expect("lock account_root")
             .as_ref()
-            .and_then(|r| crate::account_key::fingerprint(&r.ak_pub));
-        Ok(json!({ "attested": root.is_some(), "fingerprint": fingerprint }))
+            .map(|r| r.ak_pub.clone());
+        let fingerprint = ak_pub.as_deref().and_then(crate::account_key::fingerprint);
+        // Read back rather than remembered from the write: on the desktop a
+        // keyring write is queued, so only a read tells the truth about what the
+        // device actually holds — and that is what decides whether it can vouch
+        // for a joining device.
+        let holds_key = ak_pub.as_deref().is_some_and(|pub_hex| {
+            crate::account_key::recall(&*self.state.secrets, pub_hex).is_some()
+        });
+        Ok(json!({
+            "attested": ak_pub.is_some(),
+            "fingerprint": fingerprint,
+            "holds_key": holds_key,
+        }))
     }
 
     /// Creates the account key (first device): generates the recovery code,
     /// derives AK, attests OUR `node_id`, persists the root (AK_pub +
-    /// attestation; AK_priv discarded) and publishes it. Returns the code — the
-    /// ONLY copy of AK_priv, to hand to the user — and the fingerprint to
-    /// compare on the other devices.
+    /// attestation) plus AK_priv in the keyring, and publishes it. Returns the
+    /// code — the user's way back if every device is lost — and the fingerprint
+    /// to compare on the other devices.
     async fn account_setup(&mut self) -> Result<Value, RpcErr> {
         self.require_scope("session.manage")?;
         self.require_server_connected()?;
@@ -674,6 +693,10 @@ impl Conn {
     /// OUR `node_id`, persists and publishes. Returns the fingerprint — to
     /// compare with that of the other devices (a divergence betrays a wrong
     /// code: this device would then stay outside the account, fail-closed).
+    ///
+    /// Entering the code of the account this device is ALREADY in is accepted and
+    /// changes nothing but the keyring: it is how a device that joined before the
+    /// key was kept at rest picks it up (see `install_account_root`).
     async fn account_join(&mut self, params: &Value) -> Result<Value, RpcErr> {
         self.require_scope("session.manage")?;
         self.require_server_connected()?;
@@ -686,19 +709,41 @@ impl Conn {
         Ok(json!({ "fingerprint": fingerprint }))
     }
 
-    /// Attests our `node_id` under `ak`, persists the root and installs it in
-    /// memory — atomically under the lock. Refuses if a root already exists:
-    /// replacing it (AK rotation) is a follow-up building block; to start over,
-    /// `account-key.json` must first be erased.
+    /// Attests our `node_id` under `ak`, stows AK_priv, persists the root and
+    /// installs it in memory — atomically under the lock.
+    ///
+    /// A root already there for **another** account key is refused
+    /// (`ACCOUNT_KEY_SET`): replacing it is a rotation, a follow-up building
+    /// block, and it is also the surface an attacker with `session.manage` would
+    /// use to re-attest this device under a key of their choosing. The **same**
+    /// account key, however, goes through: re-deriving the key this device is
+    /// already attested under proves the caller has the account's recovery code,
+    /// re-attesting is byte-for-byte the same signature (Ed25519 is
+    /// deterministic), and the one thing it does change is the keyring. That is
+    /// the migration gesture for a device enrolled before the key was kept at
+    /// rest: retype the code once, and it can vouch for others.
+    ///
+    /// The keyring comes before the root on purpose. A device that has the root
+    /// but not the key is a legal state (every device enrolled before this
+    /// existed is in it), so failing halfway must leave the *retryable* half
+    /// behind: had the root gone in first, its own guard would then answer
+    /// `ACCOUNT_KEY_SET` on the retry. Writing the secret under the lock is the
+    /// established pattern here (`session.logout` deletes the refresh token under
+    /// the session lock) — it is what `daemon::secrets`' background thread exists
+    /// for.
     fn install_account_root(
         &self,
         ak: &ed25519_dalek::SigningKey,
     ) -> Result<crate::account_key::AccountRoot, RpcErr> {
         let root = crate::account_key::root_for(ak, &self.state.identity.node_id());
         let mut slot = self.state.account_root.lock().expect("lock account_root");
-        if slot.is_some() {
+        if let Some(existing) = slot.as_ref()
+            && existing.ak_pub != root.ak_pub
+        {
             return Err(RpcErr::app("ACCOUNT_KEY_SET"));
         }
+        crate::account_key::remember(&*self.state.secrets, ak)
+            .map_err(|_| RpcErr::app("ACCOUNT_KEY_SAVE_FAILED"))?;
         crate::account_key::save(&self.state.config_dir, &root)
             .map_err(|_| RpcErr::app("ACCOUNT_KEY_SAVE_FAILED"))?;
         *slot = Some(root.clone());

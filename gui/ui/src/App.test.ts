@@ -134,7 +134,7 @@ test("the app shows its own version", () => {
 test("when not linked to the account, the onboarding portal hides everything else", () => {
   store.primed = true;
   store.session = { logged_in: true, server_connected: true };
-  store.account = { attested: false, fingerprint: null };
+  store.account = { attested: false, fingerprint: null, holds_key: false };
 
   const app = render(App, { store });
 
@@ -145,7 +145,7 @@ test("when not linked to the account, the onboarding portal hides everything els
 test("when linked to the account, the normal app is shown", () => {
   store.primed = true;
   store.session = { logged_in: true, server_connected: true };
-  store.account = { attested: true, fingerprint: "AB12" };
+  store.account = { attested: true, fingerprint: "AB12", holds_key: true };
 
   const app = render(App, { store });
 
@@ -158,7 +158,7 @@ test("when linked to the account, the normal app is shown", () => {
 test("onboardingPending holds the portal even once attested", () => {
   store.primed = true;
   store.session = { logged_in: true, server_connected: true };
-  store.account = { attested: true, fingerprint: "AB12" };
+  store.account = { attested: true, fingerprint: "AB12", holds_key: true };
   store.onboardingPending = true;
 
   const app = render(App, { store });
@@ -187,7 +187,7 @@ test("with no known account state, no portal", () => {
 test("when logged out, an unattested device does not see the portal", () => {
   store.primed = true;
   store.session = { logged_in: false, server_connected: false };
-  store.account = { attested: false, fingerprint: null };
+  store.account = { attested: false, fingerprint: null, holds_key: false };
 
   const app = render(App, { store });
 
@@ -253,7 +253,7 @@ test("a configured Core shows the app with a Server settings tab", () => {
 test("a pending share opens the Devices view", async () => {
   store.primed = true;
   store.session = { logged_in: true, server_connected: true };
-  store.account = { attested: true, fingerprint: "AB12" };
+  store.account = { attested: true, fingerprint: "AB12", holds_key: true };
 
   const app = render(App, { store });
   expect(app.querySelector("h1")?.textContent).toBe("Account");

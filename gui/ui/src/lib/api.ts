@@ -53,10 +53,17 @@ export interface SessionState {
  * account vault (root of trust installed) — without which `files.send` fails
  * closed, for lack of an attestation the peer can verify. `fingerprint` is the
  * safety number to compare across devices; `null` until attested.
+ *
+ * `holds_key` says whether this device also holds the account's PRIVATE key, at
+ * rest in its keyring — which is what lets it vouch for a device joining the
+ * account. It can be `false` while `attested` is `true`: that is a device
+ * enrolled before the key was kept at rest, and retyping the recovery code
+ * (`joinAccount`) upgrades it.
  */
 export interface AccountKey {
   attested: boolean;
   fingerprint: string | null;
+  holds_key: boolean;
 }
 
 /** Derived from the peer credentials; empty on macOS in v1. */

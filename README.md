@@ -267,8 +267,8 @@ from source, run them by hand:
 
 4. **Attach the device to the account** (a blocking portal after login):
    - on the **first** machine: "This is my first device" → a **recovery code** is
-     displayed. This is the **only copy** of the account's private key: write it
-     down offline. Then "Continue".
+     displayed. It is your way back if you ever lose every device: write it down
+     offline. Then "Continue".
    - on the **others**: "I already have a device on this account" → enter that
      same code. The **safety number** shown on the Account screen must be
      **identical** everywhere — compare it visually (a mismatch betrays a wrong

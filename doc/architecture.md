@@ -81,19 +81,35 @@ On each PC:
    inject a foreign device.
 
    - Each device derives the key from the code, attests ITS `node_id`, persists
-     the account's public key + its attestation, then **discards** the private
-     key: after onboarding, no device holds the account's private key at rest;
-     the code (with the user) is its only copy.
+     the account's public key + its attestation — and **keeps the private key at
+     rest**, in its keyring (OS keyring, or a 0600 file: the same perimeter as
+     the device key and the OIDC refresh token). The recovery code is therefore
+     not the only copy of that key; it is the way back when every device is gone.
+   - **Why it is kept, and what that costs.** A device that holds the key can
+     vouch for a new one — which is what makes pairing possible (scan a QR code
+     on an enrolled device instead of retyping the code). The price is stated
+     plainly: whoever reads a device's storage reads the account key, where
+     before they would have needed the user's recovery code. So **a compromised
+     device means a compromised account key**, and rotating it stops being a
+     nicety — it becomes the mandatory response. The key is never displayed and
+     never leaves the device except sealed inside a pairing, over a channel keyed
+     by a secret that traveled from a screen to a camera.
    - **Out-of-band verification**: a fingerprint (safety number) of the account
      key, identical on every device, is compared visually — it diverges as soon
      as one device has derived a different key or a substitution has taken place.
+     A device that reads a key from its keyring checks it against the public key
+     it persisted: the keyring does not get to choose what the device signs with.
    - The attestation binds the `node_id` alone (stable crypto identity), not the
      `device_id` (ephemeral server label): it survives a re-enrollment. The
      signed payload is versioned to allow a later key rotation.
    - **Revocation**: removing a specific device = striking it from the server
-     directory (`devices.revoke`); the "compromised device that keeps the
-     secret" case is handled by rotating the account key — a follow-up building
-     block.
+     directory (`devices.revoke`). That is enough to stop it vouching for
+     anything — a device must be authenticated in the account to reach the
+     pairing rendezvous — but it is not enough for a device whose storage was
+     *read*: that case is an account-key rotation, a follow-up building block.
+     Until it exists, the manual equivalent is to erase the trust root and the
+     stored key on **every** device and start over from `account.setup` — a new
+     recovery code, and every device attested again.
 
 4. **Push between long-lived processes, pull for ephemeral artifacts.**
    Server → Core → managers: subscriptions/events, in-memory caches always warm.

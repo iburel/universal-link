@@ -773,10 +773,10 @@ export class CoreStore {
   // `busy` is managed by hand rather than via `#act`.
 
   /**
-   * Creates the account vault (first device). Returns the recovery code — the
-   * ONLY copy of the private key, to display once — or `null` on failure (a
-   * banner is set). Does not touch `this.account`: it is `finishOnboarding`
-   * that, on "Continue", reads its fresh state.
+   * Creates the account vault (first device). Returns the recovery code — to
+   * display once, and never again — or `null` on failure (a banner is set).
+   * Does not touch `this.account`: it is `finishOnboarding` that, on
+   * "Continue", reads its fresh state.
    */
   async createAccount(): Promise<string | null> {
     if (this.busy) return null;

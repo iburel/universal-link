@@ -32,7 +32,7 @@ beforeEach(() => {
   store.primed = true;
   // Connected to the account, server ready: onboarding can act.
   store.session = { logged_in: true, server_connected: true };
-  store.account = { attested: false, fingerprint: null };
+  store.account = { attested: false, fingerprint: null, holds_key: false };
 });
 
 afterEach(() => {
@@ -55,7 +55,7 @@ test("the portal offers to create or join, by intent", () => {
   expect(textOf(view)).toContain("I already have a device on this account");
 });
 
-test("creating shows the recovery code only once", async () => {
+test("creating shows the recovery code once, and says what it is for", async () => {
   const create = vi
     .spyOn(store, "createAccount")
     .mockResolvedValue("riverbed-lantern-92");
@@ -65,7 +65,7 @@ test("creating shows the recovery code only once", async () => {
 
   expect(create).toHaveBeenCalledOnce();
   await settle(view, "riverbed-lantern-92");
-  expect(textOf(view)).toContain("only copy");
+  expect(textOf(view)).toContain("never be shown again");
 });
 
 test('"Continue" acknowledges the displayed code', async () => {

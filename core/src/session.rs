@@ -184,6 +184,16 @@ fn drop_session(state: &AppState) {
         // The refresh token belonged to this session: a device the account has
         // struck off should no longer hold the means to obtain ID tokens.
         state.secrets.delete(crate::secrets::REFRESH_TOKEN);
+        // The account key stays, and so does `account-key.json` — deliberately.
+        // Erasing it here would buy nothing: vouching for a joining device
+        // requires being authenticated in the account at the rendezvous
+        // (server-api.md, "Pairing"), which is exactly what this revocation just
+        // took away. What it would cost is real, because this path also fires on
+        // a revocation the user did not mean: the device would then need the
+        // recovery code typed into it again after a re-enrollment. A device that
+        // must genuinely stop being able to vouch is a compromised device, and
+        // the answer to that is an AK rotation, not a deletion an attacker has
+        // already outrun.
         remove_session_file(&state.config_dir);
         // The broadcast goes out under the session lock (order: session then
         // registry) — the order of notifications is the order of transitions.

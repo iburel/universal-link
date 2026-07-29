@@ -51,7 +51,11 @@ const SESSION: SessionState = {
   server_connected: true,
   account: { email: "account@example.test" },
 };
-const ATTESTED: AccountKey = { attested: true, fingerprint: "AB12 CD34" };
+const ATTESTED: AccountKey = {
+  attested: true,
+  fingerprint: "AB12 CD34",
+  holds_key: true,
+};
 const REQUEST: PendingRequest = {
   request_id: "r_1",
   name: "clipnet",
@@ -1248,7 +1252,7 @@ test("a replayed transfer.started downgrades neither progress nor status", async
 
 // -- Account (C7 account key / onboarding) ----------------------------------
 
-const UNATTESTED: AccountKey = { attested: false, fingerprint: null };
+const UNATTESTED: AccountKey = { attested: false, fingerprint: null, holds_key: false };
 
 test("resync reads the account key state", async () => {
   await primed({ "account.status": () => UNATTESTED });
@@ -1459,8 +1463,9 @@ test("a closed session during onboarding disarms the portal", async () => {
   expect(store.onboardingPending).toBe(false); // disarmed, no re-locking
 });
 
-// The recovery code is the only copy of the private key: it must live only in
-// the view's LOCAL state, never in the store.
+// The recovery code is shown once and never again, and it is the way back into
+// an account whose every device is lost: it must live only in the view's LOCAL
+// state, never in the store.
 test("createAccount keeps the code in no store state", async () => {
   await primed({
     "account.status": () => UNATTESTED,

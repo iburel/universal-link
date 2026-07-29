@@ -70,7 +70,11 @@ test("the account fingerprint is shown when it exists", () => {
     server_connected: true,
     account: { email: "account@example.test" },
   };
-  store.account = { attested: true, fingerprint: "AB12 CD34 EF56 7890" };
+  store.account = {
+    attested: true,
+    fingerprint: "AB12 CD34 EF56 7890",
+    holds_key: true,
+  };
 
   const view = render(Account, { store });
 

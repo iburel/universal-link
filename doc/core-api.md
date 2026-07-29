@@ -143,22 +143,33 @@ The account's root of trust: an account key (derived from a **recovery code**)
 attests that each `node_id` is indeed one of the user's devices, independently of
 the server (see [server-api.md](server-api.md), "Account attestation", and
 [architecture.md](architecture.md)). Each device derives the key from the code,
-attests ITS `node_id`, persists `ak_pub` + its attestation, then **discards** the
-private key: after onboarding, no device holds the account's private key at rest.
+attests ITS `node_id`, persists `ak_pub` + its attestation in
+`account-key.json` — and **keeps the private key at rest** in its keyring, which
+is what lets it later vouch for a device joining the account. What that costs is
+in [architecture.md](architecture.md) (principle 3): a compromised device now
+means a compromised account key.
 
 | Method | Description |
 |---|---|
-| `account.status {}` | → `{ attested: bool, fingerprint: string? }`. `fingerprint` = fingerprint (safety number) of the account key, to compare across devices (out-of-band verification) |
-| `account.setup {}` | **first device**: generates the code, derives the key, attests and publishes → `{ recovery_code, fingerprint }`. `recovery_code` is the ONLY copy of the private key — display it once and hand it to the user. `ACCOUNT_KEY_SET` if a key already exists |
-| `account.join { recovery_code }` | **subsequent device**: re-derives the key from the entered code, attests and publishes → `{ fingerprint }`. `INVALID_CODE` if the code is malformed or wrong (checksum); `ACCOUNT_KEY_SET` if a key already exists |
+| `account.status {}` | → `{ attested: bool, fingerprint: string?, holds_key: bool }`. `fingerprint` = fingerprint (safety number) of the account key, to compare across devices (out-of-band verification); `holds_key` = this device also holds the account's PRIVATE key, so it can vouch for a joining one |
+| `account.setup {}` | **first device**: generates the code, derives the key, stows it, attests and publishes → `{ recovery_code, fingerprint }`. Display `recovery_code` once and hand it to the user — it is their way back if every device is lost. `ACCOUNT_KEY_SET` if a key already exists |
+| `account.join { recovery_code }` | **subsequent device**: re-derives the key from the entered code, stows it, attests and publishes → `{ fingerprint }`. `INVALID_CODE` if the code is malformed or wrong (checksum); `ACCOUNT_KEY_SET` if the code derives a key OTHER than the one this device is already attested under |
 
 The same key ⇒ the same `fingerprint` on every device: a divergence betrays a
 wrong code (the device would then remain outside the account, *fail-closed*) or a
 substitution. Replacing an existing key (rotation) is a follow-up building block —
-v1 refuses it (`ACCOUNT_KEY_SET`). `account.setup`/`account.join` assume the
-server is reachable (`SERVER_UNREACHABLE` otherwise) and return
-`ACCOUNT_KEY_SAVE_FAILED` if the root cannot be persisted (folder not writable) —
-nothing is installed in that case.
+v1 refuses it (`ACCOUNT_KEY_SET`). Entering the code of the account this device is
+already in, on the other hand, is accepted: the attestation is byte-for-byte the
+same, and the one thing it changes is the keyring — that is the gesture that
+upgrades a device enrolled before the key was kept at rest (`holds_key: false`).
+
+`account.setup`/`account.join` assume the server is reachable
+(`SERVER_UNREACHABLE` otherwise) and return `ACCOUNT_KEY_SAVE_FAILED` if the key
+or the root cannot be persisted — nothing is installed in that case. `holds_key`
+is answered by reading the keyring back, not by remembering the write: a keyring
+write can be queued, and a stored key that does not derive `ak_pub` is ignored
+(*fail-closed*) rather than used to sign — so `attested: true` with
+`holds_key: false` is a legitimate state, not a corrupt one.
 
 ## `devices.*`
 
@@ -476,9 +487,9 @@ Standard JSON-RPC codes + application codes in `error.data.code`:
 | `SERVER_UNREACHABLE` | operation requiring the server, offline |
 | `NO_DESCRIPTOR` | `session.discover`: the address answered but publishes no deployment descriptor (server older than that endpoint, or not one of ours) |
 | `INVALID_DESCRIPTOR` | `session.discover`: a descriptor without what a login needs (the message names the field, never the response) |
-| `ACCOUNT_KEY_SET` | `account.setup` / `account.join` while an account key already exists (rotation is a follow-up) |
+| `ACCOUNT_KEY_SET` | `account.setup` / `account.join` for an account key OTHER than the one already installed (rotation is a follow-up) |
 | `INVALID_CODE` | `account.join`: malformed or wrong recovery code (checksum) |
-| `ACCOUNT_KEY_SAVE_FAILED` | the account root cannot be persisted (folder not writable) — nothing is installed |
+| `ACCOUNT_KEY_SAVE_FAILED` | the account key or its root cannot be persisted (keyring refused, folder not writable) — nothing is installed |
 | `DEVICE_UNKNOWN` / `DEVICE_OFFLINE` | target unknown / unreachable |
 | `TRANSFER_UNKNOWN` | unknown `transfer_id` |
 | `FORMAT_UNKNOWN` | format not present in the transaction |

@@ -65,9 +65,9 @@
     </p>
     <code class="recovery">{recoveryCode}</code>
     <p class="muted">
-      This is the only copy. It will never be shown again. Write it down: you
-      must enter it on your other devices to link them to this account —
-      without it, no additional device can join.
+      It will never be shown again. Write it down and keep it offline: you must
+      enter it on your other devices to link them to this account, and it is
+      your only way back in if you ever lose every device.
     </p>
     <button class="primary" onclick={done}>I've saved the code, continue</button>
   {:else}

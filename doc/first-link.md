@@ -198,13 +198,14 @@ appears in the config folder. Common failures → see [Troubleshooting](#trouble
 
 ### 1.6 Create the account (blocking portal after login)
 
-Choose **"This is my first device"**. A **recovery code** is displayed: it is the
-**only copy** of the account's private key — **write it down offline** (password
+Choose **"This is my first device"**. A **recovery code** is displayed: it is your
+way back if you ever lose every device — **write it down offline** (password
 manager, paper). The Account screen then displays a **fingerprint** (safety number);
 remember it for step 2.6.
 
-Under the hood: `account.setup` publishes the account attestation (C7) to the server
-and writes `account-key.json` in the config folder.
+Under the hood: `account.setup` publishes the account attestation (C7) to the server,
+writes `account-key.json` in the config folder, and stows the account's private key
+in the keyring (or `secrets.json` when no keyring answers).
 
 ## Step 2 — Machine B (second device, *joins* the account)
 
@@ -321,8 +322,10 @@ Verification reminders:
 
 To start from scratch on a machine: stop the Core, delete `account-key.json`
 (otherwise `account.setup` answers `ACCOUNT_KEY_SET`) and possibly `session.json`,
-then resume at login. Beware: deleting `account-key.json` **everywhere** without
-having the recovery code cuts you off from the account.
+then resume at login. The account key stays in the keyring; drop its
+`account-key-seed` entry too (or `secrets.json` wholesale) to leave nothing
+behind. Beware: erasing all of this **everywhere** without having the recovery
+code cuts you off from the account.
 
 ## How this differs from an installed machine
 
