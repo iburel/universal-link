@@ -141,8 +141,12 @@ curl https://your-server.example.com/health         # -> ok
 # issuer and the client here — a device is then set up with this address alone.
 curl https://your-server.example.com/.well-known/universallink.json
 
-# The WebSocket handshake must answer 101 (Switching Protocols):
-curl -sSi https://your-server.example.com/ws \
+# The WebSocket handshake must answer 101 (Switching Protocols). `--http1.1` is
+# not optional: this is an HTTP/1.1 Upgrade, and those headers are meaningless
+# over HTTP/2 — which is what you get as soon as anything in front (a CDN, Caddy
+# itself) negotiates h2. Without it the answer is a 400 that looks exactly like a
+# broken deployment. Real clients speak HTTP/1.1 here.
+curl -sSi --http1.1 https://your-server.example.com/ws \
      -H "Connection: Upgrade" -H "Upgrade: websocket" \
      -H "Sec-WebSocket-Version: 13" \
      -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" | head -1
