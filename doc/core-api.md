@@ -104,8 +104,38 @@ Topics filtered by scopes. Notifications are named (below, by namespace). After 
 | `session.login {}` | starts the OIDC flow (PKCE + loopback) → `{ auth_url }`. **The caller** opens the browser — the Core does not touch the UI. Completion signaled by `session.changed` |
 | `session.logout {}` | closes the server session |
 | `session.reload {}` | re-reads `config.json` (which the GUI's setup screen has just written) and swaps the server config in place — no restart. → the fresh `session.status`. `INVALID_CONFIG` if the file is malformed / half-filled. The Core only READS the file; the GUI is its sole writer |
+| `session.discover { url }` | reads the **deployment descriptor** at an address the user typed and returns what to write into `config.json`: → `{ server_url, oidc_issuer, oidc_client_id, oidc_client_secret }` (the last one `null` when the IdP wants none). Writes nothing — the caller does that, then `session.reload`. Meaningful with nothing configured, which is the case it exists for. See below |
 
 Notification: `session.changed { logged_in, server_connected, account? }` — note it carries NO `configured` (a caller that needs it re-reads `session.status`, which a session change prompts anyway).
+
+### `session.discover`: one address instead of three fields
+
+The IdP and the OIDC client are properties of the deployment, identical on every
+device of one server, and the server publishes them
+([server-api.md](server-api.md#deployment-descriptor)). So `url` is whatever the
+user typed and the Core derives the rest of it:
+
+- **No scheme means TLS.** `host` → `https://host/.well-known/universallink.json`,
+  and the returned `server_url` is `wss://host/ws`. `http://` and `ws://` are
+  honored when written out — a cleartext deployment is accepted everywhere else in
+  the Core — but they are never a default: this answer decides where the login
+  goes and under which client id, so a MITM able to substitute the IdP would own
+  the sign-in.
+- **Only the authority is kept.** A pasted `wss://host/ws` (what a configured
+  device has in its `config.json`) or a trailing slash works; the descriptor and
+  `/ws` both live at the root, fixed by the server API. A deployment mounted under
+  a path prefix is therefore not discoverable.
+- Errors are distinct because the answer for the user differs: `-32602` the
+  address is not one, `SERVER_UNREACHABLE` nothing answered (or an HTTP status
+  that leaves nothing to read), `NO_DESCRIPTOR` something answered but publishes
+  none — a server older than this endpoint, or another site altogether, and the
+  interface falls back to asking for the fields — and `INVALID_DESCRIPTOR` a
+  descriptor missing what a login needs. The message names the field at fault and
+  never quotes the response: the caller picks the address, so an echoed body would
+  make the Core a reader of whatever else answers on its network.
+
+`api_version` from the descriptor is ignored: nothing in the Core acts on the
+server's version today, and discovery is not where that policy gets invented.
 
 ## `account.*` (account key, C7)
 
@@ -444,6 +474,8 @@ Standard JSON-RPC codes + application codes in `error.data.code`:
 | `ALREADY_LOGGED_IN` | `session.login` while a session is open (re-logging in starts with `session.logout`) |
 | `INVALID_CONFIG` | `session.reload` on a malformed / half-filled `config.json` (the message carries the reason) |
 | `SERVER_UNREACHABLE` | operation requiring the server, offline |
+| `NO_DESCRIPTOR` | `session.discover`: the address answered but publishes no deployment descriptor (server older than that endpoint, or not one of ours) |
+| `INVALID_DESCRIPTOR` | `session.discover`: a descriptor without what a login needs (the message names the field, never the response) |
 | `ACCOUNT_KEY_SET` | `account.setup` / `account.join` while an account key already exists (rotation is a follow-up) |
 | `INVALID_CODE` | `account.join`: malformed or wrong recovery code (checksum) |
 | `ACCOUNT_KEY_SAVE_FAILED` | the account root cannot be persisted (folder not writable) — nothing is installed |

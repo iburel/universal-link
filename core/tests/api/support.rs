@@ -304,8 +304,14 @@ impl Drop for TestServer {
 
 impl TestServer {
     pub async fn start() -> TestServer {
+        TestServer::start_with(|_| {}).await
+    }
+
+    /// Starts with an adjusted server config — a deployment that publishes an
+    /// OIDC client secret, for instance.
+    pub async fn start_with(tweak: impl FnOnce(&mut universallink_server::Config)) -> TestServer {
         let oidc = FakeOidc::start().await;
-        let config = universallink_server::Config {
+        let mut config = universallink_server::Config {
             bind_addr: "127.0.0.1:0".parse().expect("addr"),
             oidc: universallink_server::OidcConfig {
                 issuer_url: oidc.issuer(),
@@ -319,6 +325,7 @@ impl TestServer {
             nonce_ttl: Duration::from_secs(60),
             max_requests_per_minute: None,
         };
+        tweak(&mut config);
         let server = universallink_server::spawn(config)
             .await
             .expect("server startup");
