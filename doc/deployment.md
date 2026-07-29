@@ -181,6 +181,13 @@ its own scopes: `universallink-tray`, `universallink-clipboard` (a per-OS
 backend, on all three desktops) and `universallink-menu` (the contextual menu).
 The GUI is not in that list — the user launches it.
 
+One exception to "next to its binary": on macOS the tray lives in a nested
+application bundle, `UniversalLink.app/Contents/Frameworks/UniversalLinkTray.app`,
+and the supervisor looks there first. It has to — a process started from
+`Contents/MacOS` is *the application* to Launch Services, and a tray holding the
+app's identity made `open` activate the tray instead of opening the window. See
+[architecture.md](architecture.md#official-components).
+
 The contract of a supervised component:
 
 1. It finds the Core at the path passed in `UNIVERSALLINK_IPC_PATH`.

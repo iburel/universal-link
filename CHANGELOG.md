@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **macOS: clicking the app icon opened nothing.** Not the Dock, not the Finder,
+  not the Launchpad, not the tray's own *Open* — no window, no error, nothing.
+  The tray shipped as a plain executable inside the app bundle, and to macOS a
+  process started from there *is* the application: it took the app's identity, so
+  from the moment the background service started the tray, the system considered
+  UniversalLink to be already running and every launch just brought the tray to
+  the front. It now ships as a helper application of its own inside the bundle,
+  which is how the same problem is solved in Chrome and in every Electron app.
+  Two things follow: the icon opens the window again, and the second
+  "UniversalLink" that sat in the Dock — the tray, wearing the app's name — is
+  gone, as a menu-bar item should be. It also stops taking the focus from
+  whatever you are doing when it starts at login. Windows and Linux were never
+  affected.
+
 ## [0.6.0] - 2026-07-29
 
 Adding a machine to the account is a code shown on one screen and read by the

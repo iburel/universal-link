@@ -37,7 +37,25 @@ enum UserEvent {
 }
 
 fn main() {
-    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+
+    // macOS: an agent, not an application. Our helper bundle says so with
+    // `LSUIElement` (see `tray/macos/Info.plist`), but tao sets
+    // `NSApplicationActivationPolicyRegular` on the application object itself,
+    // and that wins over the plist — measured: the tray checked in as
+    // `type="Foreground"`. Said here too, it stops being an icon in the Dock and
+    // an entry in the application switcher.
+    //
+    // And it must not activate itself when the Core starts it at login: the
+    // default is to come to the front regardless of what the user is doing.
+    #[cfg(target_os = "macos")]
+    {
+        use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
+
+        event_loop.set_activation_policy(ActivationPolicy::Accessory);
+        event_loop.set_activate_ignoring_other_apps(false);
+    }
 
     // Menu built now that tao has initialized gtk; ids captured to match clicks.
     let open_item = MenuItem::new("Open UniversalLink", true, None);
