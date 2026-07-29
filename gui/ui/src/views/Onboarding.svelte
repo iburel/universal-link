@@ -4,6 +4,7 @@
 <script lang="ts">
   import type { CoreStore } from "../lib/store.svelte";
   import LinkDevice from "./LinkDevice.svelte";
+  import RecoveryCode from "./RecoveryCode.svelte";
 
   let { store }: { store: CoreStore } = $props();
 
@@ -11,7 +12,6 @@
   // one-shot secret that the view displays then forgets.
   type Step = "choose" | "join" | "created";
   let step = $state<Step>("choose");
-  let code = $state(""); // input for "Join"
   let recoveryCode = $state<string | null>(null); // code shown after "Create"
 
   // The Core refuses setup/join when the server is disconnected
@@ -25,14 +25,6 @@
       recoveryCode = result;
       step = "created";
     }
-  }
-
-  async function join() {
-    const entered = code.trim();
-    if (!entered) return;
-    // A success lifts the portal (finishOnboarding internal to the store); on
-    // failure we stay here, the banner explains.
-    if (await store.joinAccount(entered)) code = "";
   }
 
   function done() {
@@ -91,25 +83,13 @@
            device is gone. -->
       <LinkDevice {store} mode="join" />
 
-      <p class="or muted">Or enter your recovery code:</p>
-      <input
-        bind:value={code}
-        aria-label="Recovery code"
-        placeholder="recovery code"
-        onkeydown={(e) => {
-          if (e.key === "Enter" && !disabled) void join();
-        }}
-      />
-      <div class="actions">
-        <button
-          class="primary"
-          disabled={disabled || !code.trim()}
-          onclick={join}>Join</button
-        >
-        <button disabled={store.busy} onclick={() => (step = "choose")}
-          >Back</button
-        >
-      </div>
+      <RecoveryCode {store} label="Or enter your recovery code:">
+        {#snippet extra()}
+          <button disabled={store.busy} onclick={() => (step = "choose")}>
+            Back
+          </button>
+        {/snippet}
+      </RecoveryCode>
     {:else}
       <div class="choices">
         <button class="primary" {disabled} onclick={create}>
@@ -165,24 +145,10 @@
     word-break: break-all;
   }
 
-  input {
-    width: 100%;
-    max-width: 24rem;
-  }
-
   .choices {
     display: grid;
     gap: 0.5rem;
     justify-items: stretch;
-  }
-
-  .actions {
-    display: flex;
-    gap: 0.4rem;
-  }
-
-  .or {
-    margin-top: 0.5rem;
   }
 
   .link {

@@ -131,18 +131,21 @@ test("signing in is not the only way in", () => {
   expect(byText(view, "button", "Show a code")).toBeTruthy();
 });
 
-// Attested but without the account's private key: the state every device
-// enrolled before the key was kept at rest is in. Pairing lifts it, and the
-// screen says so — this is the alternative to retyping the recovery code.
-test("a device that cannot vouch is offered the key", () => {
+// Attested but without the account's private key. Both ways back in have to be
+// on this screen, and this screen only: the onboarding portal shows for a device
+// that is NOT attested, so a keyless one would otherwise be told to type a
+// recovery code with nowhere to type it.
+test("a device without the key is offered both ways back in", () => {
   store.primed = true;
   store.session = { logged_in: true, server_connected: true };
   store.account = { attested: true, fingerprint: "AB12", holds_key: false };
 
   const view = render(Account, { store });
 
-  expect(textOf(view)).toContain("cannot vouch for a new one");
+  expect(textOf(view)).toContain("has your account, but not its key");
   expect(byText(view, "button", "Show a code")).toBeTruthy();
+  expect(view.querySelector('input[aria-label="Recovery code"]')).toBeTruthy();
+  expect(byText(view, "button", "Join")).toBeTruthy();
 });
 
 test("a device that holds the key is offered nothing of the sort", () => {
@@ -150,5 +153,7 @@ test("a device that holds the key is offered nothing of the sort", () => {
   store.session = { logged_in: true, server_connected: true };
   store.account = { attested: true, fingerprint: "AB12", holds_key: true };
 
-  expect(textOf(render(Account, { store }))).not.toContain("cannot vouch");
+  const view = render(Account, { store });
+  expect(textOf(view)).not.toContain("not its key");
+  expect(view.querySelector('input[aria-label="Recovery code"]')).toBeNull();
 });

@@ -483,11 +483,21 @@ above).
 ### A device that holds no key
 
 Enrolled in the account but holding no account key (`account.status`
-→ `holds_key: false`) is a legitimate state, not a corrupt one: it is where every
-device enrolled before the key was kept at rest sits, and where a device whose
-keyring lost the entry lands. Such a device can **join** — it cannot **sponsor**,
-and it is not offered the gesture. Its two ways out are to be paired *to* by a
-device that does hold the key, or to have the recovery code typed into it once
-(entering the code of the account it is already in changes nothing but the
-keyring). Both go through the same rules, and both refuse a key other than the one
-this device is already attested under.
+→ `holds_key: false`) is a legitimate state, not a corrupt one: it is where a
+device whose keyring lost the seed lands, or one whose keyring never answered.
+Such a device still works — `ak_pub` is what verifies peers — it simply cannot
+**sponsor**, and is not offered the gesture.
+
+The way back in is the same door a device with no account at all uses, and the
+Account screen puts both of its halves there: be paired *to* by a device that does
+hold the key, or type the recovery code (entering the code of the account it is
+already in changes nothing but the keyring). It has to be on that screen, because
+the onboarding portal only shows for a device that is not attested. Both halves go
+through the same rules, and both refuse a key other than the one this device is
+already attested under.
+
+Installing the key is verified by a **read-back** before the device claims to
+have joined: a keyring `set` that answered `Ok` may only have been queued
+(`daemon::secrets`), so `attested: true` with the key silently absent was
+reachable, and no longer is. What remains reachable is a keyring emptied
+afterwards — which is exactly the state above, and has the door.

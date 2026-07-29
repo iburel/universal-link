@@ -758,9 +758,9 @@ async fn complete_as_joiner(state: Arc<AppState>, p: Pairing, bundle: String) {
     };
 
     if state.session.lock().expect("lock session").logged_in {
-        // Already in the directory (a device that had joined the account before
-        // the key was kept at rest, or one that has just been re-enrolled): the
-        // attestation is all that is missing.
+        // Already in the directory — a device that has the account but not its
+        // key, or one that has just been re-enrolled: the attestation is all that
+        // is missing.
         crate::session::publish_attestation(&state, &root).await;
     } else if let Err(reason) = enroll_on_grant(&state, &p, plain.get("account")).await {
         tracing::warn!(error = %reason, "enrollment on the pairing failed");

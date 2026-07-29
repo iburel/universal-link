@@ -277,17 +277,17 @@ async fn a_new_device_joins_by_scanning_a_device_of_the_account() {
     wait_server_connected(&mut tc, true).await;
 }
 
-/// A device that joined the account BEFORE the key was kept at rest: it is
-/// enrolled and attested, but cannot vouch for anyone. Pairing gives it the key
-/// without a code being retyped — and without a second entry in the directory.
+/// The way back in, the other one. A device that has the account but not its key
+/// is enrolled and attested, and cannot vouch for anyone. Pairing gives it the
+/// key with nothing typed — and without a second entry in the directory.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_that_cannot_vouch_gets_the_key_by_pairing() {
     let server = TestServer::start().await;
     let giver = sponsor(&server).await;
     let (mut gc, fingerprint, code) = (giver.c, giver.fingerprint, giver.code);
 
-    // Same account key, seeded on disk the way onboarding used to leave it: the
-    // root, and nothing in the keyring.
+    // Same account key, seeded on disk as a lost keyring leaves it: the root, and
+    // nothing to vouch with.
     let switchboard = universallink_test_support::memory_transport::MemorySwitchboard::new();
     let old = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
     let mut oc = manager(&old).await;

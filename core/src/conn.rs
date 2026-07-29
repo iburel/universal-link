@@ -716,8 +716,8 @@ impl Conn {
     /// code: this device would then stay outside the account, fail-closed).
     ///
     /// Entering the code of the account this device is ALREADY in is accepted and
-    /// changes nothing but the keyring: it is how a device that joined before the
-    /// key was kept at rest picks it up (see `install_account_root`).
+    /// changes nothing but the keyring: it is the way back in for a device that
+    /// has the account but not its key (see `install_account_root`).
     async fn account_join(&mut self, params: &Value) -> Result<Value, RpcErr> {
         self.require_scope("session.manage")?;
         self.require_server_connected()?;

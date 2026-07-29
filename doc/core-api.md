@@ -168,8 +168,8 @@ wrong code (the device would then remain outside the account, *fail-closed*) or 
 substitution. Replacing an existing key (rotation) is a follow-up building block —
 v1 refuses it (`ACCOUNT_KEY_SET`). Entering the code of the account this device is
 already in, on the other hand, is accepted: the attestation is byte-for-byte the
-same, and the one thing it changes is the keyring — that is the gesture that
-upgrades a device enrolled before the key was kept at rest (`holds_key: false`).
+same, and the one thing it changes is the keyring — which is what makes it the way
+back in for a device that has the account without its key (`holds_key: false`).
 
 There are two ways to install that key on a device: the recovery code typed in
 (here) and a **pairing** confirmed on a device that already has it (below). Both
