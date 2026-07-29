@@ -182,10 +182,16 @@ impl Session {
     }
 }
 
-/// What a claimer is told in return: who the server says it is, and — when it
-/// is the sponsor — the device it must show the human.
+/// What a claimer is told in return: who the server says it is, how long the
+/// session has left, and — when it is the sponsor — the device it must show the
+/// human.
 pub struct Claimed {
     pub role: Role,
+    /// Seconds left before the session expires. The claimer needs it as much as
+    /// the offerer (which got it from `create`): both sides time out on their own
+    /// clocks, and a side that was never told the deadline would have to invent
+    /// one. Truncated downwards — expiring a shade early is the safe rounding.
+    pub expires_in: u64,
     pub joining: Option<JoiningDevice>,
 }
 
@@ -299,6 +305,10 @@ impl Sessions {
         // is: it is the one that has to show a human what it is vouching for.
         let mut claimed = Claimed {
             role,
+            expires_in: session
+                .expires_at
+                .saturating_duration_since(Instant::now())
+                .as_secs(),
             joining: None,
         };
         let mut announced = json!({ "channel": claimer.channel });

@@ -219,7 +219,7 @@ slots:
    │◄─ { pairing_id, expires_in } ────────────────│
    │·············· QR code, read off the screen ·············►│  (the secret never
    │                                              │◄─ pairing.claim {pairing_id, channel} ─┤   reaches the server)
-   │◄─ pairing.claimed { channel } ───────────────│── { role: sponsor, device } ──────────►│
+   │◄─ pairing.claimed { channel } ───────────────│─ { role: sponsor, expires_in, device } ►│
    │                                              │                          (a human confirms)
    │                                              │◄─ pairing.approve {id_token, bundle} ──┤
    │◄─ pairing.completed { bundle } ──────────────│
@@ -251,6 +251,9 @@ is what decides who is joining.
 - One offer per connection: a new `pairing.create` retires that connection's
   previous session (a dialog closed and reopened must work, and the code left on
   the abandoned screen must stop working).
+- **Both sides are told the deadline**: `expires_in` at `pairing.create` for the
+  offerer, and in `pairing.claim`'s answer for the claimer. Neither has to invent
+  one, which is what makes the silent expiry below defensible.
 - A device that is **re-joining** — enrolled already, but holding no account key —
   offers with `role="joiner"` on its authenticated connection. Its account is then
   known from the start, and a sponsor from another one is turned away with
@@ -275,7 +278,7 @@ confirmation screen alone; the residual risk that follows is in
 | `auth.enroll { id_token, node_id, name, platform, proof }` | OIDC ID token + key proof | Creates the device under the account → `{ device_id, api_version, device }` |
 | `auth.enroll { pairing_id, proof }` | approved pairing + key proof | Same, on the strength of a confirmation instead of a token (below) |
 | `pairing.create { role, channel, device? }` | none, or session if `role="sponsor"` | Opens a pairing session and displays it → `{ pairing_id, expires_in }` |
-| `pairing.claim { pairing_id, channel, device? }` | none, or session if the claimer turns out to be the sponsor | Joins a scanned session → `{ role, device? }` |
+| `pairing.claim { pairing_id, channel, device? }` | none, or session if the claimer turns out to be the sponsor | Joins a scanned session → `{ role, expires_in, device? }` |
 | `pairing.approve { pairing_id, id_token, bundle }` | session + fresh OIDC | Confirms: relays the sealed `bundle` and turns the session into an enrollment grant |
 | `pairing.cancel { pairing_id }` | party to the session | Gives up; the other side is told at once |
 | `auth.authenticate { device_id, proof, relay_url? }` | key proof | Binds the connection to the device (→ online) → `{ api_version, device }` (its own record) |

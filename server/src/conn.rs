@@ -651,7 +651,7 @@ impl Conn {
             joining,
         )?;
 
-        let mut result = json!({ "role": claimed.role.as_str() });
+        let mut result = json!({ "role": claimed.role.as_str(), "expires_in": claimed.expires_in });
         if let Some(device) = claimed.joining {
             result["device"] = device.record();
         }

@@ -256,6 +256,58 @@ pub fn recall(secrets: &dyn crate::SecretStore, ak_pub_hex: &str) -> Option<Sign
     Some(ak)
 }
 
+/// Why installing a trust root was refused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum InstallError {
+    /// A root is already installed for ANOTHER account key.
+    OtherKey,
+    /// The key or the root could not be persisted (keyring refused, folder not
+    /// writable) — nothing was installed.
+    SaveFailed,
+}
+
+/// Attests our `node_id` under `ak`, stows AK_priv, persists the root and
+/// installs it in memory — atomically under the lock. The single way in for
+/// every path that joins the account: a typed recovery code (`account.setup` /
+/// `account.join`) or a pairing that handed the seed over.
+///
+/// A root already there for **another** account key is refused
+/// ([`InstallError::OtherKey`]): replacing it is a rotation, a follow-up building
+/// block, and it is also the surface an attacker would use to re-attest this
+/// device under a key of their choosing — whether they hold `session.manage` or
+/// sponsor a pairing. The **same** account key, however, goes through:
+/// re-deriving the key this device is already attested under proves the caller
+/// has the account, re-attesting is byte-for-byte the same signature (Ed25519 is
+/// deterministic), and the one thing it does change is the keyring. That is the
+/// migration gesture for a device enrolled before the key was kept at rest.
+///
+/// The keyring comes before the root on purpose, and the reason is not
+/// retryability — the same key being accepted, either order retries cleanly. It
+/// is that of the two halves the keyring is the fragile one (a write handed to an
+/// OS service that may refuse it), while the root is the *visible* one: it is
+/// what makes `account.status` answer `attested: true` and what the data plane
+/// verifies peers against. So the fragile half is attempted first, and a device
+/// never claims to have joined the account on the strength of a half-install.
+/// Writing the secret under the lock is the established pattern here
+/// (`session.logout` deletes the refresh token under the session lock) — it is
+/// what `daemon::secrets`' background thread exists for.
+pub(crate) fn install(
+    state: &crate::state::AppState,
+    ak: &SigningKey,
+) -> Result<AccountRoot, InstallError> {
+    let root = root_for(ak, &state.identity.node_id());
+    let mut slot = state.account_root.lock().expect("lock account_root");
+    if let Some(existing) = slot.as_ref()
+        && existing.ak_pub != root.ak_pub
+    {
+        return Err(InstallError::OtherKey);
+    }
+    remember(&*state.secrets, ak).map_err(|_| InstallError::SaveFailed)?;
+    save(&state.config_dir, &root).map_err(|_| InstallError::SaveFailed)?;
+    *slot = Some(root.clone());
+    Ok(root)
+}
+
 fn attest_message(node_id: &str) -> Vec<u8> {
     let mut msg = ATTEST_DOMAIN.to_vec();
     msg.extend_from_slice(node_id.as_bytes());

@@ -53,6 +53,10 @@ pub(crate) enum Goal {
     /// Revoke `device_id` — the re-auth of a `devices.revoke` whose refresh
     /// token was not enough.
     Revoke { device_id: String },
+    /// Confirm a pairing — the re-auth of a `pairing.confirm` whose refresh
+    /// token was not enough. The bundle was sealed before the browser opened and
+    /// travels in memory only: it carries the account key's seed.
+    Pairing { pairing_id: String, bundle: String },
 }
 
 /// Starts an OIDC flow: discovery, loopback listener, waiting task. Returns the
@@ -287,6 +291,10 @@ impl Flow {
             Goal::Revoke { device_id } => {
                 self.finish_revoke(device_id, id_token, refresh_token).await
             }
+            Goal::Pairing { pairing_id, bundle } => {
+                self.finish_pairing(pairing_id, bundle, id_token, refresh_token)
+                    .await
+            }
         }
     }
 
@@ -313,52 +321,7 @@ impl Flow {
             device_id,
             account: account_from_id_token(id_token),
         };
-        {
-            let mut s = self.state.session.lock().expect("lock session");
-            // A session opened during enrollment (a faster concurrent flow): do
-            // not overwrite it.
-            if s.logged_in {
-                return Err("A session is already open.".to_string());
-            }
-            // session.json under the same lock as the state it materializes:
-            // nothing can slip between the disk and memory.
-            let mut session_json = json!({
-                "server_url": info.server_url,
-                "device_id": info.device_id,
-            });
-            if let Some(account) = &info.account {
-                session_json["account"] = account.clone();
-            }
-            crate::write_private_file(
-                &self.state.config_dir.join("session.json"),
-                &session_json.to_string(),
-            )
-            .map_err(|e| format!("Writing session.json failed ({e})."))?;
-            if let Some(refresh) = refresh_token {
-                // Under the same lock: a logout serialized after us will delete
-                // it — never the other way around. Degraded if the write fails:
-                // revokes will go through re-auth.
-                if let Err(e) = self
-                    .state
-                    .secrets
-                    .set(crate::secrets::REFRESH_TOKEN, refresh)
-                {
-                    tracing::error!(error = %e, "refresh token not stored");
-                }
-            }
-            s.logged_in = true;
-            s.account = info.account.clone();
-            s.own_device_id = Some(info.device_id.clone());
-            let payload = s.status_record();
-            // Broadcast under the session lock (order: session then registry):
-            // the order of notifications is the order of transitions.
-            self.state
-                .registry
-                .lock()
-                .expect("lock registry")
-                .notify_topic("session", "session.changed", &payload);
-        }
-        crate::start_session_task(&self.state, info);
+        open_session(&self.state, info, refresh_token)?;
         Ok("Login succeeded. You can close this tab.".to_string())
     }
 
@@ -368,31 +331,7 @@ impl Flow {
         id_token: &str,
         refresh_token: Option<&str>,
     ) -> Result<String, String> {
-        // Take the slot before acting — after which nothing can stop us midway.
-        if !self.claim_slot() {
-            return Err("Re-authentication replaced by another.".to_string());
-        }
-        {
-            let s = self.state.session.lock().expect("lock session");
-            // The session may have closed while the tab was waiting (logout
-            // kills the flow, but not if it had already taken the slot): an
-            // orphan re-auth must neither stow a credential nor revoke.
-            if !s.logged_in {
-                return Err("The session was closed in the meantime.".to_string());
-            }
-            // The refresh token that led here was dead or absent: this one will
-            // serve again for the next sensitive operations. Under the lock: a
-            // logout serialized after us will delete it — never the other way
-            // around.
-            if let Some(refresh) = refresh_token
-                && let Err(e) = self
-                    .state
-                    .secrets
-                    .set(crate::secrets::REFRESH_TOKEN, refresh)
-            {
-                tracing::error!(error = %e, "refresh token not stored");
-            }
-        }
+        self.claim_and_stash(refresh_token)?;
         crate::session::proxy(
             &self.state,
             "devices.revoke",
@@ -406,6 +345,61 @@ impl Flow {
                 err.app.as_deref().unwrap_or("server error")
             )
         })
+    }
+
+    async fn finish_pairing(
+        &self,
+        pairing_id: &str,
+        bundle: &str,
+        id_token: &str,
+        refresh_token: Option<&str>,
+    ) -> Result<String, String> {
+        self.claim_and_stash(refresh_token)?;
+        let result = crate::session::proxy(
+            &self.state,
+            "pairing.approve",
+            json!({ "pairing_id": pairing_id, "id_token": id_token, "bundle": bundle }),
+        )
+        .await;
+        // The caller's `pairing.confirm` returned "reauth_required" and has been
+        // waiting ever since: the outcome reaches it through the events, whichever
+        // way it went — the browser page is not something a GUI can read.
+        crate::pairing::approved(&self.state, pairing_id, &result);
+        result
+            .map(|_| "Device confirmed. You can close this tab.".to_string())
+            .map_err(|err| {
+                format!(
+                    "Confirmation refused ({}).",
+                    err.app.as_deref().unwrap_or("server error")
+                )
+            })
+    }
+
+    /// The preamble every re-auth goal shares: take the slot — after which
+    /// nothing can stop us midway — and stow the fresh refresh token.
+    fn claim_and_stash(&self, refresh_token: Option<&str>) -> Result<(), String> {
+        if !self.claim_slot() {
+            return Err("Re-authentication replaced by another.".to_string());
+        }
+        let s = self.state.session.lock().expect("lock session");
+        // The session may have closed while the tab was waiting (logout kills
+        // the flow, but not if it had already taken the slot): an orphan re-auth
+        // must neither stow a credential nor act on the account.
+        if !s.logged_in {
+            return Err("The session was closed in the meantime.".to_string());
+        }
+        // The refresh token that led here was dead or absent: this one will serve
+        // again for the next sensitive operations. Under the lock: a logout
+        // serialized after us will delete it — never the other way around.
+        if let Some(refresh) = refresh_token
+            && let Err(e) = self
+                .state
+                .secrets
+                .set(crate::secrets::REFRESH_TOKEN, refresh)
+        {
+            tracing::error!(error = %e, "refresh token not stored");
+        }
+        Ok(())
     }
 
     /// Does the flow still hold the slot? Takes it (empties it) if so — no one
@@ -422,6 +416,65 @@ impl Flow {
             false
         }
     }
+}
+
+/// Opens the session a fresh enrollment has earned: `session.json` on disk, the
+/// state in memory, one notification, and the session task started. The single
+/// way in for both ways of enrolling — an OIDC login, or a pairing a device of
+/// the account confirmed (`pairing.rs`) — so that "a session is open" means one
+/// same thing whichever door was used.
+///
+/// `refresh_token` is what the IdP handed over, and `None` when nothing went
+/// through the IdP at all (the pairing path): the device then has no browserless
+/// credential, and its first sensitive operation opens a browser once.
+pub(crate) fn open_session(
+    state: &Arc<AppState>,
+    info: SessionInfo,
+    refresh_token: Option<&str>,
+) -> Result<(), String> {
+    {
+        let mut s = state.session.lock().expect("lock session");
+        // A session opened while we were enrolling (a faster concurrent flow):
+        // do not overwrite it.
+        if s.logged_in {
+            return Err("A session is already open.".to_string());
+        }
+        // session.json under the same lock as the state it materializes: nothing
+        // can slip between the disk and memory.
+        let mut session_json = json!({
+            "server_url": info.server_url,
+            "device_id": info.device_id,
+        });
+        if let Some(account) = &info.account {
+            session_json["account"] = account.clone();
+        }
+        crate::write_private_file(
+            &state.config_dir.join("session.json"),
+            &session_json.to_string(),
+        )
+        .map_err(|e| format!("Writing session.json failed ({e})."))?;
+        if let Some(refresh) = refresh_token {
+            // Under the same lock: a logout serialized after us will delete it —
+            // never the other way around. Degraded if the write fails: revokes
+            // will go through re-auth.
+            if let Err(e) = state.secrets.set(crate::secrets::REFRESH_TOKEN, refresh) {
+                tracing::error!(error = %e, "refresh token not stored");
+            }
+        }
+        s.logged_in = true;
+        s.account = info.account.clone();
+        s.own_device_id = Some(info.device_id.clone());
+        let payload = s.status_record();
+        // Broadcast under the session lock (order: session then registry): the
+        // order of notifications is the order of transitions.
+        state.registry.lock().expect("lock registry").notify_topic(
+            "session",
+            "session.changed",
+            &payload,
+        );
+    }
+    crate::start_session_task(state, info);
+    Ok(())
 }
 
 /// A WS connection dedicated to enrollment: challenge → enroll → device_id,

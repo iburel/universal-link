@@ -40,6 +40,11 @@ pub struct AppState {
     /// Pending OIDC flow (login or revoke re-auth) — one at a time, the next
     /// one replaces it.
     pub login: Mutex<Option<LoginSlot>>,
+    /// The pairing in flight (`pairing.rs`): one at a time, the next one replaces
+    /// it — a device displays one code and confirms one device. LEAF lock,
+    /// deliberately: the paths that touch it read the session, the account root
+    /// and the keyring, and they release each before taking this one.
+    pub pairing: Mutex<Option<crate::pairing::Pairing>>,
     /// To remove `session.json` at logout / revocation.
     pub config_dir: PathBuf,
     /// The device's Ed25519 identity (`device.key`), cloned by the session and

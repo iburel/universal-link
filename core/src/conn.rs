@@ -64,6 +64,10 @@ fn topic_scope(topic: &str) -> Option<&'static str> {
         "devices" => Some("devices.read"),
         "transfers" => Some("transfers.read"),
         "clipboard" => Some("clipboard.read"),
+        // The only topic gated on a `manage` scope, deliberately: a pairing's
+        // events drive a confirmation screen and carry the device asking to
+        // join. Whoever watches one is whoever may answer it.
+        "pairing" => Some("session.manage"),
         _ => None,
     }
 }
@@ -320,6 +324,23 @@ impl Conn {
             "account.status" => self.account_status(),
             "account.setup" => self.account_setup().await,
             "account.join" => self.account_join(params).await,
+            "pairing.offer" => {
+                self.require_scope("session.manage")?;
+                crate::pairing::offer(&self.state).await
+            }
+            "pairing.accept" => {
+                self.require_scope("session.manage")?;
+                crate::pairing::accept(&self.state, &rpc::required_str(params, "code")?).await
+            }
+            "pairing.confirm" => {
+                self.require_scope("session.manage")?;
+                crate::pairing::confirm(&self.state, &rpc::required_str(params, "pairing_id")?)
+                    .await
+            }
+            "pairing.cancel" => {
+                self.require_scope("session.manage")?;
+                crate::pairing::cancel(&self.state, &rpc::required_str(params, "pairing_id")?).await
+            }
             "devices.list" => self.devices_list(),
             "devices.rename" => self.devices_rename(params).await,
             "devices.revoke" => self.devices_revoke(params).await,
@@ -709,45 +730,17 @@ impl Conn {
         Ok(json!({ "fingerprint": fingerprint }))
     }
 
-    /// Attests our `node_id` under `ak`, stows AK_priv, persists the root and
-    /// installs it in memory — atomically under the lock.
-    ///
-    /// A root already there for **another** account key is refused
-    /// (`ACCOUNT_KEY_SET`): replacing it is a rotation, a follow-up building
-    /// block, and it is also the surface an attacker with `session.manage` would
-    /// use to re-attest this device under a key of their choosing. The **same**
-    /// account key, however, goes through: re-deriving the key this device is
-    /// already attested under proves the caller has the account's recovery code,
-    /// re-attesting is byte-for-byte the same signature (Ed25519 is
-    /// deterministic), and the one thing it does change is the keyring. That is
-    /// the migration gesture for a device enrolled before the key was kept at
-    /// rest: retype the code once, and it can vouch for others.
-    ///
-    /// The keyring comes before the root on purpose. A device that has the root
-    /// but not the key is a legal state (every device enrolled before this
-    /// existed is in it), so failing halfway must leave the *retryable* half
-    /// behind: had the root gone in first, its own guard would then answer
-    /// `ACCOUNT_KEY_SET` on the retry. Writing the secret under the lock is the
-    /// established pattern here (`session.logout` deletes the refresh token under
-    /// the session lock) — it is what `daemon::secrets`' background thread exists
-    /// for.
+    /// Installs the trust root derived from a typed recovery code
+    /// (`account_key::install` holds the rules, shared with the pairing path) and
+    /// names its refusals in this API's vocabulary.
     fn install_account_root(
         &self,
         ak: &ed25519_dalek::SigningKey,
     ) -> Result<crate::account_key::AccountRoot, RpcErr> {
-        let root = crate::account_key::root_for(ak, &self.state.identity.node_id());
-        let mut slot = self.state.account_root.lock().expect("lock account_root");
-        if let Some(existing) = slot.as_ref()
-            && existing.ak_pub != root.ak_pub
-        {
-            return Err(RpcErr::app("ACCOUNT_KEY_SET"));
-        }
-        crate::account_key::remember(&*self.state.secrets, ak)
-            .map_err(|_| RpcErr::app("ACCOUNT_KEY_SAVE_FAILED"))?;
-        crate::account_key::save(&self.state.config_dir, &root)
-            .map_err(|_| RpcErr::app("ACCOUNT_KEY_SAVE_FAILED"))?;
-        *slot = Some(root.clone());
-        Ok(root)
+        crate::account_key::install(&self.state, ak).map_err(|e| match e {
+            crate::account_key::InstallError::OtherKey => RpcErr::app("ACCOUNT_KEY_SET"),
+            crate::account_key::InstallError::SaveFailed => RpcErr::app("ACCOUNT_KEY_SAVE_FAILED"),
+        })
     }
 
     /// Refuses when the server is not connected: publishing the attestation
@@ -769,22 +762,8 @@ impl Conn {
         Ok(())
     }
 
-    /// Publishes our attestation to the server then, on success, carries it
-    /// onto OUR OWN cache record: the server excludes the publisher from its
-    /// broadcast, and without this gesture our local directory would ignore
-    /// itself until reconnection (same reasons as `set_own_relay` for the
-    /// relay).
     async fn publish_attestation(&self, root: &crate::account_key::AccountRoot) {
-        let published = crate::session::proxy(
-            &self.state,
-            "presence.update",
-            json!({ "attestation": root.attestation }),
-        )
-        .await
-        .is_ok();
-        if published {
-            crate::session::set_own_attestation(&self.state, &root.attestation);
-        }
+        crate::session::publish_attestation(&self.state, root).await;
     }
 
     /// Serves the last known directory snapshot — even disconnected; freshness

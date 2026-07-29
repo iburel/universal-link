@@ -19,6 +19,7 @@ mod framing;
 mod http;
 mod identity;
 mod login;
+mod pairing;
 mod rpc;
 mod secrets;
 mod session;
@@ -291,6 +292,7 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
         session: Mutex::new(SessionState::new(session_info.as_ref())),
         account_root: Mutex::new(account_root),
         login: Mutex::new(None),
+        pairing: Mutex::new(None),
         config_dir: config.config_dir,
         identity: device_identity,
         server_config: Mutex::new(config.server),

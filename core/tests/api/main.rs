@@ -16,6 +16,7 @@ mod enrollment;
 mod events;
 mod hello;
 mod login;
+mod pairing;
 mod protocol;
 mod session;
 mod startup;

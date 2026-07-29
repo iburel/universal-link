@@ -109,6 +109,14 @@ async fn a_new_device_joins_by_being_confirmed_on_a_device_of_the_account() {
     assert_eq!(claimed["device"]["name"], "New-PC");
     assert_eq!(claimed["device"]["platform"], "linux");
     assert_eq!(claimed["device"]["node_id"], joiner.key.node_id());
+    // The claimer is told the deadline too. It did not create the session, so
+    // this answer is the only place it can learn one — and both sides time out
+    // on their own clocks (no `expired` notification exists).
+    let left = claimed["expires_in"].as_u64().expect("expires_in");
+    assert!(
+        (1..=120).contains(&left),
+        "the time left must be what remains of the TTL, not a fresh one: {left}"
+    );
 
     // 3. The newcomer learns the other side is there, and gets its channel.
     let told = joiner.conn.expect_notification("pairing.claimed").await;
@@ -214,6 +222,10 @@ async fn a_new_device_joins_by_scanning_a_device_of_the_account() {
         claimed.get("device"),
         None,
         "nothing to display: it is the one being displayed"
+    );
+    assert!(
+        (1..=120).contains(&claimed["expires_in"].as_u64().expect("expires_in")),
+        "the claimer is told the deadline whichever side it is on"
     );
 
     // The displaying device is the sponsor here, so it is the one that receives

@@ -69,7 +69,7 @@ only through these two paths, never via the prompt.
 | Scope | Grants access to |
 |---|---|
 | `session.read` | `session.status`, `account.status`, the `session` topic |
-| `session.manage` | `session.login`, `session.logout`, `session.reload`, `account.setup`, `account.join` |
+| `session.manage` | `session.login`, `session.logout`, `session.reload`, `account.setup`, `account.join`, `pairing.*` and the `pairing` topic |
 | `devices.read` | `devices.list`, the `devices` topic |
 | `devices.manage` | `devices.rename`, `devices.revoke` |
 | `files.send` | `files.send`, `files.cancel` (any transfer, outgoing or incoming — components are the user's trusted agents; the `transfer_id` is random, non-enumerable) |
@@ -89,7 +89,7 @@ too, so without it the menu would offer targets that cannot be reached); tray:
 ## Subscribing to events
 
 ```
-events.subscribe { topics: ["session", "devices", "transfers", "clipboard"] }
+events.subscribe { topics: ["session", "devices", "transfers", "clipboard", "pairing"] }
 ```
 
 Topics filtered by scopes. Notifications are named (below, by namespace). After a
@@ -163,6 +163,12 @@ already in, on the other hand, is accepted: the attestation is byte-for-byte the
 same, and the one thing it changes is the keyring — that is the gesture that
 upgrades a device enrolled before the key was kept at rest (`holds_key: false`).
 
+There are two ways to install that key on a device: the recovery code typed in
+(here) and a **pairing** confirmed on a device that already has it (below). Both
+end in the same `account-key.json` + keyring entry, and both go through the same
+rules (`account_key::install`) — a key other than the one already installed is
+refused either way.
+
 `account.setup`/`account.join` assume the server is reachable
 (`SERVER_UNREACHABLE` otherwise) and return `ACCOUNT_KEY_SAVE_FAILED` if the key
 or the root cannot be persisted — nothing is installed in that case. `holds_key`
@@ -170,6 +176,59 @@ is answered by reading the keyring back, not by remembering the write: a keyring
 write can be queued, and a stored key that does not derive `ak_pub` is ignored
 (*fail-closed*) rather than used to sign — so `attested: true` with
 `holds_key: false` is a legitimate state, not a corrupt one.
+
+## `pairing.*` (joining without typing the code)
+
+A device joins the account by being **confirmed on a device that is already in
+it**: one displays a code, the other scans it (or the code is pasted, which is the
+same thing), a human confirms on the side that gives, and the account key crosses
+sealed. The recovery code stays what its name says — the way back when every
+device is gone.
+
+The server is a rendezvous and a relay of ciphertext
+([server-api.md](server-api.md), "Pairing"); the channel is keyed by an X25519
+exchange **plus** the code's own 128-bit secret, which travels by a screen and a
+camera. So a server that records everything cannot read the bundle, and a
+photograph of the screen is not enough either — but being faster than the
+legitimate scanner *is*, which is what the confirmation screen exists to catch
+(`doc/architecture.md`).
+
+| Method | Description |
+|---|---|
+| `pairing.offer {}` | display a code → `{ pairing_id, code, role, expires_in }`. `code` is the string to render as a QR **and** to offer as copyable text; `expires_in` is in seconds |
+| `pairing.accept { code }` | a code was scanned or pasted → `{ pairing_id, role, device? }`. `device` (`{ name, platform, node_id }`) is present when this device turns out to be the **sponsor**: it is what must be put in front of the human before confirming. `-32602` if `code` is not one |
+| `pairing.confirm { pairing_id }` | the human said yes (sponsor only) → `{ status: "done" }`, or `{ status: "reauth_required", auth_url }` when the server wants a fresher OIDC token than the keyring can mint — the caller opens the URL and reads the outcome from the events, exactly as for `devices.revoke` |
+| `pairing.cancel { pairing_id }` | the human declined, or the dialog closed → `{}`. Idempotent: an id we no longer hold is not an error |
+
+Notifications (topic `pairing`):
+
+| Notification | Emitted when |
+|---|---|
+| `pairing.claimed { pairing_id, device? }` | the other side scanned. `device` present when we are the sponsor — same record as `pairing.accept`'s |
+| `pairing.completed { pairing_id }` | this pairing is done: the account is installed (joiner) or handed over (sponsor). The joiner's `session.changed` and `account.status` carry what changed |
+| `pairing.failed { pairing_id, reason }` | `declined` (the other side gave up), `abandoned` (its connection died), `expired` (the deadline, counted here — the server says nothing), `channel` (the other side's channel material is unusable), `bundle` (what arrived does not open), `other_account` (it opened, and held a key other than this device's), `install` (the key could not be persisted), `enroll` (the server refused the enrollment), `server` (the rendezvous was lost), or a server code such as `PAIRING_UNKNOWN` |
+
+**The role is not the caller's to choose.** This device sponsors when it can
+actually vouch — it holds the account key AND is in the account — and joins
+otherwise; `pairing.offer` answers which. That covers the case a parameter would
+get wrong: a device that holds the key but was revoked needs to *join* again, not
+to sponsor. A scanner is told its role by the **server**, since the session is what
+decides who is joining; being told to sponsor with no key answers
+`NO_ACCOUNT_KEY` and gives the session back rather than leaving the other side
+waiting.
+
+**One pairing at a time**, per Core and not per connection: a new `offer`/`accept`
+replaces the previous one. A pairing is not tied to the connection that opened it
+(a GUI that restarts mid-dialog does not cancel it), so what bounds it is the
+deadline — both sides count it themselves.
+
+**The Core must be configured** (a server address) to pair at all —
+`SERVER_UNREACHABLE` otherwise, the same answer `session.login` gives. A device
+with no session opens a connection of its own for the pairing and enrolls on it;
+one already logged in pairs over its session connection, which is what tells the
+server its account (so a sponsor from another one is turned away). A device that
+enrolls this way has no OIDC refresh token: its first sensitive operation
+(`devices.revoke`, sponsoring in its turn) opens a browser once.
 
 ## `devices.*`
 
@@ -490,6 +549,8 @@ Standard JSON-RPC codes + application codes in `error.data.code`:
 | `ACCOUNT_KEY_SET` | `account.setup` / `account.join` for an account key OTHER than the one already installed (rotation is a follow-up) |
 | `INVALID_CODE` | `account.join`: malformed or wrong recovery code (checksum) |
 | `ACCOUNT_KEY_SAVE_FAILED` | the account key or its root cannot be persisted (keyring refused, folder not writable) — nothing is installed |
+| `NO_ACCOUNT_KEY` | this device cannot vouch: it holds no account key (`pairing.accept` told to sponsor, `pairing.confirm`) |
+| `PAIRING_UNKNOWN` / `PAIRING_STATE` / `PAIRING_LIMIT` | relayed from the server as-is: unknown/expired/spent session, wrong moment (confirming before anyone scanned, or from the joining side), too many sessions at once |
 | `DEVICE_UNKNOWN` / `DEVICE_OFFLINE` | target unknown / unreachable |
 | `TRANSFER_UNKNOWN` | unknown `transfer_id` |
 | `FORMAT_UNKNOWN` | format not present in the transaction |
