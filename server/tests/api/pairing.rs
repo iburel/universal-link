@@ -378,6 +378,135 @@ async fn a_second_scanner_is_turned_away() {
     assert_eq!(refused.app_code(), "PAIRING_STATE");
 }
 
+/// Nothing enrolls before a human has said yes. This is the one rule the whole
+/// feature exists to enforce, so it is checked from the joiner's own connection,
+/// mid-flow, with the scan already done.
+#[tokio::test]
+async fn enrolling_before_the_confirmation_is_refused() {
+    let env = TestEnv::start().await;
+    let mut sponsor = online_device(&env, TEST_SUB, "Phone", "android").await;
+    let mut joiner = Joiner::arrive(&env).await;
+    let pairing_id = offer(&mut joiner, "New-PC").await;
+
+    let refused = joiner
+        .enroll_with(&pairing_id)
+        .await
+        .expect_err("an unscanned session is not a grant");
+    assert_eq!(refused.app_code(), "PAIRING_STATE");
+
+    sponsor
+        .conn
+        .request(
+            "pairing.claim",
+            json!({ "pairing_id": &pairing_id, "channel": SPONSOR_CHANNEL }),
+        )
+        .await
+        .expect("pairing.claim");
+    let refused = joiner
+        .enroll_with(&pairing_id)
+        .await
+        .expect_err("scanned is not confirmed");
+    assert_eq!(refused.app_code(), "PAIRING_STATE");
+}
+
+/// A sponsor cannot confirm into thin air. This is the direction where the
+/// sponsor holds the session itself, so the stage is the only thing standing
+/// between "nobody scanned" and a confirmation addressed to no one.
+#[tokio::test]
+async fn a_sponsor_cannot_confirm_before_anyone_scanned() {
+    let env = TestEnv::start().await;
+    let mut sponsor = online_device(&env, TEST_SUB, "Office-PC", "linux").await;
+
+    let offered = sponsor
+        .conn
+        .request(
+            "pairing.create",
+            json!({ "role": "sponsor", "channel": SPONSOR_CHANNEL }),
+        )
+        .await
+        .expect("pairing.create");
+    let pairing_id = offered["pairing_id"].as_str().expect("pairing_id");
+
+    let refused = sponsor
+        .conn
+        .request(
+            "pairing.approve",
+            json!({
+                "pairing_id": pairing_id,
+                "id_token": env.oidc.id_token(TEST_SUB),
+                "bundle": BUNDLE,
+            }),
+        )
+        .await
+        .expect_err("there is nobody to confirm");
+    assert_eq!(refused.app_code(), "PAIRING_STATE");
+}
+
+/// One connection can rebind to another device — including a device of another
+/// account (`auth.authenticate` allows it). A pairing it claimed beforehand must
+/// not follow it there: the account a session is about is settled at the scan,
+/// and the connection identity alone no longer says which one that was.
+#[tokio::test]
+async fn a_connection_that_switched_account_cannot_confirm() {
+    let env = TestEnv::start().await;
+    let mut alice = online_device(&env, "alice", "Alice-PC", "linux").await;
+    // Enrolled under another account, on its own connection, and never
+    // authenticated there: free for Alice's connection to bind to.
+    let bob = enroll_device(&env, "bob", "Bob-PC", "linux").await;
+    let mut joiner = Joiner::arrive(&env).await;
+    let pairing_id = offer(&mut joiner, "New-PC").await;
+
+    alice
+        .conn
+        .request(
+            "pairing.claim",
+            json!({ "pairing_id": &pairing_id, "channel": SPONSOR_CHANNEL }),
+        )
+        .await
+        .expect("pairing.claim");
+    joiner.conn.expect_notification("pairing.claimed").await;
+
+    // Same connection, now speaking for Bob.
+    authenticate(&mut alice.conn, &bob.key, &bob.device_id).await;
+    let refused = alice
+        .conn
+        .request(
+            "pairing.approve",
+            json!({
+                "pairing_id": &pairing_id,
+                "id_token": env.oidc.id_token("bob"),
+                "bundle": BUNDLE,
+            }),
+        )
+        .await
+        .expect_err("Bob must not confirm what Alice scanned");
+    assert_eq!(refused.app_code(), "PAIRING_UNKNOWN");
+    joiner.conn.assert_silent().await;
+}
+
+/// The grant is the joiner's, not the pairing id's: knowing the id is not being
+/// the device that was confirmed.
+#[tokio::test]
+async fn only_the_joiner_spends_the_grant() {
+    let env = TestEnv::start().await;
+    let mut sponsor = online_device(&env, TEST_SUB, "Phone", "android").await;
+    let mut joiner = Joiner::arrive(&env).await;
+    let pairing_id = offer_and_confirm(&env, &mut sponsor, &mut joiner, "New-PC").await;
+
+    let mut outsider = Joiner::arrive(&env).await;
+    let refused = outsider
+        .enroll_with(&pairing_id)
+        .await
+        .expect_err("another connection must not spend the grant");
+    assert_eq!(refused.app_code(), "PAIRING_UNKNOWN");
+
+    // And the confirmed device is untouched by the attempt.
+    joiner
+        .enroll_with(&pairing_id)
+        .await
+        .expect("the grant still belongs to the joiner");
+}
+
 /// The side that gives the account away must be in it. An unauthenticated
 /// scanner has nothing to vouch with.
 #[tokio::test]
@@ -511,6 +640,9 @@ async fn declining_tells_the_other_side_and_settles_it() {
         .expect("pairing.cancel");
     let failed = joiner.conn.expect_notification("pairing.failed").await;
     assert_eq!(failed["reason"], "declined");
+    // The side that gave up has the response; it is not notified of its own
+    // decision.
+    sponsor.conn.assert_silent().await;
 
     let refused = joiner
         .enroll_with(&pairing_id)
