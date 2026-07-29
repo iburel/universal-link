@@ -168,6 +168,25 @@ impl Session {
             || self.claimer.as_ref().is_some_and(|c| c.conn_id == conn_id)
     }
 
+    /// Does this connection leaving end the pairing? Either party's, up to the
+    /// confirmation: a pairing that lost a side can never complete.
+    ///
+    /// Afterwards, only the joiner's. What is left of an approved session is the
+    /// joiner's own enrollment, on the joiner's own connection, and the sponsor
+    /// has nothing more to say — so a sponsor that confirms and closes at once
+    /// must not take the grant with it. The window is small and entirely real: a
+    /// phone swiped out of the recents list right after the confirmation kills
+    /// its process, and the device it just vouched for would be left holding the
+    /// account key with no directory entry to go with it.
+    fn orphaned_by(&self, conn_id: ConnId) -> bool {
+        if matches!(self.stage, Stage::Approved) {
+            return self
+                .party(Role::Joiner)
+                .is_some_and(|p| p.conn_id == conn_id);
+        }
+        self.involves(conn_id)
+    }
+
     /// Tells whichever party is NOT `conn_id` that the pairing is over, so it
     /// stops waiting instead of sitting until the TTL.
     fn tell_the_other(&self, conn_id: ConnId, reason: &str) {
@@ -241,6 +260,9 @@ impl Sessions {
         // One offer per connection: a device displays one QR code at a time,
         // and a dialog closed then reopened must not be blocked by the session
         // it left behind — which would otherwise hold the slot for a whole TTL.
+        // A session this connection has already sponsored to the end survives
+        // (`orphaned_by`): the grant is the other device's now, and opening a
+        // second dialog does not take back the confirmation just given.
         self.drop_for_conn(offerer.conn_id);
         if self.by_id.len() >= MAX_SESSIONS {
             return Err(RpcErr::app("PAIRING_LIMIT"));
@@ -417,13 +439,14 @@ impl Sessions {
         self.by_id.remove(pairing_id);
     }
 
-    /// Forgets every session this connection took part in. A pairing that lost
-    /// a party can never complete, so the survivor is told instead of waiting.
+    /// Forgets every session this connection leaves without a future
+    /// ([`Session::orphaned_by`]), and tells the survivor instead of letting it
+    /// wait out the TTL.
     pub fn drop_for_conn(&mut self, conn_id: ConnId) {
         let orphaned: Vec<String> = self
             .by_id
             .iter()
-            .filter(|(_, session)| session.involves(conn_id))
+            .filter(|(_, session)| session.orphaned_by(conn_id))
             .map(|(id, _)| id.clone())
             .collect();
         for id in orphaned {

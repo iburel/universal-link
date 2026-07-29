@@ -39,7 +39,11 @@ export function roleLabel(role: string): string {
 
 const SCOPES: Record<string, string> = {
   "session.read": "Read the session state",
-  "session.manage": "Open and close the session",
+  // Pairing rides this scope (`pairing.*` and the `pairing` topic), and pairing
+  // hands the account key to another device. A label that stopped at "open and
+  // close the session" would understate what the user is granting — the prompt
+  // is the only place they are ever told.
+  "session.manage": "Open and close the session, and link new devices to the account",
   "devices.read": "Read the device list",
   "devices.manage": "Rename and revoke devices",
   "files.send": "Send files",

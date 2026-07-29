@@ -685,6 +685,80 @@ async fn a_vanished_party_releases_the_other() {
     assert_eq!(failed["reason"], "abandoned");
 }
 
+/// ...but a sponsor that has already confirmed may walk away: what is left of the
+/// session is the joiner's own enrollment, on the joiner's own connection.
+///
+/// The window is real and short — a phone swiped out of the recents list right
+/// after the confirmation kills its process — and the device it vouched for would
+/// be left having installed the account key with no directory entry to go with
+/// it, reporting a failure for something a human had legitimately approved.
+#[tokio::test]
+async fn an_approved_grant_outlives_the_sponsor_leaving() {
+    let env = TestEnv::start().await;
+    let mut sponsor = online_device(&env, TEST_SUB, "Phone", "android").await;
+    // A third device, for one reason only: it is the account's witness that the
+    // server has finished handling the sponsor's departure. Without it nothing
+    // would say when, and the enrollment below could pass by outrunning the
+    // cleanup instead of surviving it.
+    let mut witness = online_device(&env, TEST_SUB, "Desk-PC", "linux").await;
+    let mut joiner = Joiner::arrive(&env).await;
+
+    // The helper leaves the joiner having seen the confirmation: the bundle is
+    // installed on its side, and only the enrollment is left.
+    let pairing_id = offer_and_confirm(&env, &mut sponsor, &mut joiner, "New-PC").await;
+
+    drop(sponsor);
+    let offline = witness.conn.wait_notification("device.offline").await;
+    assert!(offline["device_id"].is_string());
+
+    let enrolled = joiner
+        .enroll_with(&pairing_id)
+        .await
+        .expect("a confirmed device enrolls even if the sponsor has gone");
+    assert_eq!(enrolled["device"]["name"], "New-PC");
+    // And still exactly one shot: the grant is spent, not merely outliving its
+    // sponsor.
+    let refused = joiner
+        .enroll_with(&pairing_id)
+        .await
+        .expect_err("a spent grant enrolls nothing");
+    assert_eq!(refused.app_code(), "PAIRING_UNKNOWN");
+}
+
+/// The joiner is the party an approved session still needs: if IT leaves, the
+/// grant goes with it. Nobody could spend it anyway — enrolling demands the very
+/// connection that took part — and leaving it behind would hold a slot for
+/// nothing.
+#[tokio::test]
+async fn an_approved_grant_dies_with_the_joiner() {
+    let env = TestEnv::start().await;
+    let mut sponsor = online_device(&env, TEST_SUB, "Phone", "android").await;
+    let mut joiner = Joiner::arrive(&env).await;
+    let pairing_id = offer_and_confirm(&env, &mut sponsor, &mut joiner, "New-PC").await;
+
+    // The same key, on a connection of its own: the seed is all it takes.
+    let key = DeviceKey::from_seed_hex(&joiner.key.seed_hex());
+    drop(joiner);
+    // The sponsor is told, on the same grounds as before the confirmation: it was
+    // waiting for nothing more, but a device that vanished mid-pairing is
+    // something its interface has to be able to stop showing.
+    let failed = sponsor.conn.wait_notification("pairing.failed").await;
+    assert_eq!(failed["reason"], "abandoned");
+
+    // A fresh connection with the same key cannot pick the grant up: the pairing
+    // was pinned to the connection a human confirmed, not to the key.
+    let mut second = env.connect().await;
+    let nonce = challenge(&mut second).await;
+    let refused = second
+        .request(
+            "auth.enroll",
+            json!({ "pairing_id": &pairing_id, "proof": key.proof(&nonce) }),
+        )
+        .await
+        .expect_err("an abandoned grant enrolls nothing");
+    assert_eq!(refused.app_code(), "PAIRING_UNKNOWN");
+}
+
 /// One offer per connection: reopening the dialog must work, and the code left
 /// on the abandoned screen must stop working.
 #[tokio::test]

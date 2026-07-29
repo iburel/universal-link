@@ -44,6 +44,13 @@ test("labels fall back to the raw value when it is unknown", () => {
   expect(scopeLabel("future.scope")).toBe("future.scope");
 });
 
+// The approval prompt is the only place a user is told what a component may do,
+// so a scope that grew must not keep its old label. `session.manage` now carries
+// pairing, which hands the account key to another device.
+test("the scope that can give the account away says so", () => {
+  expect(scopeLabel("session.manage")).toMatch(/link new devices/);
+});
+
 // The phone runs the SAME view as the desktop, so the self label has to follow
 // the platform rather than the build it is displayed on.
 test("a device names itself after what it is", () => {
