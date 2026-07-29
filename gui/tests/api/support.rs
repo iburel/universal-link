@@ -564,6 +564,7 @@ impl TestServer {
             oidc: universallink_server::OidcConfig {
                 issuer_url: oidc.issuer(),
                 client_id: TEST_CLIENT_ID.into(),
+                client_secret: None,
                 max_fresh_token_age: Duration::from_secs(300),
                 jwks_refresh_min_interval: Duration::from_secs(60),
             },
@@ -581,6 +582,11 @@ impl TestServer {
             _server: server,
             url,
         }
+    }
+
+    /// This server's WebSocket URL — what a user pastes into the setup screen.
+    pub fn url(&self) -> String {
+        self.url.clone()
     }
 
     /// The config a Core pointed at this environment receives.

@@ -6,7 +6,8 @@
 //! `universallink-test-support`).
 //!
 //! Protocol decisions **frozen by this suite** (complementing doc/server-api.md):
-//! - Endpoints: WebSocket on `/ws`, health on `GET /health`. TLS is terminated
+//! - Endpoints: WebSocket on `/ws`, health on `GET /health`, deployment
+//!   descriptor on `GET /.well-known/universallink.json`. TLS is terminated
 //!   upstream — the tests speak in the clear over localhost.
 //! - JSON-RPC 2.0: client→server requests with a numeric `id`; server→client
 //!   notifications without an `id`; application codes in `error.data.code`
@@ -53,6 +54,7 @@ fn base_config(oidc: &FakeOidc) -> Config {
         oidc: OidcConfig {
             issuer_url: oidc.issuer(),
             client_id: TEST_CLIENT_ID.into(),
+            client_secret: None,
             max_fresh_token_age: Duration::from_secs(300),
             jwks_refresh_min_interval: Duration::from_secs(60),
         },
@@ -99,6 +101,15 @@ impl TestEnv {
 
     /// Raw HTTP GET; returns the status code.
     pub async fn http_get_status(&self, path: &str) -> u16 {
+        self.http_get(path).await.0
+    }
+
+    /// Raw HTTP GET; returns the status code, the headers as one lowercased
+    /// blob (so a test can look for one without parsing), and the body.
+    ///
+    /// HTTP/1.0 without `keep-alive`: the server closes once it has answered,
+    /// which is what makes reading to EOF the whole response.
+    pub async fn http_get(&self, path: &str) -> (u16, String, String) {
         let mut stream = TcpStream::connect(self.server.local_addr())
             .await
             .expect("HTTP connection");
@@ -111,10 +122,14 @@ impl TestEnv {
             .read_to_string(&mut buf)
             .await
             .expect("HTTP response");
-        buf.split_whitespace()
+
+        let status = buf
+            .split_whitespace()
             .nth(1)
             .and_then(|s| s.parse().ok())
-            .expect("HTTP status")
+            .expect("HTTP status");
+        let (headers, body) = buf.split_once("\r\n\r\n").expect("end of the headers");
+        (status, headers.to_lowercase(), body.to_string())
     }
 }
 

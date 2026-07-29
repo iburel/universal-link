@@ -64,9 +64,14 @@ The config folder houses:
 ```
 
 **Nothing is baked into the binary**: a fresh install carries no server. The GUI's
-first-run setup screen collects `server_url` / `oidc_issuer` / `oidc_client_id`
-(+ the optional secret), writes this file, and calls `session.reload` so the Core
-applies it live — no restart. `config.json` can also be written by hand.
+first-run setup screen asks for the **address** and reads the rest from the server
+itself (`session.discover` → its deployment descriptor, see
+[core-api.md](core-api.md#sessiondiscover-one-address-instead-of-three-fields)):
+`oidc_issuer` / `oidc_client_id` (+ the optional secret) describe the deployment,
+not the user. It writes this file, then calls `session.reload` so the Core applies
+it live — no restart. A server that publishes no descriptor (older than that
+endpoint) makes the screen fall back to asking for the three fields, and
+`config.json` can always be written by hand.
 
 `oidc_client_secret` is optional: a conformant PKCE IdP has none, but Google
 requires it at the token exchange even under PKCE (it is not confidential for a

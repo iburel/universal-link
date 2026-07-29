@@ -6,7 +6,7 @@
 //! (doc/core-api.md "session.*", doc/server-api.md "Lifecycle").
 //! The OIDC login is the next building block: the harness seeds the identity.
 
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::support::*;
 
@@ -391,4 +391,113 @@ async fn revocation_while_offline_drops_session_at_reconnect() {
         !core.config_dir().join("session.json").exists(),
         "session.json must be deleted after offline revocation"
     );
+}
+
+// ---------------------------------------------------------------------------
+// session.discover: the deployment's settings read from the server itself,
+// against the REAL descriptor endpoint (doc/server-api.md).
+// ---------------------------------------------------------------------------
+
+/// The whole point: a Core with nothing configured, an address, and the settings
+/// come back ready to be written.
+#[tokio::test]
+async fn discover_reads_the_deployment_from_the_server() {
+    let server =
+        TestServer::start_with(|c| c.oidc.client_secret = Some("GOCSPX-secret".into())).await;
+    let core = TestCore::start().await;
+    let mut c = spawn_component(&core, "gui-official", "gui", &["session.manage"]).await;
+
+    // The address as someone would paste it out of a configured device's
+    // config.json — path and all.
+    let r = c
+        .request("session.discover", json!({ "url": server.core_url() }))
+        .await
+        .expect("session.discover");
+
+    assert_eq!(r["server_url"], server.core_url());
+    assert_eq!(r["oidc_issuer"], server.oidc.issuer());
+    assert_eq!(r["oidc_client_id"], TEST_CLIENT_ID);
+    // The field that used to be carried to every device by hand.
+    assert_eq!(r["oidc_client_secret"], "GOCSPX-secret");
+}
+
+#[tokio::test]
+async fn discover_reports_a_deployment_without_a_secret() {
+    let server = TestServer::start().await;
+    let core = TestCore::start().await;
+    let mut c = spawn_component(&core, "gui-official", "gui", &["session.manage"]).await;
+
+    let r = c
+        .request("session.discover", json!({ "url": server.core_url() }))
+        .await
+        .expect("session.discover");
+
+    // Null, not an empty string: an empty secret would be sent at the token
+    // exchange and rejected.
+    assert_eq!(r["oidc_client_secret"], Value::Null);
+}
+
+#[tokio::test]
+async fn discover_requires_session_manage() {
+    let server = TestServer::start().await;
+    let core = TestCore::start().await;
+    // Reading the session is not enough to make the Core fetch a URL.
+    let mut c = spawn_component(&core, "tray-official", "tray", &["session.read"]).await;
+
+    let err = c
+        .request("session.discover", json!({ "url": server.core_url() }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.app_code(), "SCOPE_DENIED");
+}
+
+/// An HTTP server that is not a UniversalLink server — the case of an address
+/// typed from memory. Distinguished from an unreachable one, because the answer
+/// for the user is different: fill the fields in yourself.
+#[tokio::test]
+async fn discover_reports_a_server_that_publishes_nothing() {
+    let server = TestServer::start().await;
+    let core = TestCore::start().await;
+    let mut c = spawn_component(&core, "gui-official", "gui", &["session.manage"]).await;
+
+    let err = c
+        .request("session.discover", json!({ "url": server.oidc.issuer() }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.app_code(), "NO_DESCRIPTOR");
+}
+
+#[tokio::test]
+async fn discover_reports_an_unreachable_server() {
+    let server = TestServer::start().await;
+    let core = TestCore::start().await;
+    let mut c = spawn_component(&core, "gui-official", "gui", &["session.manage"]).await;
+    server.cut();
+
+    let err = c
+        .request("session.discover", json!({ "url": server.core_url() }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.app_code(), "SERVER_UNREACHABLE");
+}
+
+#[tokio::test]
+async fn discover_refuses_what_is_not_an_address() {
+    let core = TestCore::start().await;
+    let mut c = spawn_component(&core, "gui-official", "gui", &["session.manage"]).await;
+
+    for url in ["", "ftp://host", "https://"] {
+        let err = c
+            .request("session.discover", json!({ "url": url }))
+            .await
+            .unwrap_err();
+        // Invalid params, not an application code: nothing was attempted.
+        assert_eq!(err.code, -32602, "{url:?}");
+    }
+
+    let err = c.request("session.discover", json!({})).await.unwrap_err();
+    assert_eq!(err.code, -32602);
 }

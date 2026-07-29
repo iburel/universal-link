@@ -579,6 +579,7 @@ mod tests {
                     // validation, and `presence.update` performs none.
                     issuer_url: "http://127.0.0.1:9".into(),
                     client_id: "tests".into(),
+                    client_secret: None,
                     max_fresh_token_age: Duration::from_secs(300),
                     jwks_refresh_min_interval: Duration::from_secs(60),
                 },

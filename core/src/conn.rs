@@ -316,6 +316,7 @@ impl Conn {
             "session.login" => self.session_login().await,
             "session.logout" => self.session_logout(),
             "session.reload" => self.session_reload(),
+            "session.discover" => self.session_discover(params).await,
             "account.status" => self.account_status(),
             "account.setup" => self.account_setup().await,
             "account.join" => self.account_join(params).await,
@@ -498,6 +499,43 @@ impl Conn {
     /// Meaningful outside a session: a live session stays pinned to the server
     /// it enrolled on (`SessionInfo.server_url`), so changing servers means
     /// logging out first — the GUI enforces that.
+    /// Reads the deployment descriptor at an address the user typed and returns
+    /// the settings to write into `config.json` — the interface then applies them
+    /// with `session.reload`, the pair being what replaces a screen asking for
+    /// the issuer and the client. Writes nothing itself: the Core is not the
+    /// owner of that file.
+    ///
+    /// Meaningful precisely when nothing is configured, which is why it takes the
+    /// address as a parameter instead of reading it from the config.
+    ///
+    /// It does make the Core fetch a URL a caller chose. That is bounded by the
+    /// `session.manage` scope and by `http`'s own budget, and the failures name
+    /// only the field at fault — never what came back (`discover::parse`), so it
+    /// is not a way to read this machine's network through us.
+    async fn session_discover(&mut self, params: &Value) -> Result<Value, RpcErr> {
+        self.require_scope("session.manage")?;
+        let url = rpc::required_str(params, "url")?;
+        match crate::discover::discover(self.state.connector.as_ref(), &url).await {
+            Ok(deployment) => Ok(json!({
+                "server_url": deployment.server_url,
+                "oidc_issuer": deployment.oidc_issuer,
+                "oidc_client_id": deployment.oidc_client_id,
+                "oidc_client_secret": deployment.oidc_client_secret,
+            })),
+            Err(crate::discover::DiscoverError::BadUrl) => Err(RpcErr::invalid_params("url")),
+            Err(crate::discover::DiscoverError::NoDescriptor) => Err(RpcErr::app_message(
+                "NO_DESCRIPTOR",
+                "this server does not publish its settings",
+            )),
+            Err(crate::discover::DiscoverError::Unreachable(why)) => {
+                Err(RpcErr::app_message("SERVER_UNREACHABLE", why))
+            }
+            Err(crate::discover::DiscoverError::Invalid(why)) => {
+                Err(RpcErr::app_message("INVALID_DESCRIPTOR", why))
+            }
+        }
+    }
+
     fn session_reload(&self) -> Result<Value, RpcErr> {
         self.require_scope("session.manage")?;
         let server = (self.state.reload_server)()

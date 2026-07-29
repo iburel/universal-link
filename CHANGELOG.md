@@ -8,6 +8,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Setting up a device takes one field: the server's address.** The issuer and
+  the OpenID Connect client describe the *deployment*, not the user — identical on
+  every device of one server, yet retyped on each machine and each phone. The
+  server now publishes them at `GET /.well-known/universallink.json`, the Core
+  reads them from an address in any shape (a bare host, or the `wss://…/ws` you
+  paste from another device), and the setup screen writes them for you. Set the
+  secret on the server with `UNIVERSALLINK_OIDC_CLIENT_SECRET` — Google's clients
+  need one, other IdPs may not — and it is served with the rest deliberately: for
+  an installed application it identifies the app rather than authenticating it,
+  and it already shipped inside every client's configuration.
+  - A schemeless address is read over TLS. `http://` and `ws://` work when written
+    out, but never by default: those settings decide where the sign-in goes.
+  - A server that publishes none — one older than this release, or another site
+    altogether — makes the screen say so and ask for the three fields, as before.
+    They also stay available behind "Enter the OpenID Connect settings manually",
+    for a deployment you want to override.
+  - Saving in the Server settings tab asks the server again, so a deployment that
+    rotated its OpenID Connect client is picked up without touching each device.
 - **The app shows which version it is** — at the foot of its sidebar, and on the
   screen that asks you to update, the one place where the question always comes
   up. It is the interface's version: on Linux the background Core runs from a

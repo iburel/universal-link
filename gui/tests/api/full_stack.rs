@@ -59,3 +59,52 @@ async fn login_and_devices_through_the_shell() {
     assert_eq!(p["logged_in"], false);
     assert_eq!(p["server_connected"], false);
 }
+
+/// First run, through the shell: an address, and the settings the setup screen no
+/// longer asks for come back from the server's own descriptor and land in
+/// `config.json`. The three steps the screen strings together — `session.discover`,
+/// the shell's write, `session.reload`.
+///
+/// What this cannot show is `configured` flipping: this harness's Core carries a
+/// fixed `reload_server` closure (it does not read the shell's file, and the two
+/// keep separate folders), so a reload here re-applies what it was built with.
+/// That effect is covered where it is expressible, on a real closure —
+/// `core/tests/api/session.rs::reload_configures_an_unconfigured_core`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_configures_itself_from_the_server_address() {
+    let server = TestServer::start().await;
+    // Nothing configured: the state a fresh install starts from.
+    let core = TestCore::start().await;
+    let shell = shell_app(gui_config(&core)).await;
+    shell.wait_status("connected").await;
+    assert_eq!(shell.get_server_config().await["server_url"], "");
+
+    // One address — as it would be pasted, path and all.
+    let found = shell
+        .core_request("session.discover", json!({ "url": server.url() }))
+        .await
+        .expect("session.discover");
+    assert_eq!(found["server_url"], server.url());
+    assert_eq!(found["oidc_issuer"], server.oidc.issuer());
+    assert!(
+        found["oidc_client_id"].is_string(),
+        "the client id the deployment publishes: {found}"
+    );
+
+    // The shell writes what came back — it owns config.json — and the Core takes
+    // the sequence without complaint.
+    shell
+        .set_server_config(found.clone())
+        .await
+        .expect("set_server_config");
+    shell
+        .core_request("session.reload", json!({}))
+        .await
+        .expect("session.reload");
+
+    // Written, from an address alone: what used to take three fields.
+    let written = shell.get_server_config().await;
+    assert_eq!(written["server_url"], server.url());
+    assert_eq!(written["oidc_issuer"], server.oidc.issuer());
+    assert_eq!(written["oidc_client_id"], found["oidc_client_id"]);
+}

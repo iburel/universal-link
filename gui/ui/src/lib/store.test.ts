@@ -1905,3 +1905,106 @@ test.each([
 ])("a pending share reads as %o → %s", (files, summary) => {
   expect(shareSummary(files)).toBe(summary);
 });
+
+test("setUpFromAddress asks the server for its settings, then writes them", async () => {
+  const CONFIGURED: SessionState = {
+    logged_in: false,
+    server_connected: false,
+    configured: true,
+  };
+  const fake = mockCore({
+    status: CONNECTED,
+    methods: {
+      "session.status": () => CONFIGURED,
+      "session.reload": () => CONFIGURED,
+      "session.discover": () => ({
+        server_url: "wss://universallink.example.com/ws",
+        oidc_issuer: "https://accounts.google.com",
+        oidc_client_id: "abc.apps.googleusercontent.com",
+        oidc_client_secret: "GOCSPX-secret",
+      }),
+    },
+  });
+  await store.start();
+  await flush();
+
+  const outcome = await store.setUpFromAddress("universallink.example.com");
+
+  expect(outcome).toBe("saved");
+  // The address goes as typed — deriving the URLs is the Core's job, in one
+  // place, shared with the phone.
+  expect(
+    fake.calls.find((c) => c.method === "session.discover")?.params,
+  ).toEqual({ url: "universallink.example.com" });
+  // What came back is what got written, secret included: the field that used to
+  // be carried to every device by hand.
+  expect(fake.configWrites).toEqual([
+    {
+      server_url: "wss://universallink.example.com/ws",
+      oidc_issuer: "https://accounts.google.com",
+      oidc_client_id: "abc.apps.googleusercontent.com",
+      oidc_client_secret: "GOCSPX-secret",
+    },
+  ]);
+  expect(store.session?.configured).toBe(true);
+});
+
+test("setUpFromAddress reports a server that publishes nothing, without a banner", async () => {
+  const fake = mockCore({
+    status: CONNECTED,
+    methods: {
+      "session.discover": () => {
+        throw appError("NO_DESCRIPTOR", "this server does not publish its settings");
+      },
+    },
+  });
+  await store.start();
+  await flush();
+
+  const outcome = await store.setUpFromAddress("old-server.example.com");
+
+  // The caller acts on this one (it reveals the fields to fill in) instead of
+  // reading a banner it would have to explain around.
+  expect(outcome).toBe("unpublished");
+  expect(store.notice).toBeNull();
+  // Nothing was written: a failed discovery leaves the config as it was.
+  expect(fake.configWrites).toEqual([]);
+});
+
+test("setUpFromAddress gives an incomplete descriptor its context", async () => {
+  mockCore({
+    status: CONNECTED,
+    methods: {
+      "session.discover": () => {
+        throw appError("INVALID_DESCRIPTOR", "oidc_client_id is missing");
+      },
+    },
+  });
+  await store.start();
+  await flush();
+
+  const outcome = await store.setUpFromAddress("host.example");
+
+  expect(outcome).toBe("failed");
+  // The Core names the field; on its own that reads as noise, so the banner says
+  // what it is about too.
+  expect(store.notice?.text).toContain("oidc_client_id");
+  expect(store.notice?.text).toContain("incomplete");
+});
+
+test("setUpFromAddress surfaces an unreachable server as any other failure", async () => {
+  const fake = mockCore({
+    status: CONNECTED,
+    methods: {
+      "session.discover": () => {
+        throw appError("SERVER_UNREACHABLE", "connecting to host.example");
+      },
+    },
+  });
+  await store.start();
+  await flush();
+
+  expect(await store.setUpFromAddress("host.example")).toBe("failed");
+  expect(store.notice?.text).toBe("Server unreachable.");
+  expect(fake.configWrites).toEqual([]);
+});

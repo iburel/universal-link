@@ -54,6 +54,11 @@ fn load_from(env: &dyn Fn(&str) -> Option<String>) -> Result<Config, String> {
 
     let client_id = required(env, "UNIVERSALLINK_OIDC_CLIENT_ID", &mut errors);
 
+    // Optional: the server never uses it, it advertises it in the deployment
+    // descriptor so the clients do not have to be told by hand. An IdP that
+    // conforms to RFC 7636 needs none; Google asks for one even under PKCE.
+    let client_secret = non_empty(env, "UNIVERSALLINK_OIDC_CLIENT_SECRET");
+
     let heartbeat_interval = optional_secs(
         env,
         "UNIVERSALLINK_HEARTBEAT_SECS",
@@ -96,6 +101,7 @@ fn load_from(env: &dyn Fn(&str) -> Option<String>) -> Result<Config, String> {
         oidc: OidcConfig {
             issuer_url: issuer_url.expect("validated"),
             client_id: client_id.expect("validated"),
+            client_secret,
             max_fresh_token_age: max_fresh_token_age.expect("validated"),
             jwks_refresh_min_interval: jwks_refresh_min_interval.expect("validated"),
         },
@@ -227,6 +233,7 @@ mod tests {
         assert_eq!(config.bind_addr, "0.0.0.0:8080".parse().unwrap());
         assert_eq!(config.oidc.issuer_url, "https://accounts.google.com");
         assert_eq!(config.oidc.client_id, "abc.apps.googleusercontent.com");
+        assert_eq!(config.oidc.client_secret, None);
         assert_eq!(config.heartbeat_interval, Duration::from_secs(30));
         assert_eq!(config.heartbeat_max_missed, 2);
         assert_eq!(config.nonce_ttl, Duration::from_secs(60));
@@ -290,6 +297,24 @@ mod tests {
             Duration::from_secs(90)
         );
         assert_eq!(config.max_requests_per_minute, Some(300));
+    }
+
+    /// The one setting the server holds without ever using it: it is there to be
+    /// handed to the clients in the deployment descriptor.
+    #[test]
+    fn the_oidc_client_secret_is_optional() {
+        let mut vars = REQUIRED.to_vec();
+        vars.push(("UNIVERSALLINK_OIDC_CLIENT_SECRET", "GOCSPX-secret"));
+        let config = load_from(&env_of(&vars)).expect("valid config");
+        assert_eq!(config.oidc.client_secret.as_deref(), Some("GOCSPX-secret"));
+
+        // Set but empty counts as absent, like every other variable here — and
+        // NOT as an empty secret, which would be sent at the token exchange and
+        // rejected by the IdP.
+        let mut blank = REQUIRED.to_vec();
+        blank.push(("UNIVERSALLINK_OIDC_CLIENT_SECRET", "  "));
+        let config = load_from(&env_of(&blank)).expect("valid config");
+        assert_eq!(config.oidc.client_secret, None);
     }
 
     #[test]

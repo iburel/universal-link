@@ -14,6 +14,7 @@ mod conn;
 mod connector;
 mod datachannel;
 mod dataplane;
+mod discover;
 mod framing;
 mod http;
 mod identity;
