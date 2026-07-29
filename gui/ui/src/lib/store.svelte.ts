@@ -64,7 +64,7 @@ import {
   type ShareStatus,
   type SharedFile,
 } from "./core";
-import { humanize, isCoreError, isInvalidParams } from "./errors";
+import { humanize, isAppCode, isCoreError, isInvalidParams } from "./errors";
 import { formatSize } from "./format";
 
 export interface Notice {
@@ -707,9 +707,7 @@ export class CoreStore {
     this.busy = true;
     this.notice = null;
     try {
-      await setServerConfig(input);
-      await api.sessionReload();
-      await this.resync();
+      await this.#writeAndApply(input);
       return true;
     } catch (e) {
       this.notice = { kind: "error", text: humanize(e) };
@@ -717,6 +715,53 @@ export class CoreStore {
     } finally {
       this.busy = false;
     }
+  }
+
+  /**
+   * Reads the deployment's settings from its own address, then writes and applies
+   * them — the one-field path of the setup screen. The issuer and the OIDC client
+   * belong to the deployment, so the server is asked for them instead of the user.
+   *
+   * `"unpublished"` is the one failure the caller acts on rather than reads: the
+   * screen reveals the fields to fill in by hand, which is what a server older
+   * than that endpoint needs. No banner for it — the screen explains itself.
+   */
+  async setUpFromAddress(
+    address: string,
+  ): Promise<"saved" | "unpublished" | "failed"> {
+    if (this.busy) return "failed";
+    this.busy = true;
+    this.notice = null;
+    try {
+      const found = await api.sessionDiscover(address);
+      await this.#writeAndApply({
+        server_url: found.server_url,
+        oidc_issuer: found.oidc_issuer,
+        oidc_client_id: found.oidc_client_id,
+        oidc_client_secret: found.oidc_client_secret,
+      });
+      return "saved";
+    } catch (e) {
+      if (isAppCode(e, "NO_DESCRIPTOR")) return "unpublished";
+      this.notice = {
+        kind: "error",
+        // A descriptor that is missing a field needs the context: on its own,
+        // the Core's message is a field name.
+        text: isAppCode(e, "INVALID_DESCRIPTOR")
+          ? `The settings this server publishes are incomplete: ${humanize(e)}`
+          : humanize(e),
+      };
+      return "failed";
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  /** Writes `config.json`, has the Core re-read it, resyncs. Throws on refusal. */
+  async #writeAndApply(input: ServerConfigInput): Promise<void> {
+    await setServerConfig(input);
+    await api.sessionReload();
+    await this.resync();
   }
 
   // -- Account (C7 account key) -------------------------------------------

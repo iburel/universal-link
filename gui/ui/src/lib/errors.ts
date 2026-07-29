@@ -27,6 +27,10 @@ const APP_MESSAGES: Record<string, string> = {
   SCOPE_DENIED: "The Core refused this operation (missing permission).",
   ROLE_CONFLICT: "This role is already held by another component.",
   NOT_ENROLLED: "This interface is not enrolled with the Core.",
+  // Deliberately absent: `session.discover`'s NO_DESCRIPTOR, which the setup
+  // screen acts on rather than reports (it reveals the fields to fill in), and
+  // INVALID_DESCRIPTOR, whose own message names the field at fault — more use to
+  // whoever runs the server than a sentence written here.
 };
 
 const KIND_MESSAGES: Record<Exclude<CoreError["kind"], "rpc">, string> = {
@@ -56,4 +60,9 @@ export function humanize(e: unknown): string {
  */
 export function isInvalidParams(e: unknown): boolean {
   return isCoreError(e) && e.kind === "rpc" && e.code === -32602;
+}
+
+/** Whether this is the Core answering with a given application code. */
+export function isAppCode(e: unknown, code: string): boolean {
+  return isCoreError(e) && e.kind === "rpc" && e.data_code === code;
 }

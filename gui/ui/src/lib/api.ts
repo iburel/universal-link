@@ -91,6 +91,18 @@ export type RevokeResult =
   | { status: "done" }
   | { status: "reauth_required"; auth_url: string };
 
+/**
+ * What a deployment publishes about itself — the settings to write into
+ * `config.json`, read from the server rather than typed in. `oidc_client_secret`
+ * is `null` for an IdP that wants none.
+ */
+export interface DiscoveredDeployment {
+  server_url: string;
+  oidc_issuer: string;
+  oidc_client_id: string;
+  oidc_client_secret: string | null;
+}
+
 export const api = {
   sessionStatus: () => coreRequest<SessionState>("session.status"),
   /** The caller opens `auth_url`; completion arrives via `session.changed`. */
@@ -102,6 +114,18 @@ export const api = {
    * `session.status`. `INVALID_CONFIG` if the file is malformed/half-filled.
    */
   sessionReload: () => coreRequest<SessionState>("session.reload"),
+  /**
+   * Reads the deployment descriptor at `url` — anything a user might type, a bare
+   * host included — and returns the settings to write. The Core writes nothing:
+   * the shell does, then {@link Api.sessionReload}.
+   *
+   * `NO_DESCRIPTOR`: something answered but publishes none (a server older than
+   * that endpoint, or another site) — the setup screen falls back to asking.
+   * `INVALID_DESCRIPTOR`: one missing what a login needs, the message naming the
+   * field. `-32602`: the address is not one, and nothing was attempted.
+   */
+  sessionDiscover: (url: string) =>
+    coreRequest<DiscoveredDeployment>("session.discover", { url }),
 
   /** Whether this device has joined the account vault, and under which fingerprint. */
   accountStatus: () => coreRequest<AccountKey>("account.status"),

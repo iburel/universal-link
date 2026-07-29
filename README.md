@@ -52,8 +52,9 @@ Store listing.
 
 On first launch the app installs the background service (per-user, no admin),
 registers it to start at login, and opens a setup screen. **Nothing is baked into
-the build**: it asks for your server's address and its OpenID Connect client,
-which means the one thing you must provide yourself is a server — see
+the build**: it asks for your server's address — the server itself supplies the
+OpenID Connect client to sign you in with — which means the one thing you must
+provide yourself is a server, see
 [Set up a real link](#set-up-a-real-link-between-your-machines).
 
 ## Status
@@ -137,8 +138,9 @@ verify (*fail-closed*).
 ## Set up a real link between your machines
 
 Two pieces have to exist before your machines can see each other, and neither is
-turnkey: an **OIDC client** and a **server**. Installing the app gets you as far
-as its setup screen; that screen asks for exactly these two.
+turnkey: an **OIDC client** and a **server**. You register the OIDC client with
+the server, once — every device then reads it from there, and the app's setup
+screen asks each of them for one thing: the server's address.
 
 ### Piece 1 — an OIDC client
 
@@ -201,9 +203,11 @@ docker compose up -d --build
 
 ### Piece 3 — `config.json` on each PC
 
-The installed app's **first-run screen writes this file for you** — this section
-is what it writes, and the path to take on a machine you drive from a terminal
-(development, a headless box). The Core reads it in its config directory (see
+The installed app's **first-run screen writes this file for you**, asking only for
+the address and reading the OIDC fields from the server (`GET
+/.well-known/universallink.json`) — this section is what it writes, and the path
+to take on a machine you drive from a terminal (development, a headless box). The
+Core reads it in its config directory (see
 [Where the files live](#where-the-files-live)) and never writes it itself.
 
 ```json

@@ -19,41 +19,79 @@
   let oidcClientSecret = $state("");
   let justSaved = $state(false);
 
+  // The OIDC fields are the deployment's, not the user's: the server publishes
+  // them and the Core reads them (`session.discover`). They are only asked for
+  // when that fails — a server older than that endpoint — or when someone wants
+  // to override them.
+  let manual = $state(false);
+  // Set when discovery found no descriptor: says why the fields just appeared,
+  // which a generic error banner would not.
+  let unpublished = $state(false);
+
   onMount(async () => {
     try {
       const c = await store.loadServerConfig();
-      serverUrl = c.server_url ?? "";
-      oidcIssuer = c.oidc_issuer ?? "";
-      oidcClientId = c.oidc_client_id ?? "";
-      oidcClientSecret = c.oidc_client_secret ?? "";
+      // Only fills what is still empty: this reads a file through the shell, so
+      // it can land after the user has started typing — on first run the address
+      // is the very first thing they touch — and a convenience must not take
+      // away what they wrote.
+      serverUrl ||= c.server_url ?? "";
+      oidcIssuer ||= c.oidc_issuer ?? "";
+      oidcClientId ||= c.oidc_client_id ?? "";
+      oidcClientSecret ||= c.oidc_client_secret ?? "";
     } catch {
       // Fresh install (no config.json) or unreadable: start from blank fields.
     }
   });
 
   // Light client-side checks — the Core re-validates and stays authoritative,
-  // but we spare the user a round-trip for the obvious mistakes.
-  const urlOk = $derived(/^wss?:\/\//.test(serverUrl.trim()));
+  // but we spare the user a round-trip for the obvious mistakes. Discovery takes
+  // an address in any shape (a bare host included) and derives the rest, so all
+  // it needs is something to send; the manual path writes `server_url` straight
+  // into config.json, where the daemon requires a ws(s) URL.
+  const addressOk = $derived(
+    manual
+      ? /^wss?:\/\//.test(serverUrl.trim())
+      : serverUrl.trim().length > 0,
+  );
   const issuerOk = $derived(/^https?:\/\//.test(oidcIssuer.trim()));
   const idOk = $derived(oidcClientId.trim().length > 0);
-  const valid = $derived(urlOk && issuerOk && idOk);
+  const valid = $derived(
+    manual ? addressOk && issuerOk && idOk : addressOk,
+  );
 
   // Changing the server invalidates a session enrolled on the old one.
   const warnLoggedIn = $derived(!firstRun && store.session?.logged_in === true);
 
   async function save() {
     justSaved = false;
-    const ok = await store.saveServerConfig({
-      server_url: serverUrl.trim(),
-      oidc_issuer: oidcIssuer.trim(),
-      oidc_client_id: oidcClientId.trim(),
-      // A blank secret means "none" (a conformant PKCE IdP has none): the shell
-      // clears the key rather than writing an empty string.
-      oidc_client_secret: oidcClientSecret.trim() || null,
-    });
+    unpublished = false;
+    const ok = manual
+      ? await store.saveServerConfig({
+          server_url: serverUrl.trim(),
+          oidc_issuer: oidcIssuer.trim(),
+          oidc_client_id: oidcClientId.trim(),
+          // A blank secret means "none" (a conformant PKCE IdP has none): the
+          // shell clears the key rather than writing an empty string.
+          oidc_client_secret: oidcClientSecret.trim() || null,
+        })
+      : await discover();
     // On first run, success flips `configured` and this whole screen is
     // replaced — no message needed. In settings the view stays: confirm inline.
     if (ok) justSaved = true;
+  }
+
+  /** The one-field path: the server is asked for the rest. */
+  async function discover(): Promise<boolean> {
+    const outcome = await store.setUpFromAddress(serverUrl.trim());
+    if (outcome === "unpublished") {
+      // Nothing was written. The fields appear, carrying whatever was already
+      // configured, and the address the user typed stays in place — they only
+      // have to complete it (the manual path wants a full ws(s) URL).
+      manual = true;
+      unpublished = true;
+    }
+    return outcome === "saved";
   }
 </script>
 
@@ -61,10 +99,11 @@
   <h1>{firstRun ? "Set up your server" : "Server"}</h1>
   <p class="muted">
     {#if firstRun}
-      UniversalLink connects to a server you choose. Enter its address and the
-      OpenID Connect client it uses to sign you in.
+      UniversalLink connects to a server you choose. Enter its address — it tells
+      this device how to sign you in.
     {:else}
-      The server and OpenID Connect client this device connects to.
+      The server this device connects to. Saving asks it again how to sign you in,
+      so a deployment that changed its OpenID Connect client is picked up.
     {/if}
   </p>
 
@@ -85,54 +124,65 @@
     </p>
   {/if}
 
+  {#if unpublished}
+    <p class="banner warn" role="status">
+      This server does not publish its settings — an older version, or not a
+      UniversalLink server. Enter them below; whoever runs it has them.
+    </p>
+  {/if}
+
   <label>
     <span>Server address</span>
     <input
       bind:value={serverUrl}
       aria-label="Server address"
-      placeholder="wss://universallink.example.com/ws"
+      placeholder={manual
+        ? "wss://universallink.example.com/ws"
+        : "universallink.example.com"}
       autocapitalize="off"
       autocorrect="off"
       spellcheck="false"
     />
   </label>
 
-  <label>
-    <span>OpenID Connect issuer</span>
-    <input
-      bind:value={oidcIssuer}
-      aria-label="OpenID Connect issuer"
-      placeholder="https://accounts.google.com"
-      autocapitalize="off"
-      autocorrect="off"
-      spellcheck="false"
-    />
-  </label>
+  {#if manual}
+    <label>
+      <span>OpenID Connect issuer</span>
+      <input
+        bind:value={oidcIssuer}
+        aria-label="OpenID Connect issuer"
+        placeholder="https://accounts.google.com"
+        autocapitalize="off"
+        autocorrect="off"
+        spellcheck="false"
+      />
+    </label>
 
-  <label>
-    <span>OpenID Connect client ID</span>
-    <input
-      bind:value={oidcClientId}
-      aria-label="OpenID Connect client ID"
-      placeholder="xxxxx.apps.googleusercontent.com"
-      autocapitalize="off"
-      autocorrect="off"
-      spellcheck="false"
-    />
-  </label>
+    <label>
+      <span>OpenID Connect client ID</span>
+      <input
+        bind:value={oidcClientId}
+        aria-label="OpenID Connect client ID"
+        placeholder="xxxxx.apps.googleusercontent.com"
+        autocapitalize="off"
+        autocorrect="off"
+        spellcheck="false"
+      />
+    </label>
 
-  <label>
-    <span>OpenID Connect client secret <em>(optional)</em></span>
-    <input
-      bind:value={oidcClientSecret}
-      aria-label="OpenID Connect client secret"
-      type="password"
-      placeholder="only if your provider requires one (e.g. Google)"
-      autocapitalize="off"
-      autocorrect="off"
-      spellcheck="false"
-    />
-  </label>
+    <label>
+      <span>OpenID Connect client secret <em>(optional)</em></span>
+      <input
+        bind:value={oidcClientSecret}
+        aria-label="OpenID Connect client secret"
+        type="password"
+        placeholder="only if your provider requires one (e.g. Google)"
+        autocapitalize="off"
+        autocorrect="off"
+        spellcheck="false"
+      />
+    </label>
+  {/if}
 
   <div class="actions">
     <button class="primary" disabled={store.busy || !valid} onclick={save}>
@@ -142,6 +192,21 @@
       <span class="saved" role="status">Saved.</span>
     {/if}
   </div>
+
+  <!-- Always available, both ways: someone may want to override what the server
+       publishes, or go back to letting it answer. -->
+  <button
+    class="link"
+    onclick={() => {
+      manual = !manual;
+      unpublished = false;
+      justSaved = false;
+    }}
+  >
+    {manual
+      ? "Read the settings from the server"
+      : "Enter the OpenID Connect settings manually"}
+  </button>
 </section>
 
 <style>
@@ -196,6 +261,16 @@
   .saved {
     color: var(--ok);
     font-size: 0.85rem;
+  }
+
+  /* A button, not an anchor: it navigates nowhere. */
+  .link {
+    border: none;
+    background: none;
+    padding: 0;
+    font-size: 0.85rem;
+    color: var(--muted);
+    text-decoration: underline;
   }
 
   .banner {

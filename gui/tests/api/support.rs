@@ -584,6 +584,11 @@ impl TestServer {
         }
     }
 
+    /// This server's WebSocket URL — what a user pastes into the setup screen.
+    pub fn url(&self) -> String {
+        self.url.clone()
+    }
+
     /// The config a Core pointed at this environment receives.
     pub fn core_cfg(&self) -> universallink_core::ServerConfig {
         universallink_core::ServerConfig {
