@@ -250,6 +250,115 @@ async fn a_mistyped_recovery_code_is_rejected() {
     );
 }
 
+/// The order in which onboarding persists things, seen from outside: the key
+/// goes in BEFORE the root. A keyring that refuses must therefore leave nothing
+/// behind — because the root's own guard would answer `ACCOUNT_KEY_SET` on the
+/// retry, and the device would be stuck attested-but-keyless with no way out
+/// through the API.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keyring_that_refuses_the_key_installs_nothing() {
+    let server = TestServer::start().await;
+    let core = TestCore::start_with_server(&server).await;
+    let mut c = manager(&core).await;
+    complete_login(&mut c).await;
+
+    // A directory where `secrets.json` belongs: every write to the fallback
+    // keyring now fails. (Done after the login, which stows the refresh token
+    // there.)
+    let secrets = core.config_dir().join("secrets.json");
+    std::fs::remove_file(&secrets).ok();
+    std::fs::create_dir(&secrets).expect("block the keyring");
+
+    let refused = c
+        .request("account.setup", json!({}))
+        .await
+        .expect_err("no key stowed, no account");
+    assert_eq!(refused.app_code(), "ACCOUNT_KEY_SAVE_FAILED");
+    let status = c
+        .request("account.status", json!({}))
+        .await
+        .expect("account.status");
+    assert_eq!(
+        status["attested"],
+        json!(false),
+        "the root must not be installed without the key"
+    );
+    assert!(
+        !core.config_dir().join("account-key.json").exists(),
+        "nor written to disk"
+    );
+
+    // And the retry, once the keyring answers again, goes through — which is the
+    // whole point of that ordering.
+    std::fs::remove_dir(&secrets).expect("unblock the keyring");
+    c.request("account.setup", json!({}))
+        .await
+        .expect("account.setup retried");
+    let status = c
+        .request("account.status", json!({}))
+        .await
+        .expect("account.status");
+    assert_eq!(status["attested"], json!(true));
+    assert_eq!(status["holds_key"], json!(true));
+}
+
+/// A revocation takes the refresh token away and leaves the account key —
+/// deliberately. Vouching for a joining device requires being authenticated in
+/// the account at the server's rendezvous, which this revocation just took away,
+/// so erasing the key buys nothing; and it would cost a recovery code retyped
+/// after every revocation the user did not mean. Whoever decides otherwise
+/// should have to change this test on purpose.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revoked_device_keeps_the_account_key() {
+    let server = TestServer::start().await;
+    let mut admin = server.online_device("PC-Admin", "macos").await;
+    let core = TestCore::start_enrolled(&server).await;
+    let mut c = manager(&core).await;
+    wait_server_connected(&mut c, true).await;
+    c.request("account.setup", json!({}))
+        .await
+        .expect("account.setup");
+
+    admin
+        .conn
+        .request(
+            "devices.revoke",
+            json!({
+                "device_id": core.device_id(),
+                "id_token": server.oidc.id_token(TEST_SUB),
+            }),
+        )
+        .await
+        .expect("devices.revoke");
+
+    eventually(
+        async || {
+            let r = c
+                .request("session.status", json!({}))
+                .await
+                .expect("session.status");
+            r["logged_in"] == json!(false)
+        },
+        "abandonment of the session after revocation",
+    )
+    .await;
+    assert!(
+        core.secret("oidc-refresh-token").is_none(),
+        "the refresh token belonged to the session: it leaves with it"
+    );
+
+    let status = c
+        .request("account.status", json!({}))
+        .await
+        .expect("account.status");
+    assert_eq!(status["attested"], json!(true), "still in the account");
+    assert_eq!(
+        status["holds_key"],
+        json!(true),
+        "and still holding its key: a re-enrollment must not need the code again"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn account_setup_requires_session_manage() {
     let server = TestServer::start().await;

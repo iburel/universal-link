@@ -449,19 +449,43 @@ mod tests {
         assert_eq!(a.to_bytes(), b.to_bytes());
     }
 
+    /// A FIXED code and a fixed typo, deliberately. The checksum is one byte, so
+    /// roughly one typo in 256 slips through unnoticed — which is precisely what
+    /// this test used to be: a random code plus a random substitution failed
+    /// about 0.4 % of runs (measured: 79 escapes in 20 000 draws). The vector
+    /// below is a typo the checksum does catch, which is the property being
+    /// pinned; the sweep that follows states what one byte is actually worth,
+    /// instead of pretending it is worth more.
     #[test]
     fn a_typo_is_caught_by_the_checksum() {
-        let code = generate_recovery_code();
-        // Change a content character (the first one), staying within the
-        // alphabet, to target the checksum and not the format.
-        let mut chars: Vec<char> = code.chars().collect();
-        let first = chars.iter().position(|c| *c != '-').unwrap();
-        chars[first] = if chars[first] == '0' { '1' } else { '0' };
-        let typo: String = chars.into_iter().collect();
-        match account_key_from_code(&typo) {
-            Err(RecoveryCodeError::Checksum) => {}
-            other => panic!("a typo must be caught: {other:?}"),
+        let code = encode_code(&[0x42u8; CODE_ENTROPY]);
+        let chars: Vec<char> = code.chars().collect();
+        // '8' → '0': still inside the alphabet, so this targets the checksum and
+        // not the format.
+        let mut typo = chars.clone();
+        typo[0] = '0';
+        assert_eq!(
+            account_key_from_code(&typo.into_iter().collect::<String>()).unwrap_err(),
+            RecoveryCodeError::Checksum
+        );
+
+        // Every single-character substitution of that code: a one-byte checksum
+        // lets about 1 in 256 through, and no more than that.
+        let (mut tried, mut escaped) = (0, 0);
+        for (i, c) in chars.iter().enumerate().filter(|(_, c)| **c != '-') {
+            for sub in CROCKFORD.iter().map(|b| *b as char).filter(|s| s != c) {
+                let mut mangled = chars.clone();
+                mangled[i] = sub;
+                tried += 1;
+                if account_key_from_code(&mangled.into_iter().collect::<String>()).is_ok() {
+                    escaped += 1;
+                }
+            }
         }
+        assert!(
+            escaped * 50 < tried,
+            "the checksum let {escaped}/{tried} single-character typos through"
+        );
     }
 
     #[test]
@@ -591,6 +615,20 @@ mod tests {
             assert!(
                 recall(&secrets, &ak_pub).is_none(),
                 "unusable seed accepted: {junk:?}"
+            );
+        }
+
+        // The real seed with something appended to it, and cut short. Only the
+        // length check catches the first: take the leading 32 bytes of it and you
+        // derive the right key, so a lenient decoder would hand back the account
+        // key for a value that is not the one we stored.
+        let real = hex::encode(ak.to_bytes());
+        for tampered in [format!("{real}ab"), real[..60].to_string()] {
+            crate::SecretStore::set(&secrets, crate::secrets::ACCOUNT_SEED, &tampered)
+                .expect("stow");
+            assert!(
+                recall(&secrets, &ak_pub).is_none(),
+                "a seed of the wrong length accepted: {tampered}"
             );
         }
 
