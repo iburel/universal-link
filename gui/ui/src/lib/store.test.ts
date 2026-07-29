@@ -2455,6 +2455,21 @@ test("a device with no camera stops being offered one", async () => {
   expect(store.notice?.text).toContain("no camera");
 });
 
+// The shell holds a scanner this page knows nothing about — a webview reloaded
+// while the camera was up. Nothing to say: the scanner the user is looking at is
+// the one that will answer.
+test("a scanner the shell already has open is not reported", async () => {
+  await primed(pairingMethods(), {
+    scanner: true,
+    scanned: () => ({ reason: "busy" }),
+  });
+
+  await store.scanPairingCode();
+
+  expect(store.notice).toBeNull();
+  expect(store.canScan).toBe(true);
+});
+
 // A word from a newer shell than this page: still an answer, still a sentence.
 test("an outcome this page has no word for is still reported", async () => {
   await primed(pairingMethods(), {
