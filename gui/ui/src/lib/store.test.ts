@@ -2115,6 +2115,26 @@ test("the code is trimmed, and an empty one never reaches the Core", async () =>
   });
 });
 
+// A pairing joins exactly two devices, so a code the server calls out of state is
+// one somebody else got to first. That refusal is the only signal the user gets,
+// and the threat model in doc/architecture.md leans on it: it has to name the
+// cause rather than describe a state machine.
+test("a code someone else answered first says so", async () => {
+  await primed({
+    ...pairingMethods(),
+    "pairing.accept": () => {
+      throw appError("PAIRING_STATE");
+    },
+  });
+
+  await store.enterPairingCode("UL1:x:y:p_1");
+
+  expect(store.pairing).toBeNull();
+  expect(store.notice?.kind).toBe("error");
+  expect(store.notice?.text).toMatch(/already answered/);
+  expect(store.notice?.text).toMatch(/someone else/);
+});
+
 test("being claimed carries the number both ends must show", async () => {
   await primed(pairingMethods());
   await store.showPairingCode();

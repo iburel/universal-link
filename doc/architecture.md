@@ -438,7 +438,8 @@ Both sides show the number, and what is asked of the human differs:
 That asymmetry is the residual risk, and it is worth naming rather than glossing:
 a user who ignores the number on the joining device can be linked into **someone
 else's** account by whoever read the displayed code first — the signal they missed
-being their own device's scan failing with "already claimed". What it costs is a
+being their own device's refusal, which says the code was already answered and by
+whom it might have been (`PAIRING_STATE`). What it costs is a
 device that syncs with a stranger, not an account of theirs that leaks: nothing of
 the user's own account crosses in that direction. And what catches it afterwards is
 the safety number — the fingerprint a paired device displays is derived from the key

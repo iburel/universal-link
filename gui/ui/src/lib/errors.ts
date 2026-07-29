@@ -29,7 +29,12 @@ const APP_MESSAGES: Record<string, string> = {
   NOT_ENROLLED: "This interface is not enrolled with the Core.",
   NO_ACCOUNT_KEY: "This device cannot vouch for another: it holds no account key.",
   PAIRING_UNKNOWN: "This link has expired or was already answered.",
-  PAIRING_STATE: "This link is not at that step.",
+  // A pairing joins exactly two devices, so the case a user actually meets here
+  // is a code somebody else got to first — and that is the one signal telling
+  // them so. "Not at that step" was true and said nothing; the other cases this
+  // code covers (confirming before anyone scanned) are unreachable from the UI.
+  PAIRING_STATE:
+    "That code was already answered — show a new one. If it was not you, someone else read it.",
   PAIRING_LIMIT: "The server is handling too many links at once — try again.",
   // Deliberately absent: `session.discover`'s NO_DESCRIPTOR, which the setup
   // screen acts on rather than reports (it reveals the fields to fill in), and
