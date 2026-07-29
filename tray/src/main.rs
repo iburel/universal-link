@@ -149,6 +149,7 @@ async fn brain(cmd_rx: mpsc::Receiver<UiCommand>, proxy: EventLoopProxy<UserEven
         // within the supervisor's grant.
         scopes: vec!["session.read".into(), "system.shutdown".into()],
         topics: vec!["session".into()],
+        optional_topics: Vec::new(),
         served_methods: vec![],
         reconnect_base_delay: RECONNECT_BASE_DELAY,
         request_timeout: REQUEST_TIMEOUT,

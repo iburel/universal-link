@@ -11,6 +11,7 @@
 mod conn;
 mod descriptor;
 mod oidc;
+mod pairing;
 mod rpc;
 mod state;
 mod store;
@@ -44,6 +45,10 @@ pub struct Config {
     pub heartbeat_max_missed: u32,
     /// Lifetime of a nonce issued by `auth.challenge`.
     pub nonce_ttl: Duration,
+    /// How long a pairing session stays open (`pairing.create`). Paced by a
+    /// human walking to another device, scanning and confirming — long enough
+    /// for that, short enough that an abandoned QR code stops being one.
+    pub pairing_ttl: Duration,
     /// Request limit per connection per minute (`None` = unlimited).
     pub max_requests_per_minute: Option<u32>,
 }

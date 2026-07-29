@@ -57,8 +57,18 @@ pub struct ClientConfig {
     pub role: String,
     pub scopes: Vec<String>,
     /// `events.subscribe` topics, subscribed on every (re)connection before
-    /// `Event::Connected`. Empty: no subscription.
+    /// `Event::Connected`. Empty: no subscription. A topic the Core does not
+    /// know fails the whole subscription, and with it the connection — see
+    /// [`ClientConfig::optional_topics`] for a topic that must not.
     pub topics: Vec<String>,
+    /// Topics asked for ALONGSIDE [`ClientConfig::topics`], whose refusal must
+    /// not cost the connection: a Core older than the topic answers `invalid
+    /// params` for the whole list (it subscribes all or nothing), and the client
+    /// then subscribes to the required topics alone. This is what lets a
+    /// component that has grown a topic keep working against a Core that has
+    /// not — it loses that topic's events, which such a Core would never send.
+    /// A topic can be promoted to `topics` once no such Core is in the field.
+    pub optional_topics: Vec<String>,
     /// Core→component request methods this component serves (e.g.
     /// `clipboard.get_data` for the clipboard backend). A served method is
     /// surfaced as [`Event::Request`], to be answered with [`Client::respond`]

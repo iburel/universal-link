@@ -228,6 +228,89 @@ async fn backoff_doubles_and_resets() {
     );
 }
 
+// One subscription for the lot: a Core that knows every topic must not be asked
+// twice — the second call would be a round trip on every reconnection.
+#[tokio::test]
+async fn the_topics_are_all_asked_for_in_one_call() {
+    let mut scripted = ScriptedCore::start().await;
+    let mut config = client_config_at(scripted.path());
+    config.topics = vec!["session".into()];
+    config.optional_topics = vec!["pairing".into()];
+
+    let (_client, mut events) = universallink_ipc_client::spawn(config);
+    let mut conn = scripted.accept().await;
+    conn.handle_hello(1).await;
+
+    let sub = conn.recv().await;
+    assert_eq!(sub["method"], "events.subscribe");
+    assert_eq!(sub["params"]["topics"], json!(["session", "pairing"]));
+    conn.send(&json!({ "jsonrpc": "2.0", "id": sub["id"], "result": {} }))
+        .await;
+
+    expect_connected(&mut events, &["session.read"]).await;
+    conn.assert_no_frame().await;
+}
+
+// A Core older than an optional topic refuses the WHOLE list (it subscribes all
+// or nothing). The connection must survive that: without the fallback, an
+// interface that has grown a topic would never connect to a Core that is merely
+// still running from the previous session.
+#[tokio::test]
+async fn an_optional_topic_the_core_does_not_know_costs_only_that_topic() {
+    let mut scripted = ScriptedCore::start().await;
+    let mut config = client_config_at(scripted.path());
+    config.topics = vec!["session".into()];
+    config.optional_topics = vec!["pairing".into()];
+
+    let (_client, mut events) = universallink_ipc_client::spawn(config);
+    let mut conn = scripted.accept().await;
+    conn.handle_hello(1).await;
+
+    let both = conn.recv().await;
+    assert_eq!(both["params"]["topics"], json!(["session", "pairing"]));
+    conn.send(&json!({
+        "jsonrpc": "2.0",
+        "id": both["id"],
+        "error": { "code": -32602, "message": "invalid params: topics" },
+    }))
+    .await;
+
+    // Second call, on the SAME connection: the required topics alone.
+    let required = conn.recv().await;
+    assert_eq!(required["method"], "events.subscribe");
+    assert_eq!(required["params"]["topics"], json!(["session"]));
+    conn.send(&json!({ "jsonrpc": "2.0", "id": required["id"], "result": {} }))
+        .await;
+
+    expect_connected(&mut events, &["session.read"]).await;
+}
+
+// The fallback is for the OPTIONAL half only: a required topic that is refused is
+// still a cycle failure. Nothing is downgraded silently.
+#[tokio::test]
+async fn a_required_topic_the_core_refuses_still_fails_the_cycle() {
+    let mut scripted = ScriptedCore::start().await;
+    let mut config = client_config_at(scripted.path());
+    config.topics = vec!["session".into()];
+
+    let (_client, mut events) = universallink_ipc_client::spawn(config);
+    let mut conn = scripted.accept().await;
+    conn.handle_hello(1).await;
+
+    let sub = conn.recv().await;
+    assert_eq!(sub["params"]["topics"], json!(["session"]));
+    conn.send(&json!({
+        "jsonrpc": "2.0",
+        "id": sub["id"],
+        "error": { "code": -32602, "message": "invalid params: topics" },
+    }))
+    .await;
+
+    // No second attempt, and never Connected: the client closes and retries.
+    conn.expect_close().await;
+    assert_no_event(&mut events).await;
+}
+
 /// Config pointed at a scripted Core (static token, no file).
 pub fn client_config_at(path: std::path::PathBuf) -> universallink_ipc_client::ClientConfig {
     universallink_ipc_client::ClientConfig {
@@ -238,6 +321,7 @@ pub fn client_config_at(path: std::path::PathBuf) -> universallink_ipc_client::C
         role: "gui".into(),
         scopes: vec!["session.read".into()],
         topics: vec![],
+        optional_topics: Vec::new(),
         served_methods: vec![],
         reconnect_base_delay: std::time::Duration::from_millis(25),
         request_timeout: RESPONSE_TIMEOUT,

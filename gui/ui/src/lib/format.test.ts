@@ -12,6 +12,7 @@ import {
   scopeLabel,
   selfLabel,
   sortDevices,
+  validFor,
 } from "./format";
 
 const NOW = new Date("2026-07-10T12:00:00Z");
@@ -41,6 +42,13 @@ test("labels fall back to the raw value when it is unknown", () => {
   expect(roleLabel("future-role")).toBe("future-role");
   expect(scopeLabel("files.send")).toBe("Send files");
   expect(scopeLabel("future.scope")).toBe("future.scope");
+});
+
+// The approval prompt is the only place a user is told what a component may do,
+// so a scope that grew must not keep its old label. `session.manage` now carries
+// pairing, which hands the account key to another device.
+test("the scope that can give the account away says so", () => {
+  expect(scopeLabel("session.manage")).toMatch(/link new devices/);
 });
 
 // The phone runs the SAME view as the desktop, so the self label has to follow
@@ -90,4 +98,19 @@ test.each([
   [Number.NaN, ""],
 ])("formatSize(%i) === %s", (bytes, text) => {
   expect(formatSize(bytes)).toBe(text);
+});
+
+// How long a pairing code is good for: a hint, deliberately rounded — the Core
+// is what counts the deadline, and it says when the code has expired.
+test.each([
+  [120, "2 minutes"],
+  [119, "2 minutes"],
+  [90, "2 minutes"],
+  [89, "89 seconds"],
+  [30, "30 seconds"],
+  [0, ""],
+  [-1, ""],
+  [Number.NaN, ""],
+])("validFor(%s) is %s", (seconds, expected) => {
+  expect(validFor(seconds)).toBe(expected);
 });

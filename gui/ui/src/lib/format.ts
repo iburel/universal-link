@@ -39,7 +39,11 @@ export function roleLabel(role: string): string {
 
 const SCOPES: Record<string, string> = {
   "session.read": "Read the session state",
-  "session.manage": "Open and close the session",
+  // Pairing rides this scope (`pairing.*` and the `pairing` topic), and pairing
+  // hands the account key to another device. A label that stopped at "open and
+  // close the session" would understate what the user is granting — the prompt
+  // is the only place they are ever told.
+  "session.manage": "Open and close the session, and link new devices to the account",
   "devices.read": "Read the device list",
   "devices.manage": "Rename and revoke devices",
   "files.send": "Send files",
@@ -99,6 +103,17 @@ export function formatSize(bytes: number): string {
   // unit the tenth is noise.
   const digits = unit === 0 || value >= 100 ? 0 : 1;
   return `${value.toFixed(digits)} ${UNITS[unit]}`;
+}
+
+/**
+ * "2 minutes" / "45 seconds" — how long a pairing code is good for, as the tail
+ * of a sentence. Rounded on purpose: this is a hint, not a countdown. The Core is
+ * the one that counts, and it says when the code has expired.
+ */
+export function validFor(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "";
+  if (seconds < 90) return `${Math.round(seconds)} seconds`;
+  return `${Math.round(seconds / 60)} minutes`;
 }
 
 /** This PC first, then online devices, then by name. */

@@ -131,6 +131,7 @@ impl TestServer {
             heartbeat_interval: Duration::from_secs(30),
             heartbeat_max_missed: 2,
             nonce_ttl: Duration::from_secs(60),
+            pairing_ttl: Duration::from_secs(120),
             max_requests_per_minute: None,
         };
         let server = universallink_server::spawn(config)
@@ -271,6 +272,7 @@ pub async fn login(core: &TestCore) -> String {
             "devices.read".into(),
         ],
         topics: vec!["session".into()],
+        optional_topics: Vec::new(),
         served_methods: vec![],
         reconnect_base_delay: Duration::from_millis(50),
         request_timeout: RESPONSE_TIMEOUT,
@@ -427,6 +429,7 @@ impl Manager {
             role: ROLE.into(),
             scopes: SCOPES.iter().map(|s| (*s).to_string()).collect(),
             topics: TOPICS.iter().map(|t| (*t).to_string()).collect(),
+            optional_topics: Vec::new(),
             served_methods: vec![],
             reconnect_base_delay: Duration::from_millis(50),
             request_timeout: RESPONSE_TIMEOUT,
@@ -552,6 +555,7 @@ impl TransferWatcher {
             role: "custom".into(),
             scopes: vec!["transfers.read".into()],
             topics: vec!["transfers".into()],
+            optional_topics: Vec::new(),
             served_methods: vec![],
             reconnect_base_delay: Duration::from_millis(50),
             request_timeout: RESPONSE_TIMEOUT,

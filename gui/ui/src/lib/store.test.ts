@@ -51,7 +51,11 @@ const SESSION: SessionState = {
   server_connected: true,
   account: { email: "account@example.test" },
 };
-const ATTESTED: AccountKey = { attested: true, fingerprint: "AB12 CD34" };
+const ATTESTED: AccountKey = {
+  attested: true,
+  fingerprint: "AB12 CD34",
+  holds_key: true,
+};
 const REQUEST: PendingRequest = {
   request_id: "r_1",
   name: "clipnet",
@@ -102,7 +106,25 @@ interface Fake {
   taken: string[];
   /** The keep-alive declarations (mobile only): `kind:on`, in order. */
   holds: string[];
+  /** How many scans were asked for (mobile only). */
+  scans: number;
   methods: Record<string, Method>;
+}
+
+interface MockOptions {
+  status?: ConnectionStatus;
+  methods?: Record<string, Method>;
+  /** Run when the shell is queried for its snapshot. */
+  onStatusRead?: () => void;
+  /** What the mobile `share_status` snapshot returns (mobile only). */
+  retainedShare?: unknown;
+  /**
+   * What the mobile shell answers about its camera. Undefined means the command
+   * is not registered at all — the desktop, where a rejection IS the answer.
+   */
+  scanner?: boolean;
+  /** What the mobile `scan_code` answers, once per call. */
+  scanned?: () => unknown;
 }
 
 type Internals = {
@@ -115,14 +137,7 @@ type Internals = {
   };
 };
 
-function mockCore(options: {
-  status?: ConnectionStatus;
-  methods?: Record<string, Method>;
-  /** Run when the shell is queried for its snapshot. */
-  onStatusRead?: () => void;
-  /** What the mobile `share_status` snapshot returns (mobile only). */
-  retainedShare?: unknown;
-}): Fake {
+function mockCore(options: MockOptions): Fake {
   const fake: Fake = {
     calls: [],
     opened: [],
@@ -131,6 +146,7 @@ function mockCore(options: {
     discards: [],
     taken: [],
     holds: [],
+    scans: 0,
     methods: {
       "session.status": () => SESSION,
       "account.status": () => ATTESTED,
@@ -176,6 +192,15 @@ function mockCore(options: {
       if (cmd === "keep_alive") {
         fake.holds.push(`${args.kind}:${args.on}`);
         return null;
+      }
+      // Mobile-only: the camera. Both commands are ABSENT on the desktop shell,
+      // which is why the default here is to fall through to the rejection below.
+      if (cmd === "scan_supported" && options.scanner !== undefined) {
+        return options.scanner;
+      }
+      if (cmd === "scan_code" && options.scanned) {
+        fake.scans += 1;
+        return options.scanned();
       }
       if (cmd === "core_request") {
         const { method, params } = payload as {
@@ -872,8 +897,11 @@ test("an action while disconnected surfaces the shell's message", async () => {
 // -- Transfers --------------------------------------------------------------
 
 /** A primed, connected store, ready to receive notifications. */
-async function primed(methods?: Record<string, Method>) {
-  const fake = mockCore({ status: CONNECTED, methods });
+async function primed(
+  methods?: Record<string, Method>,
+  over: Omit<MockOptions, "status" | "methods"> = {},
+) {
+  const fake = mockCore({ status: CONNECTED, methods, ...over });
   await store.start();
   await vi.waitFor(() => expect(store.primed).toBe(true));
   return fake;
@@ -1248,7 +1276,7 @@ test("a replayed transfer.started downgrades neither progress nor status", async
 
 // -- Account (C7 account key / onboarding) ----------------------------------
 
-const UNATTESTED: AccountKey = { attested: false, fingerprint: null };
+const UNATTESTED: AccountKey = { attested: false, fingerprint: null, holds_key: false };
 
 test("resync reads the account key state", async () => {
   await primed({ "account.status": () => UNATTESTED });
@@ -1459,8 +1487,9 @@ test("a closed session during onboarding disarms the portal", async () => {
   expect(store.onboardingPending).toBe(false); // disarmed, no re-locking
 });
 
-// The recovery code is the only copy of the private key: it must live only in
-// the view's LOCAL state, never in the store.
+// The recovery code is shown once and never again, and it is the way back into
+// an account whose every device is lost: it must live only in the view's LOCAL
+// state, never in the store.
 test("createAccount keeps the code in no store state", async () => {
   await primed({
     "account.status": () => UNATTESTED,
@@ -2007,4 +2036,468 @@ test("setUpFromAddress surfaces an unreachable server as any other failure", asy
   expect(await store.setUpFromAddress("host.example")).toBe("failed");
   expect(store.notice?.text).toBe("Server unreachable.");
   expect(fake.configWrites).toEqual([]);
+});
+
+// -- Pairing ----------------------------------------------------------------
+
+const OFFER = {
+  pairing_id: "p_1",
+  code: "UL1:secret:key:p_1",
+  role: "joiner",
+  expires_in: 120,
+};
+
+/** The methods a pairing walks through, with the answers a Core would give. */
+function pairingMethods(over: Record<string, Method> = {}) {
+  return {
+    "pairing.offer": () => OFFER,
+    "pairing.accept": () => ({
+      pairing_id: "p_1",
+      role: "joiner",
+      verification: "428 913",
+    }),
+    "pairing.confirm": () => ({ status: "done" }),
+    "pairing.cancel": () => ({}),
+    ...over,
+  };
+}
+
+test("showing a code puts the Core's answer on screen, role included", async () => {
+  const fake = await primed(pairingMethods());
+
+  await store.showPairingCode();
+
+  expect(fake.calls.map((c) => c.method)).toContain("pairing.offer");
+  expect(store.pairing).toEqual({
+    pairing_id: "p_1",
+    role: "joiner",
+    phase: "showing",
+    code: "UL1:secret:key:p_1",
+    expires_in: 120,
+  });
+});
+
+// The role is the Core's answer, not this screen's assumption: the SAME gesture
+// on a device that can vouch makes it the sponsor, and the confirmation is then
+// this device's to make.
+test("a code read on a device that can vouch goes straight to the confirmation", async () => {
+  await primed(
+    pairingMethods({
+      "pairing.accept": () => ({
+        pairing_id: "p_2",
+        role: "sponsor",
+        verification: "111 222",
+        device: { name: "New laptop", platform: "linux", node_id: "ab" },
+      }),
+    }),
+  );
+
+  await store.enterPairingCode("  UL1:secret:key:p_2  ");
+
+  expect(store.pairing).toMatchObject({
+    pairing_id: "p_2",
+    role: "sponsor",
+    phase: "confirm",
+    verification: "111 222",
+    device: { name: "New laptop" },
+  });
+});
+
+test("the code is trimmed, and an empty one never reaches the Core", async () => {
+  const fake = await primed(pairingMethods());
+
+  await store.enterPairingCode("   ");
+  expect(fake.calls.map((c) => c.method)).not.toContain("pairing.accept");
+
+  await store.enterPairingCode(" UL1:x:y:p_1 \n");
+  expect(fake.calls.find((c) => c.method === "pairing.accept")?.params).toEqual({
+    code: "UL1:x:y:p_1",
+  });
+});
+
+// A pairing joins exactly two devices, so a code the server calls out of state is
+// one somebody else got to first. That refusal is the only signal the user gets,
+// and the threat model in doc/architecture.md leans on it: it has to name the
+// cause rather than describe a state machine.
+test("a code someone else answered first says so", async () => {
+  await primed({
+    ...pairingMethods(),
+    "pairing.accept": () => {
+      throw appError("PAIRING_STATE");
+    },
+  });
+
+  await store.enterPairingCode("UL1:x:y:p_1");
+
+  expect(store.pairing).toBeNull();
+  expect(store.notice?.kind).toBe("error");
+  expect(store.notice?.text).toMatch(/already answered/);
+  expect(store.notice?.text).toMatch(/someone else/);
+});
+
+test("being claimed carries the number both ends must show", async () => {
+  await primed(pairingMethods());
+  await store.showPairingCode();
+
+  await emit("core:notification", {
+    method: "pairing.claimed",
+    params: { pairing_id: "p_1", verification: "428 913" },
+  });
+
+  // A joiner waits: the human confirms on the OTHER device, and this screen's
+  // job is to show the number they will compare it against.
+  expect(store.pairing).toMatchObject({
+    phase: "waiting",
+    verification: "428 913",
+  });
+});
+
+// The role decides who confirms — never the presence of a device record. A
+// server that sent one to the joining side must not turn it into the one that
+// vouches.
+test("a device record does not make the joining side the one that confirms", async () => {
+  await primed(pairingMethods());
+  await store.showPairingCode(); // role: joiner
+
+  await emit("core:notification", {
+    method: "pairing.claimed",
+    params: {
+      pairing_id: "p_1",
+      verification: "428 913",
+      device: { name: "Somebody else", platform: "linux" },
+    },
+  });
+
+  expect(store.pairing?.phase).toBe("waiting");
+});
+
+test("an event that names another pairing is not ours to act on", async () => {
+  await primed(pairingMethods());
+  await store.showPairingCode();
+
+  for (const method of ["pairing.claimed", "pairing.completed", "pairing.failed"]) {
+    await emit("core:notification", {
+      method,
+      params: { pairing_id: "p_other", reason: "declined" },
+    });
+  }
+
+  expect(store.pairing).toMatchObject({ pairing_id: "p_1", phase: "showing" });
+  expect(store.notice).toBeNull();
+});
+
+// The completion is the ONLY word the joining device gets that it now has the
+// account: `account.status` has no notification, so this is what re-reads it —
+// and the message has to survive that very resnapshot.
+test("a completed pairing resnapshots, and says so in a message that survives it", async () => {
+  const fake = await primed(pairingMethods());
+  await store.showPairingCode();
+  const before = fake.calls.length;
+
+  await emit("core:notification", {
+    method: "pairing.completed",
+    params: { pairing_id: "p_1" },
+  });
+
+  expect(store.pairing).toBeNull();
+  await vi.waitFor(() =>
+    expect(
+      fake.calls.slice(before).some((c) => c.method === "account.status"),
+    ).toBe(true),
+  );
+  expect(store.notice).toEqual({
+    kind: "info",
+    sticky: true,
+    text: "This device is now linked to your account.",
+  });
+});
+
+test("a sponsor's completion names the device it added", async () => {
+  await primed(
+    pairingMethods({
+      "pairing.accept": () => ({
+        pairing_id: "p_1",
+        role: "sponsor",
+        verification: "1",
+        device: { name: "New laptop", platform: "linux" },
+      }),
+    }),
+  );
+  await store.enterPairingCode("UL1:x:y:p_1");
+
+  await emit("core:notification", {
+    method: "pairing.completed",
+    params: { pairing_id: "p_1" },
+  });
+
+  expect(store.notice?.text).toBe("New laptop is now linked to your account.");
+});
+
+test.each([
+  ["declined", "The other device declined."],
+  ["expired", "The code expired before the link was confirmed."],
+  ["other_account", "That device belongs to a different account."],
+  // Outside the vocabulary (a server code, a later version): carried verbatim
+  // rather than swallowed.
+  ["WHATEVER", "The link failed (WHATEVER)."],
+])("a failed pairing ends the screen and says why: %s", async (reason, text) => {
+  await primed(pairingMethods());
+  await store.showPairingCode();
+
+  await emit("core:notification", {
+    method: "pairing.failed",
+    params: { pairing_id: "p_1", reason },
+  });
+
+  expect(store.pairing).toBeNull();
+  expect(store.notice).toEqual({ kind: "error", sticky: true, text });
+});
+
+test("confirming is the sponsor's gesture alone", async () => {
+  const fake = await primed(pairingMethods());
+  await store.showPairingCode(); // joiner, phase "showing"
+
+  await store.confirmPairing();
+  await emit("core:notification", {
+    method: "pairing.claimed",
+    params: { pairing_id: "p_1", verification: "1" },
+  });
+  await store.confirmPairing(); // phase "waiting" now, still not ours
+
+  expect(fake.calls.map((c) => c.method)).not.toContain("pairing.confirm");
+});
+
+test("a confirmation the server wants re-authorized goes through the browser", async () => {
+  const fake = await primed(
+    pairingMethods({
+      "pairing.accept": () => ({
+        pairing_id: "p_1",
+        role: "sponsor",
+        verification: "1",
+        device: { name: "New laptop", platform: "linux" },
+      }),
+      "pairing.confirm": () => ({
+        status: "reauth_required",
+        auth_url: "https://idp.test/reauth",
+      }),
+    }),
+  );
+  await store.enterPairingCode("UL1:x:y:p_1");
+
+  await store.confirmPairing();
+
+  expect(fake.opened).toEqual(["https://idp.test/reauth"]);
+  // Same round-trip as a login, so the same hold on the process (mobile only).
+  expect(fake.holds).toEqual(["auth:true"]);
+  // The screen stays up: the outcome will arrive as an event.
+  expect(store.pairing).toMatchObject({ phase: "confirming" });
+  expect(store.notice?.kind).toBe("info");
+});
+
+test("a confirmation the keyring could settle opens no browser", async () => {
+  const fake = await primed(
+    pairingMethods({
+      "pairing.accept": () => ({
+        pairing_id: "p_1",
+        role: "sponsor",
+        verification: "1",
+        device: { name: "New laptop", platform: "linux" },
+      }),
+    }),
+  );
+  await store.enterPairingCode("UL1:x:y:p_1");
+
+  await store.confirmPairing();
+
+  expect(fake.opened).toEqual([]);
+  // Nothing is concluded here either: `pairing.completed` closes the screen.
+  expect(store.pairing).toMatchObject({ phase: "confirm" });
+});
+
+test("declining tells the Core and closes the screen at once", async () => {
+  const fake = await primed(pairingMethods());
+  await store.showPairingCode();
+
+  await store.cancelPairing();
+
+  expect(store.pairing).toBeNull();
+  expect(fake.calls.find((c) => c.method === "pairing.cancel")?.params).toEqual({
+    pairing_id: "p_1",
+  });
+});
+
+// A Core or a server older than pairing answers `method not found`. There is
+// nothing to retry, so the screens stop offering it — and a RECONNECTION (which
+// may be to a Core that was just updated) offers it again.
+test("a Core that does not know pairing takes the offer off the screen", async () => {
+  await primed({
+    "pairing.offer": () => {
+      throw { kind: "rpc", message: "method not found", code: -32601 };
+    },
+  });
+
+  await store.showPairingCode();
+
+  expect(store.pairing).toBeNull();
+  expect(store.pairingSupported).toBe(false);
+  expect(store.notice?.text).toContain("newer UniversalLink");
+
+  await emit("core:connection", CONNECTED);
+  await vi.waitFor(() => expect(store.pairingSupported).toBe(true));
+});
+
+test("any other refusal is reported without taking the offer away", async () => {
+  await primed({
+    "pairing.offer": () => {
+      throw appError("SERVER_UNREACHABLE");
+    },
+  });
+
+  await store.showPairingCode();
+
+  expect(store.pairing).toBeNull();
+  expect(store.pairingSupported).toBe(true);
+  expect(store.notice).toEqual({ kind: "error", text: "Server unreachable." });
+});
+
+// The Core says nothing about a code it cannot parse beyond "invalid params",
+// which is not a sentence: the likely cause is a line copied short of its end.
+test("a code the Core cannot read is explained, not relayed", async () => {
+  await primed({
+    "pairing.accept": () => {
+      throw invalidParams("code");
+    },
+  });
+
+  await store.enterPairingCode("UL1:truncated");
+
+  expect(store.pairing).toBeNull();
+  expect(store.pairingSupported).toBe(true);
+  expect(store.notice?.text).toContain("not a complete pairing code");
+});
+
+// -- Pairing: reading a code with the camera (mobile) ------------------------
+
+test("the shell is asked once whether this device can read a code", async () => {
+  await primed(undefined, { scanner: true });
+
+  expect(store.canScan).toBe(true);
+});
+
+// The desktop shell registers no scanner at all, and that rejection IS the
+// answer: no camera gesture is ever offered there.
+test("a shell with no scanner leaves the gesture off", async () => {
+  await primed();
+
+  expect(store.canScan).toBe(false);
+});
+
+// The point of the whole brick: what the camera reads takes exactly the path a
+// pasted code takes, and nothing else.
+test("a scanned code is joined with, like any other", async () => {
+  const fake = await primed(pairingMethods(), {
+    scanner: true,
+    scanned: () => ({ code: "UL1:scanned:key:p_1" }),
+  });
+
+  await store.scanPairingCode();
+
+  expect(fake.scans).toBe(1);
+  expect(fake.calls.find((c) => c.method === "pairing.accept")?.params).toEqual({
+    code: "UL1:scanned:key:p_1",
+  });
+  expect(store.pairing).toMatchObject({ pairing_id: "p_1", phase: "waiting" });
+  expect(store.notice).toBeNull();
+  expect(store.scanning).toBe(false);
+});
+
+// A scan is a human framing a camera, so it must not hold `busy`: that would
+// disarm the rest of the app for a minute, and would make the very
+// `pairing.accept` this gesture exists for return early.
+test("the scan holds its own flag, not the one that guards the Core", async () => {
+  const scan = deferred<unknown>();
+  const fake = await primed(pairingMethods(), {
+    scanner: true,
+    scanned: () => scan.promise,
+  });
+
+  const done = store.scanPairingCode();
+  await flush();
+  expect(store.scanning).toBe(true);
+  expect(store.busy).toBe(false);
+
+  // A second gesture while the camera is up asks for nothing.
+  await store.scanPairingCode();
+  expect(fake.scans).toBe(1);
+
+  scan.resolve({ code: "UL1:scanned:key:p_1" });
+  await done;
+  expect(store.scanning).toBe(false);
+  expect(fake.calls.map((c) => c.method)).toContain("pairing.accept");
+});
+
+test("backing out of the camera says nothing at all", async () => {
+  const fake = await primed(pairingMethods(), {
+    scanner: true,
+    scanned: () => ({ reason: "cancelled" }),
+  });
+
+  await store.scanPairingCode();
+
+  expect(store.notice).toBeNull();
+  expect(store.pairing).toBeNull();
+  expect(fake.calls.map((c) => c.method)).not.toContain("pairing.accept");
+});
+
+test("a refused camera explains itself and names the way round it", async () => {
+  await primed(pairingMethods(), {
+    scanner: true,
+    scanned: () => ({ reason: "denied" }),
+  });
+
+  await store.scanPairingCode();
+
+  expect(store.notice?.text).toContain("paste the code instead");
+  // Refused once is not refused for good: the gesture stays on offer.
+  expect(store.canScan).toBe(true);
+});
+
+// ...whereas a camera that does not exist will not appear: the button goes.
+test("a device with no camera stops being offered one", async () => {
+  await primed(pairingMethods(), {
+    scanner: true,
+    scanned: () => ({ reason: "no_camera" }),
+  });
+
+  await store.scanPairingCode();
+
+  expect(store.canScan).toBe(false);
+  expect(store.notice?.text).toContain("no camera");
+});
+
+// The shell holds a scanner this page knows nothing about — a webview reloaded
+// while the camera was up. Nothing to say: the scanner the user is looking at is
+// the one that will answer.
+test("a scanner the shell already has open is not reported", async () => {
+  await primed(pairingMethods(), {
+    scanner: true,
+    scanned: () => ({ reason: "busy" }),
+  });
+
+  await store.scanPairingCode();
+
+  expect(store.notice).toBeNull();
+  expect(store.canScan).toBe(true);
+});
+
+// A word from a newer shell than this page: still an answer, still a sentence.
+test("an outcome this page has no word for is still reported", async () => {
+  await primed(pairingMethods(), {
+    scanner: true,
+    scanned: () => ({ reason: "lens_cap" }),
+  });
+
+  await store.scanPairingCode();
+
+  expect(store.notice?.text).toContain("could not be read");
 });

@@ -11,6 +11,7 @@
   import Approvals from "./views/Approvals.svelte";
   import Devices from "./views/Devices.svelte";
   import Onboarding from "./views/Onboarding.svelte";
+  import Pairing from "./views/Pairing.svelte";
   import ServerSetup from "./views/ServerSetup.svelte";
 
   type View = "account" | "devices" | "approvals" | "settings";
@@ -83,6 +84,12 @@
   </div>
 {:else if needsServerSetup}
   <ServerSetup {store} firstRun />
+{:else if store.pairing}
+  <!-- A pairing under way owns the window, above the onboarding portal: the
+       device being linked is IN that portal when it starts one, and the
+       confirmation is not a screen the user may wander away from. It cannot come
+       before the setup screen, though — pairing needs a server to go through. -->
+  <Pairing {store} />
 {:else if needsOnboarding}
   <Onboarding {store} />
 {:else}

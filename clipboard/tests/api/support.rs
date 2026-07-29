@@ -125,6 +125,7 @@ pub fn spawn_client(
         role: role.into(),
         scopes: scopes.iter().map(|s| s.to_string()).collect(),
         topics: vec![],
+        optional_topics: Vec::new(),
         served_methods: served.iter().map(|s| s.to_string()).collect(),
         reconnect_base_delay: Duration::from_millis(25),
         request_timeout: RESPONSE_TIMEOUT,

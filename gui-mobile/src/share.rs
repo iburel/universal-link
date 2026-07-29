@@ -391,6 +391,7 @@ pub fn spawn(app: AppHandle, gui: &ClientConfig) {
         role: "clipboard-backend".into(),
         scopes: vec!["clipboard.write".into(), "session.read".into()],
         topics: vec![],
+        optional_topics: Vec::new(),
         // Nothing to serve: a materialized clip is answered from the receiving
         // Core's cache, so `clipboard.get_data` never comes back to us — and if
         // one ever did, the client's automatic -32601 surfaces to the paster as

@@ -19,6 +19,7 @@ mod framing;
 mod http;
 mod identity;
 mod login;
+mod pairing;
 mod rpc;
 mod secrets;
 mod session;
@@ -34,6 +35,7 @@ pub use crate::dataplane::{
     read_offer, receive_bodies, send_transfer,
 };
 pub use crate::identity::load_or_generate_device_seed;
+pub use crate::pairing::PAYLOAD_TAG as PAIRING_CODE_TAG;
 pub use crate::secrets::{FileSecretStore, SecretStore};
 use crate::state::{AppState, Registry, SessionState, SpawnGrant, Transfers, random_hex};
 
@@ -291,6 +293,7 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
         session: Mutex::new(SessionState::new(session_info.as_ref())),
         account_root: Mutex::new(account_root),
         login: Mutex::new(None),
+        pairing: Mutex::new(None),
         config_dir: config.config_dir,
         identity: device_identity,
         server_config: Mutex::new(config.server),

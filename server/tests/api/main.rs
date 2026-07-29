@@ -11,6 +11,7 @@ mod auth_authenticate;
 mod auth_enroll;
 mod descriptor;
 mod devices;
+mod pairing;
 mod persistence;
 mod presence;
 mod protocol;

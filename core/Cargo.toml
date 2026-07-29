@@ -43,6 +43,9 @@ tracing = "0.1"
 tokio-tungstenite = { version = "0.30", default-features = false, features = [
     "handshake",
 ] }
+x25519-dalek = "3"
+chacha20poly1305 = "0.11"
+hkdf = "0.13"
 
 [target.'cfg(unix)'.dependencies]
 # Peer verification (uid): compare the socket's uid against our own.

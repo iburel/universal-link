@@ -123,6 +123,7 @@ async fn brain<B: universallink_clipboard::ClipboardBackend>(
         role: "clipboard-backend".into(),
         scopes,
         topics,
+        optional_topics: Vec::new(),
         served_methods: vec!["clipboard.get_data".into()],
         reconnect_base_delay: Duration::from_millis(500),
         request_timeout: Duration::from_secs(10),

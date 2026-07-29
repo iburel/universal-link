@@ -10,12 +10,22 @@
     sortDevices,
   } from "../lib/format";
   import { shareSummary, type CoreStore, type Transfer } from "../lib/store.svelte";
+  import LinkDevice from "./LinkDevice.svelte";
 
   // `now` is a parameter: tests don't have to freeze the clock.
   let { store, now = new Date() }: { store: CoreStore; now?: Date } = $props();
 
   const devices = $derived(sortDevices(store.devices));
   const disabled = $derived(store.connection.status !== "connected" || store.busy);
+
+  // Adding a device is offered where the devices are — but only by a device that
+  // can actually vouch: it holds the account key AND is in the account. A device
+  // without the key would be offered the gesture and then be told by the Core
+  // that it is the one JOINING, which is not what "add a device" means. The
+  // Account screen offers it that, in those words.
+  const canVouch = $derived(
+    store.session?.logged_in === true && store.account?.holds_key === true,
+  );
 
   // Files shared from the Android share sheet, waiting for a destination: the
   // list becomes a picker (one tap = one send), and the management actions step
@@ -236,6 +246,13 @@
         </li>
       {/each}
     </ul>
+
+    <!-- Not while a share is waiting for a destination: that question owns the
+         list until it is answered (mobile). -->
+    {#if canVouch && !share}
+      <h2>Add a device</h2>
+      <LinkDevice {store} mode="sponsor" />
+    {/if}
   {/if}
 </section>
 
@@ -248,6 +265,11 @@
   .muted {
     color: var(--muted);
     margin: 0;
+  }
+
+  h2 {
+    margin: 0.5rem 0 0;
+    font-size: 1rem;
   }
 
   /* The pending share: what the taps below are about. */

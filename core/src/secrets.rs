@@ -2,10 +2,10 @@
 // Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
 
 //! Keyring abstraction: where the Core stows its durable secrets (the OIDC
-//! refresh token). The deployment binary will wire in the OS keyring (abstract
-//! plumbing: it is the Core's job, not the components'); in the meantime,
-//! `FileSecretStore` — a 0600 file in the config folder — offers the same trust
-//! perimeter as `device.key`.
+//! refresh token, the account key's seed). The deployment binary will wire in
+//! the OS keyring (abstract plumbing: it is the Core's job, not the
+//! components'); in the meantime, `FileSecretStore` — a 0600 file in the config
+//! folder — offers the same trust perimeter as `device.key`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -14,6 +14,18 @@ use std::sync::Mutex;
 /// Name of the secret carrying the OIDC refresh token: obtain fresh ID tokens
 /// (sensitive operations) without reopening a browser.
 pub(crate) const REFRESH_TOKEN: &str = "oidc-refresh-token";
+
+/// Name of the secret carrying the account key's seed (32 bytes, hex) — the
+/// account's private key, held at rest so this device can vouch for another one
+/// (`account_key`).
+///
+/// The **seed**, deliberately, and not the recovery code that produced it. Both
+/// derive the same key, so they are equally powerful; but the code is a value a
+/// human can read out, and anything a device can display is something a human
+/// can be talked into dictating. Nothing displays the seed. Storing the seed
+/// therefore keeps the recovery code what it has always been — shown once, in
+/// the user's hands, never re-derivable from a device.
+pub(crate) const ACCOUNT_SEED: &str = "account-key-seed";
 
 /// A keyring of named secrets. Read errors count as absence: a lost secret is
 /// recovered by re-running the flow that produced it.

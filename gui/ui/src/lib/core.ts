@@ -189,6 +189,52 @@ export async function keepAlive(
 }
 
 /**
+ * One reading of a pairing code with the camera (gui-mobile/src/scan.rs).
+ *
+ * MOBILE ONLY, and it is the mobile app's whole part in pairing: a desktop shows
+ * a code, the phone reads it. Every outcome is a word, including the ones that
+ * are nobody's fault — `cancelled` (the user backed out) and `busy` (a scanner is
+ * already up) say nothing to the user at all.
+ */
+export type ScanOutcome =
+  | { code: string; reason?: undefined }
+  | {
+      code?: undefined;
+      reason: "cancelled" | "busy" | "denied" | "no_camera" | "failed";
+    };
+
+/**
+ * Whether this device can read a code: a camera, on a shell that has a scanner.
+ * The desktop shell does not implement the command — a rejection there IS the
+ * answer, the same contract as {@link shareStatus} — and Android answers for the
+ * DEVICE, so a tablet or a TV without a camera says no too.
+ */
+export async function scanSupported(): Promise<boolean> {
+  try {
+    return await invoke<boolean>("scan_supported");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Opens the camera and resolves with what it read. Long-lived by nature: the
+ * promise is a human framing a code, so it can be a minute or more, and the
+ * caller must disarm the gesture rather than wait on `busy` (see the store).
+ *
+ * Never rejects for a scanning failure — the Rust side answers with a `reason` —
+ * so a rejection means the command is not there at all: the desktop shell, or a
+ * mobile shell older than pairing.
+ */
+export async function scanCode(): Promise<ScanOutcome> {
+  try {
+    return await invoke<ScanOutcome>("scan_code");
+  } catch {
+    return { reason: "failed" };
+  }
+}
+
+/**
  * The server + OIDC fields the setup screen collects, mirroring the shell's
  * `ServerConfigForm` (gui/src/bridge.rs). The secret is optional (a conformant
  * PKCE IdP has none); a blank one clears the key on write.

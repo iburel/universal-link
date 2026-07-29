@@ -29,9 +29,9 @@
 //!   change; "core:notification" (`{ method, params }`) for each Core
 //!   notification, as-is, in order. No initial event: the snapshot is
 //!   authoritative.
-//! - The production config (scopes/topics `GUI_SCOPES`/`GUI_TOPICS`, default
-//!   paths `paths::production_endpoint`) is held by the binary; the lib takes
-//!   an arbitrary `ClientConfig`.
+//! - The production config (scopes/topics `GUI_SCOPES`/`GUI_TOPICS` plus
+//!   `GUI_OPTIONAL_TOPICS`, default paths `paths::production_endpoint`) is held
+//!   by the binary; the lib takes an arbitrary `ClientConfig`.
 //!
 //! Mechanics: `get_ipc_response` blocks its thread (internal block_on) — the
 //! invokes go through `spawn_blocking`, and the tests run in multi_thread
@@ -186,6 +186,10 @@ pub fn gui_config(core: &TestCore) -> ClientConfig {
             .map(|s| s.to_string())
             .collect(),
         topics: universallink_gui::GUI_TOPICS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        optional_topics: universallink_gui::GUI_OPTIONAL_TOPICS
             .iter()
             .map(|s| s.to_string())
             .collect(),
@@ -571,6 +575,7 @@ impl TestServer {
             heartbeat_interval: Duration::from_secs(30),
             heartbeat_max_missed: 2,
             nonce_ttl: Duration::from_secs(60),
+            pairing_ttl: Duration::from_secs(120),
             max_requests_per_minute: None,
         };
         let server = universallink_server::spawn(config)

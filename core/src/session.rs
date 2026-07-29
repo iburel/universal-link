@@ -184,6 +184,16 @@ fn drop_session(state: &AppState) {
         // The refresh token belonged to this session: a device the account has
         // struck off should no longer hold the means to obtain ID tokens.
         state.secrets.delete(crate::secrets::REFRESH_TOKEN);
+        // The account key stays, and so does `account-key.json` — deliberately.
+        // Erasing it here would buy nothing: vouching for a joining device
+        // requires being authenticated in the account at the rendezvous
+        // (server-api.md, "Pairing"), which is exactly what this revocation just
+        // took away. What it would cost is real, because this path also fires on
+        // a revocation the user did not mean: the device would then need the
+        // recovery code typed into it again after a re-enrollment. A device that
+        // must genuinely stop being able to vouch is a compromised device, and
+        // the answer to that is an AK rotation, not a deletion an attacker has
+        // already outrun.
         remove_session_file(&state.config_dir);
         // The broadcast goes out under the session lock (order: session then
         // registry) — the order of notifications is the order of transitions.
@@ -295,7 +305,7 @@ impl ServerConn {
     }
 }
 
-async fn connect_and_serve(state: &AppState, info: &SessionInfo) -> Outcome {
+async fn connect_and_serve(state: &Arc<AppState>, info: &SessionInfo) -> Outcome {
     // The timeout covers opening the stream AND the handshake: a connector that
     // drags (TLS to a mute peer) would otherwise freeze reconnection.
     let connected = tokio::time::timeout(SETUP_TIMEOUT, open_ws(state, &info.server_url)).await;
@@ -526,7 +536,7 @@ async fn connect_and_serve(state: &AppState, info: &SessionInfo) -> Outcome {
 
 /// A message from the server in the cruising regime: a notification to apply
 /// and relay, or a reply to a proxied request.
-fn handle_server_message(state: &AppState, v: Value, pending: &mut PendingReplies) {
+fn handle_server_message(state: &Arc<AppState>, v: Value, pending: &mut PendingReplies) {
     if let Some(method) = v.get("method").and_then(Value::as_str) {
         let params = v.get("params").cloned().unwrap_or_else(|| json!({}));
         apply_event(state, method, &params);
@@ -567,7 +577,15 @@ fn handle_server_message(state: &AppState, v: Value, pending: &mut PendingReplie
 /// Applies a `device.*` to the cache and relays it to the subscribers of the
 /// `devices` topic, records enriched with `is_self`. An event we do not know
 /// how to apply is not relayed: we do not broadcast a state we do not hold.
-fn apply_event(state: &AppState, method: &str, params: &Value) {
+fn apply_event(state: &Arc<AppState>, method: &str, params: &Value) {
+    // A pairing in flight on this connection: nothing to do with the directory,
+    // and its own module knows what to make of it. Here rather than in
+    // `handle_server_message` so the notifications set aside during setup are
+    // routed too.
+    if method.starts_with("pairing.") {
+        crate::pairing::on_server_event(state, method, params);
+        return;
+    }
     let relayed = {
         let mut s = state.session.lock().expect("lock session");
         let own = s.own_device_id.clone();
@@ -626,6 +644,28 @@ fn set_own_relay(state: &AppState, device_id: &str, url: &str) {
         .and_then(|devices| devices.get_mut(device_id))
     {
         record["relay_url"] = json!(url);
+    }
+}
+
+/// Publishes our attestation to the server then, on success, carries it onto OUR
+/// OWN cache record: the server excludes the publisher from its broadcast, and
+/// without this gesture our local directory would ignore itself until
+/// reconnection (same reason as `set_own_relay` for the relay).
+///
+/// Called after joining the account mid-session — by a typed recovery code
+/// (`account.setup`/`join`) or by a pairing. On (re)connection there is nothing
+/// to do: setup publishes before taking the snapshot, so the snapshot already
+/// carries it.
+pub(crate) async fn publish_attestation(state: &AppState, root: &crate::account_key::AccountRoot) {
+    let published = proxy(
+        state,
+        "presence.update",
+        json!({ "attestation": root.attestation }),
+    )
+    .await
+    .is_ok();
+    if published {
+        set_own_attestation(state, &root.attestation);
     }
 }
 

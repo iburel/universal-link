@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::API_VERSION;
+use crate::pairing::{JoiningDevice, Party, Role};
 use crate::rpc::{self, RpcErr};
 use crate::state::{AppState, ConnId, DeviceEntry, OutMsg, now_rfc3339, random_hex};
 
@@ -46,6 +47,18 @@ const RELAY_URL_MAX: usize = 2048;
 /// hex = 128 chars), stored and rebroadcast without ever being interpreted.
 /// Bounded loosely: the server does not decode it, it just rejects the absurd.
 const ATTESTATION_MAX: usize = 256;
+/// `node_id` = an Ed25519 public key in hex. Bounded here because the pairing
+/// path PINS one before any proof has been checked, so an absurd value would sit
+/// in a session; `auth.enroll`'s OIDC path verifies the proof first, which by
+/// itself rejects anything that is not a key.
+const NODE_ID_MAX: usize = 64;
+/// A pairing party's public channel material: opaque to us (an X25519 public key
+/// in hex, as it happens — 64 chars), relayed to the other side.
+const CHANNEL_MAX: usize = 256;
+/// The sealed bundle a sponsor hands to a joiner. Ciphertext we cannot read;
+/// what it holds is the two ends' business (`doc/core-api.md`). Bounded loosely,
+/// like the attestation: the plaintext is a key seed, a public key and an email.
+const BUNDLE_MAX: usize = 4096;
 
 const PLATFORMS: [&str; 4] = ["windows", "macos", "linux", "android"];
 
@@ -137,6 +150,7 @@ pub async fn run(state: Arc<AppState>, socket: WebSocket) {
     }
 
     conn.mark_offline();
+    conn.drop_pairings();
     if closing && !writer_done {
         // Let the close (and what precedes it) leave before aborting.
         let _ = tokio::time::timeout(WRITE_TIMEOUT, &mut writer).await;
@@ -214,6 +228,10 @@ impl Conn {
             "devices.rename" => self.devices_rename(params),
             "devices.revoke" => self.devices_revoke(params).await,
             "presence.update" => self.presence_update(params),
+            "pairing.create" => self.pairing_create(params),
+            "pairing.claim" => self.pairing_claim(params),
+            "pairing.approve" => self.pairing_approve(params).await,
+            "pairing.cancel" => self.pairing_cancel(params),
             _ => Err(RpcErr::method_not_found(method)),
         }
     }
@@ -265,7 +283,18 @@ impl Conn {
         Ok(json!({ "nonce": nonce }))
     }
 
+    /// Two ways into the directory, and a request uses exactly one: an OIDC ID
+    /// token (the account's own credential) or an approved pairing session (a
+    /// device already in the account vouched for this one). Both end in the same
+    /// directory entry — see `insert_device`.
     async fn auth_enroll(&mut self, params: &Value) -> Result<Value, RpcErr> {
+        match rpc::optional_str(params, "pairing_id")? {
+            Some(pairing_id) => self.enroll_by_pairing(&pairing_id, params),
+            None => self.enroll_by_oidc(params).await,
+        }
+    }
+
+    async fn enroll_by_oidc(&mut self, params: &Value) -> Result<Value, RpcErr> {
         let id_token = rpc::required_str(params, "id_token")?;
         let node_id = rpc::required_str(params, "node_id")?;
         let name = rpc::required_str_max(params, "name", NAME_MAX)?;
@@ -289,9 +318,57 @@ impl Conn {
             .await
             .map_err(|_| RpcErr::app("OIDC_INVALID"))?;
 
+        Ok(self.insert_device(claims.sub, name, platform, node_id))
+    }
+
+    /// Enrollment on an approved pairing. The identity comes from the SESSION,
+    /// never from these params: it is what a human confirmed on the sponsor, and
+    /// letting the request restate it would mean enrolling something other than
+    /// what was shown. All the request adds is the proof that the joiner really
+    /// holds the key that was pinned — the same proof of possession the OIDC path
+    /// demands, for the same reason.
+    ///
+    /// No `id_token` here, deliberately: the joiner has no account credential
+    /// (that is the point of pairing), and the account was proven by the
+    /// sponsor's fresh token at `pairing.approve`.
+    fn enroll_by_pairing(&mut self, pairing_id: &str, params: &Value) -> Result<Value, RpcErr> {
+        let proof = rpc::required_str(params, "proof")?;
+        // Read, verify, then spend. Spending first would mean a failed proof
+        // costs the human another walk to the other device and another scan.
+        let grant = self
+            .state
+            .pairings
+            .lock()
+            .expect("lock pairings")
+            .peek_grant(pairing_id, self.conn_id)?;
+        self.verify_proof(&grant.joining.node_id, &proof)?;
+        self.state
+            .pairings
+            .lock()
+            .expect("lock pairings")
+            .consume(pairing_id);
+
+        Ok(self.insert_device(
+            grant.account,
+            grant.joining.name,
+            grant.joining.platform,
+            grant.joining.node_id,
+        ))
+    }
+
+    /// Puts a device in the account's directory and announces it. What lands
+    /// there is identical whichever way the account was established: the
+    /// directory does not record how a device got in.
+    fn insert_device(
+        &self,
+        account: String,
+        name: String,
+        platform: String,
+        node_id: String,
+    ) -> Value {
         let device_id = format!("d_{}", random_hex(8));
         let entry = DeviceEntry {
-            account: claims.sub,
+            account: account.clone(),
             device_id: device_id.clone(),
             name,
             platform,
@@ -300,12 +377,11 @@ impl Conn {
             status: None,
             last_seen: None,
             // Published separately (`presence.update`) once the device has joined
-            // the account (C7): OIDC enrollment alone does not carry it.
+            // the account (C7): enrollment alone does not carry it.
             attestation: None,
             conn: None,
         };
         let record = entry.record();
-        let account = entry.account.clone();
 
         {
             let mut reg = self.state.registry.lock().expect("lock registry");
@@ -321,7 +397,7 @@ impl Conn {
         // (otherwise an OIDC re-login would be forced).
         self.state.persist();
 
-        Ok(json!({ "device_id": device_id, "api_version": API_VERSION, "device": record }))
+        json!({ "device_id": device_id, "api_version": API_VERSION, "device": record })
     }
 
     fn auth_authenticate(&mut self, params: &Value) -> Result<Value, RpcErr> {
@@ -525,6 +601,122 @@ impl Conn {
         Ok(json!({}))
     }
 
+    /// `pairing.create` — this device displays a QR code: open the session the
+    /// other one will claim by scanning it.
+    fn pairing_create(&mut self, params: &Value) -> Result<Value, RpcErr> {
+        let role = Role::parse(&rpc::required_str(params, "role")?)
+            .ok_or_else(|| RpcErr::invalid_params("role"))?;
+        let channel = rpc::required_str_max(params, "channel", CHANNEL_MAX)?;
+        let account = match role {
+            // The side that gives the account away must be in it.
+            Role::Sponsor => Some(self.require_account()?),
+            // A joiner has no account yet — that is the point. Unless it is
+            // RE-joining (enrolled, but holding no account key of its own):
+            // then keeping its account is what stops a sponsor from another one
+            // from answering.
+            Role::Joiner => self.account.clone(),
+        };
+        let joining = match role {
+            Role::Joiner => {
+                Some(joining_device(params)?.ok_or_else(|| RpcErr::invalid_params("device"))?)
+            }
+            Role::Sponsor => None,
+        };
+
+        let party = Party::new(self.conn_id, self.tx.clone(), channel);
+        let (pairing_id, expires_in) = self
+            .state
+            .pairings
+            .lock()
+            .expect("lock pairings")
+            .create(role, party, account, joining)?;
+        Ok(json!({ "pairing_id": pairing_id, "expires_in": expires_in }))
+    }
+
+    /// `pairing.claim` — this device scanned a QR code: join the session and let
+    /// the offerer know. The role in the answer is the server's, not the
+    /// scanner's claim: the session is what decides who is joining.
+    fn pairing_claim(&mut self, params: &Value) -> Result<Value, RpcErr> {
+        let pairing_id = rpc::required_str(params, "pairing_id")?;
+        let channel = rpc::required_str_max(params, "channel", CHANNEL_MAX)?;
+        // Read whatever the caller declared: whether a device is *required*
+        // depends on the role, which only the session knows.
+        let joining = joining_device(params)?;
+
+        let party = Party::new(self.conn_id, self.tx.clone(), channel);
+        let claimed = self.state.pairings.lock().expect("lock pairings").claim(
+            &pairing_id,
+            party,
+            self.account.clone(),
+            joining,
+        )?;
+
+        let mut result = json!({ "role": claimed.role.as_str(), "expires_in": claimed.expires_in });
+        if let Some(device) = claimed.joining {
+            result["device"] = device.record();
+        }
+        Ok(result)
+    }
+
+    /// `pairing.approve` — a human confirmed on the sponsor: the sealed bundle
+    /// goes to the joiner and the session becomes its enrollment grant.
+    async fn pairing_approve(&mut self, params: &Value) -> Result<Value, RpcErr> {
+        let account = self.require_account()?;
+        let pairing_id = rpc::required_str(params, "pairing_id")?;
+        let id_token = rpc::required_str(params, "id_token")?;
+        let bundle = rpc::required_str_max(params, "bundle", BUNDLE_MAX)?;
+
+        // Sensitive operation, like `devices.revoke`: a fresh token, of THIS
+        // account (a valid token from another one grants nothing).
+        //
+        // What that proves is worth stating plainly, because it is narrower than
+        // it looks: the sponsor's session at the IdP is still alive, so cutting
+        // the account's access there stops devices from being taken in. It is NOT
+        // evidence that a human is at the keyboard — the Core mints this token
+        // from the refresh token in its keyring, browserless
+        // (`core/src/login.rs::fresh_id_token`). The human-presence gate is the
+        // confirmation screen; see the threat model in `doc/architecture.md`.
+        let claims = self
+            .state
+            .oidc
+            .validate_fresh(&id_token)
+            .await
+            .map_err(|_| RpcErr::app("OIDC_INVALID"))?;
+        if claims.sub != account {
+            return Err(RpcErr::app("OIDC_INVALID"));
+        }
+
+        self.state.pairings.lock().expect("lock pairings").approve(
+            &pairing_id,
+            self.conn_id,
+            &account,
+            &bundle,
+        )?;
+        Ok(json!({}))
+    }
+
+    /// `pairing.cancel` — either side gives up (the human declined, the dialog
+    /// was closed).
+    fn pairing_cancel(&mut self, params: &Value) -> Result<Value, RpcErr> {
+        let pairing_id = rpc::required_str(params, "pairing_id")?;
+        self.state
+            .pairings
+            .lock()
+            .expect("lock pairings")
+            .cancel(&pairing_id, self.conn_id)?;
+        Ok(json!({}))
+    }
+
+    /// A pairing that lost a party can never complete: forget this connection's,
+    /// and tell whoever was waiting on the other end.
+    fn drop_pairings(&self) {
+        self.state
+            .pairings
+            .lock()
+            .expect("lock pairings")
+            .drop_for_conn(self.conn_id);
+    }
+
     /// If this connection is still its device's current connection, marks it
     /// offline and notifies the account. No effect otherwise (connection
     /// replaced, device revoked, or never authenticated).
@@ -558,6 +750,26 @@ impl Conn {
     }
 }
 
+/// The joining device a pairing call declares, `None` if it declares none (only
+/// the joiner's own calls have to). Same bounds and same closed platform set as
+/// `auth.enroll`: this is the very record that ends up in the directory.
+fn joining_device(params: &Value) -> Result<Option<JoiningDevice>, RpcErr> {
+    let Some(device) = params.get("device").filter(|d| !d.is_null()) else {
+        return Ok(None);
+    };
+    let name = rpc::required_str_max(device, "name", NAME_MAX)?;
+    let platform = rpc::required_str(device, "platform")?;
+    let node_id = rpc::required_str_max(device, "node_id", NODE_ID_MAX)?;
+    if !PLATFORMS.contains(&platform.as_str()) {
+        return Err(RpcErr::invalid_params("device.platform"));
+    }
+    Ok(Some(JoiningDevice {
+        name,
+        platform,
+        node_id,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     //! The "replaced connection that still speaks" window is a race: the
@@ -586,6 +798,7 @@ mod tests {
                 heartbeat_interval: Duration::from_secs(30),
                 heartbeat_max_missed: 2,
                 nonce_ttl: Duration::from_secs(60),
+                pairing_ttl: Duration::from_secs(120),
                 max_requests_per_minute: None,
             },
             Arc::new(MemoryStore::default()),

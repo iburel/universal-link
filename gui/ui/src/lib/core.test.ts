@@ -13,6 +13,8 @@ import {
   coreRequest,
   onConnectionChanged,
   onCoreNotification,
+  scanCode,
+  scanSupported,
   type ConnectionStatus,
   type CoreError,
   type CoreNotification,
@@ -80,6 +82,30 @@ test("onConnectionChanged listens to core:connection", async () => {
   await emit("core:connection", { status: "connecting" });
   await emit("core:other", { status: "connected" });
   expect(seen).toEqual([{ status: "connecting" }]);
+});
+
+// The two mobile-only camera commands. On the desktop shell they are not
+// registered at all, and that rejection is the answer rather than an error to
+// report — the same contract the share commands have.
+test("the scanner commands answer for a shell that has no scanner", async () => {
+  mockIPC((cmd) => {
+    throw new Error(`unexpected command: ${cmd}`);
+  });
+
+  expect(await scanSupported()).toBe(false);
+  expect(await scanCode()).toEqual({ reason: "failed" });
+});
+
+test("a scanned code comes back as the shell reports it", async () => {
+  const seen: string[] = [];
+  mockIPC((cmd) => {
+    seen.push(cmd);
+    return cmd === "scan_supported" ? true : { code: "UL1:a:b:p_1" };
+  });
+
+  expect(await scanSupported()).toBe(true);
+  expect(await scanCode()).toEqual({ code: "UL1:a:b:p_1" });
+  expect(seen).toEqual(["scan_supported", "scan_code"]);
 });
 
 test("onCoreNotification listens to core:notification", async () => {

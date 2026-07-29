@@ -3,6 +3,7 @@
 
 <script lang="ts">
   import type { CoreStore } from "../lib/store.svelte";
+  import LinkDevice from "./LinkDevice.svelte";
 
   let { store }: { store: CoreStore } = $props();
 
@@ -65,9 +66,9 @@
     </p>
     <code class="recovery">{recoveryCode}</code>
     <p class="muted">
-      This is the only copy. It will never be shown again. Write it down: you
-      must enter it on your other devices to link them to this account —
-      without it, no additional device can join.
+      It will never be shown again. Write it down and keep it offline: it is your
+      way back in if you ever lose every device. You will not need it to link your
+      other devices — this one can vouch for them, from the Devices screen.
     </p>
     <button class="primary" onclick={done}>I've saved the code, continue</button>
   {:else}
@@ -75,14 +76,22 @@
       To exchange files in a verified way, this device must join your account.
     </p>
 
-    {#if !serverReady}
+    <!-- Said once per screen: on the join step below, it is the pairing block
+         that says it — right under the buttons it disarms. -->
+    {#if !serverReady && step !== "join"}
       <p class="banner warn" role="status">
         Waiting for the server connection…
       </p>
     {/if}
 
     {#if step === "join"}
-      <p>Enter the code shown on a device already linked to this account.</p>
+      <!-- The way in that needs nothing typed: a code read from one screen by the
+           other. The recovery code stays available underneath — it is what a
+           deployment too old for pairing leaves, and the way back when every
+           device is gone. -->
+      <LinkDevice {store} mode="join" />
+
+      <p class="or muted">Or enter your recovery code:</p>
       <input
         bind:value={code}
         aria-label="Recovery code"
@@ -170,6 +179,10 @@
   .actions {
     display: flex;
     gap: 0.4rem;
+  }
+
+  .or {
+    margin-top: 0.5rem;
   }
 
   .link {

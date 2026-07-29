@@ -346,22 +346,46 @@ async fn establish(config: &ClientConfig, next_id: &mut u64) -> Result<Link, Est
         .collect::<Option<Vec<_>>>()
         .ok_or(EstablishError::Failed)?;
 
-    if !config.topics.is_empty() {
-        *next_id += 1;
-        let sub_id = *next_id;
-        let subscribe = json!({
-            "jsonrpc": "2.0",
-            "id": sub_id,
-            "method": "events.subscribe",
-            "params": { "topics": config.topics },
-        });
-        write_frame(&mut link.writer, &subscribe.to_string())
-            .await
-            .map_err(|_| EstablishError::Failed)?;
-        wait_response(&mut link, sub_id).await?;
+    // One call for every topic: the Core subscribes all or nothing, on purpose
+    // (no silent partial subscription). A topic declared OPTIONAL may be one
+    // this Core has never heard of — it is older than the topic — and its
+    // refusal takes the whole call down with it. That must not cost the
+    // connection: we ask for everything, and fall back to the required set
+    // alone. What is then lost is the events of a topic this Core would never
+    // have sent anyway.
+    let required: Vec<&str> = config.topics.iter().map(String::as_str).collect();
+    let wanted: Vec<&str> = required
+        .iter()
+        .copied()
+        .chain(config.optional_topics.iter().map(String::as_str))
+        .collect();
+    if !wanted.is_empty() && subscribe(&mut link, next_id, &wanted).await.is_err() {
+        if config.optional_topics.is_empty() {
+            return Err(EstablishError::Failed);
+        }
+        subscribe(&mut link, next_id, &required).await?;
     }
 
     Ok(link)
+}
+
+async fn subscribe(
+    link: &mut Link,
+    next_id: &mut u64,
+    topics: &[&str],
+) -> Result<(), EstablishError> {
+    *next_id += 1;
+    let sub_id = *next_id;
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": sub_id,
+        "method": "events.subscribe",
+        "params": { "topics": topics },
+    });
+    write_frame(&mut link.writer, &request.to_string())
+        .await
+        .map_err(|_| EstablishError::Failed)?;
+    wait_response(link, sub_id).await.map(|_| ())
 }
 
 /// Awaits response `id` during establishment, buffering notifications

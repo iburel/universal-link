@@ -375,3 +375,45 @@ test("with the Core unreachable, no destination is offered", () => {
 
   expect(byLabel(view, "Send to Living Room PC").hasAttribute("disabled")).toBe(true);
 });
+
+// -- Adding a device --------------------------------------------------------
+//
+// Offered where the devices are, but only by a device that can actually vouch:
+// it holds the account key AND is in the account.
+
+test("a device that can vouch is offered to add another", () => {
+  store.account = { attested: true, fingerprint: "AB12", holds_key: true };
+  const show = vi.spyOn(store, "showPairingCode").mockResolvedValue();
+
+  const view = render(Devices, { store, now: NOW });
+
+  expect(textOf(view)).toContain("Add a device");
+  click(byText(view, "button", "Show a code"));
+  expect(show).toHaveBeenCalledOnce();
+});
+
+test.each([
+  ["it does not hold the account key", { attested: true, fingerprint: "AB12", holds_key: false }],
+  ["the Core does not say (an older one)", null],
+])("no offer to add a device when %s", (_why, account) => {
+  store.account = account;
+
+  expect(textOf(render(Devices, { store, now: NOW }))).not.toContain(
+    "Add a device",
+  );
+});
+
+// A share waiting for a destination owns the list until it is answered: the
+// question is "where to?", and everything else steps aside for it (mobile).
+test("a pending share hides the offer to add a device", () => {
+  store.account = { attested: true, fingerprint: "AB12", holds_key: true };
+  store.pendingShare = {
+    phase: "pick",
+    id: "s_1",
+    files: [{ path: "/c/s_1/a.pdf", name: "a.pdf", size: 10 }],
+  };
+
+  expect(textOf(render(Devices, { store, now: NOW }))).not.toContain(
+    "Add a device",
+  );
+});

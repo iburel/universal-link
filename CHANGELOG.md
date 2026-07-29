@@ -8,6 +8,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Link a device by showing it a code.** One machine displays a QR code, the
+  other reads it — the phone with its camera, a PC by pasting the same line under
+  it — and one confirmation on the machine already on the account hands the
+  newcomer everything it needs to be trusted by the others: it signs in, enters the
+  directory and gets the account key in one gesture, with no browser and nothing
+  typed. Either machine may be the one that displays, so the phone can add a PC as
+  readily as the reverse. The buttons are on the Devices screen (*Add a device*) and
+  in the join step of the setup portal.
+  - **Both screens show the same six digits**, and the confirmation asks you to
+    check them: they come out of the channel the two devices share, so someone who
+    read your code over your shoulder — or off a screen share — is showing
+    different ones. Decline then; that person is the one you would be adding.
+  - Your **recovery code is still accepted** and is unchanged. What changes is its
+    job: it is the way back if you ever lose every device, not something to retype
+    on each new one.
+  - A code is good for two minutes, works once, and both screens count the deadline
+    down themselves. Closing the dialog cancels it on the other device rather than
+    leaving it waiting.
+  - On the phone the scanner is the app's own (CameraX + ZXing, no Play Services,
+    both Apache-2.0), so it works on a de-Googled phone; the camera is asked for
+    the first time you scan and never otherwise. It keeps looking until it sees one
+    of *our* codes, so another QR code in the frame is ignored.
 - **Setting up a device takes one field: the server's address.** The issuer and
   the OpenID Connect client describe the *deployment*, not the user — identical on
   every device of one server, yet retyped on each machine and each phone. The
@@ -31,6 +53,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   up. It is the interface's version: on Linux the background Core runs from a
   copy the app refreshes when it starts, so between an upgrade and the next
   launch an autostarted Core can still be the previous one.
+
+### Changed
+
+- **Every device now keeps the account key**, in its keyring — the OIDC refresh
+  token's neighbour — where before each one derived it from the recovery code and
+  discarded it. That is what makes the pairing above possible: a device can only
+  vouch for another if it still holds the key. Stated plainly, it also means a
+  device whose storage is read gives up the account key, where previously that took
+  the user's recovery code, so key rotation stops being a nicety — it is the answer
+  to a compromised device, and it is still upcoming.
+  - A device that joined **before** this release holds no key: it can be linked
+    *from* another device, but is not offered "add a device" until it has one. Its
+    Account screen says so and offers the two ways out — get the key from a device
+    that has it (pair with it), or retype the recovery code once, which now does
+    nothing but stow the key.
+  - A key that does not match the account this device is attested under is refused,
+    from a keyring as from a pairing: the account key cannot be swapped underneath a
+    device.
+  - The approval prompt for a third-party component now reads "open and close the
+    session, **and link new devices to the account**" for the `session.manage`
+    scope. Same scope, wider consequence, and the prompt is the only place you are
+    told.
 
 ### Fixed
 

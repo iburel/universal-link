@@ -41,11 +41,13 @@ The config folder houses:
 - `device.key` (0600) — the device's Ed25519 seed, generated at first startup.
   This is the iroh identity, and it precedes the login;
 - `account-key.json` — the account's root of trust (C7): the account's PUBLIC key
-  + this device's attestation. **Not secret** (no private key: the account key is
-  reconstituted from the recovery code, with the user). Absent until the device
-  has joined the account (`account.setup`/`join`);
+  + this device's attestation. **Not secret** — no private key in this file.
+  Absent until the device has joined the account (`account.setup`/`join`);
 - `session.json` — present ⟺ a session is open;
-- `secrets.json` (0600) — fallback when no keyring is reachable.
+- `secrets.json` (0600) — fallback when no keyring is reachable. What the keyring
+  holds: the OIDC refresh token, and the account's **private** key
+  (`account-key-seed`) — kept at rest so this device can vouch for a joining one
+  ([architecture.md](architecture.md), principle 3).
 
 ## Configuration
 
@@ -114,10 +116,18 @@ to talk to.
 
 ## Secrets
 
-The OIDC refresh token goes to the OS keyring: Secret Service (Linux), Keychain
-(macOS), Credential Manager (Windows). If none responds — SSH session, machine with
-no agent, CI — the Core falls back to `secrets.json` in 0600, and says so in its
-log.
+Two go to the OS keyring — Secret Service (Linux), Keychain (macOS), Credential
+Manager (Windows): the **OIDC refresh token**, and the **account key's seed**
+(`account-key-seed`), which is what lets this device vouch for one joining the
+account. If none responds — SSH session, machine with no agent, CI — the Core falls
+back to `secrets.json` in 0600, and says so in its log.
+
+Which keyring answered therefore decides more than a re-login: a device whose
+keyring has lost the seed still works in every respect but one — it can be linked
+*from* another device and cannot link one itself (`account.status` →
+`holds_key: false`). That is a legitimate state, not a corrupt one, and the
+interface offers the two ways out of it
+([architecture.md](architecture.md#pairing-a-device)).
 
 Keyring accesses go through a dedicated thread: the Core writes its secrets while
 holding the session lock, and a Keychain that opens a confirmation window would

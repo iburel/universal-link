@@ -40,6 +40,11 @@ class MainActivity : TauriActivity() {
             )
         }
 
+        // The window a scanner is opened from, and the answer to "can this device
+        // read a code at all". After super.onCreate: unlike the keep-alive seam,
+        // nothing can ask for a scan before the page that offers the button exists.
+        ScanBridge.attach(this)
+
         insetContentFromSystemBars()
 
         // A share that cold-started the app. Only on a FRESH start: after a

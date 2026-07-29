@@ -128,6 +128,22 @@ dependencies {
     implementation("androidx.activity:activity-ktx:1.13.0")
     implementation("com.google.android.material:material:1.14.0")
     implementation("androidx.lifecycle:lifecycle-process:2.11.0")
+    // The QR scanner (ScanActivity): the camera, and the decoder. Both Apache-2.0
+    // — the alternative was Google's code scanner, and ScanBridge.kt says why an
+    // AGPL app that must also run on a de-Googled phone does not take it.
+    //
+    // camera-view is what makes this four artifacts rather than two: it carries
+    // PreviewView, which owns the surface's lifecycle and its rotation. CameraX
+    // 1.5 declares kotlin-stdlib 2.0.21, well under the metadata ceiling the root
+    // build.gradle.kts documents.
+    implementation("androidx.camera:camera-core:1.5.3")
+    implementation("androidx.camera:camera-camera2:1.5.3")
+    implementation("androidx.camera:camera-lifecycle:1.5.3")
+    implementation("androidx.camera:camera-view:1.5.3")
+    // `core` alone: the decoder, pure Java, no Android dependency and no UI. The
+    // `android-core`/`zxing-android-embedded` packages bring a capture activity
+    // built on the deprecated Camera1 API, which is what CameraX above replaces.
+    implementation("com.google.zxing:core:3.5.4")
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.3.0")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.7.0")
