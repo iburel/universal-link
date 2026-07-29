@@ -56,9 +56,9 @@ export interface SessionState {
  *
  * `holds_key` says whether this device also holds the account's PRIVATE key, at
  * rest in its keyring — which is what lets it vouch for a device joining the
- * account. It can be `false` while `attested` is `true`: that is a device
- * enrolled before the key was kept at rest, and retyping the recovery code
- * (`joinAccount`) upgrades it.
+ * account. It can be `false` while `attested` is `true`: a device whose keyring no
+ * longer holds the seed still verifies peers, it just cannot vouch. The way back
+ * in is a pairing, or the recovery code (`joinAccount`).
  */
 export interface AccountKey {
   attested: boolean;

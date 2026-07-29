@@ -13,8 +13,8 @@
 //! The account's private key is also kept AT REST, in the keyring, so a device
 //! can later vouch for a joining one. `account.status` answers `holds_key` by
 //! reading it back, and refuses a seed that is not this account's — the tests
-//! below pin both, plus the gesture that upgrades a device enrolled before the
-//! key was kept.
+//! below pin both, plus the way back in for a device that has the account and not
+//! its key.
 
 use serde_json::json;
 use universallink_test_support::memory_transport::MemorySwitchboard;
@@ -104,8 +104,8 @@ async fn setup_then_join_converge_on_one_fingerprint() {
 
     // Re-entering the code of the account this device is ALREADY in goes
     // through, and changes nothing: same key, so byte-for-byte the same
-    // attestation. This is the gesture that upgrades a device enrolled before
-    // the key was kept at rest — see the test below.
+    // attestation. It is also the way back in for a device that lost the key —
+    // see the test below.
     let again = bc
         .request("account.join", json!({ "recovery_code": code }))
         .await
@@ -133,17 +133,17 @@ async fn setup_then_join_converge_on_one_fingerprint() {
     );
 }
 
-/// The fleet's migration path. A device that joined the account before the key
-/// was kept at rest has a trust root and no key: it verifies peers, but has
-/// nothing to hand a joining device. Retyping the recovery code — and nothing
-/// else — upgrades it.
+/// The way back in, one of the two. A device that has the account but not its key
+/// — a keyring that lost the seed, or one that never answered — verifies peers
+/// but has nothing to hand a joining device. Typing the recovery code, and
+/// nothing else, gives it back.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_device_enrolled_before_the_key_was_kept_picks_it_up() {
+async fn a_device_without_the_key_gets_it_back_from_the_code() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
     let code = universallink_core::account_key::generate_recovery_code();
-    // The harness seeds `account-key.json` alone — exactly the state of a device
-    // enrolled under the previous model.
+    // The harness seeds `account-key.json` alone — the state of a device whose
+    // keyring no longer holds the seed.
     let core = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
     let mut c = manager(&core).await;
     // `account.join` republishes the attestation, so it wants the server: this
@@ -165,7 +165,7 @@ async fn a_device_enrolled_before_the_key_was_kept_picks_it_up() {
         .expect("fingerprint")
         .to_string();
 
-    // The upgrade: the same code it joined with.
+    // The way back: the same code it joined with.
     let joined = c
         .request("account.join", json!({ "recovery_code": code }))
         .await

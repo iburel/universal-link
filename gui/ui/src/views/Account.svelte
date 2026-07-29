@@ -4,18 +4,20 @@
 <script lang="ts">
   import type { CoreStore } from "../lib/store.svelte";
   import LinkDevice from "./LinkDevice.svelte";
+  import RecoveryCode from "./RecoveryCode.svelte";
 
   let { store }: { store: CoreStore } = $props();
 
   const connected = $derived(store.connection.status === "connected");
   const disabled = $derived(!connected || store.busy);
 
-  // In the account, but without the account's private key: this device cannot
-  // vouch for a new one. It is the state every device enrolled before the key was
-  // kept at rest is in, and pairing is what lifts it — the same gesture as
-  // joining, from this device's point of view, and the alternative to retyping
-  // the recovery code.
-  const cannotVouch = $derived(
+  // In the account, but without the account's private key. The device works —
+  // `ak_pub` is what verifies peers — it just cannot vouch for a new one. The way
+  // back in is the same one a device with no account at all takes: a pairing from
+  // a device that holds the key, or the recovery code typed here. This screen is
+  // where it is offered, because the onboarding portal only shows for a device
+  // that is not attested, and this one is.
+  const keyless = $derived(
     store.account?.attested === true && store.account.holds_key === false,
   );
 </script>
@@ -56,14 +58,15 @@
       {/if}
     </dl>
 
-    {#if cannotVouch}
-      <h2>This device cannot vouch for a new one</h2>
+    {#if keyless}
+      <h2>This device has your account, but not its key</h2>
       <p class="muted">
-        It joined your account before devices kept the account key. Get the key
-        from one of your other devices and it will be able to link the next one —
-        or retype your recovery code, which does the same thing.
+        It can still exchange files with your other devices; it just cannot link a
+        new one. Give it the key and it will — the same two ways in as a brand-new
+        device.
       </p>
       <LinkDevice {store} mode="join" />
+      <RecoveryCode {store} label="Or enter your recovery code:" />
     {/if}
 
     <button {disabled} onclick={() => store.logout()}>Sign out</button>

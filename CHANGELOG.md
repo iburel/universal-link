@@ -63,11 +63,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   device whose storage is read gives up the account key, where previously that took
   the user's recovery code, so key rotation stops being a nicety — it is the answer
   to a compromised device, and it is still upcoming.
-  - A device that joined **before** this release holds no key: it can be linked
-    *from* another device, but is not offered "add a device" until it has one. Its
-    Account screen says so and offers the two ways out — get the key from a device
-    that has it (pair with it), or retype the recovery code once, which now does
-    nothing but stow the key.
+  - A device upgrading from the previous release holds no key yet, and so is not
+    offered "add a device" until it has one. Its Account screen says which state it
+    is in and puts both ways back in right there: pair it with a device that holds
+    the key, or type the recovery code once — which now does nothing but stow the
+    key. The same screen answers for a keyring that loses the entry later, which is
+    the other way to land in that state.
+  - Installing the key is confirmed by reading it back before the device claims to
+    have joined the account. A keyring write can be *accepted* and never land — on
+    the desktop it is queued — which used to leave a device attested with no key,
+    silently.
   - A key that does not match the account this device is attested under is refused,
     from a keyring as from a pairing: the account key cannot be swapped underneath a
     device.
