@@ -4,7 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0] - 2026-07-29
+
+Adding a machine to the account is a code shown on one screen and read by the
+other, six digits to compare, and one confirmation — no browser, nothing typed.
+Setting a machine up is one field, the server's address. Both rest on the same
+change underneath: every device now keeps the account key, so any device can vouch
+for the next.
 
 ### Added
 
@@ -80,6 +86,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     session, **and link new devices to the account**" for the `session.manage`
     scope. Same scope, wider consequence, and the prompt is the only place you are
     told.
+- **Server** — both features above need the deployment updated too. It gained the
+  `pairing.*` methods that bring the two devices together (a server still on 0.5.0
+  does not know them, so the dialog fails against it) and the descriptor at
+  `/.well-known/universallink.json` that makes the one-field setup possible. What
+  the two devices exchange stays sealed to the channel their code establishes: the
+  server relays that bundle without being able to read it, and so never learns the
+  account key. It does learn that two devices paired, and when — as it already
+  learns every enrollment.
 
 ### Fixed
 
@@ -92,6 +106,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   paths while keeping the host's. Measured on Debian 13, where the tray stays up
   again. Only the case where the app itself starts the Core was affected: a Core
   started by autostart at login never had the problem.
+
+### Known limitations
+
+- **Only the device that already holds the account confirms a pairing.** The one
+  being added checks that the six digits match, but it has no button to decline
+  with: it takes what the confirmation hands it. So someone who reads your code
+  before your own machine does can put that device into *their* account instead —
+  and the account name it then shows is a label their side chose. What settles the
+  question is the account fingerprint on the Account screen, next to the one another
+  of your devices shows. Deliberate for this release; what bounds it is that a code
+  lives two minutes and answers exactly once.
+- Account key rotation is still not implemented, and it matters more than it did:
+  every device now keeps the key, so a device whose storage is read gives it up.
+- Desktop installers remain unsigned (milestone 1); the OS shows a first-launch
+  warning. That is also what keeps the two richer context-menu integrations out of
+  reach — the Windows 11 **main** menu and a Finder extension both have to be
+  signed. The Android APK *is* signed, with the project's own self-issued key,
+  because Android installs nothing otherwise: a sideload, not a Play Store listing.
+- The phone shares, it does not receive, and is never offered as a menu
+  destination.
+- Aggressive power management can still end the Android app: on the test device,
+  swiping it out of Recents kills the process even with the foreground service
+  running.
+- A menu manager that *crashes* leaves its entries behind until the supervisor
+  restarts it, and a click on a stale one fails silently. A clean shutdown removes
+  them, and so does every startup.
 
 ## [0.5.0] - 2026-07-28
 
@@ -319,7 +359,8 @@ Linux, macOS, and Windows.
 - Flat transfers only (no directory trees).
 - Account key rotation is not implemented.
 
-[Unreleased]: https://github.com/iburel/universal-link/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/iburel/universal-link/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/iburel/universal-link/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/iburel/universal-link/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/iburel/universal-link/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/iburel/universal-link/compare/v0.2.0...v0.3.0
