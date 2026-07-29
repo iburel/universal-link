@@ -56,7 +56,7 @@ icon, `libayatana-appindicator3` plus a StatusNotifierItem host (on GNOME, the
 AppIndicator extension). The **Android APK is signed**, with the project's own
 key — Android installs nothing otherwise — which makes it a sideload, not a Play
 Store listing. It asks for the **camera** the first time you scan a pairing code,
-and for nothing else: the permission is optional, and the scanner is the app's own
+and not before: the permission is optional, and the scanner is the app's own
 (CameraX + ZXing, no Play Services), so a de-Googled phone reads a code just as
 well.
 
