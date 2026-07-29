@@ -219,6 +219,7 @@ pub fn client_config(
         role: role.into(),
         scopes: scopes.iter().map(|s| s.to_string()).collect(),
         topics: topics.iter().map(|s| s.to_string()).collect(),
+        optional_topics: Vec::new(),
         served_methods: vec![],
         reconnect_base_delay: Duration::from_millis(25),
         request_timeout: RESPONSE_TIMEOUT,

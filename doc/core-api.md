@@ -196,7 +196,7 @@ legitimate scanner *is*, which is what the confirmation screen exists to catch
 | Method | Description |
 |---|---|
 | `pairing.offer {}` | display a code → `{ pairing_id, code, role, expires_in }`. `code` is the string to render as a QR **and** to offer as copyable text; `expires_in` is in seconds |
-| `pairing.accept { code }` | a code was scanned or pasted → `{ pairing_id, role, device? }`. `device` (`{ name, platform, node_id }`) is present when this device turns out to be the **sponsor**: it is what must be put in front of the human before confirming. `-32602` if `code` is not one |
+| `pairing.accept { code }` | a code was scanned or pasted → `{ pairing_id, role, verification, device? }`. `verification` is the confirmation number (below); `device` (`{ name, platform, node_id }`) is present when this device turns out to be the **sponsor**: it is what must be put in front of the human before confirming. `-32602` if `code` is not one |
 | `pairing.confirm { pairing_id }` | the human said yes (sponsor only) → `{ status: "done" }`, or `{ status: "reauth_required", auth_url }` when the server wants a fresher OIDC token than the keyring can mint — the caller opens the URL and reads the outcome from the events, exactly as for `devices.revoke` |
 | `pairing.cancel { pairing_id }` | the human declined, or the dialog closed → `{}`. Idempotent: an id we no longer hold is not an error |
 
@@ -204,9 +204,17 @@ Notifications (topic `pairing`):
 
 | Notification | Emitted when |
 |---|---|
-| `pairing.claimed { pairing_id, device? }` | the other side scanned. `device` present when we are the sponsor — same record as `pairing.accept`'s |
+| `pairing.claimed { pairing_id, verification, device? }` | the other side scanned. `verification` is the confirmation number (below), known only from here — before the claim there is no channel to derive it from. `device` present when we are the sponsor — same record as `pairing.accept`'s |
 | `pairing.completed { pairing_id }` | this pairing is done: the account is installed (joiner) or handed over (sponsor). The joiner's `session.changed` and `account.status` carry what changed |
 | `pairing.failed { pairing_id, reason }` | `declined` (the other side gave up), `abandoned` (its connection died), `expired` (the deadline, counted here — the server says nothing), `channel` (the other side's channel material is unusable), `bundle` (what arrived does not open), `other_account` (it opened, and held a key other than this device's), `install` (the key could not be persisted), `enroll` (the server refused the enrollment), `server` (the rendezvous was lost), or a server code such as `PAIRING_UNKNOWN` |
+
+**The confirmation number** (`verification`, six digits in two groups) is derived
+from the channel key, which only the two ends of that one exchange can compute.
+Both sides must show it — the joining side while it waits, the sponsoring side on
+its confirmation screen — and the human is asked to check they match. That is what
+turns the screen into a check: whoever photographed the code and claimed the
+session ahead of the legitimate device gets a channel of its own, and so a
+different number, while the name and platform it declares are its own to choose.
 
 **The role is not the caller's to choose.** This device sponsors when it can
 actually vouch — it holds the account key AND is in the account — and joins

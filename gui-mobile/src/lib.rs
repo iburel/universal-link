@@ -25,7 +25,7 @@ use tauri::Manager;
 use tls::WebPkiConnector;
 use universallink_core::{Config, FileSecretStore, ServerConfig};
 use universallink_daemon::dataplane::LazyIrohTransport;
-use universallink_gui::{CoreState, GUI_SCOPES, GUI_TOPICS, bridge_loop};
+use universallink_gui::{CoreState, GUI_OPTIONAL_TOPICS, GUI_SCOPES, GUI_TOPICS, bridge_loop};
 use universallink_ipc_client::{ClientConfig, TokenSource};
 
 /// The embedded Core, kept alive for the whole process (dropping the handle
@@ -217,6 +217,7 @@ async fn boot_core(data_dir: &Path) -> anyhow::Result<ClientConfig> {
         role: "gui".into(),
         scopes: GUI_SCOPES.iter().map(|s| s.to_string()).collect(),
         topics: GUI_TOPICS.iter().map(|s| s.to_string()).collect(),
+        optional_topics: GUI_OPTIONAL_TOPICS.iter().map(|s| s.to_string()).collect(),
         served_methods: vec![],
         reconnect_base_delay: Duration::from_secs(1),
         request_timeout: Duration::from_secs(30),

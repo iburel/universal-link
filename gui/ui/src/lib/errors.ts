@@ -27,6 +27,10 @@ const APP_MESSAGES: Record<string, string> = {
   SCOPE_DENIED: "The Core refused this operation (missing permission).",
   ROLE_CONFLICT: "This role is already held by another component.",
   NOT_ENROLLED: "This interface is not enrolled with the Core.",
+  NO_ACCOUNT_KEY: "This device cannot vouch for another: it holds no account key.",
+  PAIRING_UNKNOWN: "This link has expired or was already answered.",
+  PAIRING_STATE: "This link is not at that step.",
+  PAIRING_LIMIT: "The server is handling too many links at once — try again.",
   // Deliberately absent: `session.discover`'s NO_DESCRIPTOR, which the setup
   // screen acts on rather than reports (it reveals the fields to fill in), and
   // INVALID_DESCRIPTOR, whose own message names the field at fault — more use to
@@ -65,4 +69,38 @@ export function isInvalidParams(e: unknown): boolean {
 /** Whether this is the Core answering with a given application code. */
 export function isAppCode(e: unknown, code: string): boolean {
   return isCoreError(e) && e.kind === "rpc" && e.data_code === code;
+}
+
+/**
+ * `-32601 method not found`. On `pairing.*` this means one of the two halves is
+ * older than pairing: the Core, or the server it relays to (the Core passes the
+ * server's refusal on as it stands, and the code cannot tell them apart). Either
+ * way there is nothing the user can do here, so the interface stops offering it.
+ */
+export function isUnknownMethod(e: unknown): boolean {
+  return isCoreError(e) && e.kind === "rpc" && e.code === -32601;
+}
+
+/**
+ * Why a pairing ended, as `pairing.failed` words it (doc/core-api.md). The
+ * vocabulary is the Core's; anything outside it — a server application code, a
+ * word from a later version — falls back to a sentence that carries it
+ * verbatim, which is of more use to whoever has to explain it than a shrug.
+ */
+const PAIRING_REASONS: Record<string, string> = {
+  declined: "The other device declined.",
+  abandoned: "The other device dropped out.",
+  expired: "The code expired before the link was confirmed.",
+  channel: "That code could not be used — start again with a fresh one.",
+  bundle: "What the other device sent could not be read.",
+  other_account: "That device belongs to a different account.",
+  install: "The account key could not be saved on this device.",
+  enroll: "The server refused to add this device to the account.",
+  server: "The link was lost — the server dropped it.",
+  state: "The link went out of step and was abandoned.",
+  PAIRING_UNKNOWN: "The link expired before it was confirmed.",
+};
+
+export function pairingFailure(reason: string): string {
+  return PAIRING_REASONS[reason] ?? `The link failed (${reason}).`;
 }

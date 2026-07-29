@@ -138,7 +138,7 @@ test("when not linked to the account, the onboarding portal hides everything els
 
   const app = render(App, { store });
 
-  expect(textOf(app)).toContain("Link this device");
+  expect(app.querySelector("h1")?.textContent).toBe("Link this device");
   expect(app.querySelector("nav")).toBeNull();
 });
 
@@ -150,7 +150,7 @@ test("when linked to the account, the normal app is shown", () => {
   const app = render(App, { store });
 
   expect(app.querySelector("nav")).not.toBeNull();
-  expect(textOf(app)).not.toContain("Link this device");
+  expect(app.querySelector("h1")?.textContent).not.toBe("Link this device");
 });
 
 // The code has just been created: even though attested has flipped, the flag
@@ -163,7 +163,7 @@ test("onboardingPending holds the portal even once attested", () => {
 
   const app = render(App, { store });
 
-  expect(textOf(app)).toContain("Link this device");
+  expect(app.querySelector("h1")?.textContent).toBe("Link this device");
   expect(app.querySelector("nav")).toBeNull();
 });
 
@@ -177,7 +177,7 @@ test("with no known account state, no portal", () => {
   const app = render(App, { store });
 
   expect(app.querySelector("nav")).not.toBeNull();
-  expect(textOf(app)).not.toContain("Link this device");
+  expect(app.querySelector("h1")?.textContent).not.toBe("Link this device");
 });
 
 // The portal is blocking AFTER login, not before: account.status is always
@@ -192,7 +192,7 @@ test("when logged out, an unattested device does not see the portal", () => {
   const app = render(App, { store });
 
   expect(app.querySelector("nav")).not.toBeNull();
-  expect(textOf(app)).not.toContain("Link this device");
+  expect(app.querySelector("h1")?.textContent).not.toBe("Link this device");
 });
 
 // onboardingPending holds the portal ON ITS OWN: even if the account state is
@@ -206,7 +206,7 @@ test("onboardingPending holds the portal even if the account state is null", () 
 
   const app = render(App, { store });
 
-  expect(textOf(app)).toContain("Link this device");
+  expect(app.querySelector("h1")?.textContent).toBe("Link this device");
   expect(app.querySelector("nav")).toBeNull();
 });
 
@@ -267,4 +267,39 @@ test("a pending share opens the Devices view", async () => {
     expect(app.querySelector("h1")?.textContent).toBe("Devices"),
   );
   expect(textOf(app)).toContain("Send to…");
+});
+
+// A pairing under way owns the window, ABOVE the onboarding portal: the device
+// being linked is inside that portal when it starts one, and a confirmation the
+// user could navigate away from would leave the other side waiting.
+test("a pairing under way takes over the window, onboarding portal included", () => {
+  store.primed = true;
+  store.session = { logged_in: true, server_connected: true };
+  store.account = { attested: false, fingerprint: null, holds_key: false };
+  store.pairing = {
+    pairing_id: "p_1",
+    role: "joiner",
+    phase: "waiting",
+    verification: "428 913",
+  };
+
+  const app = render(App, { store });
+
+  expect(textOf(app)).toContain("428 913");
+  expect(app.querySelector("nav")).toBeNull();
+});
+
+// But not above the setup screen: pairing goes through the server, and a Core
+// with none configured has nowhere to go.
+test("an unconfigured Core still asks for a server first", () => {
+  store.primed = true;
+  store.session = { logged_in: false, server_connected: false, configured: false };
+  store.pairing = { pairing_id: "p_1", role: "joiner", phase: "showing", code: "UL1:a:b:p_1" };
+  vi.spyOn(store, "loadServerConfig").mockResolvedValue({
+    server_url: "",
+    oidc_issuer: "",
+    oidc_client_id: "",
+  });
+
+  expect(textOf(render(App, { store }))).toContain("Set up your server");
 });

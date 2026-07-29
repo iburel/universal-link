@@ -101,6 +101,17 @@ export function formatSize(bytes: number): string {
   return `${value.toFixed(digits)} ${UNITS[unit]}`;
 }
 
+/**
+ * "2 minutes" / "45 seconds" — how long a pairing code is good for, as the tail
+ * of a sentence. Rounded on purpose: this is a hint, not a countdown. The Core is
+ * the one that counts, and it says when the code has expired.
+ */
+export function validFor(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "";
+  if (seconds < 90) return `${Math.round(seconds)} seconds`;
+  return `${Math.round(seconds / 60)} minutes`;
+}
+
 /** This PC first, then online devices, then by name. */
 export function sortDevices(devices: readonly Device[]): Device[] {
   return [...devices].sort((a, b) => {

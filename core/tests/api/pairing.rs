@@ -149,6 +149,21 @@ async fn a_new_device_joins_by_being_confirmed_on_another() {
         None,
         "the joiner has no use for its own declaration coming back"
     );
+    // The number the human is asked to compare, on BOTH screens: it comes out of
+    // the channel key, which a server relaying ciphertext cannot compute — so
+    // agreeing on it end to end is what makes the confirmation screen a check
+    // rather than a formality.
+    assert_eq!(
+        told["verification"], claimed["verification"],
+        "the two ends of one exchange must show the same number"
+    );
+    assert!(
+        told["verification"]
+            .as_str()
+            .is_some_and(|v| v.len() == 7 && v.as_bytes()[3] == b' '),
+        "six digits to read aloud: {}",
+        told["verification"]
+    );
 
     // The side that RECEIVES never confirms — not even now that it holds a
     // channel and could seal something on it. Confirming is the giving side's
@@ -244,10 +259,12 @@ async fn a_new_device_joins_by_scanning_a_device_of_the_account() {
     );
 
     // The displaying side is the sponsor here, so it is the one that must show
-    // the human what scanned.
+    // the human what scanned — and both still land on the same number, whichever
+    // way round the gesture went.
     let told = gc.wait_notification("pairing.claimed").await;
     assert_eq!(told["device"]["name"], CORE_DEVICE_NAME);
     assert_eq!(told["device"]["platform"], std::env::consts::OS);
+    assert_eq!(told["verification"], claimed["verification"]);
 
     gc.request("pairing.confirm", json!({ "pairing_id": pairing_id }))
         .await

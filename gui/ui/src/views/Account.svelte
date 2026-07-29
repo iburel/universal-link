@@ -3,11 +3,21 @@
 
 <script lang="ts">
   import type { CoreStore } from "../lib/store.svelte";
+  import LinkDevice from "./LinkDevice.svelte";
 
   let { store }: { store: CoreStore } = $props();
 
   const connected = $derived(store.connection.status === "connected");
   const disabled = $derived(!connected || store.busy);
+
+  // In the account, but without the account's private key: this device cannot
+  // vouch for a new one. It is the state every device enrolled before the key was
+  // kept at rest is in, and pairing is what lifts it — the same gesture as
+  // joining, from this device's point of view, and the alternative to retyping
+  // the recovery code.
+  const cannotVouch = $derived(
+    store.account?.attested === true && store.account.holds_key === false,
+  );
 </script>
 
 <section>
@@ -24,6 +34,11 @@
     <button class="primary" {disabled} onclick={() => store.login()}>
       Sign in
     </button>
+
+    <!-- Or no browser at all: a device already on the account can hand this one
+         everything it needs, sign-in included. -->
+    <h2>Already have a device on this account?</h2>
+    <LinkDevice {store} mode="join" />
   {:else}
     <dl>
       <dt>Account</dt>
@@ -40,6 +55,17 @@
         </dd>
       {/if}
     </dl>
+
+    {#if cannotVouch}
+      <h2>This device cannot vouch for a new one</h2>
+      <p class="muted">
+        It joined your account before devices kept the account key. Get the key
+        from one of your other devices and it will be able to link the next one —
+        or retype your recovery code, which does the same thing.
+      </p>
+      <LinkDevice {store} mode="join" />
+    {/if}
+
     <button {disabled} onclick={() => store.logout()}>Sign out</button>
   {/if}
 </section>
@@ -59,6 +85,11 @@
 
   p {
     margin: 0;
+  }
+
+  h2 {
+    margin: 0.5rem 0 0;
+    font-size: 1rem;
   }
 
   dl {

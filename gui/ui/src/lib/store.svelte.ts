@@ -44,6 +44,8 @@ import {
   type AccountKey,
   type Component,
   type Device,
+  type PairingDevice,
+  type PairingRole,
   type PendingRequest,
   type SessionState,
 } from "./api";
@@ -64,7 +66,14 @@ import {
   type ShareStatus,
   type SharedFile,
 } from "./core";
-import { humanize, isAppCode, isCoreError, isInvalidParams } from "./errors";
+import {
+  humanize,
+  isAppCode,
+  isCoreError,
+  isInvalidParams,
+  isUnknownMethod,
+  pairingFailure,
+} from "./errors";
 import { formatSize } from "./format";
 
 export interface Notice {
@@ -193,6 +202,40 @@ function shareText(status: ShareBanner): Notice {
   }
 }
 
+/**
+ * Where a pairing has got to, on THIS device. There is at most one — the Core
+ * holds a single pairing at a time — and it is the same object whichever gesture
+ * started it: showing a code or reading one.
+ */
+export type PairingPhase =
+  /** Our code is on screen and nobody has taken it yet. */
+  | "showing"
+  /** Taken: the human on the OTHER device is the one who confirms. */
+  | "waiting"
+  /** We are the one who confirms; `device` is what to put in front of them. */
+  | "confirm"
+  /** Confirmed, and the browser is settling the fresh token the server wants. */
+  | "confirming";
+
+export interface PairingFlow {
+  pairing_id: string;
+  /** Settled by the Core (offer) or by the server (accept), never here. */
+  role: PairingRole;
+  phase: PairingPhase;
+  /** The code to display — absent when we read the other device's. */
+  code?: string;
+  /** The joining device, when we sponsor: the record the human confirms. */
+  device?: PairingDevice;
+  /**
+   * The number BOTH ends show, once a channel exists, so the human can tell the
+   * legitimate device from one that read the code over their shoulder. Absent
+   * while a code is merely on screen: there is nothing to derive it from yet.
+   */
+  verification?: string;
+  /** Seconds the code is good for. The COUNTING is the Core's, not ours. */
+  expires_in?: number;
+}
+
 /** A file within a transfer (the `transfer.started` manifest). */
 export interface TransferFile {
   name: string;
@@ -253,6 +296,23 @@ export class CoreStore {
    * app's cache is released.
    */
   pendingShare = $state<PendingShare | null>(null);
+  /**
+   * The pairing under way, or `null`. It has no snapshot method: it is born of
+   * an action here and lives on the `pairing` notifications — so an event that
+   * names another pairing is not ours to answer, and a pairing this interface
+   * did not start is one it will not show. That is also the one thing a restart
+   * loses: the Core keeps the pairing (it is not tied to a connection), but no
+   * one can tell us about it, and its own deadline ends it.
+   */
+  pairing = $state<PairingFlow | null>(null);
+  /**
+   * Whether pairing can be offered at all. Assumed yes, and turned off for the
+   * duration of this connection by a `-32601`: this Core, or the server it
+   * relays to, is older than pairing. There is nothing to probe beforehand — a
+   * method that does not exist is only discovered by calling it — so the screens
+   * offer it, and stop offering it once it is known not to work.
+   */
+  pairingSupported = $state(true);
   /** Why the directory is empty, when the Core refuses to serve it. */
   devicesError = $state<string | null>(null);
   /** The last action's feedback, shown as a banner. */
@@ -388,7 +448,12 @@ export class CoreStore {
     this.connection = status;
     // A connection loss clears nothing: the data stays displayed, flagged as
     // frozen by the status. `incompatible` is terminal.
-    if (status.status === "connected") void this.resync();
+    if (status.status !== "connected") return;
+    // A fresh connection may be a fresh Core — an update installed while the old
+    // one was still running is exactly how a Core comes to be too old for a
+    // moment. Whatever we learned about the previous one is not about this one.
+    this.pairingSupported = true;
+    void this.resync();
   }
 
   /** Total resnapshot. The only path for a bulk write of the state. */
@@ -523,6 +588,60 @@ export class CoreStore {
       case "device.removed": {
         const id = (params as { device_id?: string } | null)?.device_id;
         if (id) this.devices = this.devices.filter((d) => d.device_id !== id);
+        return false;
+      }
+      // A pairing's three outcomes. Each one names its pairing, and only the one
+      // we are showing is ours to act on: a late event must not speak for the
+      // pairing that replaced it, nor one another interface is running.
+      case "pairing.claimed": {
+        const p = params as {
+          pairing_id?: string;
+          verification?: string;
+          device?: PairingDevice;
+        } | null;
+        const flow = this.#pairingNamed(p?.pairing_id);
+        if (!flow) return false;
+        flow.verification = p?.verification;
+        // The ROLE says who confirms — the record is only what is shown. Reading
+        // it the other way round (a record arrived, so it must be for us) would
+        // let the server decide who vouches.
+        if (p?.device) flow.device = p.device;
+        flow.phase = flow.role === "sponsor" ? "confirm" : "waiting";
+        return false;
+      }
+      case "pairing.completed": {
+        const id = (params as { pairing_id?: string } | null)?.pairing_id;
+        const flow = this.#pairingNamed(id);
+        if (!flow) return false;
+        this.pairing = null;
+        // STICKY, and a resnapshot: the account key arriving is announced by
+        // nothing else (`account.status` has no notification), and the
+        // resnapshot it asks for is exactly what would erase an ordinary
+        // notice — on the joining device this sentence is the only word it gets
+        // that the whole screen was waiting for.
+        this.notice = {
+          kind: "info",
+          sticky: true,
+          text:
+            flow.role === "sponsor"
+              ? `${flow.device?.name ?? "That device"} is now linked to your account.`
+              : "This device is now linked to your account.",
+        };
+        return true;
+      }
+      case "pairing.failed": {
+        const p = params as { pairing_id?: string; reason?: string } | null;
+        const flow = this.#pairingNamed(p?.pairing_id);
+        if (!flow) return false;
+        this.pairing = null;
+        // Sticky for the same reason as the success: the human may well be
+        // looking at the other device, and this is the only account of what
+        // happened.
+        this.notice = {
+          kind: "error",
+          sticky: true,
+          text: pairingFailure(p?.reason ?? "server"),
+        };
         return false;
       }
       case "component.pending": {
@@ -828,6 +947,122 @@ export class CoreStore {
   finishOnboarding(): void {
     this.onboardingPending = false;
     void this.resync();
+  }
+
+  // -- Pairing ------------------------------------------------------------
+  //
+  // Two gestures, one flow: show a code, or read the one another device shows.
+  // Which END of the exchange this device is on is NOT decided here — the Core
+  // derives it from what this device can actually do, and the server settles it
+  // for whoever reads a code (doc/core-api.md). So both entry points below are
+  // the same call to the same screen; only the gesture differs.
+
+  /** Shows a code for another device to scan or paste. */
+  showPairingCode(): Promise<void> {
+    return this.#startPairing(async () => {
+      const offer = await api.pairingOffer();
+      return {
+        pairing_id: offer.pairing_id,
+        role: offer.role,
+        phase: "showing",
+        code: offer.code,
+        expires_in: offer.expires_in,
+      };
+    });
+  }
+
+  /** A code was read from the other device — scanned, or pasted by hand. */
+  enterPairingCode(code: string): Promise<void> {
+    const entered = code.trim();
+    if (!entered) return Promise.resolve();
+    return this.#startPairing(async () => {
+      const claim = await api.pairingAccept(entered);
+      return {
+        pairing_id: claim.pairing_id,
+        role: claim.role,
+        // The sponsor is the one who confirms, and its claim already carries the
+        // record to confirm: no waiting step on that side.
+        phase: claim.role === "sponsor" ? "confirm" : "waiting",
+        device: claim.device,
+        verification: claim.verification,
+      };
+    });
+  }
+
+  /**
+   * `busy`-guarded by hand rather than through `#act`: the failure of a START is
+   * the one place where a refusal is not just a message — a Core that does not
+   * know the method takes the feature off the screen. The banner IS cleared on
+   * the way in, like everywhere else: the sentence explaining why the last code
+   * expired has no business sitting over a fresh one.
+   */
+  async #startPairing(begin: () => Promise<PairingFlow>): Promise<void> {
+    if (this.busy) return;
+    this.busy = true;
+    this.notice = null;
+    try {
+      this.pairing = await begin();
+    } catch (e) {
+      if (isUnknownMethod(e)) {
+        // Half of the chain is older than pairing, and the error cannot say
+        // which half. Nothing to retry: the entry points go away, and the
+        // recovery code stays the way in.
+        this.pairingSupported = false;
+        this.notice = {
+          kind: "error",
+          text: "Linking by code needs a newer UniversalLink on this device and on the server.",
+        };
+      } else {
+        this.notice = { kind: "error", text: humanize(e) };
+      }
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  /**
+   * The human said yes: the account key crosses, sealed for the device shown.
+   * Only the sponsor has anything to confirm, and the outcome comes back as an
+   * event — even here, where the Core answers `done` in the same breath.
+   */
+  confirmPairing(): Promise<void> {
+    const flow = this.pairing;
+    if (!flow || flow.phase !== "confirm") return Promise.resolve();
+    return this.#act(async () => {
+      const result = await api.pairingConfirm(flow.pairing_id);
+      if (result.status !== "reauth_required") return;
+      // The server wants a token fresher than the keyring can mint: the browser
+      // settles it, and `pairing.completed` / `pairing.failed` is the way back.
+      // Same round-trip as a login, so the same hold on the process (mobile).
+      await keepAlive("auth", true);
+      await openUrl(result.auth_url);
+      if (this.pairing?.pairing_id === flow.pairing_id) {
+        this.pairing.phase = "confirming";
+      }
+      this.notice = {
+        kind: "info",
+        text: "Confirm in your browser to finish linking that device.",
+      };
+    });
+  }
+
+  /** Declined, or the screen was left. */
+  cancelPairing(): Promise<void> {
+    const flow = this.pairing;
+    if (!flow) return Promise.resolve();
+    // Dropped here, not on the way back: the screen closes on the click, and
+    // there is nothing in the Core's answer to wait for — a cancellation that
+    // names a pairing it no longer holds is an empty success.
+    this.pairing = null;
+    return this.#act(async () => {
+      await api.pairingCancel(flow.pairing_id);
+    });
+  }
+
+  /** The pairing under way if it is the one named, `null` otherwise. */
+  #pairingNamed(pairing_id: string | undefined): PairingFlow | null {
+    if (!pairing_id) return null;
+    return this.pairing?.pairing_id === pairing_id ? this.pairing : null;
   }
 
   renameDevice(device_id: string, name: string): Promise<void> {

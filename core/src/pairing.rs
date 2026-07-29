@@ -19,9 +19,11 @@
 //! optical secret; someone who photographs the screen lacks a private key.
 //! Photographing the screen AND being faster than the legitimate scanner does
 //! work — the server hands the session to whoever claims first — and that is
-//! precisely what the confirmation screen is for: what the human is shown is the
-//! *device that scanned*, and an intruder cannot make that look like the phone in
-//! the user's hand. The residual risk is stated in `doc/architecture.md`.
+//! precisely what the confirmation screen is for. What the human is shown there
+//! is the device that scanned AND a **number derived from the channel key**
+//! ([`verification`]): only the two ends of one exchange can compute it, so an
+//! intruder's number cannot match the one on the device in the user's hand. The
+//! name is recognition; the number is the check.
 //!
 //! **The seed is never held here.** The sponsor reads it out of the keyring at
 //! the instant it seals the bundle (`account_key::recall`) and lets it go; a
@@ -69,6 +71,9 @@ const PSK_LEN: usize = 16;
 /// Domain separation for the channel key. Versioned like the rest of the
 /// project's derivations (`account_key`).
 const CHANNEL_DOMAIN: &[u8] = b"ul-pairing-channel-v1";
+
+/// Domain separation for the confirmation number (see [`verification`]).
+const SAS_DOMAIN: &[u8] = b"ul-pairing-sas-v1";
 
 /// Depth of the request queue toward a pairing's own connection. Tiny: the
 /// exchange is a handful of sequential calls.
@@ -318,6 +323,28 @@ fn derive_key(
     key
 }
 
+/// The number both ends put in front of their human, so that the confirmation
+/// screen asks something an intruder cannot answer.
+///
+/// It comes out of the **channel key**, which only the two ends of this one
+/// exchange hold: whoever photographed the code and claimed the session first has
+/// a channel of its own, hence different digits from the ones showing on the
+/// device the user is actually holding. A name is not that check — the joining
+/// side declares its own, and an intruder picks a convincing one. Six digits, two
+/// groups, like the account fingerprint: the point is a human reading them aloud.
+///
+/// Another output of the same KDF, with its own label: the key is already a PRK,
+/// and a digest of it says nothing about it.
+fn verification(key: &[u8; 32]) -> String {
+    let mut out = [0u8; 4];
+    hkdf::Hkdf::<Sha256>::from_prk(key)
+        .expect("a 32-byte channel key is a valid HKDF-SHA256 PRK")
+        .expand(SAS_DOMAIN, &mut out)
+        .expect("4 bytes is a valid HKDF-SHA256 output length");
+    let n = u32::from_be_bytes(out) % 1_000_000;
+    format!("{:03} {:03}", n / 1000, n % 1000)
+}
+
 /// Seals the bundle: a random nonce, then the ciphertext, base64url. The key is
 /// used for exactly one message here; the extended nonce is what keeps that from
 /// being a property the next message has to remember.
@@ -421,12 +448,10 @@ pub(crate) async fn accept(state: &Arc<AppState>, code: &str) -> Result<Value, R
     let mut channel = Channel::scanning(payload.psk);
     // Derived before claiming: the code carries everything needed, and a code
     // whose public key is unusable must cost the server nothing.
-    if channel
-        .establish(&payload.epk, &payload.pairing_id)
-        .is_none()
-    {
+    let Some(key) = channel.establish(&payload.epk, &payload.pairing_id) else {
         return Err(RpcErr::invalid_params("code"));
-    }
+    };
+    let number = verification(&key);
     let wire = open_wire(state, epoch).await?;
 
     let mut params = json!({
@@ -481,7 +506,11 @@ pub(crate) async fn accept(state: &Arc<AppState>, code: &str) -> Result<Value, R
         },
         expires_in,
     );
-    let mut result = json!({ "pairing_id": payload.pairing_id, "role": role.as_str() });
+    let mut result = json!({
+        "pairing_id": payload.pairing_id,
+        "role": role.as_str(),
+        "verification": number,
+    });
     if let Some(device) = device {
         result["device"] = device;
     }
@@ -610,7 +639,8 @@ pub(crate) fn on_server_event(state: &Arc<AppState>, method: &str, params: &Valu
 }
 
 /// The other side scanned: establish the channel and tell the caller what it has
-/// to show (nothing, when we are the one being shown).
+/// to show — the confirmation number both ends now share, and the device record
+/// when we are the one who has to decide.
 fn on_claimed(state: &Arc<AppState>, params: &Value) {
     let outcome = {
         let mut slot = state.pairing.lock().expect("lock pairing");
@@ -621,13 +651,17 @@ fn on_claimed(state: &Arc<AppState>, params: &Value) {
             .as_str()
             .and_then(unb64)
             .and_then(|b| b.try_into().ok());
-        match their_key {
-            Some(theirs)
-                if p.channel
-                    .establish(&PublicKey::from(theirs), &p.pairing_id)
-                    .is_some() =>
-            {
-                let mut announced = json!({ "pairing_id": p.pairing_id });
+        match their_key
+            .and_then(|theirs| p.channel.establish(&PublicKey::from(theirs), &p.pairing_id))
+        {
+            Some(key) => {
+                let mut announced = json!({
+                    "pairing_id": p.pairing_id,
+                    // Both ends are told it here, and only here: this is the
+                    // first moment either of them has a channel to derive it
+                    // from, and the moment a human is asked to compare.
+                    "verification": verification(&key),
+                });
                 if let Some(device) = params.get("device") {
                     announced["device"] = device.clone();
                 }
@@ -1241,6 +1275,54 @@ mod tests {
             "the session id is in the transcript: a server that hands the same \
              material to two sessions cannot cross them"
         );
+    }
+
+    // The confirmation number is what the human is asked to compare, so the two
+    // ends have to agree on it — and an intruder who claimed the session ahead of
+    // the legitimate device must not.
+    #[test]
+    fn both_ends_show_the_same_confirmation_number() {
+        let (mut offerer, mut claimer) = two_ends();
+        let theirs = claimer.ours;
+        let ours = offerer.ours;
+        let here = offerer.establish(&theirs, "p_1").expect("key");
+        let there = claimer.establish(&ours, "p_1").expect("key");
+        assert_eq!(verification(&here), verification(&there));
+        // Six digits in two groups, and nothing else: a number to read aloud.
+        assert!(
+            regex_lite_six_digits(&verification(&here)),
+            "unexpected shape: {}",
+            verification(&here)
+        );
+    }
+
+    #[test]
+    fn another_channel_shows_another_number() {
+        let (mut offerer, claimer) = two_ends();
+        let legitimate = offerer.establish(&claimer.ours, "p_1").expect("key");
+        // Someone who read the code off the screen and claimed the session first:
+        // same optical secret, same offerer, but a keypair of their own.
+        let intruder = Channel::scanning(offerer.psk);
+        let mut theirs = Channel::displaying();
+        theirs.psk = offerer.psk;
+        let raced = theirs.establish(&intruder.ours, "p_1").expect("key");
+        assert_ne!(
+            verification(&legitimate),
+            verification(&raced),
+            "the number must not survive a different channel — it is the whole \
+             point of showing it"
+        );
+    }
+
+    /// `NNN NNN`, without pulling a regex crate in for one assertion.
+    fn regex_lite_six_digits(text: &str) -> bool {
+        let bytes = text.as_bytes();
+        bytes.len() == 7
+            && bytes[3] == b' '
+            && bytes
+                .iter()
+                .enumerate()
+                .all(|(i, b)| i == 3 || b.is_ascii_digit())
     }
 
     #[test]

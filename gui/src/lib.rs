@@ -51,6 +51,17 @@ pub const GUI_SCOPES: [&str; 7] = [
 /// notifications have no topic: they follow the `gui` role.
 pub const GUI_TOPICS: [&str; 3] = ["session", "devices", "transfers"];
 
+/// Topics the GUI asks for and can do without (`ClientConfig::optional_topics`).
+///
+/// `pairing` came after the first releases, and the Core subscribes all or
+/// nothing: asking a Core that predates it would fail the whole subscription and
+/// the interface would never connect — a hard stop, on a machine where the old
+/// Core is simply still running from the previous session. It is asked for here
+/// instead, and the pairing screens report themselves unavailable if the Core
+/// turns out not to know the methods either (`-32601`). To be promoted to
+/// [`GUI_TOPICS`] once no such Core is in the field.
+pub const GUI_OPTIONAL_TOPICS: [&str; 1] = ["pairing"];
+
 #[cfg(test)]
 mod tests {
     /// The interface displays a version, and it can only take it from

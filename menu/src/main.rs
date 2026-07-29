@@ -384,6 +384,7 @@ async fn manager(channel_override: Option<PathBuf>) -> i32 {
         role: ROLE.into(),
         scopes: SCOPES.iter().map(|s| (*s).to_string()).collect(),
         topics: TOPICS.iter().map(|t| (*t).to_string()).collect(),
+        optional_topics: Vec::new(),
         served_methods: vec![],
         reconnect_base_delay: RECONNECT_BASE_DELAY,
         request_timeout: REQUEST_TIMEOUT,

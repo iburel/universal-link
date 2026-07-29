@@ -12,6 +12,7 @@ import {
   scopeLabel,
   selfLabel,
   sortDevices,
+  validFor,
 } from "./format";
 
 const NOW = new Date("2026-07-10T12:00:00Z");
@@ -90,4 +91,19 @@ test.each([
   [Number.NaN, ""],
 ])("formatSize(%i) === %s", (bytes, text) => {
   expect(formatSize(bytes)).toBe(text);
+});
+
+// How long a pairing code is good for: a hint, deliberately rounded — the Core
+// is what counts the deadline, and it says when the code has expired.
+test.each([
+  [120, "2 minutes"],
+  [119, "2 minutes"],
+  [90, "2 minutes"],
+  [89, "89 seconds"],
+  [30, "30 seconds"],
+  [0, ""],
+  [-1, ""],
+  [Number.NaN, ""],
+])("validFor(%s) is %s", (seconds, expected) => {
+  expect(validFor(seconds)).toBe(expected);
 });

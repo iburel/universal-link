@@ -103,6 +103,38 @@ export function installFakeCore(): void {
   const notify = (method: string, params: unknown) =>
     void emit("core:notification", { method, params });
 
+  /** What both `pairing.accept` and `pairing.claimed` carry. */
+  const claimed = (pairing_id: string, role: string) => ({
+    pairing_id,
+    role,
+    verification: "428 913",
+    ...(role === "sponsor"
+      ? {
+          device: {
+            name: "New laptop",
+            platform: "linux",
+            node_id: "9f".repeat(32),
+          },
+        }
+      : {}),
+  });
+
+  /** This device received the account: what the real Core's completion leaves. */
+  const joined = (pairing_id: string) => {
+    attested = true;
+    holdsKey = true;
+    fingerprint = "AB12 CD34 EF56 7890";
+    session = {
+      logged_in: true,
+      server_connected: true,
+      configured: true,
+      account: { email: "account@example.test" },
+    };
+    devices = DEVICES.map((d) => ({ ...d }));
+    notify("pairing.completed", { pairing_id });
+    changed();
+  };
+
   const methods: Record<string, (p: Record<string, string>) => unknown> = {
     "session.status": () => session,
     "session.login": () => {
@@ -146,6 +178,36 @@ export function installFakeCore(): void {
       fingerprint = "AB12 CD34 EF56 7890";
       return { fingerprint };
     },
+    // Pairing, both roles, on timers: enough to walk the screens in a browser.
+    // The code is the shape of a real one (~105 characters) so the QR comes out at
+    // the size it will really be.
+    "pairing.offer": () => {
+      const pairing_id = `p_${"ab12".repeat(8)}`;
+      const role = attested && holdsKey ? "sponsor" : "joiner";
+      // The other device reads the code a moment later.
+      setTimeout(() => notify("pairing.claimed", claimed(pairing_id, role)), 1500);
+      if (role === "joiner") setTimeout(() => joined(pairing_id), 4000);
+      return {
+        pairing_id,
+        role,
+        expires_in: 120,
+        code: `UL1:${"A".repeat(22)}:${"B".repeat(43)}:${pairing_id}`,
+      };
+    },
+    "pairing.accept": ({ code }) => {
+      if (!code?.startsWith("UL1:")) {
+        throw { kind: "rpc", message: "invalid params: code", code: -32602 };
+      }
+      const pairing_id = code.slice(code.lastIndexOf(":") + 1);
+      const role = attested && holdsKey ? "sponsor" : "joiner";
+      if (role === "joiner") setTimeout(() => joined(pairing_id), 2500);
+      return claimed(pairing_id, role);
+    },
+    "pairing.confirm": ({ pairing_id }) => {
+      setTimeout(() => notify("pairing.completed", { pairing_id }), 400);
+      return { status: "done" };
+    },
+    "pairing.cancel": () => ({}),
     "devices.list": () => {
       if (!session.logged_in) throw rpc("SERVER_UNREACHABLE");
       return devices;

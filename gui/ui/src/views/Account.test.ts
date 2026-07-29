@@ -118,3 +118,37 @@ test("during an action, the buttons are disarmed", () => {
     true,
   );
 });
+
+// A device with no session can be handed the account by one that has it — no
+// browser at all. This is the other way in, next to "Sign in".
+test("signing in is not the only way in", () => {
+  store.primed = true;
+  store.session = { logged_in: false, server_connected: false };
+
+  const view = render(Account, { store });
+
+  expect(textOf(view)).toContain("Already have a device on this account?");
+  expect(byText(view, "button", "Show a code")).toBeTruthy();
+});
+
+// Attested but without the account's private key: the state every device
+// enrolled before the key was kept at rest is in. Pairing lifts it, and the
+// screen says so — this is the alternative to retyping the recovery code.
+test("a device that cannot vouch is offered the key", () => {
+  store.primed = true;
+  store.session = { logged_in: true, server_connected: true };
+  store.account = { attested: true, fingerprint: "AB12", holds_key: false };
+
+  const view = render(Account, { store });
+
+  expect(textOf(view)).toContain("cannot vouch for a new one");
+  expect(byText(view, "button", "Show a code")).toBeTruthy();
+});
+
+test("a device that holds the key is offered nothing of the sort", () => {
+  store.primed = true;
+  store.session = { logged_in: true, server_connected: true };
+  store.account = { attested: true, fingerprint: "AB12", holds_key: true };
+
+  expect(textOf(render(Account, { store }))).not.toContain("cannot vouch");
+});
