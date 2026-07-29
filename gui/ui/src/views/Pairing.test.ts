@@ -52,6 +52,11 @@ test("the code is on screen twice: as a symbol, and as text to copy", () => {
   // without which a camera cannot find the symbol's edges. A 105-character code
   // is a version-6 symbol, 41 modules across.
   expect(svg.getAttribute("viewBox")).toBe("0 0 49 49");
+  // And the symbol sits INSIDE that margin: drawn at the origin it would have
+  // four modules of quiet zone on two sides and none on the other two.
+  expect(svg.querySelector("path")?.getAttribute("transform")).toBe(
+    "translate(4 4)",
+  );
   expect(svg.querySelector("path")?.getAttribute("d")).toMatch(/^M\d+ \d+h1v1h-1z/);
   // Dark on light, whatever theme the app is in.
   expect(svg.querySelector("rect")?.getAttribute("fill")).toBe("#ffffff");

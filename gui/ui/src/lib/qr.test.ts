@@ -132,6 +132,17 @@ test("one byte past a version moves up to the next", () => {
   }
 });
 
+// One payload per mask rule is not something the table above gives: for almost
+// every payload the first three rules decide the mask on their own. This one is a
+// payload the FOURTH decides — the balance of dark and light. It was found by
+// searching for a case where dropping that rule changes the answer, and its
+// symbol comes from the reference like the rest.
+test("the balance of dark and light has its say in the mask", () => {
+  const matrix = qrMatrix("hfC1JyDMBHau54qW0KMHQf");
+  expect(matrix.length).toBe(25); // version 2, mask 7 — mask 3 without that rule
+  expect(digest(matrix)).toBe("f917d1f1");
+});
+
 test("what no symbol holds is refused, not truncated", () => {
   expect(() => qrMatrix(payload(2332))).toThrow(/do not fit/);
 });

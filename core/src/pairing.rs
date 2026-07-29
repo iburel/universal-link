@@ -1296,6 +1296,17 @@ mod tests {
         );
     }
 
+    // A fixed point, not a property: the number is compared BETWEEN two devices,
+    // so its derivation is a compatibility contract like the payload's version
+    // tag. A Core that changed it — another label, another slice of the digest —
+    // would show a different number from its peer, and every confirmation would
+    // read as an intruder.
+    #[test]
+    fn the_number_is_derived_the_way_it_always_was() {
+        assert_eq!(verification(&[7u8; 32]), "150 048");
+        assert_eq!(verification(&[0u8; 32]), "695 908");
+    }
+
     #[test]
     fn another_channel_shows_another_number() {
         let (mut offerer, claimer) = two_ends();

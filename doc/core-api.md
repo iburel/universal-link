@@ -96,6 +96,14 @@ Topics filtered by scopes. Notifications are named (below, by namespace). After 
 (re)connection, a component resynchronizes its state through the snapshot methods
 (`devices.list`, `session.status`…) then subscribes.
 
+**All or nothing**: a topic that is unknown or out of scope refuses the whole call
+(`-32602` / `SCOPE_DENIED`) — never a partial subscription nobody was told about.
+A consequence for anything that has grown a topic since: asking a Core that
+predates it fails the subscription, and with it the connection. The client crate
+takes topics that may be refused separately (`ClientConfig::optional_topics`) and
+falls back to the required set alone, which is how an interface keeps working
+against an older Core while simply not seeing that topic's events.
+
 ## `session.*`
 
 | Method | Description |
