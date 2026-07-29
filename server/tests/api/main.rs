@@ -9,6 +9,7 @@ mod support;
 
 mod auth_authenticate;
 mod auth_enroll;
+mod descriptor;
 mod devices;
 mod persistence;
 mod presence;

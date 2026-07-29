@@ -2,12 +2,14 @@
 // Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
 
 //! UniversalLink server — control plane: authentication (OIDC + device keys),
-//! device directory, presence, iroh dial info.
+//! device directory, presence, iroh dial info, and the deployment descriptor a
+//! client reads to configure itself.
 //!
 //! Spec: `doc/server-api.md`. The exact schemas are frozen by the integration
 //! test suite (`tests/api.rs`).
 
 mod conn;
+mod descriptor;
 mod oidc;
 mod rpc;
 mod state;
@@ -31,7 +33,8 @@ pub const API_VERSION: u64 = 1;
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Listen address (WebSocket on `/ws`, health on `GET /health`).
+    /// Listen address (WebSocket on `/ws`, health on `GET /health`, deployment
+    /// descriptor on `GET /.well-known/universallink.json`).
     /// TLS is terminated upstream (reverse proxy) — the server listens in the clear.
     pub bind_addr: SocketAddr,
     pub oidc: OidcConfig,
@@ -51,6 +54,13 @@ pub struct OidcConfig {
     pub issuer_url: String,
     /// Expected `aud` in ID tokens.
     pub client_id: String,
+    /// The OIDC client secret, when the deployment's IdP asks for one at the
+    /// token exchange (Google does, even under PKCE). The server never uses it
+    /// itself — it verifies ID token signatures, it does not exchange codes: it
+    /// only advertises it in the deployment descriptor, which is what spares
+    /// every device from being configured by hand. `None` for an IdP that wants
+    /// none. On why serving it is not a leak, see `descriptor::body`.
+    pub client_secret: Option<String>,
     /// Maximum age (`iat`) of an ID token for sensitive operations
     /// (`auth.enroll`, `devices.revoke`).
     pub max_fresh_token_age: Duration,
@@ -109,6 +119,7 @@ pub async fn spawn_with_store(
 
     let app = axum::Router::new()
         .route("/health", get(async || "ok"))
+        .route(descriptor::PATH, get(descriptor::get))
         .route("/ws", get(ws_upgrade))
         .with_state(app_state);
 

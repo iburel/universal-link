@@ -26,6 +26,13 @@ To decide knowingly before exposing it:
   and its presence (online / last seen at such a time).
 - **It does not see**: the content of the transfers (E2E, never relayed by it) nor
   the **account key** (derived from the recovery code, never transmitted).
+- **It publishes, to anyone**: your OIDC issuer, `client_id` and — if you set one
+  — `client_secret`, in its deployment descriptor. That is deliberate and is what
+  lets a device be set up from the server's address alone; for an installed
+  application that secret is not a confidential value (the reasoning is in
+  [server-api.md](server-api.md#deployment-descriptor)). If your IdP hands you a
+  genuinely confidential secret, it is the wrong client type for this flow — see
+  step 1.
 - **If it is compromised**, an attacker can **deny service**, **revoke** devices, or
   lie about presence — but **can neither decrypt the transfers nor get a rogue
   device accepted**: a peer verifies the attestation against the account key that
@@ -74,12 +81,14 @@ In the [Google Cloud console](https://console.cloud.google.com/):
 3. **Credentials → Create credentials → OAuth client ID**:
    - application type: **Desktop app**;
    - give it a name.
-4. Retrieve the **`client_id`** (`…apps.googleusercontent.com`), and **keep the
-   `client_secret`** Google shows you: with Google, the reference deployment sets
-   it on each client (`oidc_client_secret` in `config.json`). An IdP that wants no
-   secret simply gets none. For an installed application it is not confidential —
-   it ships inside every copy of the app, and PKCE is what actually protects the
-   exchange.
+4. Retrieve the **`client_id`** (`…apps.googleusercontent.com`) and the
+   **`client_secret`** Google shows you: both go into **this server's**
+   configuration (step 2), which hands them to the clients through its deployment
+   descriptor — that is what spares you configuring each machine and phone by
+   hand. An IdP that wants no secret simply gets none. For an installed
+   application the secret is not confidential — it ships inside every copy of the
+   app, and PKCE is what actually protects the exchange; the reasoning is spelled
+   out in [server-api.md](server-api.md#deployment-descriptor).
 
 The **loopback** (`http://127.0.0.1:<port>/callback`) is handled automatically for
 "Desktop app" clients: the port is dynamic, you have no redirect URL to register.
@@ -99,7 +108,7 @@ network.
 cd deploy
 cp .env.example .env
 # Edit .env: UNIVERSALLINK_DOMAIN, UNIVERSALLINK_OIDC_ISSUER,
-# UNIVERSALLINK_OIDC_CLIENT_ID.
+# UNIVERSALLINK_OIDC_CLIENT_ID (+ UNIVERSALLINK_OIDC_CLIENT_SECRET with Google).
 docker compose up -d --build
 ```
 
@@ -127,6 +136,10 @@ the errors at once — look at `docker compose logs server`.
 ```sh
 # Health, through Caddy's TLS:
 curl https://your-server.example.com/health         # -> ok
+
+# The deployment descriptor: what a client reads to configure itself. Check the
+# issuer and the client here — a device is then set up with this address alone.
+curl https://your-server.example.com/.well-known/universallink.json
 
 # The WebSocket handshake must answer 101 (Switching Protocols):
 curl -sSi https://your-server.example.com/ws \
@@ -179,7 +192,9 @@ names, not the ability to link up again.
 
 Required: `UNIVERSALLINK_SERVER_BIND`, `UNIVERSALLINK_OIDC_ISSUER`,
 `UNIVERSALLINK_OIDC_CLIENT_ID`. Optional (defaults in parentheses):
-`UNIVERSALLINK_SERVER_STATE` (`universallink-directory.json`),
+`UNIVERSALLINK_OIDC_CLIENT_SECRET` (none; the server never uses it itself — it
+advertises it in the deployment descriptor, and Google's clients need it at the
+token exchange), `UNIVERSALLINK_SERVER_STATE` (`universallink-directory.json`),
 `UNIVERSALLINK_HEARTBEAT_SECS` (30), `UNIVERSALLINK_HEARTBEAT_MAX_MISSED` (2),
 `UNIVERSALLINK_NONCE_TTL_SECS` (60), `UNIVERSALLINK_FRESH_TOKEN_MAX_AGE_SECS`
 (300), `UNIVERSALLINK_JWKS_REFRESH_MIN_SECS` (60; shortest delay between two

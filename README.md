@@ -160,16 +160,22 @@ of the app), which is why it lives in a config file rather than a keyring.
 ### Piece 2 — a running server
 
 The `universallink-server` binary (crate `server-daemon`) is configured through
-the environment and starts the control plane (WebSocket `/ws`, `GET /health`):
+the environment and starts the control plane (WebSocket `/ws`, `GET /health`,
+and `GET /.well-known/universallink.json` — the deployment descriptor, from which
+a client reads the OIDC settings below instead of having them typed in):
 
 ```sh
+# Add UNIVERSALLINK_OIDC_CLIENT_SECRET=… if your IdP demands one (Google does).
 UNIVERSALLINK_SERVER_BIND=0.0.0.0:8080 \
 UNIVERSALLINK_OIDC_ISSUER=https://accounts.google.com \
 UNIVERSALLINK_OIDC_CLIENT_ID=…apps.googleusercontent.com \
 cargo run --bin universallink-server --locked
 ```
 
-Optional settings (with their defaults): `UNIVERSALLINK_SERVER_STATE`
+Optional settings (with their defaults): `UNIVERSALLINK_OIDC_CLIENT_SECRET`
+(none; the server never uses it — it advertises it in the descriptor for the
+clients, and Google's installed-app clients need it at the token exchange),
+`UNIVERSALLINK_SERVER_STATE`
 (`universallink-directory.json` — the directory file, to point at a volume in a
 deployment), `UNIVERSALLINK_HEARTBEAT_SECS` (30),
 `UNIVERSALLINK_HEARTBEAT_MAX_MISSED` (2), `UNIVERSALLINK_NONCE_TTL_SECS` (60),
@@ -189,7 +195,7 @@ Caddy stack ready to use — follow
 
 ```sh
 cd deploy
-cp .env.example .env      # domain + OIDC issuer + client_id
+cp .env.example .env      # domain + OIDC issuer + client (+ secret if needed)
 docker compose up -d --build
 ```
 

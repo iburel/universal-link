@@ -7,7 +7,7 @@
 
 ## Scope
 
-The server has four jobs, and only four:
+The server has five jobs, and only five:
 
 1. **Authenticate** accounts (OIDC) and devices (device key).
 2. **Hold the directory** of an account's devices (enrollment, revocation,
@@ -15,6 +15,9 @@ The server has four jobs, and only four:
 3. **Broadcast presence** (online/offline, status).
 4. **Provide the composition info**: what is needed to reach a device via iroh
    (`node_id`, `relay_url`).
+5. **Describe the deployment**: the IdP and the OIDC client that every device of
+   this server must use — read before any login, since it is what makes one
+   possible.
 
 What is **deliberately not** in this API: file data, clipboard metadata, transfer
 offer/negotiation, any device-to-device message. All of that goes through the
@@ -35,9 +38,57 @@ activity — only connections, heartbeats, and the directory.
   is no longer the device's presence: a late `presence.update` it might emit
   (racing with its own closure) is silently ignored, it does not overwrite the
   state published by the current connection.
-- Outside the WebSocket: `GET /health` (monitoring). TLS mandatory everywhere —
-  terminated by the server or by an upstream reverse proxy (the server can then
-  listen in cleartext on its internal network).
+- Outside the WebSocket: `GET /health` (monitoring) and
+  `GET /.well-known/universallink.json` (the deployment descriptor, below). TLS
+  mandatory everywhere — terminated by the server or by an upstream reverse proxy
+  (the server can then listen in cleartext on its internal network).
+
+## Deployment descriptor
+
+`GET /.well-known/universallink.json` — **unauthenticated**, necessarily: a
+client reads it before it is able to log in.
+
+```json
+{
+  "api_version": 1,
+  "oidc_issuer": "https://accounts.google.com",
+  "oidc_client_id": "1234.apps.googleusercontent.com",
+  "oidc_client_secret": "GOCSPX-…"
+}
+```
+
+The IdP and the OIDC client belong to the **deployment**, not to the user: they
+are identical on every device of one server. So a client is told **one** thing,
+the server's address, and reads the rest here — instead of having three fields
+typed into it per machine and per phone. Field names are the ones the Core writes
+into its `config.json`.
+
+- `oidc_client_secret` is `null` for an IdP that wants none (RFC 7636 conformant);
+  Google asks for one even under PKCE. **Serving it in the clear is deliberate**:
+  for an *installed application* client it is not confidential. Google's own OAuth
+  2.0 documentation, under "Installed applications", says to embed it in the
+  source code of the app and that "in this context, the client secret is obviously
+  not treated as a secret" — its Android and iOS client types are issued none at
+  all, PKCE plus the loopback redirect ([RFC 8252]) being what protects the
+  exchange. The exposure is that of shipping it inside every installer, which is
+  what published clients do; the most a reader of this endpoint gains is the
+  ability to pose as this deployment's OAuth client on its IdP's consent screen,
+  which grants nothing on an account, the directory, or a device.
+- **It carries no server URL.** The client arrived by that address and derives
+  `wss://<host>/ws` itself (the path is fixed by this API). A server behind a
+  reverse proxy has no reliable knowledge of its public origin, and a URL it
+  dictated would be a redirect it controls.
+- `api_version` is the number `auth.enroll` also answers: a client can tell,
+  before enrolling, whether this server speaks its protocol.
+- `Cache-Control: no-store` — read once, when a device is set up. A cached copy is
+  how a client keeps being configured with an OIDC client already replaced.
+- **404** = a server older than this endpoint; the client falls back to asking the
+  user for the fields.
+- The `/.well-known/` name is not IANA-registered. What registration guards
+  against is a collision on a shared domain, and a deployment's domain serves this
+  control plane alone.
+
+[RFC 8252]: https://www.rfc-editor.org/rfc/rfc8252
 
 ## Authentication
 
@@ -194,7 +245,8 @@ Standard JSON-RPC error codes, plus the application codes in `error.data.code`
 
 ## Versioning
 
-- `api_version` is returned by `auth.enroll` / `auth.authenticate`.
+- `api_version` is returned by `auth.enroll` / `auth.authenticate`, and by the
+  deployment descriptor — which is readable before any connection.
 - Tolerant JSON: unknown fields are ignored, extensions are additive (new
   optional fields, new methods, new notifications).
 - An incompatible change = major increment of `api_version`; the server announces

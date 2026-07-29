@@ -19,6 +19,9 @@ services:
     environment:
       UNIVERSALLINK_OIDC_ISSUER: ${UNIVERSALLINK_OIDC_ISSUER}
       UNIVERSALLINK_OIDC_CLIENT_ID: ${UNIVERSALLINK_OIDC_CLIENT_ID}
+      # `:-` so an existing .env that predates this setting stays valid without
+      # a compose warning; empty = the deployment has no client secret.
+      UNIVERSALLINK_OIDC_CLIENT_SECRET: ${UNIVERSALLINK_OIDC_CLIENT_SECRET:-}
       # Optional (defaults baked into the binary) — uncomment as needed:
       # UNIVERSALLINK_MAX_REQUESTS_PER_MINUTE: "120"
       # UNIVERSALLINK_LOG: "info"

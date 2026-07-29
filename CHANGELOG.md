@@ -8,6 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The server tells the clients how to log in** — it publishes its OIDC issuer
+  and client at `GET /.well-known/universallink.json`, so setting a device up
+  needs the server's address and nothing else. Those values describe the
+  deployment, not the user: they were being retyped on every machine and every
+  phone. The OIDC client secret is served with them, deliberately — for an
+  installed application it identifies the app rather than authenticating it, and
+  it already shipped in every client's configuration. Set it on the server with
+  `UNIVERSALLINK_OIDC_CLIENT_SECRET` (Google's clients need one; other IdPs may
+  not).
 - **The app shows which version it is** — at the foot of its sidebar, and on the
   screen that asks you to update, the one place where the question always comes
   up. It is the interface's version: on Linux the background Core runs from a
