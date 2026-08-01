@@ -35,7 +35,7 @@ png = "0.18"
 serde_json = "1"
 # Cross-platform event loop for the tray. On Linux it initializes the gtk main
 # loop that `tray-icon` needs; on macOS it owns the main-thread run loop.
-tao = "0.35.3"
+tao = "0.36.0"
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
