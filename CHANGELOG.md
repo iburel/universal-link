@@ -40,10 +40,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **The phone is on the network too.** Android joins the same LAN discovery:
   the app now sees — and is seen by — the account's machines on the same
   Wi-Fi, badges them *"on this network"*, and shares to them directly even
-  when the internet is down. Android filters incoming multicast to save
-  battery, so the app holds the system's multicast lock exactly while it has
-  a window in front or a transfer in flight — the rest of the time the phone
-  goes quiet rather than draining the battery of a phone in a pocket.
+  when the internet is down. Android hands an app no incoming multicast
+  unless it asks, and asking keeps the Wi-Fi chip awake for every multicast
+  frame on the network, so the app asks exactly while it has a window in
+  front or a transfer in flight — and stops listening the rest of the time,
+  which is the part where a phone is in a pocket.
 
 ### Fixed
 
