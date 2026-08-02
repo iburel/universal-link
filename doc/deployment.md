@@ -114,6 +114,23 @@ Daily rotation, seven files kept. The level is set by `UNIVERSALLINK_LOG` (and n
 mirrored only if it is attached to a terminal — a Core launched at login has no one
 to talk to.
 
+## macOS's Local Network permission
+
+macOS asks each build of the app for *Local Network* access the first time it
+touches the LAN, and quietly refuses every multicast packet until someone
+answers: each send fails with `No route to host`, so LAN discovery is deaf and
+mute while the rest of the data plane (server, relay) works normally. The Core
+probes the wire when it starts with LAN discovery on and, if nothing comes
+back, writes one log line naming the cure — System Settings → Privacy &
+Security → Local Network → UniversalLink.
+
+The grant is tied to the binary's code-signing identity. Two consequences for
+unsigned (ad-hoc) builds: every update is a fresh identity and asks again, and
+a binary swapped inside the bundle by hand silently loses the grant —
+reinstall the bundle properly instead. And never overwrite a Mach-O in place:
+the kernel kills a binary whose file was rewritten under a cached signature
+(`last exit reason: OS_REASON_CODESIGNING` in `launchctl print`).
+
 ## Secrets
 
 Two go to the OS keyring — Secret Service (Linux), Keychain (macOS), Credential

@@ -40,6 +40,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **macOS: a blocked "Local Network" permission now reads as one clear line.**
+  macOS asks each fresh build for that permission and quietly refuses every
+  discovery packet until someone answers — LAN discovery deaf and mute, and
+  the only trace hundreds of cryptic `error sending mDNS: No route to host`
+  warnings. The Core now probes the wire when it starts with LAN discovery on
+  and, when nothing comes back, says plainly what is wrong and where the
+  switch is (System Settings → Privacy & Security → Local Network). The same
+  line covers any machine whose network drops multicast; sends through the
+  server and the relay were never affected.
 - **macOS: clicking the app icon opened nothing.** Not the Dock, not the Finder,
   not the Launchpad, not the tray's own *Open* — no window, no error, nothing.
   The tray shipped as a plain executable inside the app bundle, and to macOS a
