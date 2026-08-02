@@ -70,7 +70,10 @@ pub struct LogcatWriter;
 impl io::Write for LogcatWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let text = String::from_utf8_lossy(buf);
-        let trimmed = text.trim_end_matches(['\r', '\n']);
+        // Leading space: with the timestamp gone the formatter still writes its
+        // separator, and logcat would show it — twice over inside a summary,
+        // which quotes the line.
+        let trimmed = text.trim_end_matches(['\r', '\n']).trim_start_matches(' ');
         if trimmed.is_empty() {
             return Ok(buf.len());
         }
