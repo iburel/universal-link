@@ -112,6 +112,11 @@ fn init_logging() {
         let _ = tracing_subscriber::fmt()
             .with_writer(logcat::MakeLogcat)
             .with_ansi(false)
+            // logcat stamps every line it is handed, so ours would be a second
+            // clock in the same line — and, more to the point, a timestamp makes
+            // two otherwise identical lines different, which is exactly what the
+            // repeat filter needs to compare (see `logcat`).
+            .without_time()
             .with_max_level(tracing::Level::INFO)
             .try_init();
     });
