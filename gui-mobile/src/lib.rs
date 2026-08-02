@@ -167,12 +167,6 @@ async fn boot_core(data_dir: &Path) -> anyhow::Result<ClientConfig> {
     let _ = std::fs::remove_file(&ipc_path);
     let receive_dir = data_dir.join("received");
 
-    // LAN discovery stays OFF on Android: receiving mDNS multicast requires a
-    // `WifiManager.MulticastLock` held from the Java side, which this build
-    // does not take — announcing without hearing the answers would just burn
-    // radio. A later block wires the lock and turns it on.
-    let transport = Arc::new(LazyIrohTransport::new(data_dir.to_path_buf(), None, false));
-
     // How the Core re-reads its config on `session.reload` (after the frontend
     // writes config.json via set_server_config): the SAME parse the daemon
     // uses. On Android there are no env overrides, so this just reads the file.
@@ -193,6 +187,19 @@ async fn boot_core(data_dir: &Path) -> anyhow::Result<ClientConfig> {
     if let Some(problem) = &boot.problem {
         tracing::warn!(problem = %problem, "config.json present but invalid; starting unconfigured");
     }
+
+    // LAN discovery obeys config.json exactly like the desktop daemon (same
+    // parse: default ON, a broken file fails OFF). Hearing mDNS on Android
+    // additionally needs the Wi-Fi multicast filter lifted, which only Java can
+    // do: LanMulticast.kt holds the `WifiManager.MulticastLock` while the app
+    // has a window in front or work in flight — the rest of the time this Core
+    // still announces, but is deaf to the answers (and so is every mDNS
+    // listener in the process, by the platform's design, not by a defect here).
+    let transport = Arc::new(LazyIrohTransport::new(
+        data_dir.to_path_buf(),
+        None,
+        boot.lan_discovery,
+    ));
 
     let config = Config {
         ipc_path: ipc_path.clone(),

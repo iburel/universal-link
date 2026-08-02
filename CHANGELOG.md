@@ -37,6 +37,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the internet is down, appearing and disappearing as it comes and goes. The
   context menu used to empty itself the moment the server link dropped;
   now what remains is exactly what is still in the room.
+- **The phone is on the network too.** Android joins the same LAN discovery:
+  the app now sees — and is seen by — the account's machines on the same
+  Wi-Fi, badges them *"on this network"*, and shares to them directly even
+  when the internet is down. Android hands an app no incoming multicast
+  unless it asks, and asking keeps the Wi-Fi chip awake for every multicast
+  frame on the network, so the app asks exactly while it has a window in
+  front or a transfer in flight — and stops listening the rest of the time,
+  which is the part where a phone is in a pocket.
 
 ### Fixed
 

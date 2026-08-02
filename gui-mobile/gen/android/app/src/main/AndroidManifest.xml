@@ -9,6 +9,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Hearing LAN discovery: the Wi-Fi driver drops incoming multicast unless
+         an app holds a MulticastLock (LanMulticast), and without one the Core
+         announces itself over mDNS but never hears its siblings. An
+         install-time permission, granted silently. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <!-- Reading a pairing code off another device's screen (ScanActivity). Asked
          for at the moment of the gesture, never at startup, and the app works
          without it: a code can be pasted instead. The alternative that needs no
