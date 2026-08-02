@@ -23,6 +23,13 @@ export interface Device {
   node_id?: string;
   relay_url?: string | null;
   online: boolean;
+  /** This machine hears the device on the local network (mDNS) — first-hand
+   * presence, alive with or without the server. */
+  lan: boolean;
+  /** The Core's one presence verdict: what a send could reach right now —
+   * the LAN, or (while the server link is up) an online device with a
+   * published relay. Gate sends on THIS, never on `online` alone. */
+  reachable: boolean;
   /** Free-form field reserved for extensibility; v1 defines no value for it. */
   status?: string | null;
   last_seen?: string | null;

@@ -1013,6 +1013,76 @@ async fn a_stale_directory_cache_vouches_for_no_one() {
     assert_eq!(err.app_code(), "DEVICE_UNKNOWN");
 }
 
+/// LAN presence is presence: a machine heard over mDNS is served as
+/// `reachable` (with `lan: true`) by `devices.list` and re-announced as
+/// `device.updated` when its visibility flips — with the SERVER LINK DOWN,
+/// which is exactly when it matters.
+#[tokio::test(flavor = "multi_thread")]
+async fn lan_visibility_flows_into_devices_list_and_events() {
+    let server = TestServer::start().await;
+    let switchboard = MemorySwitchboard::new();
+    let code = universallink_core::account_key::generate_recovery_code();
+    let a = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
+    let b = TestCore::start_lan_only_on(&server, &switchboard, &code).await;
+    switchboard.join_lan(&a.key().node_id());
+
+    let mut watcher =
+        spawn_component(&a, "watcher", "tray", &["devices.read", "session.read"]).await;
+    wait_server_connected(&mut watcher, true).await;
+    wait_attested(&mut watcher, b.device_id()).await;
+    watcher
+        .request(
+            "events.subscribe",
+            json!({ "topics": ["devices", "session"] }),
+        )
+        .await
+        .expect("subscribe");
+
+    // The server dies: B's record keeps its stale `online`, but the LAN is
+    // first-hand — B stays reachable, and says through what.
+    server.cut();
+    wait_server_connected(&mut watcher, false).await;
+    let list = watcher
+        .request("devices.list", json!({}))
+        .await
+        .expect("devices.list serves the cache offline");
+    let record = list
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|d| d["device_id"] == json!(b.device_id()))
+        .expect("B listed")
+        .clone();
+    assert_eq!(record["lan"], json!(true));
+    assert_eq!(record["reachable"], json!(true));
+
+    // B leaves the LAN: the flip arrives as a device.updated, unprompted.
+    switchboard.leave_lan(&b.key().node_id());
+    let updated = loop {
+        let (method, params) = watcher.notification().await;
+        if method == "device.updated" && params["device"]["device_id"] == json!(b.device_id()) {
+            break params;
+        }
+    };
+    assert_eq!(updated["device"]["lan"], json!(false));
+    assert_eq!(
+        updated["device"]["reachable"],
+        json!(false),
+        "no server, no LAN: nothing left"
+    );
+
+    // And back.
+    switchboard.join_lan(&b.key().node_id());
+    let updated = loop {
+        let (method, params) = watcher.notification().await;
+        if method == "device.updated" && params["device"]["device_id"] == json!(b.device_id()) {
+            break params;
+        }
+    };
+    assert_eq!(updated["device"]["lan"], json!(true));
+    assert_eq!(updated["device"]["reachable"], json!(true));
+}
+
 /// Logging out forgets the cached directory along with the session: a Core no
 /// longer on the account serves and reaches no one at its next start.
 #[tokio::test(flavor = "multi_thread")]

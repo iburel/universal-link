@@ -585,13 +585,15 @@ mod tests {
             "relay_url": "https://relay.example/",
             "attestation": "beef",
             "online": true,
+            "lan": false,
+            "reachable": true,
             "is_self": false,
         })
     }
 
     fn live_dir(devices: &[Value]) -> Directory {
         let mut dir = Directory::new();
-        dir.apply_session(&json!({ "logged_in": true, "server_connected": true }));
+        dir.apply_session(&json!({ "logged_in": true }));
         dir.apply_account(&json!({ "attested": true }));
         dir.replace_all(devices);
         dir

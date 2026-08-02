@@ -82,6 +82,11 @@ pub struct IrohTransport {
     /// The `node_id`s currently visible over mDNS (hex), maintained by
     /// `lan_task`. Stays empty forever when LAN discovery is off.
     lan: Arc<Mutex<HashSet<String>>>,
+    /// Bumped by `lan_task` at every actual set change; `lan_changes`
+    /// subscribes to it. Owned here in the plain case; `bind` also accepts the
+    /// caller's (`LazyIrohTransport` hands over its own, created before the
+    /// endpoint exists, so a receiver taken while lazy still fires once bound).
+    lan_gen: tokio::sync::watch::Sender<u64>,
     /// Consumes the mDNS discovery events into `lan`. Ends on its own when
     /// the endpoint closes (the discovery actor dies with its last handle and
     /// the event stream with it); the abort at drop is a safety net.
@@ -116,6 +121,19 @@ impl IrohTransport {
         relay: Option<RelayUrl>,
         lan_discovery: bool,
     ) -> anyhow::Result<IrohTransport> {
+        let (lan_gen, _) = tokio::sync::watch::channel(0);
+        Self::bind_with_gen(seed, relay, lan_discovery, lan_gen).await
+    }
+
+    /// `bind`, with the LAN generation channel supplied by the caller —
+    /// `LazyIrohTransport` needs `lan_changes` to answer BEFORE the endpoint
+    /// exists, so it owns the sender and hands it over at the (lazy) bind.
+    pub async fn bind_with_gen(
+        seed: [u8; 32],
+        relay: Option<RelayUrl>,
+        lan_discovery: bool,
+        lan_gen: tokio::sync::watch::Sender<u64>,
+    ) -> anyhow::Result<IrohTransport> {
         let secret = SecretKey::from_bytes(&seed);
         let mdns = lan_lookup(&secret, lan_discovery);
         let relay_mode = match relay {
@@ -129,7 +147,7 @@ impl IrohTransport {
         if let Some(mdns) = &mdns {
             builder = builder.address_lookup(mdns.clone());
         }
-        Self::finish(builder, mdns).await
+        Self::finish(builder, mdns, lan_gen).await
     }
 
     /// Test endpoint: a LOCAL relay (self-signed certificate) whose
@@ -158,12 +176,14 @@ impl IrohTransport {
         if let Some(mdns) = &mdns {
             builder = builder.address_lookup(mdns.clone());
         }
-        Self::finish(builder, mdns).await
+        let (lan_gen, _) = tokio::sync::watch::channel(0);
+        Self::finish(builder, mdns, lan_gen).await
     }
 
     async fn finish(
         builder: iroh::endpoint::Builder,
         mdns: Option<MdnsAddressLookup>,
+        lan_gen: tokio::sync::watch::Sender<u64>,
     ) -> anyhow::Result<IrohTransport> {
         // Subscribed BEFORE the endpoint binds: the discovery actor is already
         // running (it starts with the lookup), so waiting until after `bind`
@@ -182,12 +202,14 @@ impl IrohTransport {
         let (tx, rx) = mpsc::channel(READY_QUEUE);
         let acceptor = tokio::spawn(acceptor(endpoint.clone(), tx));
         let lan = Arc::new(Mutex::new(HashSet::new()));
-        let lan_task = lan_events.map(|events| tokio::spawn(watch_lan(events, lan.clone())));
+        let lan_task =
+            lan_events.map(|events| tokio::spawn(watch_lan(events, lan.clone(), lan_gen.clone())));
         Ok(IrohTransport {
             endpoint,
             ready: tokio::sync::Mutex::new(rx),
             acceptor,
             lan,
+            lan_gen,
             lan_task,
         })
     }
@@ -225,25 +247,37 @@ fn lan_lookup(secret: &SecretKey, lan_discovery: bool) -> Option<MdnsAddressLook
 async fn watch_lan(
     mut events: impl Stream<Item = DiscoveryEvent> + Unpin,
     lan: Arc<Mutex<HashSet<String>>>,
+    lan_gen: tokio::sync::watch::Sender<u64>,
 ) {
     while let Some(event) = events.next().await {
-        let mut lan = lan.lock().expect("lock lan set");
-        match event {
-            DiscoveryEvent::Discovered { endpoint_info, .. } => {
-                let node_id = hex::encode(endpoint_info.endpoint_id.as_bytes());
-                if lan.insert(node_id.clone()) {
-                    tracing::debug!(peer = %node_id, "peer visible on the LAN");
+        // Mutate, release, THEN bump: a watcher woken by the bump re-pulls
+        // the set, so it must never observe the pre-mutation state.
+        let changed = {
+            let mut lan = lan.lock().expect("lock lan set");
+            match event {
+                DiscoveryEvent::Discovered { endpoint_info, .. } => {
+                    let node_id = hex::encode(endpoint_info.endpoint_id.as_bytes());
+                    let inserted = lan.insert(node_id.clone());
+                    if inserted {
+                        tracing::debug!(peer = %node_id, "peer visible on the LAN");
+                    }
+                    inserted
                 }
-            }
-            DiscoveryEvent::Expired { endpoint_id } => {
-                let node_id = hex::encode(endpoint_id.as_bytes());
-                if lan.remove(&node_id) {
-                    tracing::debug!(peer = %node_id, "peer gone from the LAN");
+                DiscoveryEvent::Expired { endpoint_id } => {
+                    let node_id = hex::encode(endpoint_id.as_bytes());
+                    let removed = lan.remove(&node_id);
+                    if removed {
+                        tracing::debug!(peer = %node_id, "peer gone from the LAN");
+                    }
+                    removed
                 }
+                // `#[non_exhaustive]`: an event kind a future crate version
+                // adds is no reason to stop listening — ignored, not fatal.
+                _ => false,
             }
-            // `#[non_exhaustive]`: an event kind a future crate version adds
-            // is no reason to stop listening — ignored, not fatal.
-            _ => {}
+        };
+        if changed {
+            lan_gen.send_modify(|generation| *generation += 1);
         }
     }
 }
@@ -389,6 +423,10 @@ impl PeerTransport for IrohTransport {
             .cloned()
             .collect()
     }
+
+    fn lan_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.lan_gen.subscribe()
+    }
 }
 
 /// A bidirectional iroh stream presented as an `IoStream`. The `Connection` is
@@ -449,6 +487,11 @@ pub struct LazyIrohTransport {
     /// Read once, at the bind — like `relay`, a change requires a Core
     /// restart.
     lan_discovery: bool,
+    /// The LAN generation channel, created HERE so `lan_changes` can hand out
+    /// receivers before the endpoint exists: the sender is given to the inner
+    /// transport at the (lazy) bind, and a receiver taken while still unbound
+    /// simply waits — the sender never drops.
+    lan_gen: tokio::sync::watch::Sender<u64>,
     cell: tokio::sync::OnceCell<IrohTransport>,
     /// Wakes the waiting `accept`s once the endpoint is bound.
     bound: tokio::sync::Notify,
@@ -464,6 +507,7 @@ impl LazyIrohTransport {
             config_dir,
             relay,
             lan_discovery,
+            lan_gen: tokio::sync::watch::channel(0).0,
             cell: tokio::sync::OnceCell::new(),
             bound: tokio::sync::Notify::new(),
         }
@@ -479,9 +523,14 @@ impl LazyIrohTransport {
                 // the Core's instance lock.
                 let seed = universallink_core::load_or_generate_device_seed(&self.config_dir)
                     .map_err(|e| wrap("device identity", format!("{e:#}")))?;
-                let transport = IrohTransport::bind(seed, self.relay.clone(), self.lan_discovery)
-                    .await
-                    .map_err(|e| wrap("binding the iroh endpoint", format!("{e:#}")))?;
+                let transport = IrohTransport::bind_with_gen(
+                    seed,
+                    self.relay.clone(),
+                    self.lan_discovery,
+                    self.lan_gen.clone(),
+                )
+                .await
+                .map_err(|e| wrap("binding the iroh endpoint", format!("{e:#}")))?;
                 tracing::info!(
                     node_id = %transport.endpoint.id().fmt_short(),
                     "iroh data plane bound"
@@ -556,5 +605,11 @@ impl PeerTransport for LazyIrohTransport {
             .get()
             .map(PeerTransport::lan_peers)
             .unwrap_or_default()
+    }
+
+    fn lan_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        // Our own channel — the same sender the inner transport bumps once
+        // bound, so a receiver taken now fires later without rewiring.
+        self.lan_gen.subscribe()
     }
 }

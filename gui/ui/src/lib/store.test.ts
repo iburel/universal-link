@@ -27,6 +27,8 @@ const SELF: Device = {
   name: "PC-Core",
   platform: "linux",
   online: true,
+  lan: false,
+  reachable: true,
   last_seen: null,
   is_self: true,
 };
@@ -35,6 +37,8 @@ const MAC: Device = {
   name: "MacBook",
   platform: "macos",
   online: false,
+  lan: false,
+  reachable: false,
   last_seen: "2026-07-09T10:00:00Z",
   is_self: false,
 };
@@ -43,6 +47,8 @@ const WIN: Device = {
   name: "Living Room PC",
   platform: "windows",
   online: true,
+  lan: false,
+  reachable: true,
   last_seen: null,
   is_self: false,
 };

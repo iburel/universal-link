@@ -31,6 +31,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   server, as before. Logging out forgets the list. What still needs the
   server: signing in, adding or revoking a device, and reaching machines
   beyond your own network.
+- **And you can see it.** A machine this one hears nearby is badged *"on this
+  network"* in the app — presence the machine observes itself, no server
+  involved — and stays a live drop target and a right-click destination when
+  the internet is down, appearing and disappearing as it comes and goes. The
+  context menu used to empty itself the moment the server link dropped;
+  now what remains is exactly what is still in the room.
 
 ### Fixed
 

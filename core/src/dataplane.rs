@@ -126,6 +126,17 @@ pub trait PeerTransport: Send + Sync + std::fmt::Debug {
         Vec::new()
     }
 
+    /// Wakes whenever the set of LAN-visible endpoints may have changed. The
+    /// value is a generation counter and carries no payload: the watcher
+    /// re-pulls `lan_peers` on each wakeup, so a coalesced or spurious wakeup
+    /// costs one empty diff, never a missed peer. Default: a receiver whose
+    /// sender is already gone — `changed()` errors at once and the presence
+    /// task ends, because a transport without LAN discovery has nothing to
+    /// watch.
+    fn lan_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        tokio::sync::watch::channel(0).1
+    }
+
     /// Closes the transport cleanly — at process shutdown, not at the drop of
     /// the Core. Default: nothing (the in-memory pipe has nothing to close);
     /// the iroh impl closes its endpoint, without which peers wait for a
@@ -238,6 +249,60 @@ pub(crate) async fn serve(state: Arc<AppState>) {
             // Reap as we go, so the set does not keep handles to finished tasks
             // until the next incoming stream.
             Some(_) = handlers.join_next(), if !handlers.is_empty() => {}
+        }
+    }
+}
+
+/// The presence half of LAN discovery: whenever the set of LAN-visible
+/// endpoints changes, every AFFECTED device record is re-announced on the
+/// `devices` topic as `device.updated`, freshly enriched (`lan`, `reachable`) —
+/// so the menu and the GUI follow the local network without polling, server
+/// connected or not. Runs for the life of the Core; ends by itself on a
+/// transport without LAN discovery (its `lan_changes` errors immediately).
+pub(crate) async fn watch_lan_presence(state: Arc<AppState>) {
+    let mut changes = state.transport.lan_changes();
+    let mut prev: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    loop {
+        // Applied BEFORE the first wait too: peers heard between the transport
+        // binding and this task starting are not missed.
+        let lan: std::collections::BTreeSet<String> =
+            state.transport.lan_peers().into_iter().collect();
+        let flipped: Vec<String> = prev.symmetric_difference(&lan).cloned().collect();
+        if !flipped.is_empty() {
+            let s = state.session.lock().expect("lock session");
+            let server_connected = s.server_connected;
+            let own = s.own_device_id.clone();
+            if let Some(devices) = s.devices.as_ref() {
+                for record in devices.values() {
+                    let visibility_flipped = record
+                        .get("node_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|node_id| flipped.iter().any(|f| f == node_id));
+                    if !visibility_flipped {
+                        continue;
+                    }
+                    let params = json!({
+                        "device": crate::state::enrich_device(
+                            record,
+                            own.as_deref(),
+                            server_connected,
+                            &lan,
+                        )
+                    });
+                    // Under the session lock (order: session then registry),
+                    // like every devices broadcast: a device.removed cannot
+                    // interleave here and be resurrected by this update.
+                    state.registry.lock().expect("lock registry").notify_topic(
+                        "devices",
+                        "device.updated",
+                        &params,
+                    );
+                }
+            }
+        }
+        prev = lan;
+        if changes.changed().await.is_err() {
+            return;
         }
     }
 }

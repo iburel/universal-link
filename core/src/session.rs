@@ -594,8 +594,12 @@ fn apply_event(state: &Arc<AppState>, method: &str, params: &Value) {
         return;
     }
     let relayed = {
+        // Transport snapshot BEFORE the session lock (lock ordering).
+        let lan: std::collections::BTreeSet<String> =
+            state.transport.lan_peers().into_iter().collect();
         let mut s = state.session.lock().expect("lock session");
         let own = s.own_device_id.clone();
+        let server_connected = s.server_connected;
         let Some(devices) = &mut s.devices else {
             return;
         };
@@ -608,19 +612,26 @@ fn apply_event(state: &Arc<AppState>, method: &str, params: &Value) {
                     return;
                 };
                 devices.insert(id.to_string(), record.clone());
-                json!({ "device": enrich_device(record, own.as_deref()) })
+                json!({ "device": enrich_device(record, own.as_deref(), server_connected, &lan) })
             }
             "device.offline" => {
                 let Some(id) = params.get("device_id").and_then(Value::as_str) else {
                     return;
                 };
+                let mut relayed = params.clone();
                 if let Some(record) = devices.get_mut(id) {
                     record["online"] = json!(false);
                     if let Some(seen) = params.get("last_seen") {
                         record["last_seen"] = seen.clone();
                     }
+                    // The full record rides along (additive): `reachable` is
+                    // derived state, and a consumer that only patched `online`
+                    // would keep offering a peer whose freshness just died —
+                    // or stop offering one the LAN still hears.
+                    relayed["device"] =
+                        enrich_device(record, own.as_deref(), server_connected, &lan);
                 }
-                params.clone()
+                relayed
             }
             "device.removed" => {
                 let Some(id) = params.get("device_id").and_then(Value::as_str) else {

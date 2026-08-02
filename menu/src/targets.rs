@@ -21,7 +21,6 @@ use crate::surface::Target;
 pub struct Directory {
     devices: BTreeMap<String, Value>,
     logged_in: bool,
-    server_connected: bool,
     holds_account_key: bool,
 }
 
@@ -40,11 +39,12 @@ impl Directory {
     }
 
     /// Applies a `session.status` result or a `session.changed` payload.
-    /// `session.changed` may omit `configured`; it never omits the two fields
-    /// read here.
+    /// `server_connected` is deliberately NOT read: per-device `reachable`
+    /// already accounts for it (the Core computes it at serve time), and every
+    /// `session.changed` triggers a resnapshot which refreshes those flags —
+    /// so the LAN keeps its targets when the server link drops.
     pub fn apply_session(&mut self, payload: &Value) {
         self.logged_in = payload["logged_in"].as_bool().unwrap_or(false);
-        self.server_connected = payload["server_connected"].as_bool().unwrap_or(false);
     }
 
     /// Applies an `account.status` result: whether THIS device holds the account
@@ -69,20 +69,23 @@ impl Directory {
                     None => false,
                 }
             }
-            // `device.offline { device_id, last_seen }` — the id only, so the
-            // record we hold is patched rather than replaced. A device we have
-            // never seen is NOT invented from an offline event: an entry with no
-            // name or platform would be a target we cannot even label, and the
-            // next snapshot is authoritative anyway.
-            //
-            // Only `online` is patched. The relay dies with the connection
-            // server-side too, but clearing it here would be unobservable: an
-            // offline device is already excluded, and any later event that could
-            // bring it back carries a WHOLE record which replaces this one.
+            // `device.offline { device_id, last_seen, device? }` — the Core
+            // now sends the whole re-enriched record along (its `reachable`
+            // accounts for a LAN the device may still be on), and a record we
+            // hold is replaced by it. The id-only fallback (an older Core)
+            // patches what it can: `online` off, and `reachable` down to what
+            // the LAN alone justified — keeping it as-was would keep offering
+            // a peer whose freshness just died. A device we have never seen is
+            // NOT invented from an offline event: an entry with no name or
+            // platform would be a target we cannot even label, and the next
+            // snapshot is authoritative anyway.
             "device.offline" => match params["device_id"].as_str() {
                 Some(id) => {
-                    if let Some(record) = self.devices.get_mut(id) {
+                    if let Some(full) = params.get("device").filter(|d| device_id(d).is_some()) {
+                        self.devices.insert(id.to_string(), full.clone());
+                    } else if let Some(record) = self.devices.get_mut(id) {
                         record["online"] = Value::Bool(false);
+                        record["reachable"] = Value::Bool(record["lan"].as_bool().unwrap_or(false));
                     }
                     true
                 }
@@ -104,20 +107,20 @@ impl Directory {
     /// Fail-closed, and every exclusion is a decision, not an accident. The rule
     /// behind all of them: offer only what a click could actually reach, because
     /// a menu entry that always fails is worse than no entry.
-    /// - **no session, or no server connection** → nothing at all. The directory
-    ///   cache outlives the connection (the Core serves it offline), so its
-    ///   `online` flags go stale the moment the link drops: offering them would
-    ///   be offering sends that cannot start.
+    /// - **no session** → nothing at all.
     /// - **we do not hold the account key** → nothing at all. The Core resolves
     ///   every peer against our own account root, so without it `files.send`
     ///   answers `DEVICE_UNKNOWN` for EVERY device — a full menu of dead entries
     ///   on a device that is logged in but has not joined the account yet.
     /// - **`is_self`** → we are not a destination for ourselves.
-    /// - **not `online`** → `files.send` answers `DEVICE_OFFLINE`.
-    /// - **no `relay_url`** → also `DEVICE_OFFLINE`. Coming online and publishing
-    ///   a relay are two separate steps (`auth.authenticate` carries none, and the
-    ///   server clears it when a connection closes), so there is a real window in
-    ///   which a peer is `online` and unreachable.
+    /// - **not `reachable`** → `files.send` answers `DEVICE_OFFLINE`. The Core
+    ///   derives this ONE flag from everything presence-shaped — server `online`
+    ///   only while the link feeding it is up, a published relay, and the
+    ///   machines the local network itself can hear (mDNS, first-hand and alive
+    ///   without any server) — precisely so this component never re-assembles
+    ///   presence from parts that go stale at different times. It is also why a
+    ///   dropped server link no longer empties the menu: the entries that remain
+    ///   are the ones in the same room.
     /// - **`android`** → the phone receives into app-private storage that nothing
     ///   yet opens, so a file sent there is a file lost (decision, 2026-07-27).
     /// - **no `attestation`** → `files.send` answers `DEVICE_UNKNOWN`. We check
@@ -127,7 +130,7 @@ impl Directory {
     ///   cleanly at the Core — the divergent-account case the GUI's onboarding
     ///   already guards against.
     pub fn targets(&self) -> Vec<Target> {
-        if !self.logged_in || !self.server_connected || !self.holds_account_key {
+        if !self.logged_in || !self.holds_account_key {
             return Vec::new();
         }
         let mut targets: Vec<Target> = self
@@ -159,11 +162,10 @@ fn device_id(record: &Value) -> Option<&str> {
 
 fn is_offerable(d: &Value) -> bool {
     device_id(d).is_some()
-        && d["online"].as_bool().unwrap_or(false)
+        && d["reachable"].as_bool().unwrap_or(false)
         && !d["is_self"].as_bool().unwrap_or(false)
         && d["platform"].as_str() != Some("android")
         && non_empty(&d["attestation"])
-        && non_empty(&d["relay_url"])
 }
 
 fn non_empty(v: &Value) -> bool {
@@ -186,7 +188,9 @@ mod tests {
 
     use super::*;
 
-    /// An online, attested peer — the shape `devices.list` really serves.
+    /// An online, attested, reachable peer — the shape `devices.list` really
+    /// serves (`lan` and `reachable` are the Core's derivation; this component
+    /// only ever READS `reachable`).
     fn peer(id: &str, name: &str, platform: &str) -> Value {
         json!({
             "device_id": id,
@@ -196,6 +200,8 @@ mod tests {
             "relay_url": "https://relay.example/",
             "attestation": "beef",
             "online": true,
+            "lan": false,
+            "reachable": true,
             "status": null,
             "last_seen": "2026-07-27T00:00:00Z",
             "is_self": false,
@@ -204,7 +210,7 @@ mod tests {
 
     fn live(list: &[Value]) -> Directory {
         let mut dir = Directory::new();
-        dir.apply_session(&json!({ "logged_in": true, "server_connected": true }));
+        dir.apply_session(&json!({ "logged_in": true }));
         dir.apply_account(&json!({ "attested": true }));
         dir.replace_all(list);
         dir
@@ -229,8 +235,11 @@ mod tests {
 
     #[test]
     fn every_exclusion_rule_removes_its_device() {
-        let mut offline = peer("d_off", "Offline", "linux");
-        offline["online"] = json!(false);
+        // Unreachable, whatever the Core's reason (server-offline, no relay
+        // published yet, link down and off the LAN): ONE flag says so.
+        let mut unreachable = peer("d_off", "Unreachable", "linux");
+        unreachable["online"] = json!(false);
+        unreachable["reachable"] = json!(false);
         let mut myself = peer("d_self", "Me", "linux");
         myself["is_self"] = json!(true);
         let phone = peer("d_phone", "Phone", "android");
@@ -238,22 +247,30 @@ mod tests {
         bare["attestation"] = Value::Null;
         let mut blank = peer("d_blank", "Blank attestation", "linux");
         blank["attestation"] = json!("   ");
-        // Online but with no relay published yet: `files.send` would answer
-        // DEVICE_OFFLINE. A real window — authenticating and publishing a relay
-        // are two separate steps.
-        let mut relayless = peer("d_norelay", "No relay yet", "linux");
-        relayless["relay_url"] = Value::Null;
 
         let dir = live(&[
-            offline,
+            unreachable,
             myself,
             phone,
             bare,
             blank,
-            relayless,
             peer("d_ok", "Keeper", "windows"),
         ]);
         assert_eq!(ids(&dir), ["d_ok"]);
+    }
+
+    /// The LAN case: a machine the server has never marked online — or that has
+    /// no relay at all — is offered while the local network hears it. This is
+    /// what keeps the menu alive with the internet down.
+    #[test]
+    fn a_lan_reachable_peer_is_a_target_without_the_server() {
+        let mut neighbor = peer("d_lan", "Same room", "linux");
+        neighbor["online"] = json!(false);
+        neighbor["relay_url"] = Value::Null;
+        neighbor["lan"] = json!(true);
+        neighbor["reachable"] = json!(true);
+        let dir = live(&[neighbor]);
+        assert_eq!(ids(&dir), ["d_lan"]);
     }
 
     /// The Core resolves every peer against OUR account root: without it every
@@ -277,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn nothing_is_offered_without_a_session_or_a_server() {
+    fn nothing_is_offered_without_a_session() {
         let devices = [peer("d_1", "PC-B", "linux")];
 
         let mut dir = Directory::new();
@@ -286,12 +303,10 @@ mod tests {
         // Never snapshotted a session: fail-closed.
         assert!(dir.targets().is_empty());
 
-        // Logged in but the server link is down: the `online` flags we hold are
-        // last-known, not current.
+        // The server link is NOT a global gate anymore: `reachable` carries it
+        // per device (and every session.changed triggers the resnapshot that
+        // refreshes those flags), so a LAN neighbor survives a dead link.
         dir.apply_session(&json!({ "logged_in": true, "server_connected": false }));
-        assert!(dir.targets().is_empty());
-
-        dir.apply_session(&json!({ "logged_in": true, "server_connected": true }));
         assert_eq!(ids(&dir), ["d_1"]);
 
         // A logout empties the menu even though the cache still holds the peer.
@@ -310,7 +325,8 @@ mod tests {
         ));
         assert_eq!(ids(&dir), ["d_1"]);
 
-        // Offline carries the id alone: the held record is patched.
+        // Offline from an older Core carries the id alone: the held record is
+        // patched, and `reachable` falls back to what the LAN justified.
         assert!(dir.apply_device_event(
             "device.offline",
             &json!({ "device_id": "d_1", "last_seen": "2026-07-27T00:00:00Z" })
@@ -348,8 +364,8 @@ mod tests {
     }
 
     /// A device that comes back online BEFORE publishing a relay is still not
-    /// offerable — the record replaces ours wholesale, relay included, so there is
-    /// nothing stale to inherit and nothing to offer yet.
+    /// offerable — the Core says so through `reachable`, and the record
+    /// replaces ours wholesale, so there is nothing stale to inherit.
     #[test]
     fn coming_back_online_without_a_relay_is_not_yet_a_target() {
         let mut dir = live(&[peer("d_1", "A", "linux")]);
@@ -360,6 +376,7 @@ mod tests {
 
         let mut back = peer("d_1", "A", "linux");
         back["relay_url"] = Value::Null;
+        back["reachable"] = json!(false);
         dir.apply_device_event("device.online", &json!({ "device": back }));
         assert!(dir.targets().is_empty(), "online but unreachable");
 
@@ -369,6 +386,32 @@ mod tests {
             &json!({ "device": peer("d_1", "A", "linux") }),
         );
         assert_eq!(ids(&dir), ["d_1"]);
+    }
+
+    /// The Core's `device.offline` now ships the re-enriched record: a machine
+    /// that left the SERVER but is still heard in the room stays a target.
+    #[test]
+    fn an_offline_event_with_a_lan_record_keeps_the_target() {
+        let mut dir = live(&[peer("d_1", "A", "linux")]);
+        let mut still_here = peer("d_1", "A", "linux");
+        still_here["online"] = json!(false);
+        still_here["lan"] = json!(true);
+        still_here["reachable"] = json!(true);
+        assert!(dir.apply_device_event(
+            "device.offline",
+            &json!({ "device_id": "d_1", "device": still_here })
+        ));
+        assert_eq!(ids(&dir), ["d_1"], "left the server, not the room");
+
+        // And the same event carrying an unreachable record removes it.
+        let mut gone = peer("d_1", "A", "linux");
+        gone["online"] = json!(false);
+        gone["reachable"] = json!(false);
+        assert!(dir.apply_device_event(
+            "device.offline",
+            &json!({ "device_id": "d_1", "device": gone })
+        ));
+        assert!(dir.targets().is_empty());
     }
 
     #[test]

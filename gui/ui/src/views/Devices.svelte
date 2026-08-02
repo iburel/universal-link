@@ -86,18 +86,22 @@
   }
 
   function seen(device: Device): string | null {
-    return device.online ? null : relativeTime(device.last_seen, now);
+    return device.reachable ? null : relativeTime(device.last_seen, now);
   }
 
   /**
    * "Windows · this PC · online". Joined here rather than woven out of `{#if}`
    * blocks in the markup: Svelte trims the whitespace at a block's edges, so
    * that spelling lost the space BEFORE each separator ("Windows· this PC").
+   *
+   * Presence is the Core's `reachable` verdict; "on this network" names the
+   * machines this one hears itself (mDNS) — the ones that keep working when
+   * the internet does not.
    */
   function meta(device: Device): string {
     const parts = [platformLabel(device.platform)];
     if (device.is_self) parts.push(selfLabel(device.platform));
-    if (device.online) parts.push("online");
+    if (device.reachable) parts.push(device.lan ? "on this network" : "online");
     else {
       const last = seen(device);
       if (last) parts.push(`last seen ${last}`);
@@ -138,7 +142,7 @@
           <div class="row">
             <span
               class="dot"
-              class:online={device.online}
+              class:online={device.reachable}
               aria-hidden="true"
             ></span>
 

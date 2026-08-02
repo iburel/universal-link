@@ -773,13 +773,20 @@ impl Conn {
     /// is nothing honest to serve: `SERVER_UNREACHABLE`.
     fn devices_list(&self) -> Result<Value, RpcErr> {
         self.require_scope("devices.read")?;
+        // Transport snapshot BEFORE the session lock (lock ordering: the
+        // transport has a lock of its own).
+        let lan: std::collections::BTreeSet<String> =
+            self.state.transport.lan_peers().into_iter().collect();
         let s = self.state.session.lock().expect("lock session");
         let Some(devices) = &s.devices else {
             return Err(RpcErr::app("SERVER_UNREACHABLE"));
         };
         let own = s.own_device_id.as_deref();
         Ok(Value::Array(
-            devices.values().map(|d| enrich_device(d, own)).collect(),
+            devices
+                .values()
+                .map(|d| enrich_device(d, own, s.server_connected, &lan))
+                .collect(),
         ))
     }
 
@@ -800,9 +807,16 @@ impl Conn {
         .await?;
 
         let enriched = {
+            let lan: std::collections::BTreeSet<String> =
+                self.state.transport.lan_peers().into_iter().collect();
             let s = self.state.session.lock().expect("lock session");
             let record = result.get("device").cloned().unwrap_or(Value::Null);
-            enrich_device(&record, s.own_device_id.as_deref())
+            enrich_device(
+                &record,
+                s.own_device_id.as_deref(),
+                s.server_connected,
+                &lan,
+            )
         };
         Ok(json!({ "device": enriched }))
     }

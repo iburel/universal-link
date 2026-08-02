@@ -33,6 +33,9 @@ struct Route {
     /// and dialable with no relay — the double of a real endpoint whose mDNS
     /// discovery is on.
     on_lan: bool,
+    /// This endpoint's LAN generation sender: bumped when ANY membership
+    /// changes, because anyone's join or leave may change what this one sees.
+    lan_gen: tokio::sync::watch::Sender<u64>,
     tx: mpsc::UnboundedSender<Wire>,
 }
 
@@ -62,17 +65,20 @@ impl MemorySwitchboard {
     ) -> Arc<MemoryTransport> {
         let node_id = node_id.into();
         let (tx, rx) = mpsc::unbounded_channel();
+        let lan_gen = tokio::sync::watch::channel(0).0;
         self.routes.lock().unwrap().insert(
             node_id.clone(),
             Route {
                 relay_url: relay_url.clone(),
                 on_lan: false,
+                lan_gen: lan_gen.clone(),
                 tx,
             },
         );
         Arc::new(MemoryTransport {
             node_id,
             relay_url,
+            lan_gen,
             switchboard: self.clone(),
             inbox: tokio::sync::Mutex::new(rx),
         })
@@ -84,29 +90,36 @@ impl MemorySwitchboard {
     /// bundled like the real `lan_discovery` flag. An unknown `node_id` is a
     /// test bug, so it panics.
     pub fn join_lan(&self, node_id: &str) {
-        self.routes
-            .lock()
-            .unwrap()
-            .get_mut(node_id)
-            .expect("join_lan: node_id unknown to the switchboard")
-            .on_lan = true;
+        self.set_lan(node_id, true, "join_lan");
     }
 
     /// Takes a device off the fake LAN (moved away, radio turned off): it
     /// stops being visible and LAN-dialable, its relay — if any — remains.
     pub fn leave_lan(&self, node_id: &str) {
-        self.routes
-            .lock()
-            .unwrap()
+        self.set_lan(node_id, false, "leave_lan");
+    }
+
+    fn set_lan(&self, node_id: &str, on_lan: bool, what: &str) {
+        let mut routes = self.routes.lock().unwrap();
+        let route = routes
             .get_mut(node_id)
-            .expect("leave_lan: node_id unknown to the switchboard")
-            .on_lan = false;
+            .unwrap_or_else(|| panic!("{what}: node_id unknown to the switchboard"));
+        if route.on_lan == on_lan {
+            return;
+        }
+        route.on_lan = on_lan;
+        // Everyone's view may have changed: wake every member's watcher —
+        // like a real mDNS announcement, heard by the whole network.
+        for route in routes.values() {
+            route.lan_gen.send_modify(|generation| *generation += 1);
+        }
     }
 }
 
 pub struct MemoryTransport {
     node_id: String,
     relay_url: Option<String>,
+    lan_gen: tokio::sync::watch::Sender<u64>,
     switchboard: MemorySwitchboard,
     inbox: tokio::sync::Mutex<mpsc::UnboundedReceiver<Wire>>,
 }
@@ -193,5 +206,9 @@ impl PeerTransport for MemoryTransport {
             .filter(|(id, route)| route.on_lan && id.as_str() != self.node_id)
             .map(|(id, _)| id.clone())
             .collect()
+    }
+
+    fn lan_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.lan_gen.subscribe()
     }
 }

@@ -599,11 +599,20 @@ export class CoreStore {
         const p = params as {
           device_id?: string;
           last_seen?: string | null;
+          device?: Device;
         } | null;
+        // The Core ships the re-enriched record along (its `reachable`
+        // accounts for a LAN the device may still be on): prefer it whole.
+        if (p?.device?.device_id) {
+          this.#upsertDevice(p.device);
+          return false;
+        }
         // The Core relays the event even for a device missing from its cache.
         const device = this.devices.find((d) => d.device_id === p?.device_id);
         if (!device) return false;
         device.online = false;
+        // Without the record, keep only what the LAN alone justified.
+        device.reachable = device.lan;
         if (p?.last_seen !== undefined) device.last_seen = p.last_seen;
         return false;
       }
@@ -1178,14 +1187,14 @@ export class CoreStore {
   // tracking state comes only from the `transfer.*` notifications.
 
   /**
-   * `device_id` if it is an eligible send target — online and not this PC —
-   * otherwise `null`. The drop hit-test finds some card; this is where we
-   * decide whether it can receive.
+   * `device_id` if it is an eligible send target — reachable (server presence
+   * or the local network) and not this PC — otherwise `null`. The drop
+   * hit-test finds some card; this is where we decide whether it can receive.
    */
   targetFor(device_id: string | null): string | null {
     if (!device_id) return null;
     const device = this.devices.find((d) => d.device_id === device_id);
-    return device && device.online && !device.is_self ? device_id : null;
+    return device && device.reachable && !device.is_self ? device_id : null;
   }
 
   /**

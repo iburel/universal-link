@@ -59,20 +59,24 @@ test("a device names itself after what it is", () => {
   expect(selfLabel("haiku")).toBe("this PC");
 });
 
-test("sortDevices: this PC, then the connected ones, then by name", () => {
+test("sortDevices: this PC, then the reachable ones, then by name", () => {
   const device = (over: Partial<Device>): Device => ({
     device_id: over.name ?? "d",
     name: "x",
     platform: "linux",
     online: false,
+    lan: false,
+    reachable: false,
     is_self: false,
     ...over,
   });
   const devices = [
-    device({ name: "Zephyr", online: true }),
+    device({ name: "Zephyr", online: true, reachable: true }),
     device({ name: "Alpha" }),
     device({ name: "Me", is_self: true }),
-    device({ name: "Beta", online: true }),
+    // Reachable through the LAN alone (no server presence): rises just the
+    // same — the Core's verdict is the sort key, not the server's flag.
+    device({ name: "Beta", lan: true, reachable: true }),
   ];
 
   expect(sortDevices(devices).map((d) => d.name)).toEqual([
