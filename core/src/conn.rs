@@ -626,7 +626,9 @@ impl Conn {
             }
             let (payload, abort) = s.forget();
             crate::session::remove_session_file(&self.state.config_dir);
-            // The refresh token belonged to this session: it leaves with it.
+            // The cached directory and the refresh token belonged to this
+            // session: they leave with it.
+            crate::directory::remove(&self.state.config_dir);
             self.state.secrets.delete(crate::secrets::REFRESH_TOKEN);
             // Broadcast under the session lock (order: session then registry):
             // the order of notifications is the order of transitions — the
@@ -771,13 +773,20 @@ impl Conn {
     /// is nothing honest to serve: `SERVER_UNREACHABLE`.
     fn devices_list(&self) -> Result<Value, RpcErr> {
         self.require_scope("devices.read")?;
+        // Transport snapshot BEFORE the session lock (lock ordering: the
+        // transport has a lock of its own).
+        let lan: std::collections::BTreeSet<String> =
+            self.state.transport.lan_peers().into_iter().collect();
         let s = self.state.session.lock().expect("lock session");
         let Some(devices) = &s.devices else {
             return Err(RpcErr::app("SERVER_UNREACHABLE"));
         };
         let own = s.own_device_id.as_deref();
         Ok(Value::Array(
-            devices.values().map(|d| enrich_device(d, own)).collect(),
+            devices
+                .values()
+                .map(|d| enrich_device(d, own, s.server_connected, &lan))
+                .collect(),
         ))
     }
 
@@ -798,9 +807,16 @@ impl Conn {
         .await?;
 
         let enriched = {
+            let lan: std::collections::BTreeSet<String> =
+                self.state.transport.lan_peers().into_iter().collect();
             let s = self.state.session.lock().expect("lock session");
             let record = result.get("device").cloned().unwrap_or(Value::Null);
-            enrich_device(&record, s.own_device_id.as_deref())
+            enrich_device(
+                &record,
+                s.own_device_id.as_deref(),
+                s.server_connected,
+                &lan,
+            )
         };
         Ok(json!({ "device": enriched }))
     }
@@ -1130,16 +1146,19 @@ impl Conn {
             (cb.origin_of(&tx_id), cb.is_materialized(&tx_id))
         };
         // A remote clip whose source is no longer reachable (re-enrolled under a
-        // new node_id, or with no published relay) fails fast here — the
-        // control-plane twin of the data channel's `PEER_GONE`. A MATERIALIZED
-        // remote clip is exempt: it is served from the local cache, so the source
-        // need not be reachable — indeed it may already be gone, which is the
-        // whole point of push-at-copy.
+        // new node_id, or with no route to it — no published relay, not seen on
+        // the LAN) fails fast here — the control-plane twin of the data
+        // channel's `PEER_GONE`. A MATERIALIZED remote clip is exempt: it is
+        // served from the local cache, so the source need not be reachable —
+        // indeed it may already be gone, which is the whole point of
+        // push-at-copy.
         if !materialized
             && let Some(crate::clipboard::Origin::Remote { node_id, device_id }) = origin
         {
-            let reachable = crate::dataplane::resolve_peer(&self.state, &device_id)
-                .is_some_and(|p| p.node_id == node_id && p.relay_url.is_some());
+            let reachable =
+                crate::dataplane::resolve_peer(&self.state, &device_id).is_some_and(|p| {
+                    p.node_id == node_id && crate::dataplane::peer_reachable(&self.state, &p)
+                });
             if !reachable {
                 return Err(RpcErr::app("DEVICE_OFFLINE"));
             }

@@ -14,6 +14,7 @@ mod conn;
 mod connector;
 mod datachannel;
 mod dataplane;
+mod directory;
 mod discover;
 mod framing;
 mod http;
@@ -147,6 +148,9 @@ pub struct CoreHandle {
     /// The data plane accept loop (iroh) — alive as long as the Core runs,
     /// `abort()`ed at drop (it holds an `Arc<AppState>`).
     dataplane_task: tokio::task::JoinHandle<()>,
+    /// LAN presence → `device.updated` broadcasts. Same lifecycle as the
+    /// accept loop; already finished on a transport without LAN discovery.
+    lan_presence_task: tokio::task::JoinHandle<()>,
     /// Dropped at `drop` — hence before a restart reclaims the socket.
     _instance: transport::InstanceGuard,
 }
@@ -198,6 +202,7 @@ impl Drop for CoreHandle {
     fn drop(&mut self) {
         self.accept_task.abort();
         self.dataplane_task.abort();
+        self.lan_presence_task.abort();
         // Closes the established IPC connections: a cleanly stopped Core does
         // not leave its components on a mute socket (in a separate process the
         // problem does not exist, in an in-process lib the tasks would leak).
@@ -288,6 +293,13 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
     });
 
     let session_info = session::read_session_file(&config.config_dir);
+    // The directory cache only vouches within a session: logged out, nothing
+    // is served no matter what the disk says. Stale or corrupt loads as
+    // nothing — the Core then starts fail-closed, as it did before the cache.
+    let cached_devices = match &session_info {
+        Some(_) => directory::load(&config.config_dir),
+        None => None,
+    };
     let state = Arc::new(AppState {
         registry: Mutex::new(Registry::new(file_token)),
         session: Mutex::new(SessionState::new(session_info.as_ref())),
@@ -309,6 +321,11 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
         reconnect_base_delay: config.reconnect_base_delay,
         shutdown_request: tokio::sync::Notify::new(),
     });
+    if let Some(devices) = cached_devices {
+        // Seeded before any task exists — no reader can race it. The first
+        // successful session setup replaces it with the live snapshot.
+        state.session.lock().expect("lock session").devices = Some(devices);
+    }
 
     if let Some(info) = session_info {
         start_session_task(&state, info);
@@ -320,12 +337,15 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
     // server session (a peer can open a stream without us being connected to
     // the server, as long as we know its address).
     let dataplane_task = tokio::spawn(dataplane::serve(state.clone()));
+    // LAN presence: relays mDNS visibility changes onto the `devices` topic.
+    let lan_presence_task = tokio::spawn(dataplane::watch_lan_presence(state.clone()));
 
     Ok(CoreHandle {
         ipc_path: config.ipc_path,
         state,
         accept_task,
         dataplane_task,
+        lan_presence_task,
         _instance: instance,
     })
 }

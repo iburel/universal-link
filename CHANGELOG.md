@@ -6,6 +6,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Machines on the same network now find each other directly.** Each desktop
+  announces itself over mDNS (as `universallink`, UDP 5353) and resolves its
+  siblings the same way — and being visible on the local network now *counts as
+  reachable*: sends and the shared clipboard take the local route even for a
+  machine that has no relay at all, and no longer depend on the relay to get
+  started when both ends share a network. The
+  announcement carries the device's public key and addresses, nothing more,
+  and changes nothing about trust: a machine that is not attested on the
+  account is refused exactly as before, and an impostor answering to someone
+  else's identity fails the handshake. `"lan_discovery": false` in
+  `config.json` turns the whole thing off.
+- **Two machines in the same room keep working when the server is
+  unreachable.** Each device now remembers the account's device list
+  (`directory.json` in the config directory), so a machine that starts with no
+  internet still recognizes its siblings and reaches them over the local
+  network — sends and the shared clipboard included. Remembering is not
+  trusting: every use re-verifies each device's attestation against the
+  account key, exactly as with the live list — what the memory can do is keep
+  a *revoked* device recognized until the next server contact, so a snapshot
+  older than **7 days** no longer counts and the machine then waits for the
+  server, as before. Logging out forgets the list. What still needs the
+  server: signing in, adding or revoking a device, and reaching machines
+  beyond your own network.
+- **And you can see it.** A machine this one hears nearby is badged *"on this
+  network"* in the app — presence the machine observes itself, no server
+  involved — and stays a live drop target and a right-click destination when
+  the internet is down, appearing and disappearing as it comes and goes. The
+  context menu used to empty itself the moment the server link dropped;
+  now what remains is exactly what is still in the room.
+
 ### Fixed
 
 - **macOS: clicking the app icon opened nothing.** Not the Dock, not the Finder,

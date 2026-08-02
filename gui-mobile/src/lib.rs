@@ -167,7 +167,11 @@ async fn boot_core(data_dir: &Path) -> anyhow::Result<ClientConfig> {
     let _ = std::fs::remove_file(&ipc_path);
     let receive_dir = data_dir.join("received");
 
-    let transport = Arc::new(LazyIrohTransport::new(data_dir.to_path_buf(), None));
+    // LAN discovery stays OFF on Android: receiving mDNS multicast requires a
+    // `WifiManager.MulticastLock` held from the Java side, which this build
+    // does not take — announcing without hearing the answers would just burn
+    // radio. A later block wires the lock and turns it on.
+    let transport = Arc::new(LazyIrohTransport::new(data_dir.to_path_buf(), None, false));
 
     // How the Core re-reads its config on `session.reload` (after the frontend
     // writes config.json via set_server_config): the SAME parse the daemon

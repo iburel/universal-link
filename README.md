@@ -229,7 +229,8 @@ Core reads it in its config directory (see
   "oidc_client_secret": "only-if-your-IdP-demands-one",
   "device_name": "Living-room laptop",
   "relay_url": "https://your-iroh-relay.example",
-  "receive_dir": "/home/you/Downloads"
+  "receive_dir": "/home/you/Downloads",
+  "lan_discovery": true
 }
 ```
 
@@ -244,6 +245,11 @@ Core reads it in its config directory (see
   relays are used.
 - `receive_dir`: optional — where received files land; without it,
   `<Downloads>/UniversalLink`.
+- `lan_discovery`: optional, default `true` — announce this device and resolve
+  its siblings over mDNS (UDP 5353) so machines on the same network reach each
+  other directly. The broadcast carries the device's public key and addresses,
+  nothing else, and trust is unaffected: an unknown machine is refused exactly
+  as before. Set `false` on networks where even that is too chatty.
 
 Each of the variables `UNIVERSALLINK_SERVER_URL`, `UNIVERSALLINK_OIDC_ISSUER`,
 `UNIVERSALLINK_OIDC_CLIENT_ID`, `UNIVERSALLINK_OIDC_CLIENT_SECRET`,
@@ -419,7 +425,11 @@ The config directory holds `config.json` (written by the setup screen or by you)
 `ipc-token` (0600, regenerated at every startup), `device.key` (0600, the
 device's iroh identity), `account-key.json` (the account's public key + this
 device's attestation, *not a secret*, absent until the device has joined the
-account), and `session.json` (present ⟺ a session is open). What the OS keyring
+account), `session.json` (present ⟺ a session is open), and `directory.json`
+(the last known list of the account's devices, so a machine that starts without
+reaching the server still recognizes its siblings on the local network; every
+use re-verifies the attestations, a snapshot older than 7 days is ignored, and
+it is deleted at logout). What the OS keyring
 holds is the OIDC refresh token and the account's **private** key — kept at rest
 so this device can vouch for the next one it links. `secrets.json` (0600,
 cleartext secrets at rest) only appears as a **fallback**, on a machine where no

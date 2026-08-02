@@ -10,7 +10,13 @@
 //! `EndpointId` IS the `node_id` that the Core publishes in the directory.
 //! Discovery happens through the directory (node_id + relay_url), not through
 //! iroh's DNS — hence `presets::Minimal` (no discovery, just the crypto
-//! provider).
+//! provider). One local complement: with `lan_discovery` (on by default,
+//! `config.json` turns it off), the endpoint also announces itself and
+//! resolves peers over mDNS, so a peer on the same network is reachable by
+//! its `node_id` alone — no relay, no internet. What mDNS resolves is an
+//! ADDRESS, never trust: an impostor announcing someone else's `node_id`
+//! fails the iroh handshake (the connection authenticates the key), and the
+//! Core's directory check (C7) still gates every stream.
 //!
 //! The binary wires in `LazyIrohTransport`: the endpoint is only bound on the
 //! first real use (session establishment calls `home_relay`). Three reasons. A
@@ -23,15 +29,19 @@
 //! next use, the IPC (hence the GUI) stays alive — the same policy as broken
 //! config.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::Context as _;
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, RelayUrl, SecretKey};
+use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
+use n0_future::{Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use universallink_core::{
@@ -69,65 +79,206 @@ pub struct IrohTransport {
     /// The accept task; dies on its own when the endpoint closes, aborted if
     /// the transport is dropped without `close`.
     acceptor: tokio::task::JoinHandle<()>,
+    /// The `node_id`s currently visible over mDNS (hex), maintained by
+    /// `lan_task`. Stays empty forever when LAN discovery is off.
+    lan: Arc<Mutex<HashSet<String>>>,
+    /// Bumped by `lan_task` at every actual set change; `lan_changes`
+    /// subscribes to it. Owned here in the plain case; `bind` also accepts the
+    /// caller's (`LazyIrohTransport` hands over its own, created before the
+    /// endpoint exists, so a receiver taken while lazy still fires once bound).
+    lan_gen: tokio::sync::watch::Sender<u64>,
+    /// Consumes the mDNS discovery events into `lan`. Ends on its own when
+    /// the endpoint closes (the discovery actor dies with its last handle and
+    /// the event stream with it); the abort at drop is a safety net.
+    lan_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for IrohTransport {
     fn drop(&mut self) {
         self.acceptor.abort();
+        if let Some(task) = &self.lan_task {
+            task.abort();
+        }
     }
 }
+
+/// The mDNS service name endpoints announce themselves under
+/// (`<node_id>._universallink._udp.local`). Ours rather than the crate's
+/// default `irohv1`: only UniversalLink devices answer each other, and a
+/// packet capture names the protocol honestly.
+const MDNS_SERVICE: &str = "universallink";
 
 impl IrohTransport {
     /// Production endpoint. `relay`: the deployment's relay (self-hosted) if it
     /// is configured, otherwise the n0 public relays — a server of one's own
     /// must not structurally depend on third-party infra. Certificates
-    /// verified normally, no DNS discovery.
-    pub async fn bind(seed: [u8; 32], relay: Option<RelayUrl>) -> anyhow::Result<IrohTransport> {
+    /// verified normally, no DNS discovery. `lan_discovery` adds the mDNS
+    /// lookup (see the module header) — resolution AND announcement: one flag,
+    /// both directions, because announcing without resolving (or the reverse)
+    /// would just be a device its siblings half-see.
+    pub async fn bind(
+        seed: [u8; 32],
+        relay: Option<RelayUrl>,
+        lan_discovery: bool,
+    ) -> anyhow::Result<IrohTransport> {
+        let (lan_gen, _) = tokio::sync::watch::channel(0);
+        Self::bind_with_gen(seed, relay, lan_discovery, lan_gen).await
+    }
+
+    /// `bind`, with the LAN generation channel supplied by the caller —
+    /// `LazyIrohTransport` needs `lan_changes` to answer BEFORE the endpoint
+    /// exists, so it owns the sender and hands it over at the (lazy) bind.
+    pub async fn bind_with_gen(
+        seed: [u8; 32],
+        relay: Option<RelayUrl>,
+        lan_discovery: bool,
+        lan_gen: tokio::sync::watch::Sender<u64>,
+    ) -> anyhow::Result<IrohTransport> {
+        let secret = SecretKey::from_bytes(&seed);
+        let mdns = lan_lookup(&secret, lan_discovery);
         let relay_mode = match relay {
             Some(url) => RelayMode::custom([url]),
             None => RelayMode::Default,
         };
-        let builder = Endpoint::builder(presets::Minimal)
-            .secret_key(SecretKey::from_bytes(&seed))
+        let mut builder = Endpoint::builder(presets::Minimal)
+            .secret_key(secret)
             .alpns(vec![ALPN.to_vec()])
             .relay_mode(relay_mode);
-        Self::finish(builder).await
+        if let Some(mdns) = &mdns {
+            builder = builder.address_lookup(mdns.clone());
+        }
+        Self::finish(builder, mdns, lan_gen).await
     }
 
     /// Test endpoint: a LOCAL relay (self-signed certificate) whose
     /// verification we skip, and the portmapper turned off (no UPnP/PCP/NAT-PMP
     /// probes to the test machine's gateway — the tests declare themselves
-    /// offline, and they are). Gated by the `test-utils` feature (enabled by
-    /// the dev-dependencies only): the unverified TLS path DOES NOT EXIST in
-    /// the production binary — the compiler guarantees it, not a convention.
+    /// offline, and they are). `lan_discovery` as in `bind` — with an EMPTY
+    /// relay map it is the only route between two test endpoints, which is
+    /// exactly what the LAN test proves. Gated by the `test-utils` feature
+    /// (enabled by the dev-dependencies only): the unverified TLS path DOES
+    /// NOT EXIST in the production binary — the compiler guarantees it, not a
+    /// convention.
     #[cfg(feature = "test-utils")]
     pub async fn bind_test(
         seed: [u8; 32],
         relay_map: iroh::RelayMap,
+        lan_discovery: bool,
     ) -> anyhow::Result<IrohTransport> {
-        let builder = Endpoint::builder(presets::Minimal)
-            .secret_key(SecretKey::from_bytes(&seed))
+        let secret = SecretKey::from_bytes(&seed);
+        let mdns = lan_lookup(&secret, lan_discovery);
+        let mut builder = Endpoint::builder(presets::Minimal)
+            .secret_key(secret)
             .alpns(vec![ALPN.to_vec()])
             .relay_mode(RelayMode::Custom(relay_map))
             .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
             .ca_tls_config(iroh::tls::CaTlsConfig::insecure_skip_verify());
-        Self::finish(builder).await
+        if let Some(mdns) = &mdns {
+            builder = builder.address_lookup(mdns.clone());
+        }
+        let (lan_gen, _) = tokio::sync::watch::channel(0);
+        Self::finish(builder, mdns, lan_gen).await
     }
 
-    async fn finish(builder: iroh::endpoint::Builder) -> anyhow::Result<IrohTransport> {
+    async fn finish(
+        builder: iroh::endpoint::Builder,
+        mdns: Option<MdnsAddressLookup>,
+        lan_gen: tokio::sync::watch::Sender<u64>,
+    ) -> anyhow::Result<IrohTransport> {
+        // Subscribed BEFORE the endpoint binds: the discovery actor is already
+        // running (it starts with the lookup), so waiting until after `bind`
+        // would let a first announcement slip through unheard — and the actor
+        // deduplicates republishes, so a missed first hello is missed for
+        // good. (A residual window remains inside the crate itself: a peer
+        // whose very first announcement lands while a resolution for it is in
+        // flight is recorded but not surfaced to subscribers. Its consequence
+        // is only ever conservative — the peer is not counted as LAN-visible,
+        // and the relay route still stands.)
+        let lan_events = match &mdns {
+            Some(mdns) => Some(mdns.subscribe().await),
+            None => None,
+        };
         let endpoint = builder.bind().await.context("binding the iroh endpoint")?;
         let (tx, rx) = mpsc::channel(READY_QUEUE);
         let acceptor = tokio::spawn(acceptor(endpoint.clone(), tx));
+        let lan = Arc::new(Mutex::new(HashSet::new()));
+        let lan_task =
+            lan_events.map(|events| tokio::spawn(watch_lan(events, lan.clone(), lan_gen.clone())));
         Ok(IrohTransport {
             endpoint,
             ready: tokio::sync::Mutex::new(rx),
             acceptor,
+            lan,
+            lan_gen,
+            lan_task,
         })
     }
 
     /// The underlying endpoint (local address, `online()`, for tests).
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
+    }
+}
+
+/// The mDNS lookup when `lan_discovery` is on, built ahead of the endpoint
+/// (it only needs the public key) so a handle survives for `subscribe`. A
+/// network where multicast cannot start at all (neither IPv4 nor IPv6) costs
+/// the LAN route, never the data plane: warned, not fatal — the relay still
+/// works, and `LazyIrohTransport` would otherwise retry a doomed bind forever.
+fn lan_lookup(secret: &SecretKey, lan_discovery: bool) -> Option<MdnsAddressLookup> {
+    if !lan_discovery {
+        return None;
+    }
+    match MdnsAddressLookup::builder()
+        .service_name(MDNS_SERVICE)
+        .build(secret.public())
+    {
+        Ok(mdns) => Some(mdns),
+        Err(e) => {
+            tracing::warn!(error = %e, "LAN discovery unavailable: continuing without it");
+            None
+        }
+    }
+}
+
+/// Maintains the set of LAN-visible `node_id`s from the discovery events.
+/// Exactly two event kinds: a peer heard (or updated) enters the set, an
+/// expired one (silent beyond its TTL) leaves it. Ends with the stream.
+async fn watch_lan(
+    mut events: impl Stream<Item = DiscoveryEvent> + Unpin,
+    lan: Arc<Mutex<HashSet<String>>>,
+    lan_gen: tokio::sync::watch::Sender<u64>,
+) {
+    while let Some(event) = events.next().await {
+        // Mutate, release, THEN bump: a watcher woken by the bump re-pulls
+        // the set, so it must never observe the pre-mutation state.
+        let changed = {
+            let mut lan = lan.lock().expect("lock lan set");
+            match event {
+                DiscoveryEvent::Discovered { endpoint_info, .. } => {
+                    let node_id = hex::encode(endpoint_info.endpoint_id.as_bytes());
+                    let inserted = lan.insert(node_id.clone());
+                    if inserted {
+                        tracing::debug!(peer = %node_id, "peer visible on the LAN");
+                    }
+                    inserted
+                }
+                DiscoveryEvent::Expired { endpoint_id } => {
+                    let node_id = hex::encode(endpoint_id.as_bytes());
+                    let removed = lan.remove(&node_id);
+                    if removed {
+                        tracing::debug!(peer = %node_id, "peer gone from the LAN");
+                    }
+                    removed
+                }
+                // `#[non_exhaustive]`: an event kind a future crate version
+                // adds is no reason to stop listening — ignored, not fatal.
+                _ => false,
+            }
+        };
+        if changed {
+            lan_gen.send_modify(|generation| *generation += 1);
+        }
     }
 }
 
@@ -263,6 +414,19 @@ impl PeerTransport for IrohTransport {
             }
         })
     }
+
+    fn lan_peers(&self) -> Vec<String> {
+        self.lan
+            .lock()
+            .expect("lock lan set")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    fn lan_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.lan_gen.subscribe()
+    }
 }
 
 /// A bidirectional iroh stream presented as an `IoStream`. The `Connection` is
@@ -320,16 +484,30 @@ impl AsyncWrite for BiStream {
 pub struct LazyIrohTransport {
     config_dir: PathBuf,
     relay: Option<RelayUrl>,
+    /// Read once, at the bind — like `relay`, a change requires a Core
+    /// restart.
+    lan_discovery: bool,
+    /// The LAN generation channel, created HERE so `lan_changes` can hand out
+    /// receivers before the endpoint exists: the sender is given to the inner
+    /// transport at the (lazy) bind, and a receiver taken while still unbound
+    /// simply waits — the sender never drops.
+    lan_gen: tokio::sync::watch::Sender<u64>,
     cell: tokio::sync::OnceCell<IrohTransport>,
     /// Wakes the waiting `accept`s once the endpoint is bound.
     bound: tokio::sync::Notify,
 }
 
 impl LazyIrohTransport {
-    pub fn new(config_dir: PathBuf, relay: Option<RelayUrl>) -> LazyIrohTransport {
+    pub fn new(
+        config_dir: PathBuf,
+        relay: Option<RelayUrl>,
+        lan_discovery: bool,
+    ) -> LazyIrohTransport {
         LazyIrohTransport {
             config_dir,
             relay,
+            lan_discovery,
+            lan_gen: tokio::sync::watch::channel(0).0,
             cell: tokio::sync::OnceCell::new(),
             bound: tokio::sync::Notify::new(),
         }
@@ -345,9 +523,14 @@ impl LazyIrohTransport {
                 // the Core's instance lock.
                 let seed = universallink_core::load_or_generate_device_seed(&self.config_dir)
                     .map_err(|e| wrap("device identity", format!("{e:#}")))?;
-                let transport = IrohTransport::bind(seed, self.relay.clone())
-                    .await
-                    .map_err(|e| wrap("binding the iroh endpoint", format!("{e:#}")))?;
+                let transport = IrohTransport::bind_with_gen(
+                    seed,
+                    self.relay.clone(),
+                    self.lan_discovery,
+                    self.lan_gen.clone(),
+                )
+                .await
+                .map_err(|e| wrap("binding the iroh endpoint", format!("{e:#}")))?;
                 tracing::info!(
                     node_id = %transport.endpoint.id().fmt_short(),
                     "iroh data plane bound"
@@ -413,5 +596,20 @@ impl PeerTransport for LazyIrohTransport {
                 transport.close().await;
             }
         })
+    }
+
+    fn lan_peers(&self) -> Vec<String> {
+        // Not bound = radio not on yet: nobody visible. And it must stay that
+        // way — this is called on hot paths and must never trigger the bind.
+        self.cell
+            .get()
+            .map(PeerTransport::lan_peers)
+            .unwrap_or_default()
+    }
+
+    fn lan_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        // Our own channel — the same sender the inner transport bumps once
+        // bound, so a receiver taken now fires later without rewiring.
+        self.lan_gen.subscribe()
     }
 }

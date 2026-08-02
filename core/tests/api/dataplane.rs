@@ -825,6 +825,287 @@ async fn an_attested_peer_without_a_published_relay_is_offline() {
     assert_eq!(err.app_code(), "DEVICE_OFFLINE");
 }
 
+/// The LAN route end to end: a peer that never published a relay is reachable
+/// while its `node_id` is visible on the local network — and stops being
+/// reachable the moment it leaves. The gate is live state, not a sticky
+/// verdict.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_without_a_relay_is_reachable_over_the_lan() {
+    let server = TestServer::start().await;
+    let switchboard = MemorySwitchboard::new();
+    let code = universallink_core::account_key::generate_recovery_code();
+    let a = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
+    let b = TestCore::start_lan_only_on(&server, &switchboard, &code).await;
+    // A's own mDNS is on too — resolving is half of the same switch.
+    switchboard.join_lan(&a.key().node_id());
+
+    let mut sender = spawn_component(
+        &a,
+        "sender",
+        "menu-backend",
+        &[
+            "files.send",
+            "devices.read",
+            "session.read",
+            "transfers.read",
+        ],
+    )
+    .await;
+    let mut watcher = spawn_component(
+        &b,
+        "watcher",
+        "tray",
+        &["transfers.read", "devices.read", "session.read"],
+    )
+    .await;
+    subscribe_transfers(&mut watcher).await;
+    wait_server_connected(&mut sender, true).await;
+    wait_server_connected(&mut watcher, true).await;
+    // No relay to wait for on B: its record carries the attestation alone.
+    wait_attested(&mut sender, b.device_id()).await;
+    wait_attested(&mut watcher, a.device_id()).await;
+
+    let contents = b"through the wall, not the world";
+    let src = a.write_source("lan.txt", contents);
+    sender
+        .request(
+            "files.send",
+            json!({ "device_id": b.device_id(), "paths": [src.to_str().unwrap()] }),
+        )
+        .await
+        .expect("files.send over the LAN");
+
+    let finished = watcher.wait_notification("transfer.finished").await;
+    let written = finished["paths"][0].as_str().expect("written path");
+    assert_eq!(std::fs::read(written).expect("received file"), contents);
+    assert!(
+        Path::new(written).starts_with(b.receive_dir()),
+        "written in the receive directory: {written}"
+    );
+
+    // B leaves the LAN (radio off, moved away): with no relay either, the
+    // very next send fails fast again.
+    switchboard.leave_lan(&b.key().node_id());
+    let err = sender
+        .request(
+            "files.send",
+            json!({ "device_id": b.device_id(), "paths": [src.to_str().unwrap()] }),
+        )
+        .await
+        .expect_err("gone from the LAN, no relay");
+    assert_eq!(err.app_code(), "DEVICE_OFFLINE");
+}
+
+/// The whole point of the directory cache: the SERVER IS GONE, both Cores
+/// restart from disk alone, and a transfer still crosses the LAN. Trust comes
+/// from the cached records re-verified against the account key (C7), the
+/// route from mDNS — no server contact anywhere in the chain.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cached_directory_carries_the_lan_over_a_dead_server() {
+    let server = TestServer::start().await;
+    let switchboard = MemorySwitchboard::new();
+    let code = universallink_core::account_key::generate_recovery_code();
+    let a = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
+    let b = TestCore::start_lan_only_on(&server, &switchboard, &code).await;
+    switchboard.join_lan(&a.key().node_id());
+
+    // One connected life first, so both Cores persist their directory: each
+    // must have SEEN the other attested (the save rides every mutation).
+    {
+        let mut ca = spawn_component(&a, "warm-a", "tray", &["devices.read", "session.read"]).await;
+        let mut cb = spawn_component(&b, "warm-b", "tray", &["devices.read", "session.read"]).await;
+        wait_server_connected(&mut ca, true).await;
+        wait_server_connected(&mut cb, true).await;
+        wait_attested(&mut ca, b.device_id()).await;
+        wait_attested(&mut cb, a.device_id()).await;
+    }
+
+    // The server dies, and BOTH Cores restart: whatever they knew in memory is
+    // gone — only device.key, account-key.json, session.json and the directory
+    // cache remain.
+    server.cut();
+    let a = a.restart().await;
+    let b = b.restart().await;
+
+    let mut sender = spawn_component(
+        &a,
+        "sender",
+        "menu-backend",
+        &[
+            "files.send",
+            "devices.read",
+            "session.read",
+            "transfers.read",
+        ],
+    )
+    .await;
+    let mut watcher = spawn_component(
+        &b,
+        "watcher",
+        "tray",
+        &["transfers.read", "devices.read", "session.read"],
+    )
+    .await;
+    subscribe_transfers(&mut watcher).await;
+
+    let src = a.write_source("offline.txt", b"no server anywhere");
+    transfer_and_expect(
+        &mut sender,
+        &mut watcher,
+        b.device_id(),
+        &src,
+        b"no server anywhere",
+    )
+    .await;
+}
+
+/// A snapshot past its TTL no longer vouches: the Core starts fail-closed,
+/// exactly as before the cache existed — the bound on how long a revocation
+/// can stay unheard.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_directory_cache_vouches_for_no_one() {
+    let server = TestServer::start().await;
+    let switchboard = MemorySwitchboard::new();
+    let code = universallink_core::account_key::generate_recovery_code();
+    let a = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
+    let b = TestCore::start_lan_only_on(&server, &switchboard, &code).await;
+    switchboard.join_lan(&a.key().node_id());
+    {
+        let mut ca = spawn_component(&a, "warm-a", "tray", &["devices.read", "session.read"]).await;
+        wait_server_connected(&mut ca, true).await;
+        wait_attested(&mut ca, b.device_id()).await;
+    }
+
+    // Age A's cache past the TTL (the file format is the contract here: a
+    // `saved_at` in seconds beside the records).
+    server.cut();
+    let path = a.config_dir().join("directory.json");
+    let mut cache: Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("cache written"))
+            .expect("cache parses");
+    let eight_days = 8 * 24 * 60 * 60;
+    cache["saved_at"] = json!(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs()
+            - eight_days
+    );
+    std::fs::write(&path, cache.to_string()).expect("age the cache");
+    let a = a.restart().await;
+
+    let mut sender = spawn_component(
+        &a,
+        "sender",
+        "menu-backend",
+        &["files.send", "devices.read", "session.read"],
+    )
+    .await;
+    let src = a.write_source("late.txt", b"x");
+    let err = sender
+        .request(
+            "files.send",
+            json!({ "device_id": b.device_id(), "paths": [src.to_str().unwrap()] }),
+        )
+        .await
+        .expect_err("an expired cache vouches for no one");
+    // UNKNOWN, not OFFLINE: the device is not in the (empty) directory at all.
+    assert_eq!(err.app_code(), "DEVICE_UNKNOWN");
+}
+
+/// LAN presence is presence: a machine heard over mDNS is served as
+/// `reachable` (with `lan: true`) by `devices.list` and re-announced as
+/// `device.updated` when its visibility flips — with the SERVER LINK DOWN,
+/// which is exactly when it matters.
+#[tokio::test(flavor = "multi_thread")]
+async fn lan_visibility_flows_into_devices_list_and_events() {
+    let server = TestServer::start().await;
+    let switchboard = MemorySwitchboard::new();
+    let code = universallink_core::account_key::generate_recovery_code();
+    let a = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
+    let b = TestCore::start_lan_only_on(&server, &switchboard, &code).await;
+    switchboard.join_lan(&a.key().node_id());
+
+    let mut watcher =
+        spawn_component(&a, "watcher", "tray", &["devices.read", "session.read"]).await;
+    wait_server_connected(&mut watcher, true).await;
+    wait_attested(&mut watcher, b.device_id()).await;
+    watcher
+        .request(
+            "events.subscribe",
+            json!({ "topics": ["devices", "session"] }),
+        )
+        .await
+        .expect("subscribe");
+
+    // The server dies: B's record keeps its stale `online`, but the LAN is
+    // first-hand — B stays reachable, and says through what.
+    server.cut();
+    wait_server_connected(&mut watcher, false).await;
+    let list = watcher
+        .request("devices.list", json!({}))
+        .await
+        .expect("devices.list serves the cache offline");
+    let record = list
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|d| d["device_id"] == json!(b.device_id()))
+        .expect("B listed")
+        .clone();
+    assert_eq!(record["lan"], json!(true));
+    assert_eq!(record["reachable"], json!(true));
+
+    // B leaves the LAN: the flip arrives as a device.updated, unprompted.
+    switchboard.leave_lan(&b.key().node_id());
+    let updated = loop {
+        let (method, params) = watcher.notification().await;
+        if method == "device.updated" && params["device"]["device_id"] == json!(b.device_id()) {
+            break params;
+        }
+    };
+    assert_eq!(updated["device"]["lan"], json!(false));
+    assert_eq!(
+        updated["device"]["reachable"],
+        json!(false),
+        "no server, no LAN: nothing left"
+    );
+
+    // And back.
+    switchboard.join_lan(&b.key().node_id());
+    let updated = loop {
+        let (method, params) = watcher.notification().await;
+        if method == "device.updated" && params["device"]["device_id"] == json!(b.device_id()) {
+            break params;
+        }
+    };
+    assert_eq!(updated["device"]["lan"], json!(true));
+    assert_eq!(updated["device"]["reachable"], json!(true));
+}
+
+/// Logging out forgets the cached directory along with the session: a Core no
+/// longer on the account serves and reaches no one at its next start.
+#[tokio::test(flavor = "multi_thread")]
+async fn logout_forgets_the_cached_directory() {
+    let server = TestServer::start().await;
+    let switchboard = MemorySwitchboard::new();
+    let code = universallink_core::account_key::generate_recovery_code();
+    let a = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
+
+    let mut mgr = spawn_component(&a, "mgr", "custom", &["session.manage", "session.read"]).await;
+    wait_server_connected(&mut mgr, true).await;
+    let cache = a.config_dir().join("directory.json");
+    assert!(
+        cache.exists(),
+        "the connected session persisted its directory"
+    );
+
+    mgr.request("session.logout", json!({}))
+        .await
+        .expect("logout");
+    assert!(!cache.exists(), "logout forgets whom the account trusted");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_peer_is_reachable_again_after_a_reconnection() {
     let server = TestServer::start().await;

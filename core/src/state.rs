@@ -211,11 +211,39 @@ impl Transfers {
 
 /// A device record as served on the IPC: the server's, enriched with `is_self`
 /// (doc/core-api.md, "devices.*").
-pub fn enrich_device(record: &Value, own_device_id: Option<&str>) -> Value {
+pub fn enrich_device(
+    record: &Value,
+    own_device_id: Option<&str>,
+    server_connected: bool,
+    lan: &std::collections::BTreeSet<String>,
+) -> Value {
     let mut v = record.clone();
     let is_self =
         own_device_id.is_some() && record.get("device_id").and_then(Value::as_str) == own_device_id;
     v["is_self"] = json!(is_self);
+    // First-hand presence: the transport itself hears this device on the
+    // local network right now (mDNS). Unlike `online`, it owes nothing to the
+    // server link.
+    let lan_visible = record
+        .get("node_id")
+        .and_then(Value::as_str)
+        .is_some_and(|node_id| lan.contains(node_id));
+    v["lan"] = json!(lan_visible);
+    // What a send could reach RIGHT NOW, with fresh knowledge: the LAN, or —
+    // only while the server link that feeds the `online` flags is up — an
+    // online device with a published relay (coming online and publishing a
+    // relay are two separate steps, so there is a window where a peer is
+    // online and routeless). Derived HERE, once, so no consumer re-assembles
+    // presence from parts that go stale at different times.
+    let online = record
+        .get("online")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let has_relay = record
+        .get("relay_url")
+        .and_then(Value::as_str)
+        .is_some_and(|url| !url.trim().is_empty());
+    v["reachable"] = json!(lan_visible || (server_connected && online && has_relay));
     v
 }
 

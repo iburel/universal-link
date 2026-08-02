@@ -195,6 +195,9 @@ fn drop_session(state: &AppState) {
         // the answer to that is an AK rotation, not a deletion an attacker has
         // already outrun.
         remove_session_file(&state.config_dir);
+        // The cached directory belonged to the session too: struck off, this
+        // device forgets whom the account trusted.
+        crate::directory::remove(&state.config_dir);
         // The broadcast goes out under the session lock (order: session then
         // registry) — the order of notifications is the order of transitions.
         state.registry.lock().expect("lock registry").notify_topic(
@@ -390,6 +393,10 @@ async fn connect_and_serve(state: &Arc<AppState>, info: &SessionInfo) -> Outcome
             return Outcome::Stop;
         }
         s.server_connected = true;
+        // The live snapshot replaces whatever the cache seeded, and goes to
+        // disk under the same lock (state-then-disk, like session.json): the
+        // file is never newer than the memory it mirrors.
+        crate::directory::save(&state.config_dir, &devices);
         s.devices = Some(devices);
         s.server_tx = Some(tx);
         let payload = s.status_record();
@@ -587,12 +594,16 @@ fn apply_event(state: &Arc<AppState>, method: &str, params: &Value) {
         return;
     }
     let relayed = {
+        // Transport snapshot BEFORE the session lock (lock ordering).
+        let lan: std::collections::BTreeSet<String> =
+            state.transport.lan_peers().into_iter().collect();
         let mut s = state.session.lock().expect("lock session");
         let own = s.own_device_id.clone();
+        let server_connected = s.server_connected;
         let Some(devices) = &mut s.devices else {
             return;
         };
-        match method {
+        let relayed = match method {
             "device.added" | "device.online" | "device.updated" => {
                 let Some(record) = params.get("device") else {
                     return;
@@ -601,19 +612,26 @@ fn apply_event(state: &Arc<AppState>, method: &str, params: &Value) {
                     return;
                 };
                 devices.insert(id.to_string(), record.clone());
-                json!({ "device": enrich_device(record, own.as_deref()) })
+                json!({ "device": enrich_device(record, own.as_deref(), server_connected, &lan) })
             }
             "device.offline" => {
                 let Some(id) = params.get("device_id").and_then(Value::as_str) else {
                     return;
                 };
+                let mut relayed = params.clone();
                 if let Some(record) = devices.get_mut(id) {
                     record["online"] = json!(false);
                     if let Some(seen) = params.get("last_seen") {
                         record["last_seen"] = seen.clone();
                     }
+                    // The full record rides along (additive): `reachable` is
+                    // derived state, and a consumer that only patched `online`
+                    // would keep offering a peer whose freshness just died —
+                    // or stop offering one the LAN still hears.
+                    relayed["device"] =
+                        enrich_device(record, own.as_deref(), server_connected, &lan);
                 }
-                params.clone()
+                relayed
             }
             "device.removed" => {
                 let Some(id) = params.get("device_id").and_then(Value::as_str) else {
@@ -623,7 +641,13 @@ fn apply_event(state: &Arc<AppState>, method: &str, params: &Value) {
                 params.clone()
             }
             _ => return,
-        }
+        };
+        // Under the same lock as the mutation (state-then-disk, like
+        // session.json): every change reaches the disk before its
+        // notification goes out — a subscriber that saw it can rely on a
+        // restart still knowing it.
+        crate::directory::save(&state.config_dir, devices);
+        relayed
     };
     state
         .registry
@@ -638,12 +662,11 @@ fn apply_event(state: &Arc<AppState>, method: &str, params: &Value) {
 /// our relay.
 fn set_own_relay(state: &AppState, device_id: &str, url: &str) {
     let mut s = state.session.lock().expect("lock session");
-    if let Some(record) = s
-        .devices
-        .as_mut()
-        .and_then(|devices| devices.get_mut(device_id))
-    {
-        record["relay_url"] = json!(url);
+    if let Some(devices) = s.devices.as_mut() {
+        if let Some(record) = devices.get_mut(device_id) {
+            record["relay_url"] = json!(url);
+        }
+        crate::directory::save(&state.config_dir, devices);
     }
 }
 
@@ -679,11 +702,10 @@ pub(crate) fn set_own_attestation(state: &AppState, attestation: &str) {
     let Some(device_id) = s.own_device_id.clone() else {
         return;
     };
-    if let Some(record) = s
-        .devices
-        .as_mut()
-        .and_then(|devices| devices.get_mut(&device_id))
-    {
-        record["attestation"] = json!(attestation);
+    if let Some(devices) = s.devices.as_mut() {
+        if let Some(record) = devices.get_mut(&device_id) {
+            record["attestation"] = json!(attestation);
+        }
+        crate::directory::save(&state.config_dir, devices);
     }
 }

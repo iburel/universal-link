@@ -570,6 +570,30 @@ impl TestCore {
         .await
     }
 
+    /// A Core enrolled with NO relay but ON the fake LAN — what a machine
+    /// looks like when mDNS is its only route. Attested under `code` like its
+    /// siblings; its directory record will carry the attestation and nothing
+    /// else, since `home_relay` resolves to `None`.
+    pub async fn start_lan_only_on(
+        server: &TestServer,
+        switchboard: &MemorySwitchboard,
+        code: &str,
+    ) -> TestCore {
+        let (dir, enrolled) = Self::seed_enrolled(server).await;
+        let node_id = enrolled.1.node_id();
+        seed_account_from_code(dir.path(), &node_id, code);
+        let transport: Arc<dyn universallink_core::PeerTransport> =
+            switchboard.endpoint(node_id.clone(), None);
+        switchboard.join_lan(&node_id);
+        Self::spawn_in(
+            dir,
+            Some(enrolled),
+            Some(server_cfg(server)),
+            Some(transport),
+        )
+        .await
+    }
+
     async fn seed_enrolled(server: &TestServer) -> (tempfile::TempDir, (String, DeviceKey)) {
         let dir = tempfile::tempdir().expect("tempdir");
         let key = DeviceKey::generate();

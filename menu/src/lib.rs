@@ -27,9 +27,10 @@
 //!
 //! Fail-closed, per doc/architecture.md: an entry exists only when the system is
 //! functional and targets exist. The rules live in [`targets::Directory::targets`]
-//! — online, attested, not us, not the phone, and only while the Core is actually
-//! connected to the server. No manager means no entry either: the surfaces are
-//! emptied at startup and at graceful shutdown.
+//! — reachable (the Core's one presence flag: server presence, or the machine
+//! heard on the local network — which is why the menu survives a dead internet),
+//! attested, not us, not the phone. No manager means no entry either: the
+//! surfaces are emptied at startup and at graceful shutdown.
 //!
 //! The accepted residual (decision, 2026-07-27): a manager that *crashes* leaves
 //! its artifacts behind until the supervisor restarts it. A click on one then

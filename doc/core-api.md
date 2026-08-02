@@ -249,7 +249,16 @@ enrolls this way has no OIDC refresh token: its first sensitive operation
 ## `devices.*`
 
 The device record is the one from [server-api.md](server-api.md), enriched by the
-Core with an `is_self` field.
+Core with three fields:
+
+- `is_self` — this very device.
+- `lan` — this machine currently hears the device on the local network (mDNS).
+  First-hand presence: alive with or without the server.
+- `reachable` — the Core's ONE presence verdict: what a send could reach right
+  now. True on the LAN, or — only while the server link that feeds the `online`
+  flags is up — for an online device with a published relay. **Consumers gate
+  on this**, never on `online` alone: it is derived once, Core-side, so nobody
+  re-assembles presence from parts that go stale at different times.
 
 | Method | Description |
 |---|---|
@@ -258,7 +267,12 @@ Core with an `is_self` field.
 | `devices.revoke { device_id }` | → `{ status: "done" }` or `{ status: "reauth_required", auth_url }` (fresh ID token required by the server; the caller opens the URL, completion arrives via `device.removed`) |
 
 Notifications: `device.added / removed / online / offline / updated { … }` — same
-payloads as on the server side.
+payloads as on the server side, with two Core-side additions. `device.offline`
+carries the re-enriched `device` record alongside its `device_id` (a device that
+left the *server* may still be on the LAN — patching `online` alone would get
+`reachable` wrong either way). And `device.updated` also fires, unprompted, when
+a device's LAN visibility flips — server connected or not: this is how the menu
+and the GUI follow the room without polling.
 
 ## `files.*`
 
@@ -270,7 +284,8 @@ payloads as on the server side.
 `device_id` is resolved by the directory, **C7 attestation verified before any
 opening**: a target that is absent or attested under a foreign key →
 `DEVICE_UNKNOWN` (fail-closed, indistinguishable so as to disclose nothing); known
-but with no published relay → `DEVICE_OFFLINE`. Once the `transfer_id` has been
+but with no route to it — no published relay, and not currently visible on the
+local network (mDNS) → `DEVICE_OFFLINE`. Once the `transfer_id` has been
 returned, failures (connection, disk, a target that has shrunk) go through
 `transfer.failed`.
 

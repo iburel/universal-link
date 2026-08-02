@@ -71,6 +71,28 @@ async fn connected_pair(server: &TestServer) -> (TestCore, TestComponent, TestCo
     (a, ca, b, cb)
 }
 
+/// Like `connected_pair`, but B never publishes a relay: the fake LAN is its
+/// only route (both Cores' mDNS on). B's record carries the attestation and
+/// nothing else, so the waits are on attestation, not reachability.
+async fn connected_lan_pair(
+    server: &TestServer,
+) -> (TestCore, TestComponent, TestCore, TestComponent) {
+    let switchboard = MemorySwitchboard::new();
+    let code = universallink_core::account_key::generate_recovery_code();
+    let a = TestCore::start_enrolled_on_with_code(server, &switchboard, Some(&code)).await;
+    let b = TestCore::start_lan_only_on(server, &switchboard, &code).await;
+    switchboard.join_lan(&a.key().node_id());
+    let mut ca = backend(&a).await;
+    let mut cb = backend(&b).await;
+    subscribe(&mut ca).await;
+    subscribe(&mut cb).await;
+    wait_server_connected(&mut ca, true).await;
+    wait_server_connected(&mut cb, true).await;
+    wait_attested(&mut ca, b.device_id()).await;
+    wait_attested(&mut cb, a.device_id()).await;
+    (a, ca, b, cb)
+}
+
 /// Announces `text` from a backend and returns the `tx_id`.
 async fn announce_text(c: &mut TestComponent, text: &str) -> String {
     c.request(
@@ -147,6 +169,44 @@ async fn a_copy_propagates_to_the_other_core() {
     let current = cb.request("clipboard.current", json!({})).await.unwrap();
     assert_eq!(current["tx_id"], json!(tx));
     assert_eq!(current["device_id"], json!(a.device_id()));
+}
+
+/// The shared clipboard rides the LAN route too: a source that never published
+/// a relay receives announces, announces its own copies, and serves a paste —
+/// `transactions.open` (the fail-fast reachability check) and the pull session
+/// both take LAN visibility as a route.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lan_only_source_announces_and_serves_a_paste() {
+    let server = TestServer::start().await;
+    let (a, mut ca, b, mut cb) = connected_lan_pair(&server).await;
+
+    // The relay-less B is a recipient of A's broadcast: `account_peers` now
+    // counts LAN visibility as a route.
+    let tx_a = announce_text(&mut ca, "toward the lan").await;
+    let note = cb.wait_notification("clipboard.remote_updated").await;
+    assert_eq!(note["tx_id"], json!(tx_a));
+
+    // B's own copy reaches A (A published a relay — the classic route).
+    let tx = announce_text(&mut cb, "served over lan").await;
+    let note = ca.wait_notification("clipboard.remote_updated").await;
+    assert_eq!(note["tx_id"], json!(tx));
+
+    // A pastes B's clip: the open and the pull session can only ride the LAN,
+    // B has no relay to offer.
+    let token = open_channel_token(&mut ca, &tx).await;
+    let mut ch = a.open_channel(&token).await;
+    let fetch = ch.fetch("text");
+    let serve = async {
+        let (id, params) = cb.expect_request("clipboard.get_data").await;
+        assert_eq!(params["tx_id"], json!(tx));
+        let ptoken = params["channel_token"].as_str().unwrap();
+        let mut provider = b.open_channel(ptoken).await;
+        provider.send_data(0, b"served over lan").await;
+        provider.send_eof().await;
+        cb.respond(id, json!({})).await;
+    };
+    let (fetched, ()) = tokio::join!(fetch, serve);
+    assert_eq!(fetched.unwrap(), b"served over lan");
 }
 
 #[tokio::test(flavor = "multi_thread")]

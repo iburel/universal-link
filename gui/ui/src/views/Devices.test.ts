@@ -30,6 +30,8 @@ const SELF: Device = {
   name: "Office PC",
   platform: "linux",
   online: true,
+  lan: false,
+  reachable: true,
   last_seen: null,
   is_self: true,
 };
@@ -38,6 +40,8 @@ const MAC: Device = {
   name: "MacBook",
   platform: "macos",
   online: false,
+  lan: false,
+  reachable: false,
   last_seen: "2026-07-10T09:00:00Z",
   is_self: false,
 };
@@ -46,6 +50,8 @@ const WIN: Device = {
   name: "Living Room PC",
   platform: "windows",
   online: true,
+  lan: false,
+  reachable: true,
   last_seen: null,
   is_self: false,
 };
@@ -105,6 +111,29 @@ test("this PC comes first, inactivity is dated", () => {
   expect(rows[0].textContent).toContain("Linux · this PC · online");
   expect(rows[1].textContent).toContain("MacBook");
   expect(rows[1].textContent).toContain("macOS · last seen 3 h ago");
+});
+
+test("a machine heard on the local network says so, even without the server", () => {
+  // The LAN case: the server never marked it online — mDNS is the presence.
+  store.devices = [
+    {
+      device_id: "d_lan",
+      name: "Next Door PC",
+      platform: "linux",
+      online: false,
+      lan: true,
+      reachable: true,
+      last_seen: null,
+      is_self: false,
+    },
+  ];
+
+  const view = render(Devices, { store, now: NOW });
+  const row = view.querySelector("li")!;
+  expect(row.textContent).toContain("Linux · on this network");
+  expect(row.textContent).not.toContain("last seen");
+  // And the presence dot is lit: reachable is the verdict, not `online`.
+  expect(row.querySelector(".dot.online")).not.toBeNull();
 });
 
 test("renaming sends the cleaned name to the Core", async () => {

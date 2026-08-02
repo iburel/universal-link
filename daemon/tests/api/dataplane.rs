@@ -24,16 +24,58 @@ fn node_id(seed: &[u8; 32]) -> String {
     hex::encode(SecretKey::from_bytes(seed).public().as_bytes())
 }
 
+/// Whether this environment actually routes multicast: a beacon sent to the
+/// mDNS group must come back to a member of that group on the same host.
+/// GitHub's hosted macOS runners refuse the send outright (five identical
+/// timeouts in a row on every try, while real Macs pass) — a machine that
+/// cannot multicast cannot judge a test about hearing multicast, so the
+/// real-socket LAN tests bow out loudly instead of failing on the runner's
+/// limitation. The probe uses the real group but an ephemeral port: it never
+/// collides with mDNS itself.
+fn multicast_reaches_the_wire() -> bool {
+    use std::net::{Ipv4Addr, UdpSocket};
+
+    let group = Ipv4Addr::new(224, 0, 0, 251);
+    let Ok(rx) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
+        return false;
+    };
+    let Ok(local) = rx.local_addr() else {
+        return false;
+    };
+    if rx
+        .join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)
+        .is_err()
+        || rx.set_read_timeout(Some(Duration::from_secs(2))).is_err()
+    {
+        return false;
+    }
+    let Ok(tx) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
+        return false;
+    };
+    let beacon = b"universallink multicast probe";
+    // Two beacons: the first can race the group join on a slow stack.
+    for _ in 0..2 {
+        let _ = tx.send_to(beacon, (group, local.port()));
+        let mut buf = [0u8; 64];
+        if let Ok((n, _)) = rx.recv_from(&mut buf)
+            && &buf[..n] == beacon
+        {
+            return true;
+        }
+    }
+    false
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_core_transfer_protocol_survives_real_quic() {
     let (relay_map, relay_url, _guard) = run_relay_server().await.expect("local relay");
 
     let seed_a = [1u8; 32];
     let seed_b = [2u8; 32];
-    let a = IrohTransport::bind_test(seed_a, relay_map.clone())
+    let a = IrohTransport::bind_test(seed_a, relay_map.clone(), false)
         .await
         .expect("endpoint A");
-    let b = IrohTransport::bind_test(seed_b, relay_map)
+    let b = IrohTransport::bind_test(seed_b, relay_map, false)
         .await
         .expect("endpoint B");
 
@@ -96,10 +138,114 @@ async fn the_core_transfer_protocol_survives_real_quic() {
     b.close().await;
 }
 
+/// Two endpoints with NO relay at all (empty map): mDNS is the only possible
+/// route, so a successful transfer proves the LAN discovery end to end —
+/// announcement on one side, resolution on the other, direct connection by
+/// `node_id` alone. This is what a `PeerAddr` without `relay_url` will become
+/// once the Core stops requiring a published relay (next block).
+#[tokio::test(flavor = "multi_thread")]
+async fn two_endpoints_reach_each_other_over_the_lan_without_any_relay() {
+    if !multicast_reaches_the_wire() {
+        eprintln!("skipped: this environment does not route multicast");
+        return;
+    }
+    let seed_a = [3u8; 32];
+    let seed_b = [4u8; 32];
+    let a = IrohTransport::bind_test(seed_a, iroh::RelayMap::empty(), true)
+        .await
+        .expect("endpoint A");
+    let b = IrohTransport::bind_test(seed_b, iroh::RelayMap::empty(), true)
+        .await
+        .expect("endpoint B");
+
+    // No relay to publish, and that must not block anything: reachability
+    // comes from the mDNS announcement, not from `online()`.
+    let peer = PeerAddr {
+        node_id: node_id(&seed_a),
+        relay_url: None,
+    };
+
+    let contents = b"across the room, not the internet".to_vec();
+    let src_dir = tempfile::tempdir().expect("tempdir source");
+    let src = src_dir.path().join("note.txt");
+    std::fs::write(&src, &contents).expect("write the source");
+    let dest_dir = tempfile::tempdir().expect("tempdir dest");
+
+    // Generous budget: the mDNS announcement is periodic, and the lookup can
+    // wait for the next beacon before it resolves.
+    let written = timeout(Duration::from_secs(30), async {
+        let respond = async {
+            let (peer_id, mut stream) = a.accept().await.expect("accept A");
+            assert_eq!(peer_id, node_id(&seed_b), "incoming peer's identity");
+            let manifest = read_offer(&mut stream).await.expect("offer");
+            receive_bodies(&mut stream, dest_dir.path(), &manifest, &mut |_, _| {})
+                .await
+                .expect("receive")
+        };
+        let ask = async {
+            let files = vec![OutgoingFile {
+                name: "note.txt".into(),
+                source: Some(src.clone()),
+                size: contents.len() as u64,
+                is_dir: false,
+            }];
+            let mut stream = b.open(&peer).await.expect("open B->A over the LAN");
+            send_transfer(&mut stream, &files, &mut |_, _| {})
+                .await
+                .expect("send");
+        };
+        let (written, ()) = tokio::join!(respond, ask);
+        written
+    })
+    .await
+    .expect("LAN transfer within the deadline");
+
+    assert_eq!(written.len(), 1);
+    assert_eq!(std::fs::read(&written[0]).expect("received file"), contents);
+    a.close().await;
+    b.close().await;
+}
+
+/// What `lan_peers` reports is what mDNS actually heard: two endpoints with
+/// the discovery on end up in each other's set — symmetrically — with no
+/// relay involved. This is the daemon half of the Core's reachability gate.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_lan_set_reflects_what_mdns_hears() {
+    if !multicast_reaches_the_wire() {
+        eprintln!("skipped: this environment does not route multicast");
+        return;
+    }
+    let seed_a = [5u8; 32];
+    let seed_b = [6u8; 32];
+    let a = IrohTransport::bind_test(seed_a, iroh::RelayMap::empty(), true)
+        .await
+        .expect("endpoint A");
+    let b = IrohTransport::bind_test(seed_b, iroh::RelayMap::empty(), true)
+        .await
+        .expect("endpoint B");
+
+    // Announcements are periodic: poll until both sides hear each other.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let a_sees = a.lan_peers().contains(&node_id(&seed_b));
+        let b_sees = b.lan_peers().contains(&node_id(&seed_a));
+        if a_sees && b_sees {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "mDNS never surfaced the peers: A sees B: {a_sees}, B sees A: {b_sees}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    a.close().await;
+    b.close().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_endpoint_publishes_its_relay() {
     let (relay_map, relay_url, _guard) = run_relay_server().await.expect("local relay");
-    let a = IrohTransport::bind_test([7u8; 32], relay_map)
+    let a = IrohTransport::bind_test([7u8; 32], relay_map, false)
         .await
         .expect("endpoint");
 
@@ -114,7 +260,7 @@ async fn an_endpoint_publishes_its_relay() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lazy_transport_stays_silent_until_first_use() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let transport = LazyIrohTransport::new(dir.path().to_path_buf(), None);
+    let transport = LazyIrohTransport::new(dir.path().to_path_buf(), None, false);
 
     // `accept` is not a use: the Core's `serve` loop calls it right from
     // startup, and a never-enrolled Core must neither read/create `device.key`

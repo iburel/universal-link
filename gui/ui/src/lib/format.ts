@@ -120,7 +120,9 @@ export function validFor(seconds: number): string {
 export function sortDevices(devices: readonly Device[]): Device[] {
   return [...devices].sort((a, b) => {
     if (a.is_self !== b.is_self) return a.is_self ? -1 : 1;
-    if (a.online !== b.online) return a.online ? -1 : 1;
+    // Reachable first — the Core's one presence verdict (server presence or
+    // the local network), so a LAN neighbor rises even with the internet down.
+    if (a.reachable !== b.reachable) return a.reachable ? -1 : 1;
     return a.name.localeCompare(b.name, "en");
   });
 }
