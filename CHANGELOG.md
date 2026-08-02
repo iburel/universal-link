@@ -18,8 +18,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and changes nothing about trust: a machine that is not attested on the
   account is refused exactly as before, and an impostor answering to someone
   else's identity fails the handshake. `"lan_discovery": false` in
-  `config.json` turns the whole thing off. (Groundwork: the next step is
-  letting two machines work with no reachable server at all.)
+  `config.json` turns the whole thing off.
+- **Two machines in the same room keep working when the server is
+  unreachable.** Each device now remembers the account's device list
+  (`directory.json` in the config directory), so a machine that starts with no
+  internet still recognizes its siblings and reaches them over the local
+  network — sends and the shared clipboard included. Remembering is not
+  trusting: every use re-verifies each device's attestation against the
+  account key, exactly as with the live list — what the memory can do is keep
+  a *revoked* device recognized until the next server contact, so a snapshot
+  older than **7 days** no longer counts and the machine then waits for the
+  server, as before. Logging out forgets the list. What still needs the
+  server: signing in, adding or revoking a device, and reaching machines
+  beyond your own network.
 
 ### Fixed
 

@@ -14,6 +14,7 @@ mod conn;
 mod connector;
 mod datachannel;
 mod dataplane;
+mod directory;
 mod discover;
 mod framing;
 mod http;
@@ -288,6 +289,13 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
     });
 
     let session_info = session::read_session_file(&config.config_dir);
+    // The directory cache only vouches within a session: logged out, nothing
+    // is served no matter what the disk says. Stale or corrupt loads as
+    // nothing — the Core then starts fail-closed, as it did before the cache.
+    let cached_devices = match &session_info {
+        Some(_) => directory::load(&config.config_dir),
+        None => None,
+    };
     let state = Arc::new(AppState {
         registry: Mutex::new(Registry::new(file_token)),
         session: Mutex::new(SessionState::new(session_info.as_ref())),
@@ -309,6 +317,11 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
         reconnect_base_delay: config.reconnect_base_delay,
         shutdown_request: tokio::sync::Notify::new(),
     });
+    if let Some(devices) = cached_devices {
+        // Seeded before any task exists — no reader can race it. The first
+        // successful session setup replaces it with the live snapshot.
+        state.session.lock().expect("lock session").devices = Some(devices);
+    }
 
     if let Some(info) = session_info {
         start_session_task(&state, info);

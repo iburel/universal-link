@@ -425,7 +425,11 @@ The config directory holds `config.json` (written by the setup screen or by you)
 `ipc-token` (0600, regenerated at every startup), `device.key` (0600, the
 device's iroh identity), `account-key.json` (the account's public key + this
 device's attestation, *not a secret*, absent until the device has joined the
-account), and `session.json` (present ⟺ a session is open). What the OS keyring
+account), `session.json` (present ⟺ a session is open), and `directory.json`
+(the last known list of the account's devices, so a machine that starts without
+reaching the server still recognizes its siblings on the local network; every
+use re-verifies the attestations, a snapshot older than 7 days is ignored, and
+it is deleted at logout). What the OS keyring
 holds is the OIDC refresh token and the account's **private** key — kept at rest
 so this device can vouch for the next one it links. `secrets.json` (0600,
 cleartext secrets at rest) only appears as a **fallback**, on a machine where no

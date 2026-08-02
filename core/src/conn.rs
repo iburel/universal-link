@@ -626,7 +626,9 @@ impl Conn {
             }
             let (payload, abort) = s.forget();
             crate::session::remove_session_file(&self.state.config_dir);
-            // The refresh token belonged to this session: it leaves with it.
+            // The cached directory and the refresh token belonged to this
+            // session: they leave with it.
+            crate::directory::remove(&self.state.config_dir);
             self.state.secrets.delete(crate::secrets::REFRESH_TOKEN);
             // Broadcast under the session lock (order: session then registry):
             // the order of notifications is the order of transitions — the
