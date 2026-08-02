@@ -91,12 +91,16 @@ pub struct IrohTransport {
     /// the endpoint closes (the discovery actor dies with its last handle and
     /// the event stream with it); the abort at drop is a safety net.
     lan_task: Option<tokio::task::JoinHandle<()>>,
+    /// Says one plain line if LAN discovery is on but multicast never reaches
+    /// the wire. Short-lived; aborted at drop so a torn-down transport cannot
+    /// speak for its successor.
+    lan_probe: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for IrohTransport {
     fn drop(&mut self) {
         self.acceptor.abort();
-        if let Some(task) = &self.lan_task {
+        for task in [&self.lan_task, &self.lan_probe].into_iter().flatten() {
             task.abort();
         }
     }
@@ -204,6 +208,7 @@ impl IrohTransport {
         let lan = Arc::new(Mutex::new(HashSet::new()));
         let lan_task =
             lan_events.map(|events| tokio::spawn(watch_lan(events, lan.clone(), lan_gen.clone())));
+        let lan_probe = mdns.is_some().then(|| tokio::spawn(warn_if_lan_dark()));
         Ok(IrohTransport {
             endpoint,
             ready: tokio::sync::Mutex::new(rx),
@@ -211,6 +216,7 @@ impl IrohTransport {
             lan,
             lan_gen,
             lan_task,
+            lan_probe,
         })
     }
 
@@ -237,6 +243,92 @@ fn lan_lookup(secret: &SecretKey, lan_discovery: bool) -> Option<MdnsAddressLook
         Err(e) => {
             tracing::warn!(error = %e, "LAN discovery unavailable: continuing without it");
             None
+        }
+    }
+}
+
+/// Whether multicast actually reaches the wire: a beacon sent to the mDNS
+/// group must come back to a member of that group on the same host. The probe
+/// uses the real group but an ephemeral port, so it never collides with mDNS
+/// itself. Public because it is also the tests' judge of whether an
+/// environment can host the real-socket LAN tests at all — GitHub's hosted
+/// macOS runners refuse the send outright (five identical timeouts in a row
+/// on every try, while real Macs pass).
+pub async fn multicast_reaches_the_wire() -> bool {
+    use std::net::Ipv4Addr;
+
+    let group = Ipv4Addr::new(224, 0, 0, 251);
+    let Ok(rx) = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await else {
+        return false;
+    };
+    let Ok(local) = rx.local_addr() else {
+        return false;
+    };
+    if rx.join_multicast_v4(group, Ipv4Addr::UNSPECIFIED).is_err() {
+        return false;
+    }
+    let Ok(tx) = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await else {
+        return false;
+    };
+    let beacon = b"universallink multicast probe";
+    // Two beacons: the first can race the group join on a slow stack.
+    for _ in 0..2 {
+        let _ = tx.send_to(beacon, (group, local.port())).await;
+        let mut buf = [0u8; 64];
+        match tokio::time::timeout(Duration::from_secs(2), rx.recv_from(&mut buf)).await {
+            Ok(Ok((n, _))) if &buf[..n] == beacon => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// One plain line when LAN discovery is on but the wire is dark. Without it,
+/// the only trace is the discovery library's per-send warnings — hundreds of
+/// lines that name no cure. macOS is the expected culprit: it asks each fresh
+/// build for the "Local Network" permission and quietly refuses every
+/// multicast send (`No route to host`) until someone answers, so its line
+/// names the switch to flip. Three probes over twenty seconds ride out a
+/// Wi-Fi still associating at login and a permission prompt just answered.
+async fn warn_if_lan_dark() {
+    if any_attempt_succeeds(3, Duration::from_secs(10), multicast_reaches_the_wire).await {
+        return;
+    }
+    tracing::warn!("{}", lan_dark_notice(std::env::consts::OS));
+}
+
+/// Runs `probe` up to `attempts` times, `pause` apart, stopping at the first
+/// success.
+async fn any_attempt_succeeds<F>(attempts: u32, pause: Duration, probe: impl Fn() -> F) -> bool
+where
+    F: std::future::Future<Output = bool>,
+{
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            tokio::time::sleep(pause).await;
+        }
+        if probe().await {
+            return true;
+        }
+    }
+    false
+}
+
+/// The line for a dark wire, per platform. Takes the OS as a value so every
+/// platform's message is checkable from any platform.
+fn lan_dark_notice(os: &str) -> &'static str {
+    match os {
+        "macos" => {
+            "LAN discovery is on, but multicast does not reach the wire — macOS is \
+             likely denying local network access: allow UniversalLink under System \
+             Settings → Privacy & Security → Local Network. Until then this device \
+             neither sees nor is seen on its own network; server and relay are \
+             unaffected."
+        }
+        _ => {
+            "LAN discovery is on, but multicast does not reach the wire: this device \
+             neither sees nor is seen on its own network. Server and relay are \
+             unaffected."
         }
     }
 }
@@ -611,5 +703,48 @@ impl PeerTransport for LazyIrohTransport {
         // Our own channel — the same sender the inner transport bumps once
         // bound, so a receiver taken now fires later without rewiring.
         self.lan_gen.subscribe()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::*;
+
+    #[test]
+    fn the_macos_notice_names_the_switch_to_flip() {
+        assert!(lan_dark_notice("macos").contains("Local Network"));
+    }
+
+    #[test]
+    fn other_platforms_get_the_plain_notice() {
+        for os in ["linux", "windows"] {
+            let notice = lan_dark_notice(os);
+            assert!(!notice.contains("macOS"));
+            assert!(notice.contains("multicast does not reach the wire"));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_probe_stops_at_the_first_success() {
+        let calls = AtomicU32::new(0);
+        let up_on_second = || {
+            let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            async move { n == 2 }
+        };
+        assert!(any_attempt_succeeds(3, Duration::from_millis(1), up_on_second).await);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_dead_wire_exhausts_every_attempt_then_gives_up() {
+        let calls = AtomicU32::new(0);
+        let never = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { false }
+        };
+        assert!(!any_attempt_succeeds(3, Duration::from_millis(1), never).await);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 }

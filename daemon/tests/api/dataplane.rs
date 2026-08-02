@@ -18,52 +18,12 @@ use tokio::time::timeout;
 use universallink_core::{
     OutgoingFile, PeerAddr, PeerTransport, read_offer, receive_bodies, send_transfer,
 };
-use universallink_daemon::dataplane::{IrohTransport, LazyIrohTransport};
+use universallink_daemon::dataplane::{
+    IrohTransport, LazyIrohTransport, multicast_reaches_the_wire,
+};
 
 fn node_id(seed: &[u8; 32]) -> String {
     hex::encode(SecretKey::from_bytes(seed).public().as_bytes())
-}
-
-/// Whether this environment actually routes multicast: a beacon sent to the
-/// mDNS group must come back to a member of that group on the same host.
-/// GitHub's hosted macOS runners refuse the send outright (five identical
-/// timeouts in a row on every try, while real Macs pass) — a machine that
-/// cannot multicast cannot judge a test about hearing multicast, so the
-/// real-socket LAN tests bow out loudly instead of failing on the runner's
-/// limitation. The probe uses the real group but an ephemeral port: it never
-/// collides with mDNS itself.
-fn multicast_reaches_the_wire() -> bool {
-    use std::net::{Ipv4Addr, UdpSocket};
-
-    let group = Ipv4Addr::new(224, 0, 0, 251);
-    let Ok(rx) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
-        return false;
-    };
-    let Ok(local) = rx.local_addr() else {
-        return false;
-    };
-    if rx
-        .join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)
-        .is_err()
-        || rx.set_read_timeout(Some(Duration::from_secs(2))).is_err()
-    {
-        return false;
-    }
-    let Ok(tx) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
-        return false;
-    };
-    let beacon = b"universallink multicast probe";
-    // Two beacons: the first can race the group join on a slow stack.
-    for _ in 0..2 {
-        let _ = tx.send_to(beacon, (group, local.port()));
-        let mut buf = [0u8; 64];
-        if let Ok((n, _)) = rx.recv_from(&mut buf)
-            && &buf[..n] == beacon
-        {
-            return true;
-        }
-    }
-    false
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -145,7 +105,7 @@ async fn the_core_transfer_protocol_survives_real_quic() {
 /// once the Core stops requiring a published relay (next block).
 #[tokio::test(flavor = "multi_thread")]
 async fn two_endpoints_reach_each_other_over_the_lan_without_any_relay() {
-    if !multicast_reaches_the_wire() {
+    if !multicast_reaches_the_wire().await {
         eprintln!("skipped: this environment does not route multicast");
         return;
     }
@@ -211,7 +171,7 @@ async fn two_endpoints_reach_each_other_over_the_lan_without_any_relay() {
 /// relay involved. This is the daemon half of the Core's reachability gate.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_lan_set_reflects_what_mdns_hears() {
-    if !multicast_reaches_the_wire() {
+    if !multicast_reaches_the_wire().await {
         eprintln!("skipped: this environment does not route multicast");
         return;
     }
