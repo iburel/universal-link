@@ -477,9 +477,10 @@ pub(crate) async fn pipe_consumer<R, W>(
 {
     // Resolve the source (C7 attestation) and open the session stream.
     let peer = match dataplane::resolve_peer(state, device_id) {
-        // A re-enrolled source (new node_id) or one without a published relay is
-        // no longer the device that made this offer: unreachable.
-        Some(p) if p.node_id == node_id && p.relay_url.is_some() => p,
+        // A re-enrolled source (new node_id) is no longer the device that made
+        // this offer; one with no route to it (no published relay, not seen on
+        // the LAN) is unreachable.
+        Some(p) if p.node_id == node_id && dataplane::peer_reachable(state, &p) => p,
         _ => {
             let _ = datachannel::write_error(&mut consumer_write, "PEER_GONE").await;
             return;
@@ -693,7 +694,7 @@ async fn fill_entries(
     let mut session = match mode {
         ServeMode::Remote { node_id, device_id } => {
             let peer = match dataplane::resolve_peer(state, device_id) {
-                Some(p) if p.node_id == *node_id && p.relay_url.is_some() => p,
+                Some(p) if p.node_id == *node_id && dataplane::peer_reachable(state, &p) => p,
                 _ => return Err("PEER_GONE".to_string()),
             };
             Some(RemoteSession::open(state, &peer, tx_id).await?)

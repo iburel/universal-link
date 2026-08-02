@@ -825,6 +825,77 @@ async fn an_attested_peer_without_a_published_relay_is_offline() {
     assert_eq!(err.app_code(), "DEVICE_OFFLINE");
 }
 
+/// The LAN route end to end: a peer that never published a relay is reachable
+/// while its `node_id` is visible on the local network — and stops being
+/// reachable the moment it leaves. The gate is live state, not a sticky
+/// verdict.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_without_a_relay_is_reachable_over_the_lan() {
+    let server = TestServer::start().await;
+    let switchboard = MemorySwitchboard::new();
+    let code = universallink_core::account_key::generate_recovery_code();
+    let a = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
+    let b = TestCore::start_lan_only_on(&server, &switchboard, &code).await;
+    // A's own mDNS is on too — resolving is half of the same switch.
+    switchboard.join_lan(&a.key().node_id());
+
+    let mut sender = spawn_component(
+        &a,
+        "sender",
+        "menu-backend",
+        &[
+            "files.send",
+            "devices.read",
+            "session.read",
+            "transfers.read",
+        ],
+    )
+    .await;
+    let mut watcher = spawn_component(
+        &b,
+        "watcher",
+        "tray",
+        &["transfers.read", "devices.read", "session.read"],
+    )
+    .await;
+    subscribe_transfers(&mut watcher).await;
+    wait_server_connected(&mut sender, true).await;
+    wait_server_connected(&mut watcher, true).await;
+    // No relay to wait for on B: its record carries the attestation alone.
+    wait_attested(&mut sender, b.device_id()).await;
+    wait_attested(&mut watcher, a.device_id()).await;
+
+    let contents = b"through the wall, not the world";
+    let src = a.write_source("lan.txt", contents);
+    sender
+        .request(
+            "files.send",
+            json!({ "device_id": b.device_id(), "paths": [src.to_str().unwrap()] }),
+        )
+        .await
+        .expect("files.send over the LAN");
+
+    let finished = watcher.wait_notification("transfer.finished").await;
+    let written = finished["paths"][0].as_str().expect("written path");
+    assert_eq!(std::fs::read(written).expect("received file"), contents);
+    assert!(
+        Path::new(written).starts_with(b.receive_dir()),
+        "written in the receive directory: {written}"
+    );
+
+    // B leaves the LAN (radio off, moved away): with no relay either, the
+    // very next send fails fast again.
+    switchboard.leave_lan(&b.key().node_id());
+    let err = sender
+        .request(
+            "files.send",
+            json!({ "device_id": b.device_id(), "paths": [src.to_str().unwrap()] }),
+        )
+        .await
+        .expect_err("gone from the LAN, no relay");
+    assert_eq!(err.app_code(), "DEVICE_OFFLINE");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_peer_is_reachable_again_after_a_reconnection() {
     let server = TestServer::start().await;

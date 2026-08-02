@@ -1130,16 +1130,19 @@ impl Conn {
             (cb.origin_of(&tx_id), cb.is_materialized(&tx_id))
         };
         // A remote clip whose source is no longer reachable (re-enrolled under a
-        // new node_id, or with no published relay) fails fast here — the
-        // control-plane twin of the data channel's `PEER_GONE`. A MATERIALIZED
-        // remote clip is exempt: it is served from the local cache, so the source
-        // need not be reachable — indeed it may already be gone, which is the
-        // whole point of push-at-copy.
+        // new node_id, or with no route to it — no published relay, not seen on
+        // the LAN) fails fast here — the control-plane twin of the data
+        // channel's `PEER_GONE`. A MATERIALIZED remote clip is exempt: it is
+        // served from the local cache, so the source need not be reachable —
+        // indeed it may already be gone, which is the whole point of
+        // push-at-copy.
         if !materialized
             && let Some(crate::clipboard::Origin::Remote { node_id, device_id }) = origin
         {
-            let reachable = crate::dataplane::resolve_peer(&self.state, &device_id)
-                .is_some_and(|p| p.node_id == node_id && p.relay_url.is_some());
+            let reachable =
+                crate::dataplane::resolve_peer(&self.state, &device_id).is_some_and(|p| {
+                    p.node_id == node_id && crate::dataplane::peer_reachable(&self.state, &p)
+                });
             if !reachable {
                 return Err(RpcErr::app("DEVICE_OFFLINE"));
             }

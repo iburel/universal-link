@@ -10,14 +10,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Machines on the same network now find each other directly.** Each desktop
   announces itself over mDNS (as `universallink`, UDP 5353) and resolves its
-  siblings the same way, so a transfer between two machines that share a
-  network no longer depends on the relay to get started — including when the
-  relay is unreachable. The announcement carries the device's public key and
-  addresses, nothing more, and changes nothing about trust: a machine that is
-  not attested on the account is refused exactly as before, and an impostor
-  answering to someone else's identity fails the handshake. `"lan_discovery":
-  false` in `config.json` turns the whole thing off. (Groundwork: the next
-  step is letting two machines work with no reachable server at all.)
+  siblings the same way — and being visible on the local network now *counts as
+  reachable*: sends and the shared clipboard take the local route even for a
+  machine that has no relay at all, and no longer depend on the relay to get
+  started when both ends share a network. The
+  announcement carries the device's public key and addresses, nothing more,
+  and changes nothing about trust: a machine that is not attested on the
+  account is refused exactly as before, and an impostor answering to someone
+  else's identity fails the handshake. `"lan_discovery": false` in
+  `config.json` turns the whole thing off. (Groundwork: the next step is
+  letting two machines work with no reachable server at all.)
 
 ### Fixed
 

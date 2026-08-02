@@ -270,7 +270,8 @@ payloads as on the server side.
 `device_id` is resolved by the directory, **C7 attestation verified before any
 opening**: a target that is absent or attested under a foreign key →
 `DEVICE_UNKNOWN` (fail-closed, indistinguishable so as to disclose nothing); known
-but with no published relay → `DEVICE_OFFLINE`. Once the `transfer_id` has been
+but with no route to it — no published relay, and not currently visible on the
+local network (mDNS) → `DEVICE_OFFLINE`. Once the `transfer_id` has been
 returned, failures (connection, disk, a target that has shrunk) go through
 `transfer.failed`.
 

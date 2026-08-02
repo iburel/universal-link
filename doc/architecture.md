@@ -158,6 +158,12 @@ provides:
 - NAT traversal / hole punching for direct connections.
 - Automatic fallback to a relay when a direct connection is impossible — a relay
   that only sees encrypted traffic.
+- **Local discovery** (mDNS, on by default, `lan_discovery` in `config.json`):
+  devices announce themselves on the local network and resolve each other by
+  NodeId alone, so two machines that share a network connect directly — without
+  the relay, including when a device never published one. Discovery only ever
+  provides an *address*: an impostor announcing someone else's NodeId fails the
+  QUIC handshake, and the account attestation still gates every stream.
 
 ## The Client
 

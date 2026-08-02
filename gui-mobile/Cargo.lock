@@ -6161,6 +6161,7 @@ dependencies = [
  "iroh-mdns-address-lookup",
  "keyring",
  "libc",
+ "n0-future",
  "rustls-platform-verifier",
  "serde_json",
  "tokio",

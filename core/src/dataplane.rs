@@ -68,12 +68,10 @@ use crate::state::AppState;
 pub struct PeerAddr {
     pub node_id: String,
     /// The relay the peer published in the directory. `None`: the peer has not
-    /// (yet) published one. The daemon's transport can now also resolve a peer
-    /// on the local network by its `node_id` alone (mDNS, `lan_discovery`),
-    /// but the Core still requires a published relay before it even tries
-    /// (`start_send` answers `Offline`, `account_peers` skips the device) —
-    /// lifting that gate is the next block, and the fake reflects the current
-    /// contract.
+    /// (yet) published one — still reachable if the transport currently sees
+    /// its `node_id` on the local network (`lan_peers`), otherwise opening
+    /// fails. `resolve_peer` copies the directory as-is; it is the callers
+    /// that gate on `peer_reachable` before opening.
     pub relay_url: Option<String>,
 }
 
@@ -117,6 +115,16 @@ pub trait PeerTransport: Send + Sync + std::fmt::Debug {
 
     /// The local relay to publish in the directory via `presence.update`.
     fn home_relay(&self) -> HomeRelay<'_>;
+
+    /// The endpoints currently visible on the local network (mDNS), as
+    /// `node_id`s. An ADDRESS-BOOK fact, never a trust fact: anything can
+    /// announce anything, so the callers only match these against peers
+    /// already attested through the directory (C7) — visibility decides
+    /// whether to TRY, the handshake and the attestation decide the rest.
+    /// Default: none — a transport without LAN discovery sees nobody.
+    fn lan_peers(&self) -> Vec<String> {
+        Vec::new()
+    }
 
     /// Closes the transport cleanly — at process shutdown, not at the drop of
     /// the Core. Default: nothing (the in-memory pipe has nothing to close);
@@ -296,11 +304,28 @@ pub(crate) fn resolve_peer(state: &AppState, device_id: &str) -> Option<PeerAddr
     Some(PeerAddr { node_id, relay_url })
 }
 
+/// Is this RESOLVED peer reachable right now? A published relay is a route,
+/// and so is being visible on the local network (mDNS): the transport dials
+/// either. Reachability is an address fact, not a trust fact — every caller
+/// holds a peer that `resolve_peer` already attested (C7).
+pub(crate) fn peer_reachable(state: &AppState, peer: &PeerAddr) -> bool {
+    peer.relay_url.is_some()
+        || state
+            .transport
+            .lan_peers()
+            .iter()
+            .any(|seen| seen == &peer.node_id)
+}
+
 /// Every reachable device of the account, EXCEPT this one: attested under our
-/// key (C7) and with a published relay. The recipients of a clipboard
-/// `clip_announce` broadcast (`clipnet::propagate`). Empty when we have no trust
-/// root or no directory snapshot (not joined / never connected) — fail-closed.
+/// key (C7) and with a route to it — a published relay, or its `node_id` seen
+/// on the local network. The recipients of a clipboard `clip_announce`
+/// broadcast (`clipnet::propagate`). Empty when we have no trust root or no
+/// directory snapshot (not joined / never connected) — fail-closed.
 pub(crate) fn account_peers(state: &AppState) -> Vec<PeerAddr> {
+    // Transport snapshot BEFORE the state locks: the transport has a lock of
+    // its own, and nothing here may hold ours while calling into it.
+    let lan = state.transport.lan_peers();
     let ak_pub = {
         let root = state.account_root.lock().expect("lock account_root");
         match root.as_ref() {
@@ -324,11 +349,16 @@ pub(crate) fn account_peers(state: &AppState) -> Vec<PeerAddr> {
             if !crate::account_key::verify(&ak_pub, &node_id, att) {
                 return None;
             }
-            let relay_url = record.get("relay_url").and_then(Value::as_str)?.to_string();
-            Some(PeerAddr {
-                node_id,
-                relay_url: Some(relay_url),
-            })
+            // The relay is kept when both routes exist: iroh dials it and the
+            // LAN in parallel and takes what answers.
+            let relay_url = record
+                .get("relay_url")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if relay_url.is_none() && !lan.contains(&node_id) {
+                return None;
+            }
+            Some(PeerAddr { node_id, relay_url })
         })
         .collect()
 }
@@ -848,7 +878,8 @@ pub(crate) enum SendError {
     /// Target absent from the directory, or an invalid attestation under our
     /// key (C7) — fail-closed, indistinguishable so as to disclose nothing.
     UnknownDevice,
-    /// Target known but with no published relay: unreachable for now.
+    /// Target known but with no route to it — no published relay, and not
+    /// seen on the local network: unreachable for now.
     Offline,
     /// Invalid path (missing, unreadable) — message for the caller.
     BadPath(String),
@@ -872,7 +903,7 @@ pub(crate) fn start_send(
     // Resolution first: no point reading the disk for a target we cannot reach
     // anyway (and no leak: unknown == unattested).
     let peer = resolve_peer(state, device_id).ok_or(SendError::UnknownDevice)?;
-    if peer.relay_url.is_none() {
+    if !peer_reachable(state, &peer) {
         return Err(SendError::Offline);
     }
 

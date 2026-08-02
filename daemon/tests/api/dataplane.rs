@@ -160,6 +160,38 @@ async fn two_endpoints_reach_each_other_over_the_lan_without_any_relay() {
     b.close().await;
 }
 
+/// What `lan_peers` reports is what mDNS actually heard: two endpoints with
+/// the discovery on end up in each other's set — symmetrically — with no
+/// relay involved. This is the daemon half of the Core's reachability gate.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_lan_set_reflects_what_mdns_hears() {
+    let seed_a = [5u8; 32];
+    let seed_b = [6u8; 32];
+    let a = IrohTransport::bind_test(seed_a, iroh::RelayMap::empty(), true)
+        .await
+        .expect("endpoint A");
+    let b = IrohTransport::bind_test(seed_b, iroh::RelayMap::empty(), true)
+        .await
+        .expect("endpoint B");
+
+    // Announcements are periodic: poll until both sides hear each other.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let a_sees = a.lan_peers().contains(&node_id(&seed_b));
+        let b_sees = b.lan_peers().contains(&node_id(&seed_a));
+        if a_sees && b_sees {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "mDNS never surfaced the peers: A sees B: {a_sees}, B sees A: {b_sees}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    a.close().await;
+    b.close().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_endpoint_publishes_its_relay() {
     let (relay_map, relay_url, _guard) = run_relay_server().await.expect("local relay");
