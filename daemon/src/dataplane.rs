@@ -10,7 +10,13 @@
 //! `EndpointId` IS the `node_id` that the Core publishes in the directory.
 //! Discovery happens through the directory (node_id + relay_url), not through
 //! iroh's DNS — hence `presets::Minimal` (no discovery, just the crypto
-//! provider).
+//! provider). One local complement: with `lan_discovery` (on by default,
+//! `config.json` turns it off), the endpoint also announces itself and
+//! resolves peers over mDNS, so a peer on the same network is reachable by
+//! its `node_id` alone — no relay, no internet. What mDNS resolves is an
+//! ADDRESS, never trust: an impostor announcing someone else's `node_id`
+//! fails the iroh handshake (the connection authenticates the key), and the
+//! Core's directory check (C7) still gates every stream.
 //!
 //! The binary wires in `LazyIrohTransport`: the endpoint is only bound on the
 //! first real use (session establishment calls `home_relay`). Three reasons. A
@@ -32,6 +38,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, RelayUrl, SecretKey};
+use iroh_mdns_address_lookup::MdnsAddressLookup;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use universallink_core::{
@@ -77,40 +84,65 @@ impl Drop for IrohTransport {
     }
 }
 
+/// The mDNS service name endpoints announce themselves under
+/// (`<node_id>._universallink._udp.local`). Ours rather than the crate's
+/// default `irohv1`: only UniversalLink devices answer each other, and a
+/// packet capture names the protocol honestly.
+const MDNS_SERVICE: &str = "universallink";
+
 impl IrohTransport {
     /// Production endpoint. `relay`: the deployment's relay (self-hosted) if it
     /// is configured, otherwise the n0 public relays — a server of one's own
     /// must not structurally depend on third-party infra. Certificates
-    /// verified normally, no DNS discovery.
-    pub async fn bind(seed: [u8; 32], relay: Option<RelayUrl>) -> anyhow::Result<IrohTransport> {
+    /// verified normally, no DNS discovery. `lan_discovery` adds the mDNS
+    /// lookup (see the module header) — resolution AND announcement: one flag,
+    /// both directions, because announcing without resolving (or the reverse)
+    /// would just be a device its siblings half-see.
+    pub async fn bind(
+        seed: [u8; 32],
+        relay: Option<RelayUrl>,
+        lan_discovery: bool,
+    ) -> anyhow::Result<IrohTransport> {
         let relay_mode = match relay {
             Some(url) => RelayMode::custom([url]),
             None => RelayMode::Default,
         };
-        let builder = Endpoint::builder(presets::Minimal)
+        let mut builder = Endpoint::builder(presets::Minimal)
             .secret_key(SecretKey::from_bytes(&seed))
             .alpns(vec![ALPN.to_vec()])
             .relay_mode(relay_mode);
+        if lan_discovery {
+            builder =
+                builder.address_lookup(MdnsAddressLookup::builder().service_name(MDNS_SERVICE));
+        }
         Self::finish(builder).await
     }
 
     /// Test endpoint: a LOCAL relay (self-signed certificate) whose
     /// verification we skip, and the portmapper turned off (no UPnP/PCP/NAT-PMP
     /// probes to the test machine's gateway — the tests declare themselves
-    /// offline, and they are). Gated by the `test-utils` feature (enabled by
-    /// the dev-dependencies only): the unverified TLS path DOES NOT EXIST in
-    /// the production binary — the compiler guarantees it, not a convention.
+    /// offline, and they are). `lan_discovery` as in `bind` — with an EMPTY
+    /// relay map it is the only route between two test endpoints, which is
+    /// exactly what the LAN test proves. Gated by the `test-utils` feature
+    /// (enabled by the dev-dependencies only): the unverified TLS path DOES
+    /// NOT EXIST in the production binary — the compiler guarantees it, not a
+    /// convention.
     #[cfg(feature = "test-utils")]
     pub async fn bind_test(
         seed: [u8; 32],
         relay_map: iroh::RelayMap,
+        lan_discovery: bool,
     ) -> anyhow::Result<IrohTransport> {
-        let builder = Endpoint::builder(presets::Minimal)
+        let mut builder = Endpoint::builder(presets::Minimal)
             .secret_key(SecretKey::from_bytes(&seed))
             .alpns(vec![ALPN.to_vec()])
             .relay_mode(RelayMode::Custom(relay_map))
             .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
             .ca_tls_config(iroh::tls::CaTlsConfig::insecure_skip_verify());
+        if lan_discovery {
+            builder =
+                builder.address_lookup(MdnsAddressLookup::builder().service_name(MDNS_SERVICE));
+        }
         Self::finish(builder).await
     }
 
@@ -320,16 +352,24 @@ impl AsyncWrite for BiStream {
 pub struct LazyIrohTransport {
     config_dir: PathBuf,
     relay: Option<RelayUrl>,
+    /// Read once, at the bind — like `relay`, a change requires a Core
+    /// restart.
+    lan_discovery: bool,
     cell: tokio::sync::OnceCell<IrohTransport>,
     /// Wakes the waiting `accept`s once the endpoint is bound.
     bound: tokio::sync::Notify,
 }
 
 impl LazyIrohTransport {
-    pub fn new(config_dir: PathBuf, relay: Option<RelayUrl>) -> LazyIrohTransport {
+    pub fn new(
+        config_dir: PathBuf,
+        relay: Option<RelayUrl>,
+        lan_discovery: bool,
+    ) -> LazyIrohTransport {
         LazyIrohTransport {
             config_dir,
             relay,
+            lan_discovery,
             cell: tokio::sync::OnceCell::new(),
             bound: tokio::sync::Notify::new(),
         }
@@ -345,7 +385,7 @@ impl LazyIrohTransport {
                 // the Core's instance lock.
                 let seed = universallink_core::load_or_generate_device_seed(&self.config_dir)
                     .map_err(|e| wrap("device identity", format!("{e:#}")))?;
-                let transport = IrohTransport::bind(seed, self.relay.clone())
+                let transport = IrohTransport::bind(seed, self.relay.clone(), self.lan_discovery)
                     .await
                     .map_err(|e| wrap("binding the iroh endpoint", format!("{e:#}")))?;
                 tracing::info!(

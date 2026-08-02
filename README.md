@@ -229,7 +229,8 @@ Core reads it in its config directory (see
   "oidc_client_secret": "only-if-your-IdP-demands-one",
   "device_name": "Living-room laptop",
   "relay_url": "https://your-iroh-relay.example",
-  "receive_dir": "/home/you/Downloads"
+  "receive_dir": "/home/you/Downloads",
+  "lan_discovery": true
 }
 ```
 
@@ -244,6 +245,11 @@ Core reads it in its config directory (see
   relays are used.
 - `receive_dir`: optional — where received files land; without it,
   `<Downloads>/UniversalLink`.
+- `lan_discovery`: optional, default `true` — announce this device and resolve
+  its siblings over mDNS (UDP 5353) so machines on the same network reach each
+  other directly. The broadcast carries the device's public key and addresses,
+  nothing else, and trust is unaffected: an unknown machine is refused exactly
+  as before. Set `false` on networks where even that is too chatty.
 
 Each of the variables `UNIVERSALLINK_SERVER_URL`, `UNIVERSALLINK_OIDC_ISSUER`,
 `UNIVERSALLINK_OIDC_CLIENT_ID`, `UNIVERSALLINK_OIDC_CLIENT_SECRET`,

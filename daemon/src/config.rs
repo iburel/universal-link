@@ -37,6 +37,9 @@ struct Fields {
     device_name: Option<String>,
     relay_url: Option<String>,
     receive_dir: Option<String>,
+    /// JSON boolean (the only one — the string loop in `read_file` does not
+    /// apply to it). `None`: not set, defaults to on.
+    lan_discovery: Option<bool>,
 }
 
 pub struct DaemonConfig {
@@ -51,6 +54,12 @@ pub struct DaemonConfig {
     /// `config.json`: the configured directory, otherwise the user's
     /// downloads, otherwise (silent environment) the config directory.
     pub receive_dir: PathBuf,
+    /// mDNS on the local network: announce this device and resolve its
+    /// siblings without the relay. ON by default — it only ever discloses the
+    /// `node_id` (a public key) and addresses, and trust stays with the
+    /// attestations — with `"lan_discovery": false` for networks where even
+    /// that is too chatty.
+    pub lan_discovery: bool,
     /// Configuration present but unusable. The daemon logs it and starts
     /// unconfigured: a faulty `config.json` must not deprive the user of their
     /// interface.
@@ -97,6 +106,10 @@ fn load_from(
             device_name,
             relay_url: None,
             receive_dir,
+            // A file we cannot read might have said `false`: a broken config
+            // must not put the machine back on the air, so the toggle fails
+            // OFF — unlike an ABSENT file, where on is the honest default.
+            lan_discovery: false,
             problem,
         };
     }
@@ -131,11 +144,31 @@ fn load_from(
             None
         }
     };
+    // The env override, like everywhere — spelled out because it is a boolean,
+    // not a string the `over` helper can move. Garbage neither turns the radio
+    // on nor off: the file's intent is clear, the variable's is not — reported,
+    // then ignored.
+    let lan_discovery = match env("UNIVERSALLINK_LAN_DISCOVERY")
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+        .as_deref()
+    {
+        None => fields.lan_discovery.unwrap_or(true),
+        Some("true") | Some("1") => true,
+        Some("false") | Some("0") => false,
+        Some(other) => {
+            problem.get_or_insert(format!(
+                "UNIVERSALLINK_LAN_DISCOVERY must be true or false, not {other:?}"
+            ));
+            fields.lan_discovery.unwrap_or(true)
+        }
+    };
     DaemonConfig {
         server,
         device_name,
         relay_url,
         receive_dir,
+        lan_discovery,
         problem,
     }
 }
@@ -261,6 +294,17 @@ fn read_file(path: &Path) -> Result<Fields, String> {
             Some(_) => {
                 return Err(format!("{key} must be a string in {}", path.display()));
             }
+        }
+    }
+    // The only boolean field, read apart from the string loop.
+    match object.get("lan_discovery") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::Bool(b)) => fields.lan_discovery = Some(*b),
+        Some(_) => {
+            return Err(format!(
+                "lan_discovery must be a boolean in {}",
+                path.display()
+            ));
         }
     }
     Ok(fields)
@@ -533,6 +577,62 @@ mod tests {
         assert_eq!(config.receive_dir, PathBuf::from("/other/received"));
         let config = load_with(&dir, &[("UNIVERSALLINK_RECEIVE_DIR", "  ")]);
         assert_eq!(config.receive_dir, PathBuf::from("/srv/received"));
+    }
+
+    #[test]
+    fn lan_discovery_defaults_on_and_the_file_turns_it_off() {
+        // Absent (no file, or a file without the field): on — the product
+        // default, a fresh install finds its siblings.
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(load_with(&dir, &[]).lan_discovery);
+        write(&dir, COMPLETE);
+        assert!(load_with(&dir, &[]).lan_discovery);
+
+        // The file turns it off, and that is not a fault.
+        write(&dir, r#"{ "lan_discovery": false }"#);
+        let config = load_with(&dir, &[]);
+        assert!(!config.lan_discovery);
+        assert!(config.problem.is_none());
+
+        // A non-boolean is a type fault, like everywhere.
+        write(&dir, r#"{ "lan_discovery": "yes" }"#);
+        let problem = load_with(&dir, &[]).problem.expect("type rejected");
+        assert!(problem.contains("lan_discovery"), "{problem}");
+    }
+
+    #[test]
+    fn lan_discovery_fails_off_on_a_broken_file() {
+        // The unreadable file might have said `false`: a typo in config.json
+        // must not put the machine back on the air.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(&dir, "{ this is not JSON");
+        let config = load_with(&dir, &[]);
+        assert!(!config.lan_discovery);
+        assert!(config.problem.is_some());
+    }
+
+    #[test]
+    fn lan_discovery_env_overrides_and_garbage_is_reported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(&dir, r#"{ "lan_discovery": false }"#);
+
+        // The environment overrides the file, in both directions and both
+        // spellings.
+        assert!(load_with(&dir, &[("UNIVERSALLINK_LAN_DISCOVERY", "true")]).lan_discovery);
+        assert!(load_with(&dir, &[("UNIVERSALLINK_LAN_DISCOVERY", "1")]).lan_discovery);
+        std::fs::remove_file(dir.path().join("config.json")).expect("remove config");
+        assert!(!load_with(&dir, &[("UNIVERSALLINK_LAN_DISCOVERY", "false")]).lan_discovery);
+        assert!(!load_with(&dir, &[("UNIVERSALLINK_LAN_DISCOVERY", "0")]).lan_discovery);
+
+        // An empty variable does not erase, like everywhere.
+        write(&dir, r#"{ "lan_discovery": false }"#);
+        assert!(!load_with(&dir, &[("UNIVERSALLINK_LAN_DISCOVERY", "  ")]).lan_discovery);
+
+        // Garbage: reported, and the file's clear intent is kept.
+        let config = load_with(&dir, &[("UNIVERSALLINK_LAN_DISCOVERY", "maybe")]);
+        assert!(!config.lan_discovery, "the file said false");
+        let problem = config.problem.expect("garbage reported");
+        assert!(problem.contains("UNIVERSALLINK_LAN_DISCOVERY"), "{problem}");
     }
 
     #[test]

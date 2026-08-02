@@ -68,10 +68,12 @@ use crate::state::AppState;
 pub struct PeerAddr {
     pub node_id: String,
     /// The relay the peer published in the directory. `None`: the peer has not
-    /// (yet) published one — and opening then FAILS: without iroh discovery
-    /// (`presets::Minimal`) or a direct address in the directory, the relay is
-    /// the only route. (Direct connection over LAN will come with local
-    /// discovery, not wired in yet — the fake reflects this contract.)
+    /// (yet) published one. The daemon's transport can now also resolve a peer
+    /// on the local network by its `node_id` alone (mDNS, `lan_discovery`),
+    /// but the Core still requires a published relay before it even tries
+    /// (`start_send` answers `Offline`, `account_peers` skips the device) —
+    /// lifting that gate is the next block, and the fake reflects the current
+    /// contract.
     pub relay_url: Option<String>,
 }
 

@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Machines on the same network now find each other directly.** Each desktop
+  announces itself over mDNS (as `universallink`, UDP 5353) and resolves its
+  siblings the same way, so a transfer between two machines that share a
+  network no longer depends on the relay to get started — including when the
+  relay is unreachable. The announcement carries the device's public key and
+  addresses, nothing more, and changes nothing about trust: a machine that is
+  not attested on the account is refused exactly as before, and an impostor
+  answering to someone else's identity fails the handshake. `"lan_discovery":
+  false` in `config.json` turns the whole thing off. (Groundwork: the next
+  step is letting two machines work with no reachable server at all.)
+
 ### Fixed
 
 - **macOS: clicking the app icon opened nothing.** Not the Dock, not the Finder,

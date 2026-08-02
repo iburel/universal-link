@@ -82,6 +82,7 @@ async fn run() -> anyhow::Result<Outcome> {
     let transport = Arc::new(dataplane::LazyIrohTransport::new(
         endpoint.config_dir.clone(),
         settings.relay_url,
+        settings.lan_discovery,
     ));
 
     // How the Core re-reads its config on `session.reload` (once the GUI has
