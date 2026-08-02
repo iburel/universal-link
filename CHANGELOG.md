@@ -48,6 +48,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Android: a repeating log line no longer buries the log.** Android's log is
+  a small ring buffer shared with the whole system, and an app that repeats
+  itself pushes out everything worth reading — a phone left in a pocket, whose
+  network the system takes away, had its own diagnosis wiped by hundreds of
+  identical "send refused" warnings. Each distinct line is now written once
+  and its repeats are counted out loud instead of copied (measured on the
+  device: 141 lines in 45 seconds became 9, with nothing lost — the counts are
+  reported). Nothing is silenced: a line never seen before always goes
+  through.
 - **macOS: a blocked "Local Network" permission now reads as one clear line.**
   macOS asks each fresh build for that permission and quietly refuses every
   discovery packet until someone answers — LAN discovery deaf and mute, and
