@@ -87,6 +87,10 @@ object KeepAlive {
     fun setWork(kind: Int) {
         work = kind
         val context = this.context ?: return
+        // Work in flight is also one of the two reasons to hear the LAN: a
+        // transfer running behind HOME may have to re-resolve its peer, and
+        // with every window stopped nothing else holds the multicast lock.
+        LanMulticast.work(context, kind != NONE)
         try {
             if (kind == NONE) {
                 UlForegroundService.stop(context)

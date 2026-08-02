@@ -22,6 +22,11 @@ class MainActivity : TauriActivity() {
         // exists (see KeepAlive). It needs nothing from Tauri — it loads the
         // library itself — so it can run this early.
         KeepAlive.attach(this)
+        // Also before super.onCreate, and for the same kind of reason: this
+        // registers the lifecycle callback that counts our windows, and it must
+        // be in place before this activity's own onStart is the first thing it
+        // has to count (see LanMulticast).
+        LanMulticast.attach(this)
 
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
