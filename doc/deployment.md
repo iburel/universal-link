@@ -131,6 +131,24 @@ reinstall the bundle properly instead. And never overwrite a Mach-O in place:
 the kernel kills a binary whose file was rewritten under a cached signature
 (`last exit reason: OS_REASON_CODESIGNING` in `launchctl print`).
 
+## A VPN takes the app off its own network
+
+A device-wide VPN routes a covered app's traffic — inbound and outbound —
+through the tunnel, and multicast does not survive a tunnel: the app can
+neither announce on the local network nor hear anyone announcing, even though
+everything the server and the relay carry keeps working. On Android this
+confinement is per-app and absolute (the system routes by UID; pinning a
+socket to the Wi-Fi interface changes nothing, and with a non-bypassable VPN
+the app cannot opt out programmatically). Measured on a real device under
+WireGuard: the system's own mDNS still reaches the wire, the app's never does,
+in either direction.
+
+The Core's dark-wire probe cannot see this: its beacon loops back inside the
+kernel and reports a healthy wire, so no warning line appears. If devices on
+the same network do not see each other and one of them runs a VPN, this is
+the first thing to check. The cure is the VPN app's own per-app exemption
+(WireGuard calls it *Excluded applications*) — or turning the tunnel off.
+
 ## Secrets
 
 Two go to the OS keyring — Secret Service (Linux), Keychain (macOS), Credential
