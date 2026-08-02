@@ -78,10 +78,11 @@
 //!   connection (the server broadcasts `device.offline`), deletes
 //!   `session.json` (or empties it if the deletion fails — an empty file counts
 //!   as "no session" at startup), does not reconnect.
-//! - `devices.list` IPC: serves the cache (last known snapshot), even when
-//!   disconnected — freshness is read from `session.changed`;
-//!   `SERVER_UNREACHABLE` if no snapshot since startup (or no session). Each
-//!   device record served over the IPC is enriched with `is_self`.
+//! - `devices.list` IPC: serves the stored directory (last known snapshot), even
+//!   when disconnected — freshness is read from `session.changed`;
+//!   `SERVER_UNREACHABLE` only for a Core that knows of no device AT ALL (see the
+//!   serverless block below). Each device record served over the IPC is enriched
+//!   with `is_self`.
 //! - `devices.rename` IPC: proxy to the server; the response (`{ device }`) is
 //!   relayed enriched; a server error is relayed as-is (JSON-RPC code +
 //!   `data.code`); `SERVER_UNREACHABLE` if disconnected. The Core synthesizes
@@ -183,6 +184,31 @@
 //!   outcome (`transfer.failed { error: "cancelled" }`) is emitted by the task,
 //!   ONCE, AFTER deregistration — a `files.cancel` replayed immediately after
 //!   seeing it therefore finds `TRANSFER_UNKNOWN`.
+//!
+//! An account with no server (serverless, building block 1 — `serverless.rs`):
+//! - Being IN the account (`account.status.attested`: the C7 trust root is
+//!   installed and attests THIS `node_id`) and being LOGGED IN (`session.json`)
+//!   are independent. Everything that decides trust and routes already rests on
+//!   the first alone; this block stops the second from being a prerequisite.
+//! - `account.setup`/`account.join` require a CONNECTED server only when one is
+//!   CONFIGURED. Nothing configured → nothing to publish an attestation to, and
+//!   the account is created locally. Configured but disconnected → still
+//!   `SERVER_UNREACHABLE` (the other devices would never read the attestation).
+//! - A device in the account holds its OWN directory record, minted from what it
+//!   knows first-hand (`node_id`, name, attestation): `device_id` = its `node_id`
+//!   when no server has named it, `online: true`, and `null` where only a server
+//!   can fill in (`relay_url`, `last_seen`, `status`). Hence `devices.list`
+//!   answering with no session at all, and `SERVER_UNREACHABLE` being left for a
+//!   Core that has never logged in AND never joined an account.
+//! - It survives a logout and a revocation: a session ends, a membership does
+//!   not (the trust root already stayed). The self-minted `device_id` takes over
+//!   from the server's label, which left with the session.
+//! - `directory.json` expires (7-day TTL, the revocation-staleness bound) only
+//!   where a configured server could refresh it. With none, that file is not a
+//!   cache of a directory — it IS the directory, and expiring it would erase the
+//!   account rather than fail closed. It is loaded at startup for a session OR a
+//!   trust root, and the boot-time self-record is NOT persisted (writing it would
+//!   refresh `saved_at` at every startup and silently extend the bound).
 
 #![allow(dead_code)]
 
@@ -417,7 +443,10 @@ impl TestServer {
 pub struct TestCore {
     pub handle: CoreHandle,
     dir: tempfile::TempDir,
-    /// Identity seeded by `start_enrolled` (the Core's device on the server).
+    /// Identity the harness seeded into the config directory, and the
+    /// `device_id` the Core goes by: the server's label when it was enrolled
+    /// (`start_enrolled`), its own `node_id` when the account owes nothing to a
+    /// server (`start_in_account`).
     enrolled: Option<(String, DeviceKey)>,
     /// Server+OIDC config passed to the Core (preserved by `restart`).
     server_cfg: Option<universallink_core::ServerConfig>,
@@ -432,8 +461,10 @@ pub struct TestCore {
     reload_slot: Arc<std::sync::Mutex<Result<Option<universallink_core::ServerConfig>, String>>>,
 }
 
-/// The server+OIDC config of a Core pointed at the test environment.
-fn server_cfg(server: &TestServer) -> universallink_core::ServerConfig {
+/// The server+OIDC config of a Core pointed at the test environment. Public for
+/// the tests that configure a Core AFTER it started, the way the GUI writes
+/// `config.json` and calls `session.reload`.
+pub fn server_cfg(server: &TestServer) -> universallink_core::ServerConfig {
     universallink_core::ServerConfig {
         url: server.core_url(),
         oidc_issuer: server.oidc.issuer(),
@@ -456,6 +487,20 @@ impl TestCore {
     pub async fn start() -> TestCore {
         let dir = tempfile::tempdir().expect("tempdir");
         Self::spawn_in(dir, None, None, None).await
+    }
+
+    /// A Core that has joined the account with NO server in the picture: nothing
+    /// configured, no session — just `device.key` and the trust root that
+    /// `account.join` writes. The serverless starting point, and the state a
+    /// restart has to come back to. Its `device_id` is its own `node_id`: no
+    /// server ever named it.
+    pub async fn start_in_account(code: &str) -> TestCore {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = DeviceKey::generate();
+        std::fs::write(dir.path().join("device.key"), key.seed_hex()).expect("seed device.key");
+        seed_account_from_code(dir.path(), &key.node_id(), code);
+        let device_id = key.node_id();
+        Self::spawn_in(dir, Some((device_id, key)), None, None).await
     }
 
     /// Core configured (server + OIDC) but never logged in: the state a
@@ -692,14 +737,24 @@ impl TestCore {
         *self.reload_slot.lock().expect("reload slot") = Err(reason.to_string());
     }
 
-    /// device_id of the Core in the directory (panics outside `start_enrolled`).
+    /// device_id of the Core in the directory (panics outside `start_enrolled` /
+    /// `start_in_account`).
     pub fn device_id(&self) -> &str {
         &self.enrolled.as_ref().expect("enrolled Core").0
     }
 
-    /// Key of the Core's device (panics outside `start_enrolled`).
+    /// Key of the Core's device (panics outside `start_enrolled` /
+    /// `start_in_account`).
     pub fn key(&self) -> &DeviceKey {
         &self.enrolled.as_ref().expect("enrolled Core").1
+    }
+
+    /// The Core's `node_id`, read back from `device.key`. For a Core the harness
+    /// seeded no identity into (`start`), that file — generated at startup — is
+    /// the only place it exists.
+    pub fn node_id(&self) -> String {
+        let seed = std::fs::read_to_string(self.dir.path().join("device.key")).expect("device.key");
+        DeviceKey::from_seed_hex(seed.trim()).node_id()
     }
 
     pub fn config_dir(&self) -> &Path {

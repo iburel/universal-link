@@ -293,12 +293,17 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
     });
 
     let session_info = session::read_session_file(&config.config_dir);
-    // The directory cache only vouches within a session: logged out, nothing
-    // is served no matter what the disk says. Stale or corrupt loads as
-    // nothing — the Core then starts fail-closed, as it did before the cache.
-    let cached_devices = match &session_info {
-        Some(_) => directory::load(&config.config_dir),
-        None => None,
+    // The stored directory vouches for a Core that belongs somewhere: a session,
+    // or the account's trust root — a device that joined the account without
+    // ever logging in has no server to snapshot from, so that file is not a
+    // cache of a directory, it IS the directory. Neither: nothing is served, no
+    // matter what the disk says. Stale or corrupt loads as nothing — fail-closed,
+    // exactly as before the file existed.
+    let stored_devices = match (&session_info, &account_root) {
+        (None, None) => None,
+        // Only a configured server could ever refresh it, and that is what
+        // makes expiry meaningful (see `directory`).
+        _ => directory::load(&config.config_dir, config.server.is_some()),
     };
     let state = Arc::new(AppState {
         registry: Mutex::new(Registry::new(file_token)),
@@ -321,10 +326,36 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
         reconnect_base_delay: config.reconnect_base_delay,
         shutdown_request: tokio::sync::Notify::new(),
     });
-    if let Some(devices) = cached_devices {
+    if let Some(devices) = stored_devices {
         // Seeded before any task exists — no reader can race it. The first
         // successful session setup replaces it with the live snapshot.
         state.session.lock().expect("lock session").devices = Some(devices);
+    }
+    // A device in the account knows at least ITSELF — session or not, server or
+    // not. Without this a Core that joined the account and never logged in would
+    // answer `SERVER_UNREACHABLE` to a component asking who is around, while
+    // holding everything needed to say "me".
+    //
+    // Cloned out of the leaf lock before taking `session` (lock ordering), and
+    // deliberately NOT persisted: writing the store here would refresh its
+    // `saved_at` at every startup and silently extend the staleness bound of
+    // records the server may have revoked meanwhile.
+    let own_attestation = state
+        .account_root
+        .lock()
+        .expect("lock account_root")
+        .as_ref()
+        .map(|root| root.attestation.clone());
+    if let Some(attestation) = &own_attestation {
+        state
+            .session
+            .lock()
+            .expect("lock session")
+            .adopt_own(crate::state::OwnDevice {
+                node_id: &state.identity.node_id(),
+                name: &state.device_name,
+                attestation,
+            });
     }
 
     if let Some(info) = session_info {

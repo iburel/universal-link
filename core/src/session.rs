@@ -175,12 +175,29 @@ pub async fn run(state: Arc<AppState>, info: SessionInfo) {
 /// disk, and notify the subscribers. The state returns to that of a Core never
 /// logged in. No effect if a logout has already been through here.
 fn drop_session(state: &AppState) {
+    // Read out of the leaf locks before taking `session` (lock ordering). The
+    // trust root outlives the session (see below), so this device keeps knowing
+    // itself — the same rule as a logout.
+    let own_attestation = state
+        .account_root
+        .lock()
+        .expect("lock account_root")
+        .as_ref()
+        .map(|root| root.attestation.clone());
+    let node_id = state.identity.node_id();
+    let own = own_attestation
+        .as_deref()
+        .map(|attestation| crate::state::OwnDevice {
+            node_id: &node_id,
+            name: &state.device_name,
+            attestation,
+        });
     {
         let mut s = state.session.lock().expect("lock session");
         if !s.logged_in {
             return;
         }
-        let (payload, _abort) = s.forget();
+        let (payload, _abort) = s.forget(own);
         // The refresh token belonged to this session: a device the account has
         // struck off should no longer hold the means to obtain ID tokens.
         state.secrets.delete(crate::secrets::REFRESH_TOKEN);
@@ -670,16 +687,33 @@ fn set_own_relay(state: &AppState, device_id: &str, url: &str) {
     }
 }
 
-/// Publishes our attestation to the server then, on success, carries it onto OUR
-/// OWN cache record: the server excludes the publisher from its broadcast, and
-/// without this gesture our local directory would ignore itself until
-/// reconnection (same reason as `set_own_relay` for the relay).
+/// Makes this device's attestation (C7) known: published to the server when
+/// there is one, and carried onto OUR OWN directory record either way — the
+/// server excludes the publisher from its broadcast, so without that gesture our
+/// local directory would ignore itself until reconnection (same reason as
+/// `set_own_relay` for the relay).
 ///
-/// Called after joining the account mid-session — by a typed recovery code
+/// Called after joining the account — by a typed recovery code
 /// (`account.setup`/`join`) or by a pairing. On (re)connection there is nothing
 /// to do: setup publishes before taking the snapshot, so the snapshot already
 /// carries it.
+///
+/// **With no server configured there is nothing to publish to**, and nothing to
+/// wait for: the directory is local and our own record is the whole of it. (When
+/// a server IS configured, the caller's gate has already made sure it is
+/// connected — so the branch below is exactly the serverless case, not a
+/// disconnected one, whose local write would claim an attestation the account's
+/// other devices could not read.)
 pub(crate) async fn publish_attestation(state: &AppState, root: &crate::account_key::AccountRoot) {
+    let configured = state
+        .server_config
+        .lock()
+        .expect("lock server_config")
+        .is_some();
+    if !configured {
+        adopt_own_record(state, &root.attestation);
+        return;
+    }
     let published = proxy(
         state,
         "presence.update",
@@ -688,24 +722,23 @@ pub(crate) async fn publish_attestation(state: &AppState, root: &crate::account_
     .await
     .is_ok();
     if published {
-        set_own_attestation(state, &root.attestation);
+        adopt_own_record(state, &root.attestation);
     }
 }
 
-/// Carries our freshly published attestation (C7) onto our own cache record —
-/// same reason as `set_own_relay`: the server excludes the publisher from its
-/// broadcast. Called after an `account.setup`/`join` during a session (on
-/// (re)connection, the post-publication snapshot already carries the
-/// attestation).
-pub(crate) fn set_own_attestation(state: &AppState, attestation: &str) {
+/// Puts our own record in the directory, carrying `attestation` — created if this
+/// Core has none yet (no server ever named it), otherwise just updated. Same
+/// reason as `set_own_relay`: what we publish about ourselves does not come back
+/// to us.
+pub(crate) fn adopt_own_record(state: &AppState, attestation: &str) {
+    let node_id = state.identity.node_id();
     let mut s = state.session.lock().expect("lock session");
-    let Some(device_id) = s.own_device_id.clone() else {
-        return;
-    };
-    if let Some(devices) = s.devices.as_mut() {
-        if let Some(record) = devices.get_mut(&device_id) {
-            record["attestation"] = json!(attestation);
-        }
+    s.adopt_own(crate::state::OwnDevice {
+        node_id: &node_id,
+        name: &state.device_name,
+        attestation,
+    });
+    if let Some(devices) = s.devices.as_ref() {
         crate::directory::save(&state.config_dir, devices);
     }
 }

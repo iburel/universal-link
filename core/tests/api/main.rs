@@ -18,6 +18,7 @@ mod hello;
 mod login;
 mod pairing;
 mod protocol;
+mod serverless;
 mod session;
 mod startup;
 mod system;

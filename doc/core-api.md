@@ -177,8 +177,13 @@ end in the same `account-key.json` + keyring entry, and both go through the same
 rules (`account_key::install`) — a key other than the one already installed is
 refused either way.
 
-`account.setup`/`account.join` assume the server is reachable
-(`SERVER_UNREACHABLE` otherwise) and return `ACCOUNT_KEY_SAVE_FAILED` if the key
+`account.setup`/`account.join` assume the server is reachable **when there is one
+configured** (`SERVER_UNREACHABLE` otherwise): joining publishes an attestation
+the account's other devices read from the server, and a device that could not
+publish it would be in the account for itself alone. With **no server configured**
+there is nothing to publish to and nothing to be unreachable for — the key, the
+root and this device's own record are all local, and that is how an account is
+created with no server at all. They return `ACCOUNT_KEY_SAVE_FAILED` if the key
 or the root cannot be persisted — nothing is installed in that case. `holds_key`
 is answered by reading the keyring back, not by remembering the write: a keyring
 write can be queued, and a stored key that does not derive `ak_pub` is ignored
@@ -262,7 +267,7 @@ Core with three fields:
 
 | Method | Description |
 |---|---|
-| `devices.list {}` | → `[ device, … ]` (snapshot, includes the local device) |
+| `devices.list {}` | → `[ device, … ]` (snapshot, includes the local device). `SERVER_UNREACHABLE` only for a Core that knows of no device at all — see below |
 | `devices.rename { device_id, name }` | proxy to the server |
 | `devices.revoke { device_id }` | → `{ status: "done" }` or `{ status: "reauth_required", auth_url }` (fresh ID token required by the server; the caller opens the URL, completion arrives via `device.removed`) |
 
@@ -273,6 +278,17 @@ left the *server* may still be on the LAN — patching `online` alone would get
 `reachable` wrong either way). And `device.updated` also fires, unprompted, when
 a device's LAN visibility flips — server connected or not: this is how the menu
 and the GUI follow the room without polling.
+
+**What the directory is made of.** The server's snapshot while there is a session
+(kept across an outage, freshness read from `session.changed`) — plus, for a
+device that has joined the account, **its own record**, which owes nothing to a
+server: this Core knows its `node_id`, its name and its attestation first-hand,
+and it keeps them across a logout (a session ends, a membership does not). So
+`SERVER_UNREACHABLE` is left for a Core that knows of no device at all — one that
+has never logged in *and* never joined an account. A record a Core minted for
+itself carries `device_id` = its own `node_id` (no server has named it),
+`online: true` (its own liveness needs nobody) and `null` in the fields only a
+server fills: `relay_url`, `last_seen`, `status`.
 
 ## `files.*`
 

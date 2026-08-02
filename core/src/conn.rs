@@ -619,12 +619,31 @@ impl Conn {
     /// drop → offline), session.json removed, a single notification.
     fn session_logout(&mut self) -> Result<Value, RpcErr> {
         self.require_scope("session.manage")?;
+        // Read out of the leaf lock before taking `session` (lock ordering).
+        // Logging out of a server does not leave the ACCOUNT: the trust root
+        // stays (it is what a re-enrollment or a pairing rests on), so what this
+        // device knows first-hand about itself has to survive the session too.
+        let own_attestation = self
+            .state
+            .account_root
+            .lock()
+            .expect("lock account_root")
+            .as_ref()
+            .map(|root| root.attestation.clone());
+        let node_id = self.state.identity.node_id();
+        let own = own_attestation
+            .as_deref()
+            .map(|attestation| crate::state::OwnDevice {
+                node_id: &node_id,
+                name: &self.state.device_name,
+                attestation,
+            });
         let abort = {
             let mut s = self.state.session.lock().expect("lock session");
             if !s.logged_in {
                 return Ok(json!({}));
             }
-            let (payload, abort) = s.forget();
+            let (payload, abort) = s.forget(own);
             crate::session::remove_session_file(&self.state.config_dir);
             // The cached directory and the refresh token belonged to this
             // session: they leave with it.
@@ -702,7 +721,7 @@ impl Conn {
     /// to compare on the other devices.
     async fn account_setup(&mut self) -> Result<Value, RpcErr> {
         self.require_scope("session.manage")?;
-        self.require_server_connected()?;
+        self.require_server_if_configured()?;
         let code = crate::account_key::generate_recovery_code();
         let ak = crate::account_key::account_key_from_code(&code)
             .expect("freshly generated code is valid");
@@ -722,7 +741,7 @@ impl Conn {
     /// has the account but not its key (see `install_account_root`).
     async fn account_join(&mut self, params: &Value) -> Result<Value, RpcErr> {
         self.require_scope("session.manage")?;
-        self.require_server_connected()?;
+        self.require_server_if_configured()?;
         let code = rpc::required_str(params, "recovery_code")?;
         let ak = crate::account_key::account_key_from_code(&code)
             .map_err(|_| RpcErr::app("INVALID_CODE"))?;
@@ -745,12 +764,26 @@ impl Conn {
         })
     }
 
-    /// Refuses when the server is not connected: publishing the attestation
-    /// would not succeed, and session setup has already decided what to publish
-    /// — the device would stay unreachable for the whole session. Like
-    /// `devices.revoke`, an account operation assumes the server is reachable
-    /// (and the user just logged in to get here).
-    fn require_server_connected(&self) -> Result<(), RpcErr> {
+    /// A **configured** server must be connected: joining the account publishes
+    /// an attestation, and session setup has already decided what to publish —
+    /// the device would otherwise stay unreachable for the whole session. Like
+    /// `devices.revoke`, an account operation on a deployment assumes the server
+    /// is reachable (and the user just logged in to get here).
+    ///
+    /// With **no server configured** there is nothing to publish to, and nothing
+    /// to be unreachable for: the trust root, the directory and this device's own
+    /// record are all local. Refusing here would mean an account could never be
+    /// created without a server, which is precisely what this path is for.
+    fn require_server_if_configured(&self) -> Result<(), RpcErr> {
+        let configured = self
+            .state
+            .server_config
+            .lock()
+            .expect("lock server_config")
+            .is_some();
+        if !configured {
+            return Ok(());
+        }
         if self
             .state
             .session

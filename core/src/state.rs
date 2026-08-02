@@ -107,6 +107,17 @@ pub struct ServerCmd {
     pub reply: tokio::sync::oneshot::Sender<Result<Value, RpcErr>>,
 }
 
+/// What a device knows about itself with no server involved: its crypto identity,
+/// the name it carries, and its attestation under the account key (C7). Enough to
+/// hold its own directory record — through a startup with no session, and through
+/// the end of one.
+#[derive(Clone, Copy)]
+pub struct OwnDevice<'a> {
+    pub node_id: &'a str,
+    pub name: &'a str,
+    pub attestation: &'a str,
+}
+
 /// State of the server session, published on the IPC (`session.status`,
 /// `session.changed`, `devices.*`).
 pub struct SessionState {
@@ -119,9 +130,11 @@ pub struct SessionState {
     pub server_connected: bool,
     /// The Core's device_id in the directory.
     pub own_device_id: Option<String>,
-    /// The account's directory: the last known snapshot, maintained by the
-    /// `device.*` events. `None` until a snapshot has succeeded since startup —
-    /// there is then nothing honest to serve.
+    /// The account's directory, keyed by `device_id`: the server's last snapshot
+    /// while there is a session, maintained by the `device.*` events — plus, for
+    /// a device that has joined the account, its OWN record, which owes nothing
+    /// to a server (`adopt_own`). `None` while this Core knows of no device at
+    /// all, its own included: there is then nothing honest to serve.
     pub devices: Option<BTreeMap<String, Value>>,
     /// Sender toward the session task — present when the connection is
     /// established (the `devices.rename`… proxies go through it).
@@ -155,15 +168,82 @@ impl SessionState {
         v
     }
 
+    /// Ensures the directory holds this device's OWN record, carrying its
+    /// attestation — the half of the directory that owes nothing to a server:
+    /// this Core knows its `node_id`, its name and its attestation first-hand.
+    ///
+    /// Called wherever that becomes true: at startup for a device already in the
+    /// account, when it joins one with no server in sight, after a logout (the
+    /// session leaves, the account stays) — and on the server path, where it
+    /// carries a freshly published attestation onto our own record, which the
+    /// server excludes us from hearing back.
+    ///
+    /// The record is keyed by the server's `device_id` when there is one, and by
+    /// our `node_id` otherwise — a self-minted label for a device no server has
+    /// named. It has to be the same value `own_device_id` holds, since that is
+    /// what `enrich_device` derives `is_self` from.
+    ///
+    /// The name is NOT refreshed: while a session exists the server owns it
+    /// (`devices.rename` can come from another device), and our idea of it is the
+    /// one from startup.
+    pub fn adopt_own(&mut self, own: OwnDevice<'_>) {
+        let id = self
+            .own_device_id
+            .get_or_insert_with(|| own.node_id.to_string())
+            .clone();
+        let devices = self.devices.get_or_insert_with(BTreeMap::new);
+        let record = devices.entry(id.clone()).or_insert_with(|| {
+            crate::directory::own_record(&id, own.name, own.node_id, own.attestation)
+        });
+        record["attestation"] = json!(own.attestation);
+    }
+
+    /// The server has just named this device (a login completed): our own record
+    /// moves to the label it gave. Whatever the old one was — the `node_id` a
+    /// serverless startup minted, or a previous session's — it described US, and
+    /// left where it was it would show this device to itself as a STRANGER
+    /// (`enrich_device` compares `device_id`s) for as long as it takes the first
+    /// snapshot to replace the map.
+    ///
+    /// The record is carried over rather than dropped: what we know first-hand
+    /// (our attestation, our name) is true under either label, and the snapshot
+    /// will overwrite it in a moment anyway.
+    pub fn rekey_own(&mut self, device_id: String) {
+        let previous = self.own_device_id.replace(device_id.clone());
+        let (Some(previous), Some(devices)) = (previous, self.devices.as_mut()) else {
+            return;
+        };
+        if previous == device_id {
+            return;
+        }
+        if let Some(mut record) = devices.remove(&previous) {
+            record["device_id"] = json!(device_id);
+            devices.insert(device_id, record);
+        }
+    }
+
     /// Forgets the session (logout, revocation); returns the notification
     /// payload and the task's stop handle, if there is one.
-    pub fn forget(&mut self) -> (Value, Option<tokio::task::AbortHandle>) {
+    ///
+    /// `own` is what this device knows about itself with no server involved —
+    /// `Some` whenever it holds the account's trust root. The session goes, the
+    /// ACCOUNT does not: it keeps knowing itself, under a self-minted
+    /// `device_id`, the server's label having left with the session. Taken as a
+    /// parameter rather than read here, because `account_root` is a leaf lock and
+    /// this runs under `session`.
+    pub fn forget(
+        &mut self,
+        own: Option<OwnDevice<'_>>,
+    ) -> (Value, Option<tokio::task::AbortHandle>) {
         self.logged_in = false;
         self.account = None;
         self.server_connected = false;
         self.own_device_id = None;
         self.devices = None;
         self.server_tx = None;
+        if let Some(own) = own {
+            self.adopt_own(own);
+        }
         let abort = self.session_abort.take();
         (self.status_record(), abort)
     }
@@ -524,4 +604,98 @@ pub fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     rand::Rng::fill_bytes(&mut rand::rng(), &mut buf);
     hex::encode(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What a Core in the account holds about itself before any server has named
+    /// it — the serverless startup state.
+    fn in_account_without_a_session() -> SessionState {
+        let mut s = SessionState::new(None);
+        s.adopt_own(OwnDevice {
+            node_id: "ab12",
+            name: "Office-PC",
+            attestation: "sig",
+        });
+        s
+    }
+
+    #[test]
+    fn a_device_in_the_account_knows_itself_under_its_own_node_id() {
+        let s = in_account_without_a_session();
+
+        assert_eq!(s.own_device_id.as_deref(), Some("ab12"));
+        let devices = s.devices.expect("a directory");
+        let own = devices.get("ab12").expect("our own record");
+        assert_eq!(own["node_id"], json!("ab12"));
+        assert_eq!(own["name"], json!("Office-PC"));
+        assert_eq!(own["attestation"], json!("sig"));
+    }
+
+    /// The label the server hands out replaces the self-minted one, and the record
+    /// follows it: a device must never appear in its own directory as a stranger.
+    #[test]
+    fn a_server_naming_this_device_carries_its_record_over() {
+        let mut s = in_account_without_a_session();
+
+        s.rekey_own("d_7f3a".to_string());
+
+        assert_eq!(s.own_device_id.as_deref(), Some("d_7f3a"));
+        let devices = s.devices.expect("a directory");
+        assert_eq!(devices.len(), 1, "one device, not two: {devices:?}");
+        let own = devices.get("d_7f3a").expect("our record, re-keyed");
+        assert_eq!(own["device_id"], json!("d_7f3a"), "the record says so too");
+        assert_eq!(own["attestation"], json!("sig"), "what we knew is kept");
+    }
+
+    /// A session that ends (logout, revocation) leaves the account behind: the
+    /// device goes back to knowing itself under its own `node_id`.
+    #[test]
+    fn the_end_of_a_session_leaves_the_account_knowing_itself() {
+        let mut s = SessionState::new(Some(&crate::session::SessionInfo {
+            server_url: "ws://server/ws".to_string(),
+            device_id: "d_7f3a".to_string(),
+            account: None,
+        }));
+        s.devices = Some(BTreeMap::from([(
+            "d_7f3a".to_string(),
+            json!({ "device_id": "d_7f3a", "node_id": "ab12" }),
+        )]));
+        let own = OwnDevice {
+            node_id: "ab12",
+            name: "Office-PC",
+            attestation: "sig",
+        };
+
+        let (payload, _) = s.forget(Some(own));
+
+        assert_eq!(payload["logged_in"], json!(false));
+        assert_eq!(
+            s.own_device_id.as_deref(),
+            Some("ab12"),
+            "the server's label left with the session"
+        );
+        let devices = s.devices.as_ref().expect("still a directory");
+        assert_eq!(devices.len(), 1);
+        assert!(devices.contains_key("ab12"));
+    }
+
+    /// A device that never joined the account has nothing of its own to keep: the
+    /// directory goes, and `devices.list` has nothing honest to serve.
+    #[test]
+    fn the_end_of_a_session_without_an_account_leaves_nothing() {
+        let mut s = SessionState::new(Some(&crate::session::SessionInfo {
+            server_url: "ws://server/ws".to_string(),
+            device_id: "d_7f3a".to_string(),
+            account: None,
+        }));
+        s.devices = Some(BTreeMap::new());
+
+        s.forget(None);
+
+        assert!(s.devices.is_none(), "no account, no directory");
+        assert_eq!(s.own_device_id, None);
+    }
 }

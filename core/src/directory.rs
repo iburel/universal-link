@@ -1,22 +1,31 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
 
-//! The directory cache: the account's device records (attestations included),
-//! persisted so a Core that starts with no reachable server still recognizes
+//! The account's directory as persisted: the device records (attestations
+//! included), so a Core that starts with no reachable server still recognizes
 //! its siblings. Without it, the LAN route (`dataplane::peer_reachable`) is
 //! useless precisely when it matters most — the server unreachable and two
 //! machines in the same room.
 //!
-//! The cache can never MINT trust: every use of a record re-verifies its
-//! attestation against the account key from the local keyring (C7), exactly
-//! as for a live snapshot — a tampered or injected file grants nothing, just
-//! like a lying server. What a cache CAN do is PROLONG trust: a device
-//! revoked while this one was offline keeps its cached attestation until the
-//! next server contact. `CACHE_TTL` bounds that window — a snapshot past it
-//! no longer vouches and is ignored at load, so a machine that boots after
-//! weeks in a drawer starts fail-closed, exactly as before the cache
-//! existed. (Load-time only, deliberately: a Core that stays RUNNING keeps
-//! its in-memory map across server outages, as it always has.)
+//! It can never MINT trust: every use of a record re-verifies its attestation
+//! against the account key from the local keyring (C7), exactly as for a live
+//! snapshot — a tampered or injected file grants nothing, just like a lying
+//! server. What it CAN do is PROLONG trust: a device revoked while this one was
+//! offline keeps its stored attestation until the next server contact.
+//! `CACHE_TTL` bounds that window — a snapshot past it no longer vouches and is
+//! ignored at load, so a machine that boots after weeks in a drawer starts
+//! fail-closed, exactly as before this file existed. (Load-time only,
+//! deliberately: a Core that stays RUNNING keeps its in-memory map across server
+//! outages, as it always has.)
+//!
+//! **That bound assumes an authority to be stale with respect to.** A Core with
+//! no server configured has none: nothing will ever refresh what it holds, so
+//! expiring it would not fail closed, it would erase the account — the file IS
+//! the directory there, not a cache of one. So `expires` is the caller's answer
+//! to "is there a server that could refresh this?", and a store that outlives
+//! its window without one keeps vouching. What takes the TTL's place in that
+//! case is a revocation carried inside the store itself (signed, permanent), the
+//! next building block of the serverless work.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -44,12 +53,15 @@ pub(crate) fn save(config_dir: &Path, devices: &BTreeMap<String, Value>) {
     }
 }
 
-/// The cached records, if the file exists, parses, and is fresh. Anything
-/// else — absent, corrupt, stale — is `None`: the Core starts fail-closed,
-/// exactly as before the cache existed. (A `saved_at` in the future reads as
-/// age zero — the file cannot mint trust either way, and a machine whose
-/// clock walks backward defeats any bound we could write here.)
-pub(crate) fn load(config_dir: &Path) -> Option<BTreeMap<String, Value>> {
+/// The stored records, if the file exists, parses, and — when `expires` — is
+/// fresh. Anything else — absent, corrupt, stale — is `None`: the Core starts
+/// fail-closed, exactly as before this file existed. (A `saved_at` in the future
+/// reads as age zero — the file cannot mint trust either way, and a machine
+/// whose clock walks backward defeats any bound we could write here.)
+///
+/// `expires`: is there a server that could refresh this? See the module header —
+/// without one there is nothing for the store to be stale with respect to.
+pub(crate) fn load(config_dir: &Path, expires: bool) -> Option<BTreeMap<String, Value>> {
     let path = config_dir.join(FILE);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -71,7 +83,7 @@ pub(crate) fn load(config_dir: &Path) -> Option<BTreeMap<String, Value>> {
         return None;
     };
     let age = now_secs().saturating_sub(saved_at);
-    if age > CACHE_TTL.as_secs() {
+    if expires && age > CACHE_TTL.as_secs() {
         tracing::info!(
             days = age / 86_400,
             "directory cache expired: ignored, the next server contact rebuilds it"
@@ -105,6 +117,35 @@ pub(crate) fn remove(config_dir: &Path) {
     }
 }
 
+/// This device's own directory record, built from what it knows first-hand: its
+/// `node_id` (`device.key`), the name it carries, and its attestation under the
+/// account key. Same shape as the server's record (doc/server-api.md, "The
+/// device record") because every consumer reads them side by side — the fields
+/// only a server can fill are `null`, which is a value that shape already allows
+/// for a device it has not seen yet.
+///
+/// It is what makes the directory of a Core that never logged in non-empty: a
+/// device in the account knows at least itself, and `devices.list` no longer has
+/// to answer "unreachable" to a component asking who is around.
+///
+/// `online` is `true`: this record is written by the running Core, and its own
+/// liveness is the one presence fact it does not need a server for. It says
+/// nothing about being *reachable* — `enrich_device` derives that, and with no
+/// relay published and no LAN sighting it stays `false`.
+pub(crate) fn own_record(device_id: &str, name: &str, node_id: &str, attestation: &str) -> Value {
+    json!({
+        "device_id": device_id,
+        "name": name,
+        "platform": std::env::consts::OS,
+        "node_id": node_id,
+        "relay_url": Value::Null,
+        "attestation": attestation,
+        "online": true,
+        "status": Value::Null,
+        "last_seen": Value::Null,
+    })
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -126,17 +167,19 @@ mod tests {
     fn a_saved_directory_loads_back_verbatim() {
         let dir = tempfile::tempdir().expect("tempdir");
         save(dir.path(), &sample());
-        assert_eq!(load(dir.path()), Some(sample()));
+        assert_eq!(load(dir.path(), true), Some(sample()));
     }
 
     #[test]
     fn absence_and_corruption_load_as_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
-        assert_eq!(load(dir.path()), None, "no file");
+        assert_eq!(load(dir.path(), true), None, "no file");
         std::fs::write(dir.path().join(FILE), "{ not json").expect("write");
-        assert_eq!(load(dir.path()), None, "corrupt file");
+        assert_eq!(load(dir.path(), true), None, "corrupt file");
         std::fs::write(dir.path().join(FILE), r#"{ "devices": {} }"#).expect("write");
-        assert_eq!(load(dir.path()), None, "no timestamp");
+        assert_eq!(load(dir.path(), true), None, "no timestamp");
+        // Even where nothing will ever refresh it: unreadable is unreadable.
+        assert_eq!(load(dir.path(), false), None, "no timestamp, no authority");
     }
 
     #[test]
@@ -146,12 +189,29 @@ mod tests {
         let fresh = now_secs() - CACHE_TTL.as_secs() + 60;
         let payload = json!({ "saved_at": fresh, "devices": { "d": {} } });
         std::fs::write(dir.path().join(FILE), payload.to_string()).expect("write");
-        assert!(load(dir.path()).is_some(), "within the TTL");
+        assert!(load(dir.path(), true).is_some(), "within the TTL");
         // Just past it: ignored.
         let stale = now_secs() - CACHE_TTL.as_secs() - 60;
         let payload = json!({ "saved_at": stale, "devices": { "d": {} } });
         std::fs::write(dir.path().join(FILE), payload.to_string()).expect("write");
-        assert_eq!(load(dir.path()), None, "past the TTL");
+        assert_eq!(load(dir.path(), true), None, "past the TTL");
+    }
+
+    /// The TTL is a staleness bound against a server. Where there is none, the
+    /// file is not a cache of a directory — it IS the directory, and expiring it
+    /// would erase the account rather than fail closed.
+    #[test]
+    fn without_an_authority_to_refresh_it_a_store_keeps_vouching() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stale = now_secs() - CACHE_TTL.as_secs() * 10;
+        let payload = json!({ "saved_at": stale, "devices": { "d": { "node_id": "ab" } } });
+        std::fs::write(dir.path().join(FILE), payload.to_string()).expect("write");
+
+        assert_eq!(load(dir.path(), true), None, "with a server: expired");
+        assert!(
+            load(dir.path(), false).is_some_and(|d| d.contains_key("d")),
+            "with no server: still the directory"
+        );
     }
 
     #[test]
@@ -159,8 +219,25 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         save(dir.path(), &sample());
         remove(dir.path());
-        assert_eq!(load(dir.path()), None);
+        assert_eq!(load(dir.path(), true), None);
         // Idempotent.
         remove(dir.path());
+    }
+
+    #[test]
+    fn an_own_record_has_the_shape_of_a_server_one() {
+        let record = own_record("dev-1", "Office-PC", "ab12", "sig");
+
+        assert_eq!(record["device_id"], json!("dev-1"));
+        assert_eq!(record["name"], json!("Office-PC"));
+        assert_eq!(record["node_id"], json!("ab12"));
+        assert_eq!(record["attestation"], json!("sig"));
+        assert_eq!(record["platform"], json!(std::env::consts::OS));
+        // Present and null rather than absent: the fields only a server fills.
+        assert_eq!(record["relay_url"], json!(null));
+        assert_eq!(record["last_seen"], json!(null));
+        assert_eq!(record["status"], json!(null));
+        // Our own liveness needs no server.
+        assert_eq!(record["online"], json!(true));
     }
 }

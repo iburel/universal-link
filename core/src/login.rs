@@ -463,7 +463,10 @@ pub(crate) fn open_session(
         }
         s.logged_in = true;
         s.account = info.account.clone();
-        s.own_device_id = Some(info.device_id.clone());
+        // Not a plain assignment: this device may already have been in the
+        // account with no server, under a `device_id` it minted for itself. The
+        // server has just named it, so its own record follows (`rekey_own`).
+        s.rekey_own(info.device_id.clone());
         let payload = s.status_record();
         // Broadcast under the session lock (order: session then registry): the
         // order of notifications is the order of transitions.
