@@ -84,14 +84,22 @@ test("a Core that does not know pairing is not offered it", () => {
 });
 
 // The two sides read "is the server there?" differently. A device with a session
-// pairs OVER it, so a lost server is a dead end...
-test("a signed-in device with no server says why it cannot", () => {
+// SHOWS its code over that session, so a lost server disarms showing — and only
+// showing: reading a `UL2` code dials the device that displays it on the local
+// network, which is exactly the situation a lost server leaves the room in.
+test("a signed-in device with no server can still read a code, not show one", () => {
   store.session = { logged_in: true, server_connected: false };
+  const enter = vi.spyOn(store, "enterPairingCode").mockResolvedValue();
 
   const view = render(LinkDevice, { store, mode: "sponsor" });
 
   expect(byText(view, "button", "Show a code")).toHaveProperty("disabled", true);
-  expect(textOf(view)).toContain("Waiting for the server connection");
+  expect(textOf(view)).toContain("The server is unreachable");
+
+  click(byText(view, "button", "Enter a code…"));
+  typeInto(byLabel(view, "Pairing code"), "UL2:a:b:node_1");
+  click(byText(view, "button", "Link"));
+  expect(enter).toHaveBeenCalledWith("UL2:a:b:node_1");
 });
 
 // ...whereas a device with NO session opens a connection of its own on demand,
@@ -106,7 +114,7 @@ test("a device with no session is not disarmed by a server it has never talked t
   expect(byText(view, "button", "Show a code")).toHaveProperty("disabled", false);
   click(byText(view, "button", "Show a code"));
   expect(show).toHaveBeenCalledOnce();
-  expect(textOf(view)).not.toContain("Waiting for the server");
+  expect(textOf(view)).not.toContain("The server is unreachable");
 });
 
 // The camera gesture exists only where there is a camera, and the shell is what

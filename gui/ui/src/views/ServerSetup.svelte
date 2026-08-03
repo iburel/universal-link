@@ -8,7 +8,15 @@
 
   // `firstRun`: shown full-screen as a gate on a fresh install (no server yet).
   // Otherwise it is the "Server" settings view, reachable from the nav.
-  let { store, firstRun = false }: { store: CoreStore; firstRun?: boolean } =
+  //
+  // `withoutServer` is the other way in (first run only): an account with no
+  // server at all, living on the devices themselves. The App owns what taking
+  // the door means; this screen only offers it.
+  let {
+    store,
+    firstRun = false,
+    withoutServer,
+  }: { store: CoreStore; firstRun?: boolean; withoutServer?: () => void } =
     $props();
 
   // Local form state — pre-filled from config.json. Nothing here touches the
@@ -207,6 +215,15 @@
       ? "Read the settings from the server"
       : "Enter the OpenID Connect settings manually"}
   </button>
+
+  {#if firstRun && withoutServer}
+    <!-- The other way in: the account lives on the devices, which meet on the
+         local network — no server, no sign-in. A quiet link rather than a
+         fork-in-the-road: the server is still the primary path. -->
+    <button class="link" onclick={withoutServer}>
+      Or use UniversalLink without a server
+    </button>
+  {/if}
 </section>
 
 <style>

@@ -45,23 +45,36 @@
   // The Core was reachable, then no longer is: what is shown is frozen.
   const stale = $derived(store.primed && store.connection.status !== "connected");
 
+  // The user chose the way in that needs no server (the setup screen's door):
+  // the account portal opens instead, on a device with no session. Session-UI
+  // state only, never persisted — once the device has joined an account, its
+  // ATTESTATION is what holds the door open, and restarting before that lands
+  // back on the setup screen, which is right: nothing had been done yet.
+  let localAccount = $state(false);
+
   // Fresh install: the Core has no server configured. Block on the setup screen
   // BEFORE login is possible (you cannot sign in nowhere). `configured === false`
   // and not merely falsy: an old Core (no such field) must not be pushed into
   // setup, and a session.changed delta (no field) must not flicker it on.
+  // A device already IN an account is not pushed into it either — a serverless
+  // account is a configuration too, and the proof is the attestation.
   const needsServerSetup = $derived(
-    store.primed && store.session?.configured === false,
+    store.primed &&
+      store.session?.configured === false &&
+      store.account?.attested !== true &&
+      !localAccount,
   );
 
-  // Blocking portal: once connected to the account, until this device has
-  // joined the vault (C7 attestation), nothing else is accessible — a send
-  // would fail closed without it. `onboardingPending` holds the portal while
-  // the recovery code is displayed, before `attested` is re-read (see the
-  // store). `account === null` (an old Core) does not open a portal: we don't
-  // block on a missing capability.
+  // Blocking portal: once connected to the account — or through the setup
+  // screen's no-server door — until this device has joined the vault (C7
+  // attestation), nothing else is accessible: a send would fail closed without
+  // it. `onboardingPending` holds the portal while the recovery code is
+  // displayed, before `attested` is re-read (see the store). `account === null`
+  // (an old Core) does not open a portal: we don't block on a missing
+  // capability.
   const needsOnboarding = $derived(
     store.primed &&
-      store.session?.logged_in === true &&
+      (store.session?.logged_in === true || localAccount) &&
       // `onboardingPending` holds the portal on its own: even if `account`
       // transiently goes to null (a background `account.status` that fails),
       // the displayed code must not be taken away. So it must be evaluated
@@ -83,15 +96,16 @@
     <p class="version">UniversalLink {appVersion}</p>
   </div>
 {:else if needsServerSetup}
-  <ServerSetup {store} firstRun />
+  <ServerSetup {store} firstRun withoutServer={() => (localAccount = true)} />
 {:else if store.pairing}
   <!-- A pairing under way owns the window, above the onboarding portal: the
        device being linked is IN that portal when it starts one, and the
        confirmation is not a screen the user may wander away from. It cannot come
-       before the setup screen, though — pairing needs a server to go through. -->
+       before the setup screen, though — pairing needs a server OR the no-server
+       door to have been taken first. -->
   <Pairing {store} />
 {:else if needsOnboarding}
-  <Onboarding {store} />
+  <Onboarding {store} back={localAccount ? () => (localAccount = false) : undefined} />
 {:else}
   <div class="app">
     <!-- Outside the <nav> on purpose: on a narrow screen the sections become a

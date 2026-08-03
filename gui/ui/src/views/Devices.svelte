@@ -19,13 +19,21 @@
   const disabled = $derived(store.connection.status !== "connected" || store.busy);
 
   // Adding a device is offered where the devices are — but only by a device that
-  // can actually vouch: it holds the account key AND is in the account. A device
-  // without the key would be offered the gesture and then be told by the Core
-  // that it is the one JOINING, which is not what "add a device" means. The
-  // Account screen offers it that, in those words.
+  // can actually vouch: it holds the account key AND is in the account. That is
+  // the Core's own definition, session or none — a serverless sponsor shows a
+  // `UL2` code, a signed-in one pairs through its server. A device without the
+  // key would be offered the gesture and then be told by the Core that it is the
+  // one JOINING, which is not what "add a device" means. The Account screen
+  // offers it that, in those words.
   const canVouch = $derived(
-    store.session?.logged_in === true && store.account?.holds_key === true,
+    store.account?.attested === true && store.account.holds_key === true,
   );
+
+  // No session means no server to carry a gesture: a sibling's name is its own
+  // signed word (only a server may overrule it), and a device cannot strike
+  // ITSELF from the account (a tombstone has no way back — the Core would
+  // refuse with CANNOT_REVOKE_SELF). The buttons those leave are honest ones.
+  const sessionless = $derived(store.session?.logged_in !== true);
 
   // Files shared from the Android share sheet, waiting for a destination: the
   // list becomes a picker (one tap = one send), and the management actions step
@@ -127,7 +135,10 @@
 
   {#if !store.primed}
     <p class="muted">Connecting to Core…</p>
-  {:else if !store.session?.logged_in}
+  {:else if !store.session?.logged_in && store.account?.attested !== true}
+    <!-- Not attested either: this Core knows of no device at all. A device IN
+         the account has a directory whatever its session — its own record at
+         least, plus what the account taught it — so it gets the list below. -->
     <p class="muted">Sign in to see the devices on your account.</p>
   {:else if store.devicesError}
     <p class="muted">Directory unavailable: {store.devicesError}</p>
@@ -199,19 +210,23 @@
                 >
                 <button onclick={() => (confirming = null)}>Cancel</button>
               {:else}
-                <button
-                  {disabled}
-                  aria-label="Rename {device.name}"
-                  onclick={() => startRename(device)}>Rename</button
-                >
-                <button
-                  {disabled}
-                  aria-label="Revoke {device.name}"
-                  onclick={() => {
-                    editing = null;
-                    confirming = device.device_id;
-                  }}>Revoke</button
-                >
+                {#if device.is_self || !sessionless}
+                  <button
+                    {disabled}
+                    aria-label="Rename {device.name}"
+                    onclick={() => startRename(device)}>Rename</button
+                  >
+                {/if}
+                {#if !device.is_self || !sessionless}
+                  <button
+                    {disabled}
+                    aria-label="Revoke {device.name}"
+                    onclick={() => {
+                      editing = null;
+                      confirming = device.device_id;
+                    }}>Revoke</button
+                  >
+                {/if}
               {/if}
             </div>
           </div>

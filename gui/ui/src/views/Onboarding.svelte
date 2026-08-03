@@ -6,7 +6,10 @@
   import LinkDevice from "./LinkDevice.svelte";
   import RecoveryCode from "./RecoveryCode.svelte";
 
-  let { store }: { store: CoreStore } = $props();
+  // `back`: the way out when this portal was opened by the setup screen's
+  // no-server door rather than by a session — there is nothing to sign out of,
+  // and the door must be steppable-back-through.
+  let { store, back }: { store: CoreStore; back?: () => void } = $props();
 
   // Three LOCAL sub-states. The recovery code never enters the store: it's a
   // one-shot secret that the view displays then forgets.
@@ -14,9 +17,15 @@
   let step = $state<Step>("choose");
   let recoveryCode = $state<string | null>(null); // code shown after "Create"
 
-  // The Core refuses setup/join when the server is disconnected
-  // (`SERVER_UNREACHABLE`): we disarm until it's ready rather than invite a failure.
-  const serverReady = $derived(store.session?.server_connected === true);
+  // The Core refuses setup/join while a CONFIGURED server is disconnected
+  // (`SERVER_UNREACHABLE`: the attestation has to be published): we disarm until
+  // it's ready rather than invite a failure. With no server in this device's
+  // life there is nothing to publish to and the Core accepts as it stands —
+  // that is the serverless account, and the gate would disarm the very portal
+  // the no-server door opens onto.
+  const serverReady = $derived(
+    store.session?.server_connected === true || store.serverless,
+  );
   const disabled = $derived(store.busy || !serverReady);
 
   async function create() {
@@ -101,9 +110,17 @@
       </div>
     {/if}
 
-    <button class="link logout" disabled={store.busy} onclick={() => store.logout()}>
-      Sign out
-    </button>
+    {#if store.session?.logged_in === true}
+      <button class="link logout" disabled={store.busy} onclick={() => store.logout()}>
+        Sign out
+      </button>
+    {:else if back}
+      <!-- No session to sign out of: this portal was entered through the setup
+           screen's no-server door, and the honest exit is back through it. -->
+      <button class="link logout" disabled={store.busy} onclick={back}>
+        Back
+      </button>
+    {/if}
   {/if}
 </section>
 

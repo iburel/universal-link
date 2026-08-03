@@ -282,9 +282,8 @@ The joiner then joins the **account**, not the deployment: it is not enrolled on
 the server, which simply never lists it (the server-relayed `UL1` pairing is what
 enrolls a device on the deployment too). Both tags are exported from the Core
 crate (`PAIRING_CODE_TAG`, `PAIRING_LAN_CODE_TAG`) for a camera that has to know
-which QR code in its view is a pairing code — the mobile scanner still looks for
-`UL1` alone, so a `UL2` code is pasted rather than scanned until it learns the
-second one.
+which QR code in its view is a pairing code — the mobile scanner looks for
+either, and which is which stays the Core's business.
 
 The methods and the notifications are the ones above, unchanged. What differs:
 

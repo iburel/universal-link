@@ -20,12 +20,14 @@
   }: { store: CoreStore; label: string; extra?: Snippet } = $props();
 
   let code = $state("");
-  // The Core refuses `account.join` with no server (`SERVER_UNREACHABLE`): the
-  // attestation has to be published. Disarmed rather than inviting the failure.
+  // The Core refuses `account.join` while a CONFIGURED server is unreachable
+  // (`SERVER_UNREACHABLE`: the attestation has to be published). Disarmed rather
+  // than inviting the failure — but with no server in this device's life there
+  // is nothing to publish to, and the code is accepted as it stands.
   const disabled = $derived(
     store.connection.status !== "connected" ||
       store.busy ||
-      store.session?.server_connected !== true,
+      !(store.session?.server_connected === true || store.serverless),
   );
 
   async function join() {

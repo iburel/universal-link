@@ -36,6 +36,15 @@ const APP_MESSAGES: Record<string, string> = {
   PAIRING_STATE:
     "That code was already answered — show a new one. If it was not you, someone else read it.",
   PAIRING_LIMIT: "The server is handling too many links at once — try again.",
+  // `pairing.accept` of a code shown by a device the account struck off. The
+  // sentence says the two things the human needs: it is not a glitch to retry,
+  // and the machine in front of them is not lost — it comes back as a new device.
+  DEVICE_REVOKED:
+    "That device was struck from the account for good — it can only come back as a new device.",
+  // `devices.revoke` aimed at this very device, with no server: a tombstone
+  // cannot be withdrawn, so the Core refuses to let a device bar itself.
+  CANNOT_REVOKE_SELF:
+    "This device cannot revoke itself — do it from another device on the account.",
   // Deliberately absent: `session.discover`'s NO_DESCRIPTOR, which the setup
   // screen acts on rather than reports (it reveals the fields to fill in), and
   // INVALID_DESCRIPTOR, whose own message names the field at fault — more use to
@@ -103,6 +112,9 @@ const PAIRING_REASONS: Record<string, string> = {
   enroll: "The server refused to add this device to the account.",
   server: "The link was lost — the server dropped it.",
   state: "The link went out of step and was abandoned.",
+  // Local-network pairing: the exchange found no account key on either end —
+  // or the account left this device while the link was under way.
+  no_account: "Neither device holds the account key — the link needs one that does.",
   PAIRING_UNKNOWN: "The link expired before it was confirmed.",
 };
 

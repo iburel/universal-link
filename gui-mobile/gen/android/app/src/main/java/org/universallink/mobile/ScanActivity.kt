@@ -48,8 +48,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  * would hang until its backstop, five minutes later, with the button disarmed.
  */
 class ScanActivity : AppCompatActivity() {
-    /** What a code must start with to be one of ours (from the Core, via Rust). */
-    private var tag: String = ""
+    /** What a code may start with to be one of ours (from the Core, via Rust). */
+    private var tags: List<String> = emptyList()
 
     /** Whether an outcome has been reported: at most one crosses the seam. */
     private val reported = AtomicBoolean(false)
@@ -92,7 +92,8 @@ class ScanActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
-        tag = intent.getStringExtra(ScanBridge.EXTRA_TAG).orEmpty()
+        tags = intent.getStringExtra(ScanBridge.EXTRA_TAG).orEmpty()
+            .split(',').filter { it.isNotEmpty() }
         setContentView(R.layout.activity_scan)
         preview = findViewById(R.id.scan_preview)
         hint = findViewById(R.id.scan_hint)
@@ -221,7 +222,7 @@ class ScanActivity : AppCompatActivity() {
                 null
             }
             if (text == null) return
-            if (tag.isNotEmpty() && !text.startsWith(tag)) {
+            if (tags.isNotEmpty() && tags.none { text.startsWith(it) }) {
                 // Somebody else's QR code in the camera's view. Keep looking, and
                 // say so once: a scanner that silently ignores what it is pointed
                 // at looks broken.

@@ -613,6 +613,46 @@ test("session.changed triggers a resnapshot", async () => {
   await vi.waitFor(() => expect(fake.calls.length).toBe(before + 5));
 });
 
+// The membership ended, not just a session: the Core has already erased its
+// place in the account, and this event is the only word the human gets about
+// it. The sentence must survive the resnapshot the event itself asks for —
+// which is exactly what would erase an ordinary notice.
+test("account.left says so in a message that survives its own resnapshot", async () => {
+  const fake = mockCore({ status: CONNECTED });
+  await store.start();
+  await vi.waitFor(() => expect(store.primed).toBe(true));
+  const before = fake.calls.length;
+
+  await emit("core:notification", {
+    method: "account.left",
+    params: { reason: "struck_off" },
+  });
+
+  await vi.waitFor(() => expect(fake.calls.length).toBeGreaterThan(before));
+  expect(store.notice).toEqual({
+    kind: "error",
+    sticky: true,
+    text: "This device was removed from your account by one of your other devices.",
+  });
+});
+
+// A reason from a later Core is carried verbatim rather than swallowed — the
+// same honesty as pairing.failed's fallback.
+test("an account.left reason we have no sentence for is carried as it stands", async () => {
+  mockCore({ status: CONNECTED });
+  await store.start();
+  await vi.waitFor(() => expect(store.primed).toBe(true));
+
+  await emit("core:notification", {
+    method: "account.left",
+    params: { reason: "key_rotated" },
+  });
+
+  expect(store.notice?.text).toBe(
+    "This device is no longer on your account (key_rotated).",
+  );
+});
+
 test("component.pending adds the request without a duplicate", async () => {
   mockCore({ status: CONNECTED, methods: { "components.pending": () => [] } });
   await store.start();
@@ -2141,6 +2181,42 @@ test("a code someone else answered first says so", async () => {
   expect(store.notice?.text).toMatch(/someone else/);
 });
 
+// A `UL2` code shown by a device the account struck off, refused before anything
+// is dialled: a tombstone is permanent, and the sentence must say that the way
+// out is a fresh device, not a retry.
+test("a code shown by a struck-off device says the strike is for good", async () => {
+  await primed({
+    ...pairingMethods(),
+    "pairing.accept": () => {
+      throw appError("DEVICE_REVOKED");
+    },
+  });
+
+  await store.enterPairingCode("UL2:x:y:node_b");
+
+  expect(store.pairing).toBeNull();
+  expect(store.notice?.text).toBe(
+    "That device was struck from the account for good — it can only come back as a new device.",
+  );
+});
+
+// With no server, revoking yourself would bar this installation from its own
+// account with no way back — the Core refuses, and the sentence names the
+// gesture that does exist.
+test("a device refused its own revocation is pointed at its siblings", async () => {
+  await primed({
+    "devices.revoke": () => {
+      throw appError("CANNOT_REVOKE_SELF");
+    },
+  });
+
+  await store.revokeDevice("d_self");
+
+  expect(store.notice?.text).toBe(
+    "This device cannot revoke itself — do it from another device on the account.",
+  );
+});
+
 test("being claimed carries the number both ends must show", async () => {
   await primed(pairingMethods());
   await store.showPairingCode();
@@ -2243,6 +2319,9 @@ test.each([
   ["declined", "The other device declined."],
   ["expired", "The code expired before the link was confirmed."],
   ["other_account", "That device belongs to a different account."],
+  // Local-network pairing where neither end can vouch — or the account left
+  // this device while the link was under way.
+  ["no_account", "Neither device holds the account key — the link needs one that does."],
   // Outside the vocabulary (a server code, a later version): carried verbatim
   // rather than swallowed.
   ["WHATEVER", "The link failed (WHATEVER)."],

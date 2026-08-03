@@ -17,19 +17,19 @@
   let entering = $state(false);
   let code = $state("");
 
-  // A pairing needs the server, and how to tell differs by side: a device with a
-  // session pairs OVER it, so a lost server is a dead end; a device with no
-  // session opens a connection of its own on demand, and `server_connected` is
-  // false for it at all times — gating on it there would disarm the very screen a
+  // Only the SHOWING gesture is bound to the server, and only for a device with
+  // a session: it pairs over that session, so showing a code while the server is
+  // lost is a dead end. READING a code is not — a `UL2` code names the device to
+  // dial on the local network, which is exactly the situation a lost server
+  // leaves the room in. And a device with no session opens a connection of its
+  // own on demand (or shows a `UL2` itself), so `server_connected` — false for
+  // it at all times — gates nothing there: it would disarm the very screen a
   // brand-new device needs.
   const stalled = $derived(
     store.session?.logged_in === true && store.session.server_connected !== true,
   );
   const disabled = $derived(
-    store.busy ||
-      store.scanning ||
-      stalled ||
-      store.connection.status !== "connected",
+    store.busy || store.scanning || store.connection.status !== "connected",
   );
 
   async function link() {
@@ -55,13 +55,13 @@
       <input
         bind:value={code}
         aria-label="Pairing code"
-        placeholder="UL1:…"
+        placeholder="UL1:… or UL2:…"
         autocapitalize="off"
         autocorrect="off"
         spellcheck="false"
         onkeydown={(e) => {
           // The keyboard does not get past what disarms the button: neither the
-          // server check nor the empty field.
+          // dead connection nor the empty field.
           if (e.key === "Enter" && !disabled && code.trim()) void link();
         }}
       />
@@ -90,7 +90,10 @@
             Scan a code
           </button>
         {/if}
-        <button {disabled} onclick={() => store.showPairingCode()}>
+        <button
+          disabled={disabled || stalled}
+          onclick={() => store.showPairingCode()}
+        >
           Show a code
         </button>
         <button {disabled} onclick={() => (entering = true)}>
@@ -100,7 +103,10 @@
     {/if}
 
     {#if stalled}
-      <p class="muted">Waiting for the server connection…</p>
+      <p class="muted">
+        The server is unreachable — showing a code will wait for it. Reading a
+        code from a device on this network still works.
+      </p>
     {/if}
   </div>
 {/if}

@@ -202,8 +202,10 @@ export function installFakeCore(): void {
         code: `UL1:${"A".repeat(22)}:${"B".repeat(43)}:${pairing_id}`,
       };
     },
+    // Either tag: `UL2` names a device on the local network instead of a server
+    // rendezvous, and this fake plays the flow the same either way.
     "pairing.accept": ({ code }) => {
-      if (!code?.startsWith("UL1:")) {
+      if (!code?.startsWith("UL1:") && !code?.startsWith("UL2:")) {
         throw { kind: "rpc", message: "invalid params: code", code: -32602 };
       }
       const pairing_id = code.slice(code.lastIndexOf(":") + 1);

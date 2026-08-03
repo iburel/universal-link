@@ -157,3 +157,53 @@ test("a device that holds the key is offered nothing of the sort", () => {
   expect(textOf(view)).not.toContain("not its key");
   expect(view.querySelector('input[aria-label="Recovery code"]')).toBeNull();
 });
+
+// -- In the account, signed in nowhere ---------------------------------------
+//
+// A session's end does not end a membership, and a serverless device never had
+// a session at all: "no account is connected" would be false for both.
+
+test("a serverless device in its account says so, with no sign-in pushed at it", () => {
+  store.primed = true;
+  store.session = { logged_in: false, server_connected: false, configured: false };
+  store.account = { attested: true, fingerprint: "AB12 CD34", holds_key: true };
+
+  const view = render(Account, { store });
+
+  expect(textOf(view)).toContain("This device is on your account.");
+  expect(textOf(view)).toContain("AB12 CD34");
+  expect(textOf(view)).not.toContain("No account is connected");
+  // No server in its life: sign-in is a Server-tab affair, not a button here.
+  expect(textOf(view)).not.toContain("Sign in");
+  expect(textOf(view)).toContain("local network");
+});
+
+// Signed out with a server configured: the membership survived the logout (the
+// continuum), and the way back onto the deployment is a sign-in.
+test("a signed-out device in its account is offered sign-in, not 'no account'", () => {
+  store.primed = true;
+  store.session = { logged_in: false, server_connected: false, configured: true };
+  store.account = { attested: true, fingerprint: "AB12", holds_key: true };
+  const login = vi.spyOn(store, "login").mockResolvedValue();
+
+  const view = render(Account, { store });
+
+  expect(textOf(view)).toContain("This device is on your account.");
+  expect(textOf(view)).not.toContain("No account is connected");
+  click(byText(view, "button", "Sign in"));
+  expect(login).toHaveBeenCalledOnce();
+});
+
+// The keyless ways back in cannot hide behind a session: a serverless device
+// that lost its key has no other screen to be told on.
+test("a keyless device is offered the ways back in even with no session", () => {
+  store.primed = true;
+  store.session = { logged_in: false, server_connected: false, configured: false };
+  store.account = { attested: true, fingerprint: "AB12", holds_key: false };
+
+  const view = render(Account, { store });
+
+  expect(textOf(view)).toContain("has your account, but not its key");
+  expect(byText(view, "button", "Show a code")).toBeTruthy();
+  expect(view.querySelector('input[aria-label="Recovery code"]')).toBeTruthy();
+});

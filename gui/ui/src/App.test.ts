@@ -289,8 +289,53 @@ test("a pairing under way takes over the window, onboarding portal included", ()
   expect(app.querySelector("nav")).toBeNull();
 });
 
-// But not above the setup screen: pairing goes through the server, and a Core
-// with none configured has nowhere to go.
+// The setup screen's quiet door: an account with no server at all. Taking it
+// opens the account portal; nothing is remembered — once the device is in the
+// account, the attestation is what holds the door open (test below).
+test("the no-server door opens the account portal, and steps back through", () => {
+  store.primed = true;
+  store.session = { logged_in: false, server_connected: false, configured: false };
+  store.account = { attested: false, fingerprint: null, holds_key: false };
+  vi.spyOn(store, "loadServerConfig").mockResolvedValue({
+    server_url: "",
+    oidc_issuer: "",
+    oidc_client_id: "",
+  });
+
+  const app = render(App, { store });
+  expect(textOf(app)).toContain("Set up your server");
+
+  click(byText(app, "button", "without a server"));
+  expect(app.querySelector("h1")?.textContent).toBe("Link this device");
+  // Serverless, so the server gate must NOT disarm the portal's gestures.
+  expect(byText(app, "button", "This is my first device")).toHaveProperty(
+    "disabled",
+    false,
+  );
+
+  // No session to sign out of: the way out is back through the door.
+  expect(textOf(app)).not.toContain("Sign out");
+  click(byText(app, "button", "Back"));
+  expect(textOf(app)).toContain("Set up your server");
+});
+
+// A serverless account IS a configuration: a device that joined one must not be
+// pushed into the server setup at every start. The proof is the attestation —
+// nothing else is remembered anywhere.
+test("a serverless device already in its account is not pushed into setup", () => {
+  store.primed = true;
+  store.session = { logged_in: false, server_connected: false, configured: false };
+  store.account = { attested: true, fingerprint: "AB12", holds_key: true };
+
+  const app = render(App, { store });
+
+  expect(app.querySelector("nav")).not.toBeNull();
+  expect(textOf(app)).not.toContain("Set up your server");
+});
+
+// But not above the setup screen: a pairing on an unconfigured device runs
+// behind the no-server door (which keeps the portal open while it is under
+// way); with the door untaken, the setup screen still comes first.
 test("an unconfigured Core still asks for a server first", () => {
   store.primed = true;
   store.session = { logged_in: false, server_connected: false, configured: false };

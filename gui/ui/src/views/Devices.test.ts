@@ -423,6 +423,7 @@ test("a device that can vouch is offered to add another", () => {
 
 test.each([
   ["it does not hold the account key", { attested: true, fingerprint: "AB12", holds_key: false }],
+  ["it holds a key but is not in the account", { attested: false, fingerprint: null, holds_key: true }],
   ["the Core does not say (an older one)", null],
 ])("no offer to add a device when %s", (_why, account) => {
   store.account = account;
@@ -430,6 +431,56 @@ test.each([
   expect(textOf(render(Devices, { store, now: NOW }))).not.toContain(
     "Add a device",
   );
+});
+
+// The Core's definition of "can vouch" names no session: a serverless sponsor
+// shows a `UL2` code. Gating on the session would keep the whole serverless
+// account from ever growing past one device.
+test("a serverless device that can vouch is offered to add another", () => {
+  store.session = { logged_in: false, server_connected: false, configured: false };
+  store.account = { attested: true, fingerprint: "AB12", holds_key: true };
+
+  const view = render(Devices, { store, now: NOW });
+
+  expect(textOf(view)).toContain("Add a device");
+});
+
+// -- What a session-less directory offers -----------------------------------
+//
+// No session means no server to carry a gesture: a sibling's name is its own
+// signed word, and a device cannot strike itself from the account
+// (CANNOT_REVOKE_SELF). The buttons left are the ones that can succeed.
+
+test("with no session, a sibling can be revoked but not renamed", () => {
+  store.session = { logged_in: false, server_connected: false, configured: false };
+  store.account = { attested: true, fingerprint: "AB12", holds_key: true };
+
+  const view = render(Devices, { store, now: NOW });
+
+  expect(view.querySelector('[aria-label="Rename MacBook"]')).toBeNull();
+  expect(byLabel(view, "Revoke MacBook")).toBeTruthy();
+});
+
+test("with no session, this PC can be renamed but not revoked", () => {
+  store.session = { logged_in: false, server_connected: false, configured: false };
+  store.account = { attested: true, fingerprint: "AB12", holds_key: true };
+
+  const view = render(Devices, { store, now: NOW });
+
+  expect(byLabel(view, "Rename Office PC")).toBeTruthy();
+  expect(view.querySelector('[aria-label="Revoke Office PC"]')).toBeNull();
+});
+
+// The directory of a device IN the account does not need a session: the Core
+// serves it — its own record at least, plus what the account taught it.
+test("a signed-out device in the account still sees its directory", () => {
+  store.session = { logged_in: false, server_connected: false, configured: false };
+  store.account = { attested: true, fingerprint: "AB12", holds_key: true };
+
+  const view = render(Devices, { store, now: NOW });
+
+  expect(textOf(view)).not.toContain("Sign in to see the devices");
+  expect(view.querySelectorAll("li").length).toBe(2);
 });
 
 // A share waiting for a destination owns the list until it is answered: the
