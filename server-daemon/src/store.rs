@@ -73,6 +73,8 @@ mod tests {
                 platform: "linux".into(),
                 node_id: "00".repeat(32),
                 attestation: Some("ab".repeat(64)),
+                seq: Some(7),
+                self_sig: Some("cd".repeat(64)),
             }],
             revoked: vec!["d_old".into()],
         };
@@ -85,7 +87,34 @@ mod tests {
         assert_eq!(reloaded.devices.len(), 1);
         assert_eq!(reloaded.devices[0].device_id, "d_1");
         assert_eq!(reloaded.devices[0].attestation, Some("ab".repeat(64)));
+        // The signed description is durable too (the continuum): bound to the
+        // name, which survives a restart with it.
+        assert_eq!(reloaded.devices[0].seq, Some(7));
+        assert_eq!(reloaded.devices[0].self_sig, Some("cd".repeat(64)));
         assert_eq!(reloaded.revoked, vec!["d_old".to_string()]);
+    }
+
+    /// A snapshot written before the continuum carries no signed description:
+    /// it must load — a deployed server restarts on the file it already has —
+    /// with the new fields simply absent.
+    #[test]
+    fn a_snapshot_written_before_the_continuum_still_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("directory.json");
+        let old = serde_json::json!({
+            "devices": [{
+                "account": "alice", "device_id": "d_1", "name": "PC",
+                "platform": "linux", "node_id": "00".repeat(32),
+                "attestation": null,
+            }],
+            "revoked": [],
+        });
+        std::fs::write(&path, old.to_string()).expect("write");
+
+        let loaded = FileStore::new(&path).load().expect("pre-continuum file");
+        assert_eq!(loaded.devices.len(), 1);
+        assert_eq!(loaded.devices[0].seq, None);
+        assert_eq!(loaded.devices[0].self_sig, None);
     }
 
     #[test]

@@ -274,9 +274,13 @@ local network. `pairing.offer` then mints a `UL2` code instead of answering
 | `UL1` | `UL1:<psk>:<epk>:<pairing_id>` | nobody — the server relays between the two |
 | `UL2` | `UL2:<psk>:<epk>:<node_id>` | the device that displays it, on the data plane |
 
-The tag is what tells them apart, and each is refused by the device the other is
-for: a `UL2` code on a device that answers to a server → `PAIRING_VIA_SERVER`, a
-`UL1` code with no server → `SERVER_UNREACHABLE`. Both tags are exported from the Core
+The tag is what tells them apart. A `UL1` code with no server is a rendezvous this
+device has no way to go to → `SERVER_UNREACHABLE`. A `UL2` code, since the
+continuum, is accepted by ANY device that can play its part in it — including one
+that answers to a server, which may scan it and sponsor over the local network.
+The joiner then joins the **account**, not the deployment: it is not enrolled on
+the server, which simply never lists it (the server-relayed `UL1` pairing is what
+enrolls a device on the deployment too). Both tags are exported from the Core
 crate (`PAIRING_CODE_TAG`, `PAIRING_LAN_CODE_TAG`) for a camera that has to know
 which QR code in its view is a pairing code — the mobile scanner still looks for
 `UL1` alone, so a `UL2` code is pasted rather than scanned until it learns the
@@ -338,8 +342,8 @@ Core with three fields:
 | Method | Description |
 |---|---|
 | `devices.list {}` | → `[ device, … ]` (snapshot, includes the local device). `SERVER_UNREACHABLE` only for a Core that knows of no device at all — see below |
-| `devices.rename { device_id, name }` | proxy to the server. With **no server at all**: renames THIS device (it re-signs its own record — see below); any other `device_id` → `SERVER_UNREACHABLE` |
-| `devices.revoke { device_id }` | → `{ status: "done" }` or `{ status: "reauth_required", auth_url }` (fresh ID token required by the server; the caller opens the URL, completion arrives via `device.removed`). With **no server at all**: strikes the device off locally and **for good** — see below |
+| `devices.rename { device_id, name }` | proxy to the server — and the renamed device **countersigns** the new name once it hears it (the continuum; see below). With **no server at all**: renames THIS device (it re-signs its own record); any other `device_id` → `SERVER_UNREACHABLE` |
+| `devices.revoke { device_id }` | → `{ status: "done" }` or `{ status: "reauth_required", auth_url }` (fresh ID token required by the server; the caller opens the URL, completion arrives via `device.removed`). Where this device holds the account key, the account's own **tombstone** is minted besides the server's strike (the continuum — see below). A device the server never named (its label IS its `node_id`) is struck by the account key alone, the server not asked. With **no server at all**: the tombstone, and **for good** — see below |
 
 Notifications: `device.added / removed / online / offline / updated { … }` — same
 payloads as on the server side, with two Core-side additions. `device.offline`
@@ -367,8 +371,17 @@ from device to device without the one relaying it being trusted with it, and `se
 — which only its owner can raise — is what makes one description supersede
 another. Deliberately NOT signed: `relay_url`, `online`, `last_seen`, `status`,
 `device_id`. Those are said in the present tense, and a signature over them would
-be a stale fact wearing a proof. A record the SERVER minted carries neither field:
-there the server owns the name (`devices.rename` may come from another device).
+be a stale fact wearing a proof.
+
+**Where a server names the device, the device countersigns** (the continuum). The
+server keeps the name — `devices.rename` may come from another device — and the
+named device signs the server's word as its own description, republishing the
+signature to the server the way it publishes its attestation (opaque, carried
+blind, rebroadcast in the records). So a record of the server's half proves
+itself too, and can be relayed to siblings the server never met. A record whose
+device has not countersigned yet (an old client, or one renamed and not yet
+heard back) travels nowhere — the honest gap, and it closes itself the moment
+that device reconnects.
 
 The signed description is stable — a restart hands back the very record, `seq`
 included. `devices.rename` is the one thing that re-signs it, and with no server
@@ -406,6 +419,17 @@ Core keeps refusing it. Three consequences worth stating plainly:
   `device.key`, and restarts as a first startup. Best-effort by construction: a
   device that never dials again — stolen, dead — simply never learns, and loses
   nothing by it, since the account already refuses it everywhere.
+
+**And with a server, the tombstone is minted too** (the continuum): a
+`devices.revoke` that the server accepted also signs the account's own tombstone,
+whenever this device holds the account key — a server-side strike stops at the
+server's reach, and the account's serverless half would otherwise keep trusting
+the struck device until its store expired (or forever, where nothing expires). A
+device that holds the account *without* its key cannot sign the account's word:
+the server's strike then stands alone, exactly as before the continuum, and the
+7-day staleness bound is what limits the damage. Never against this very device —
+a self-revocation through the server stays what it always was (`DEVICE_REVOKED`
+at the next exchange), for the same reason `CANNOT_REVOKE_SELF` exists.
 
 `revoked.json` survives what `directory.json` does not: a logout, and a revocation
 of this device. The struck-off device keeps a valid attestation for good, so the
@@ -445,11 +469,15 @@ safe:
   7-day staleness bound open between themselves — and keep vouching for a device
   the server revoked.
 
-With a server in the picture this exchange carries almost nothing, by
-construction: the records the server minted are not signed, so they never leave
-the device. The tombstones do travel, because they are the account's own
-signatures. The consequence to keep in view is that an account cannot yet be half
-on a server and half not.
+With a server in the picture this exchange carries the server's half too (the
+continuum): its devices countersign their descriptions, so their records prove
+themselves like any other and are relayed the same way — the account is the union
+the account key defines, of which a deployment lists the subset that enrolled
+with it. The server's snapshot is **merged**, never swapped in: what the account
+can prove about devices the server never met survives every reconnection, and a
+logout keeps that half on disk (re-keyed by `node_id`, its present-tense fields
+dropped — nothing vouches for a route anymore). A record only the server ever
+asserted still travels nowhere and leaves with the session, exactly as before.
 
 One case ends the exchange instead of feeding it: a tombstone naming *this*
 device. It is signed by the account key, so it is not hearsay — and once that
@@ -786,7 +814,6 @@ Standard JSON-RPC codes + application codes in `error.data.code`:
 | `NO_ACCOUNT_KEY` | this device cannot sign for the account: it holds no account key (`pairing.accept` told to sponsor, `pairing.confirm`, `devices.revoke` with no server) — and, pairing on the local network, when NEITHER of the two devices holds one |
 | `CANNOT_REVOKE_SELF` | `devices.revoke` aimed at this very device, with no server: a tombstone cannot be withdrawn, so this would bar the installation from its own account for good |
 | `PAIRING_UNKNOWN` / `PAIRING_STATE` / `PAIRING_LIMIT` | relayed from the server as-is: unknown/expired/spent session, wrong moment (confirming before anyone scanned, or from the joining side), too many sessions at once. `PAIRING_STATE` is also the local answer for a pairing that is out of step: a code whose window is no longer the one on screen, a device that answers a dial with something other than the protocol's next frame, and confirming a pairing whose stream is gone |
-| `PAIRING_VIA_SERVER` | `pairing.accept` of a `UL2` (local-network) code on a device that answers to a server: it pairs through that server, and pairing here would put the other device in an account half of which the server has never heard |
 | `DEVICE_UNKNOWN` / `DEVICE_OFFLINE` | target unknown / unreachable (`pairing.accept` of a `UL2` code: the device that displayed it is not on this network) |
 | `DEVICE_REVOKED` | `pairing.accept` of a `UL2` code shown by a `node_id` the account struck off: a tombstone is permanent, and that device can only come back under a fresh identity |
 | `TRANSFER_UNKNOWN` | unknown `transfer_id` |

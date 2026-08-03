@@ -576,6 +576,24 @@ impl Conn {
         if self.serverless() {
             return self.revoke_locally(&device_id);
         }
+        // The target's crypto identity, read while its record is still here (the
+        // eviction below would erase it): it is what the tombstone names.
+        let target_node_id = {
+            let s = self.state.session.lock().expect("lock session");
+            s.devices
+                .as_ref()
+                .and_then(|devices| devices.get(&device_id))
+                .and_then(|record| record.get("node_id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        // A device the server never named — its label IS its `node_id`, the
+        // self-minted convention — was learned from the account's serverless
+        // half, and asking the server to strike it would only earn a
+        // DEVICE_UNKNOWN: the account's signature is the one authority over it.
+        if target_node_id.as_deref() == Some(device_id.as_str()) {
+            return self.revoke_locally(&device_id);
+        }
         // With no server connection, neither the proxy nor re-auth would
         // succeed: no point spending the refresh token.
         if self
@@ -597,7 +615,17 @@ impl Conn {
                 )
                 .await;
                 match result {
-                    Ok(_) => Ok(json!({ "status": "done" })),
+                    Ok(_) => {
+                        // The server struck it off ITS directory; where this
+                        // device holds the account key, the account says so too —
+                        // a tombstone, so the serverless half hears the
+                        // revocation a server-side strike alone would never
+                        // reach (the continuum).
+                        if let Some(node_id) = &target_node_id {
+                            crate::account_key::tombstone_after_server_revoke(&self.state, node_id);
+                        }
+                        Ok(json!({ "status": "done" }))
+                    }
                     // Not fresh enough for the server's taste: the browser will
                     // settle it.
                     Err(err) if err.app.as_deref() == Some("OIDC_INVALID") => {
@@ -689,31 +717,36 @@ impl Conn {
         // Read out of the leaf lock before taking `session` (lock ordering).
         // Logging out of a server does not leave the ACCOUNT: the trust root
         // stays (it is what a re-enrollment or a pairing rests on), so what this
-        // device knows first-hand about itself has to survive the session too.
-        let own_attestation = self
+        // device knows first-hand about itself has to survive the session too —
+        // and, since the continuum, so does every record the account can still
+        // prove under `ak_pub` (`forget`).
+        let root = self
             .state
             .account_root
             .lock()
             .expect("lock account_root")
-            .as_ref()
-            .map(|root| root.attestation.clone());
-        let own = own_attestation
-            .as_deref()
-            .map(|attestation| crate::state::OwnDevice {
-                identity: &self.state.identity,
-                name: &self.state.device_name,
-                attestation,
-            });
+            .clone();
+        let own = root.as_ref().map(|root| crate::state::OwnDevice {
+            identity: &self.state.identity,
+            name: &self.state.device_name,
+            attestation: &root.attestation,
+        });
         let abort = {
             let mut s = self.state.session.lock().expect("lock session");
             if !s.logged_in {
                 return Ok(json!({}));
             }
-            let (payload, abort) = s.forget(own);
+            let (payload, abort) = s.forget(own, root.as_ref().map(|root| root.ak_pub.as_str()));
             crate::session::remove_session_file(&self.state.config_dir);
-            // The cached directory and the refresh token belonged to this
-            // session: they leave with it.
-            crate::directory::remove(&self.state.config_dir);
+            // What the SERVER asserted belonged to this session and leaves with
+            // it; the account's half — the records `forget` kept — does not.
+            // `save_unrefreshed`: a logout re-checks nothing against an authority.
+            match s.devices.as_ref() {
+                Some(devices) => {
+                    crate::directory::save_unrefreshed(&self.state.config_dir, devices);
+                }
+                None => crate::directory::remove(&self.state.config_dir),
+            }
             self.state.secrets.delete(crate::secrets::REFRESH_TOKEN);
             // Broadcast under the session lock (order: session then registry):
             // the order of notifications is the order of transitions — the

@@ -200,6 +200,14 @@ pub struct SessionState {
     pub server_tx: Option<mpsc::Sender<ServerCmd>>,
     /// To stop the session task at logout.
     pub session_abort: Option<tokio::task::AbortHandle>,
+    /// This device obeyed a tombstone naming it (`account_key::leave`): it is
+    /// out, and nothing is absorbed anymore. The flag exists for one race the
+    /// trust root alone cannot close: an exchange already past the root read
+    /// when the leave ran would otherwise write its records into the directory
+    /// the leave just wiped — under this very lock, which is why the flag lives
+    /// here and is checked here ([`Self::absorb`]). Never cleared: the way back
+    /// is a restart under a fresh identity.
+    pub left_the_account: bool,
 }
 
 impl SessionState {
@@ -213,6 +221,7 @@ impl SessionState {
             revoked: BTreeMap::new(),
             server_tx: None,
             session_abort: None,
+            left_the_account: false,
         }
     }
 
@@ -255,8 +264,11 @@ impl SessionState {
     /// `device.key` changed under us, or the store was edited — and peers verify a
     /// self-signature against the `node_id` itself, so republishing it would mean
     /// offering the account a description nobody accepts and nothing local
-    /// notices. A record with NO signature at all is left alone: that is a
-    /// server's, and there the server owns the name.
+    /// notices. A record with NO signature at all is a server's — the server keeps
+    /// the name — and this device COUNTERSIGNS it rather than leave it alone: the
+    /// name stays the server's word, the signature becomes ours, and the record
+    /// can now travel to siblings the server never met (the continuum;
+    /// [`crate::directory::countersign_own`]).
     pub fn adopt_own(&mut self, own: OwnDevice<'_>) {
         let node_id = own.node_id();
         let id = self
@@ -274,6 +286,9 @@ impl SessionState {
         let record = devices
             .entry(id.clone())
             .or_insert_with(|| crate::directory::own_record(&id, own, None));
+        if record.get("self_sig").is_none() {
+            crate::directory::countersign_own(record, own.identity);
+        }
         record["attestation"] = json!(own.attestation);
         // Our own liveness is the one presence fact we know first-hand, and it is
         // true by construction: this record is being written by the running Core.
@@ -368,6 +383,14 @@ impl SessionState {
         roster: &crate::directory::Roster,
     ) -> Absorbed {
         let mut out = Absorbed::default();
+        // Out of the account: absorbed NOTHING, whatever the roster says. The
+        // caller read the trust root before taking this lock, so an exchange
+        // that was in flight when the leave ran can reach this point holding a
+        // key the device no longer has — and would re-populate the directory
+        // the leave just wiped.
+        if self.left_the_account {
+            return out;
+        }
         // The account striking THIS device off. Verified FIRST, under the account
         // key — nothing a peer merely asserts may end an account — and then
         // obeyed: the caller leaves (the trust root, the account key, the
@@ -446,6 +469,58 @@ impl SessionState {
         out
     }
 
+    /// The server's snapshot meets the directory this Core already holds — and
+    /// since the continuum, holding is not the same as owing: part of what is
+    /// here may be the ACCOUNT's, learned from siblings a server never met, and a
+    /// snapshot that replaced the map wholesale would erase them at every
+    /// reconnection.
+    ///
+    /// So the snapshot is absorbed as what it is — the server's word about the
+    /// server's half:
+    ///
+    /// - **A device the server lists is the server's word entirely** — name,
+    ///   route, presence. What the fresh record may lack is the signed
+    ///   description ([`crate::directory::graft_signature`]): an old server
+    ///   carries none, and the one this Core held still proves itself if it
+    ///   matches, so it is grafted on rather than lost. A held description that
+    ///   no longer matches (the device was renamed while away) is NOT kept —
+    ///   the record goes unsigned until its own device countersigns.
+    /// - **A device the server does not list stays, if it can prove itself**:
+    ///   signed by the device it describes and attested under the account key —
+    ///   the serverless-only siblings, which are the continuum's point. It is
+    ///   re-keyed by its `node_id` and stripped of every present-tense fact
+    ///   ([`crate::directory::as_learned`]): nothing vouches for its route or
+    ///   liveness anymore. A record that cannot prove itself leaves with the
+    ///   snapshot, exactly as before the continuum.
+    /// - **Without a trust root the snapshot replaces the map**, as it always
+    ///   has: nothing can prove itself to a device that can verify nothing.
+    ///
+    /// The tombstones are not consulted here: the caller filters the snapshot
+    /// against them first (nothing barred comes in), and a barred device's held
+    /// records were evicted the moment the tombstone was absorbed.
+    pub fn merge_snapshot(&mut self, mut fresh: BTreeMap<String, Value>, ak_pub: Option<&str>) {
+        let held = self.devices.take();
+        if let (Some(held), Some(ak_pub)) = (held, ak_pub) {
+            for record in held.into_values() {
+                let Some(node_id) = record.get("node_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let twin = fresh
+                    .values_mut()
+                    .find(|f| f.get("node_id").and_then(Value::as_str) == Some(node_id));
+                if let Some(twin) = twin {
+                    crate::directory::graft_signature(twin, &record);
+                } else if crate::directory::shareable(&record, ak_pub) {
+                    fresh.insert(
+                        node_id.to_string(),
+                        crate::directory::as_learned(&record, node_id),
+                    );
+                }
+            }
+        }
+        self.devices = Some(fresh);
+    }
+
     /// The server has just named this device (a login completed): our own record
     /// moves to the label it gave. Whatever the old one was — the `node_id` a
     /// serverless startup minted, or a previous session's — it described US, and
@@ -480,6 +555,15 @@ impl SessionState {
     /// parameter rather than read here, because `account_root` is a leaf lock and
     /// this runs under `session`.
     ///
+    /// `ak_pub` widens that survival to the whole of the account's half (the
+    /// continuum): every record that proves itself under it — signed by the
+    /// device it describes, attested by the account — outlives the session too,
+    /// re-keyed by its `node_id` and stripped of the present-tense facts only the
+    /// server could vouch for. What the server alone asserted leaves with it,
+    /// exactly as everything did before the continuum. `None` keeps nothing but
+    /// `own` — the caller that ends the MEMBERSHIP, not just the session
+    /// ([`crate::account_key::leave`]), passes neither.
+    ///
     /// The tombstones stay untouched, for the same reason: a session ending says
     /// nothing about whom the account struck off, and forgetting a revocation is
     /// the one mistake that cannot be corrected later — the struck-off device
@@ -487,13 +571,29 @@ impl SessionState {
     pub fn forget(
         &mut self,
         own: Option<OwnDevice<'_>>,
+        ak_pub: Option<&str>,
     ) -> (Value, Option<tokio::task::AbortHandle>) {
         self.logged_in = false;
         self.account = None;
         self.server_connected = false;
         self.own_device_id = None;
-        self.devices = None;
         self.server_tx = None;
+        let held = self.devices.take();
+        self.devices = match (held, ak_pub) {
+            (Some(held), Some(ak_pub)) => {
+                let kept: BTreeMap<String, Value> = held
+                    .into_values()
+                    .filter(|record| crate::directory::shareable(record, ak_pub))
+                    .filter_map(|record| {
+                        let node_id = record.get("node_id")?.as_str()?.to_string();
+                        let learned = crate::directory::as_learned(&record, &node_id);
+                        Some((node_id, learned))
+                    })
+                    .collect();
+                (!kept.is_empty()).then_some(kept)
+            }
+            _ => None,
+        };
         if let Some(own) = own {
             self.adopt_own(own);
         }
@@ -974,10 +1074,12 @@ mod tests {
         assert!(crate::directory::verify_record(record));
     }
 
-    /// A record with NO signature is a server's, and the server owns the name
-    /// there: left exactly as it is.
+    /// A record with NO signature is a server's, and the server keeps the name —
+    /// which this device COUNTERSIGNS rather than contest (the continuum): the
+    /// name stays the server's word, the signature becomes ours, and the record
+    /// can now travel to siblings the server never met.
     #[test]
-    fn a_record_a_server_minted_is_left_alone() {
+    fn a_record_a_server_minted_keeps_its_name_and_gains_our_signature() {
         let identity = identity();
         let mut s = SessionState::new(Some(&crate::session::SessionInfo {
             server_url: "ws://server/ws".to_string(),
@@ -993,8 +1095,16 @@ mod tests {
         s.adopt_own(own_device(&identity));
 
         let record = &s.devices.as_ref().expect("a directory")["d_7f3a"];
-        assert_eq!(record["name"], json!("Named-By-The-Server"));
+        assert_eq!(
+            record["name"],
+            json!("Named-By-The-Server"),
+            "the name is still the server's word"
+        );
         assert_eq!(record["attestation"], json!("sig"), "carried onto it");
+        assert!(
+            crate::directory::verify_record(record),
+            "and the description now proves itself: {record}"
+        );
     }
 
     /// The one thing `adopt_own` does assert about an existing record: this Core
@@ -1094,7 +1204,7 @@ mod tests {
         // A device the account struck off while this session lived.
         s.revoked = BTreeMap::from([("cd34".to_string(), "revocation".to_string())]);
 
-        let (payload, _) = s.forget(Some(own_device(&identity)));
+        let (payload, _) = s.forget(Some(own_device(&identity)), None);
 
         assert_eq!(payload["logged_in"], json!(false));
         assert_eq!(
@@ -1109,6 +1219,194 @@ mod tests {
             s.revoked.contains_key("cd34"),
             "a session ends; a revocation does not"
         );
+    }
+
+    /// Once this device has left the account, an exchange still in flight — one
+    /// that read the trust root before the leave took it — absorbs NOTHING: not
+    /// a record into the directory the leave wiped, and not a second order to
+    /// leave (the human would be told twice).
+    #[test]
+    fn a_device_out_of_the_account_absorbs_nothing() {
+        let (ak, ak_pub) = account();
+        let identity = identity();
+        let mut s = SessionState::new(None);
+        s.left_the_account = true;
+
+        let mut roster = roster(vec![sibling(8, "Laptop", 5, &ak)]);
+        roster.revoked.insert(
+            identity.node_id(),
+            crate::account_key::revoke(&ak, &identity.node_id()),
+        );
+        let taken = s.absorb(&ak_pub, &identity.node_id(), &roster);
+
+        assert!(taken.is_empty(), "{taken:?}");
+        assert!(!taken.struck_ourselves, "left once, not twice");
+        assert!(s.devices.is_none(), "the wiped directory stays wiped");
+        assert!(s.revoked.is_empty());
+    }
+
+    /// The server's snapshot is merged, not swapped in (the continuum): what the
+    /// account can prove about devices the server never met survives it, a held
+    /// proof is grafted onto the fresh record of a device both halves know, and
+    /// everything the server alone asserted is the server's word entirely.
+    #[test]
+    fn a_snapshot_merges_the_servers_half_with_the_accounts() {
+        let (ak, ak_pub) = account();
+        let identity = identity();
+        let mut s = in_account_without_a_session(&identity);
+        let devices = s.devices.as_mut().expect("a directory");
+        // A sibling only the account knows: signed and attested, with
+        // present-tense claims picked up first-hand since.
+        let mut lan_only = sibling(8, "Atelier", 5, &ak);
+        lan_only["relay_url"] = json!("https://relay.example");
+        lan_only["online"] = json!(true);
+        devices.insert(key(8).node_id(), lan_only);
+        // A device only the SERVER ever vouched for: no signature — it leaves
+        // with the snapshot that brought it.
+        devices.insert(
+            "d_old".to_string(),
+            json!({
+                "device_id": "d_old", "node_id": key(9).node_id(),
+                "name": "Server-Only", "platform": "linux",
+            }),
+        );
+        // Two devices both halves know: one whose held proof still covers the
+        // fresh description, one renamed while we were away.
+        devices.insert(key(10).node_id(), sibling(10, "Laptop", 7, &ak));
+        devices.insert(key(11).node_id(), sibling(11, "Old-Name", 4, &ak));
+        // The server named us at login.
+        s.rekey_own("d_us".to_string());
+
+        let attest = |seed: u8| crate::account_key::attest(&ak, &key(seed).node_id());
+        let fresh = BTreeMap::from([
+            (
+                "d_us".to_string(),
+                json!({
+                    "device_id": "d_us", "node_id": identity.node_id(),
+                    "name": "Office-PC", "platform": std::env::consts::OS,
+                    "online": true,
+                }),
+            ),
+            (
+                "d_10".to_string(),
+                json!({
+                    "device_id": "d_10", "node_id": key(10).node_id(),
+                    "name": "Laptop", "platform": "linux",
+                    "attestation": attest(10), "online": true,
+                }),
+            ),
+            (
+                "d_11".to_string(),
+                json!({
+                    "device_id": "d_11", "node_id": key(11).node_id(),
+                    "name": "Renamed-By-The-Server", "platform": "linux",
+                    "attestation": attest(11), "online": true,
+                }),
+            ),
+        ]);
+
+        s.merge_snapshot(fresh, Some(&ak_pub));
+
+        let devices = s.devices.as_ref().expect("a directory");
+        assert_eq!(devices.len(), 4, "{devices:?}");
+        for key_present in ["d_us", "d_10", "d_11", key(8).node_id().as_str()] {
+            assert!(devices.contains_key(key_present), "{key_present} missing");
+        }
+        assert!(
+            !devices.contains_key(&key(10).node_id()),
+            "one device, one entry: the node_id key moved under the server's label"
+        );
+        let kept = &devices[&key(8).node_id()];
+        assert!(
+            crate::directory::verify_record(kept),
+            "still proves itself: {kept}"
+        );
+        assert_eq!(
+            kept["relay_url"],
+            json!(null),
+            "nothing vouches for its route anymore"
+        );
+        assert_eq!(kept["online"], json!(false));
+        assert!(
+            crate::directory::verify_record(&devices["d_10"]),
+            "the held proof grafted onto the fresh record: {}",
+            devices["d_10"]
+        );
+        let renamed = &devices["d_11"];
+        assert!(
+            renamed.get("self_sig").is_none(),
+            "a proof for the OLD name is not carried: {renamed}"
+        );
+        // Our own record: the server's label, our countersignature (adopt_own,
+        // as the session setup calls it right after the merge).
+        s.adopt_own(own_device(&identity));
+        let own = &s.devices.as_ref().expect("a directory")["d_us"];
+        assert!(crate::directory::verify_record(own), "{own}");
+    }
+
+    /// Without a trust root nothing can prove itself, and the snapshot replaces
+    /// the map — exactly as it did before the continuum.
+    #[test]
+    fn without_a_trust_root_the_snapshot_replaces_the_map() {
+        let (ak, _) = account();
+        let mut s = SessionState::new(None);
+        s.devices = Some(BTreeMap::from([(
+            key(8).node_id(),
+            sibling(8, "Atelier", 5, &ak),
+        )]));
+        let fresh = BTreeMap::from([("d_1".to_string(), json!({ "device_id": "d_1" }))]);
+
+        s.merge_snapshot(fresh.clone(), None);
+
+        assert_eq!(s.devices.as_ref(), Some(&fresh));
+    }
+
+    /// A logout keeps what the account can prove (the continuum): the shareable
+    /// records survive, re-keyed by `node_id` and stripped of the present-tense
+    /// facts only the server could vouch for; the server's own assertions leave
+    /// with its session.
+    #[test]
+    fn the_end_of_a_session_keeps_what_the_account_can_prove() {
+        let (ak, ak_pub) = account();
+        let identity = identity();
+        let mut s = SessionState::new(Some(&crate::session::SessionInfo {
+            server_url: "ws://server/ws".to_string(),
+            device_id: "d_7f3a".to_string(),
+            account: None,
+        }));
+        let mut sib = sibling(8, "Atelier", 5, &ak);
+        sib["device_id"] = json!("d_8");
+        sib["relay_url"] = json!("https://relay.example");
+        sib["online"] = json!(true);
+        s.devices = Some(BTreeMap::from([
+            (
+                "d_7f3a".to_string(),
+                json!({ "device_id": "d_7f3a", "node_id": identity.node_id() }),
+            ),
+            ("d_8".to_string(), sib),
+            (
+                "d_srv".to_string(),
+                json!({
+                    "device_id": "d_srv", "node_id": key(9).node_id(),
+                    "name": "Server-Only", "platform": "linux",
+                }),
+            ),
+        ]));
+
+        s.forget(Some(own_device(&identity)), Some(&ak_pub));
+
+        let devices = s.devices.as_ref().expect("a directory");
+        let node8 = key(8).node_id();
+        assert_eq!(devices.len(), 2, "{devices:?}");
+        assert!(
+            devices.contains_key(&node8) && devices.contains_key(&identity.node_id()),
+            "the sibling and ourselves, under node_ids: {devices:?}"
+        );
+        let kept = &devices[&node8];
+        assert_eq!(kept["device_id"], json!(node8), "re-keyed and re-labelled");
+        assert_eq!(kept["relay_url"], json!(null));
+        assert_eq!(kept["online"], json!(false));
+        assert!(crate::directory::verify_record(kept), "{kept}");
     }
 
     /// A tombstone bars a device only once its signature checks out under the
@@ -1595,7 +1893,7 @@ mod tests {
         }));
         s.devices = Some(BTreeMap::new());
 
-        s.forget(None);
+        s.forget(None, None);
 
         assert!(s.devices.is_none(), "no account, no directory");
         assert_eq!(s.own_device_id, None);

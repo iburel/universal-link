@@ -139,6 +139,21 @@ On each PC:
      description supersede the one already known. What a device says in the
      present tense — its relay, its liveness — is left unsigned, deliberately:
      a signature over it would be a stale fact wearing a proof.
+   - **The continuum: one account, half on a server, half not.** The account is
+     the union the ACCOUNT KEY defines; a deployment lists the subset that
+     enrolled with it, and is the authority on that subset's names and routes —
+     nothing more. Where a server names a device, the device **countersigns**:
+     the name stays the server's word, the signature is nobody's but its own,
+     published to the server as blind as the attestation and rebroadcast in its
+     records. So the server's half proves itself like the serverless half, the
+     rosters carry both, and a serverless-only sibling is a full member of an
+     account the server never learns it belongs to. The server's snapshot is
+     merged, never swapped in — what the account can prove outlives every
+     reconnection and every logout — and a `devices.revoke` through the server
+     also mints the account's own tombstone wherever the key is at hand, because
+     a server-side strike stops at the server's reach. The two halves lag each
+     other by one sync round, not a quarter of an hour: server news nudges the
+     rosters.
    - **The devices carry the directory between themselves.** Two devices that
      already hold each other's record exchange rosters over the data plane (one
      round trip, a frame type of its own on the existing ALPN): a device thereby
@@ -544,6 +559,13 @@ data plane (`UL2:<psk>:<epk>:<node_id>`, one bidirectional stream, no new ALPN).
 device that displays the code is the one that gets dialled — either of them can be
 the one displaying, so a machine with a camera and a machine without both have a
 gesture.
+
+A device that answers to a server may *scan* one of these codes and sponsor
+(the continuum, principle 3): the joiner then joins the **account** — key,
+roster, mutual records — and not the deployment, which simply never lists it.
+Showing a `UL1` code, through the server, remains that device's way of enrolling
+a newcomer on the deployment too; its `pairing.offer` still goes through the
+server whenever it has one.
 
 What changes in the threat model, and it changes for the better: **both `node_id`s
 are authenticated by the transport**. The dialer reached exactly the key the code

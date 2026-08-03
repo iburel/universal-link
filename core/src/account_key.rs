@@ -443,12 +443,21 @@ pub(crate) fn leave(state: &std::sync::Arc<crate::state::AppState>) {
             .as_ref()
             .map(|devices| devices.keys().cloned().collect())
             .unwrap_or_default();
-        // `forget(None)`: unlike a logout, nothing of this device survives — its
-        // own record was the account's too. The tombstones go with the rest: they
-        // were the account's signatures, and a device with no trust root can
-        // verify none of them anyway.
-        let (payload, abort) = s.forget(None);
+        // `forget(None, None)`: unlike a logout, nothing survives — not this
+        // device's own record, and none of the account's half either (the leave
+        // ends the MEMBERSHIP, not just the session). The tombstones go with the
+        // rest: they were the account's signatures, and a device with no trust
+        // root can verify none of them anyway.
+        let (payload, abort) = s.forget(None, None);
         s.revoked.clear();
+        // Under the same lock as the wipe: an exchange that read the trust root
+        // before we took it must find this the moment it gets here, or it would
+        // write the account it carried into the directory we just erased. (The
+        // CHECK is pinned by a unit test; this SET survives a mutation campaign,
+        // because the interleaving it guards is one no test can schedule — the
+        // absorb must be past its root read, and not yet at this lock, in the
+        // instant the leave holds it.)
+        s.left_the_account = true;
         // Disk under the lock that mutated the state (state-then-disk), like
         // every directory write.
         crate::session::remove_session_file(&state.config_dir);
@@ -489,6 +498,67 @@ pub(crate) fn leave(state: &std::sync::Arc<crate::state::AppState>) {
     // The account's read grants do not outlive it (same as the logout).
     state.clipboard.lock().expect("lock clipboard").clear_all();
     state.clipboard_reset.notify_waiters();
+}
+
+/// A server has just accepted a revocation; where this device holds the account
+/// key, the ACCOUNT signs it too. A server-side strike stops at the server's
+/// reach — it mints no tombstone, so the account's serverless half would keep
+/// trusting the struck device until its store expired, or forever where nothing
+/// expires. This closes that gap whenever it can be closed: the tombstone joins
+/// `revoked.json` and the next sync round carries it (the continuum).
+///
+/// Best-effort, and honest about it: a device that holds the account WITHOUT its
+/// key cannot sign the account's word, and says so in a log rather than pretend
+/// (the server's strike stands on its own, exactly as before the continuum). And
+/// never against ourselves — a self-revocation through the server stays what it
+/// always was, `DEVICE_REVOKED` at the next exchange: signing a tombstone
+/// against one's own `node_id` is `CANNOT_REVOKE_SELF` everywhere else, and a
+/// server's yes does not change whose signature it would be.
+pub(crate) fn tombstone_after_server_revoke(state: &crate::state::AppState, node_id: &str) {
+    if node_id == state.identity.node_id() {
+        return;
+    }
+    // The keyring read before any state lock (it can block; leaf-lock rules).
+    let ak_pub = {
+        let root = state.account_root.lock().expect("lock account_root");
+        root.as_ref().map(|root| root.ak_pub.clone())
+    };
+    let Some(ak) = ak_pub
+        .as_deref()
+        .and_then(|ak_pub| recall(&*state.secrets, ak_pub))
+    else {
+        tracing::info!(
+            %node_id,
+            "revoked on the server only: no account key here, so no tombstone for the serverless half"
+        );
+        return;
+    };
+    let revocation = revoke(&ak, node_id);
+    {
+        let mut s = state.session.lock().expect("lock session");
+        let struck = s.strike_off(node_id, revocation);
+        // Disk under the lock that mutated the state (state-then-disk).
+        // `save_unrefreshed`: the tombstone is the account's word, not a
+        // re-check of the records against the server.
+        crate::directory::save_revoked(&state.config_dir, &s.revoked);
+        if let Some(devices) = s.devices.as_ref() {
+            crate::directory::save_unrefreshed(&state.config_dir, devices);
+        }
+        // Usually empty — the server's own `device.removed` evicted the record
+        // before its reply reached us — but a label the server never knew (a
+        // `node_id`-keyed twin) leaves here, and someone should hear it.
+        let registry = state.registry.lock().expect("lock registry");
+        for device_id in struck {
+            registry.notify_topic(
+                "devices",
+                "device.removed",
+                &serde_json::json!({ "device_id": device_id }),
+            );
+        }
+    }
+    // The account's other devices should hear the tombstone now, not at the
+    // next tick — the struck device least of all can be left to wait.
+    state.dirsync_wake.notify_one();
 }
 
 /// `OtherKey` if a root is already installed for a different account key.

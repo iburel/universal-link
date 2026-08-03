@@ -105,3 +105,14 @@ pub fn optional_str_max(params: &Value, key: &str, max: usize) -> Result<Option<
     }
     Ok(value)
 }
+
+/// Optional param: absent or null → None; present but not a u64 → -32602.
+pub fn optional_u64(params: &Value, key: &str) -> Result<Option<u64>, RpcErr> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| RpcErr::invalid_params(key)),
+    }
+}

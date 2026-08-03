@@ -332,13 +332,30 @@ impl Flow {
         refresh_token: Option<&str>,
     ) -> Result<String, String> {
         self.claim_and_stash(refresh_token)?;
+        // The target's crypto identity, read while its record is still here (the
+        // eviction the reply carries would erase it): what the tombstone names,
+        // if this device can mint one — same gesture as the browser-free path.
+        let target_node_id = {
+            let s = self.state.session.lock().expect("lock session");
+            s.devices
+                .as_ref()
+                .and_then(|devices| devices.get(device_id))
+                .and_then(|record| record.get("node_id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
         crate::session::proxy(
             &self.state,
             "devices.revoke",
             json!({ "device_id": device_id, "id_token": id_token }),
         )
         .await
-        .map(|_| "Revocation done. You can close this tab.".to_string())
+        .map(|_| {
+            if let Some(node_id) = &target_node_id {
+                crate::account_key::tombstone_after_server_revoke(&self.state, node_id);
+            }
+            "Revocation done. You can close this tab.".to_string()
+        })
         .map_err(|err| {
             format!(
                 "Revocation refused ({}).",

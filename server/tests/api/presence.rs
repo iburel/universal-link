@@ -98,6 +98,110 @@ async fn presence_update_attestation_broadcasts() {
     assert_eq!(find_device(&list, &b.device_id)["attestation"], attestation);
 }
 
+/// The signed description (the continuum): opaque exactly like the attestation,
+/// carried in the record, and meaningless in halves — a `seq` orders a signature
+/// and a signature covers a `seq`, so one without the other is refused.
+#[tokio::test]
+async fn presence_update_carries_the_signed_description_whole() {
+    let env = TestEnv::start().await;
+    let mut a = online_device(&env, "alice", "pc-a", "linux").await;
+    let mut b = online_device(&env, "alice", "pc-b", "macos").await;
+    a.conn.drain().await;
+    b.conn.drain().await;
+
+    let self_sig = "ef".repeat(64);
+    b.conn
+        .request(
+            "presence.update",
+            json!({ "seq": 42, "self_sig": self_sig }),
+        )
+        .await
+        .expect("presence.update");
+    let params = a.conn.expect_notification("device.updated").await;
+    assert_eq!(params["device"]["seq"], 42);
+    assert_eq!(params["device"]["self_sig"], self_sig);
+    let list = a
+        .conn
+        .request("devices.list", json!({}))
+        .await
+        .expect("devices.list");
+    let record = find_device(&list, &b.device_id);
+    assert_eq!(record["seq"], 42);
+    assert_eq!(record["self_sig"], self_sig);
+
+    // Halves are refused — stored, they would be a claim no peer could verify.
+    for half in [json!({ "seq": 43 }), json!({ "self_sig": "ab".repeat(64) })] {
+        let err = b
+            .conn
+            .request("presence.update", half)
+            .await
+            .expect_err("half a signed description");
+        assert_eq!(err.code, -32602);
+    }
+}
+
+/// A rename that changes the name DROPS the signed description: the signature
+/// covered the old name, and rebroadcasting it would be a claim the server
+/// knows is stale. The device republishes over its own connection once it
+/// hears — until then the record is honestly unsigned.
+#[tokio::test]
+async fn a_rename_drops_the_signed_description_it_invalidates() {
+    let env = TestEnv::start().await;
+    let mut a = online_device(&env, "alice", "pc-a", "linux").await;
+    let mut b = online_device(&env, "alice", "pc-b", "macos").await;
+    a.conn.drain().await;
+    b.conn.drain().await;
+
+    b.conn
+        .request(
+            "presence.update",
+            json!({ "seq": 7, "self_sig": "ab".repeat(64) }),
+        )
+        .await
+        .expect("presence.update");
+    a.conn.expect_notification("device.updated").await;
+
+    a.conn
+        .request(
+            "devices.rename",
+            json!({ "device_id": b.device_id, "name": "renamed-b" }),
+        )
+        .await
+        .expect("devices.rename");
+    let list = a
+        .conn
+        .request("devices.list", json!({}))
+        .await
+        .expect("devices.list");
+    let record = find_device(&list, &b.device_id);
+    assert_eq!(record["name"], "renamed-b");
+    assert_eq!(record["seq"], json!(null), "covered the old name");
+    assert_eq!(record["self_sig"], json!(null));
+
+    // A rename to the SAME name invalidates nothing, and drops nothing.
+    b.conn.drain().await;
+    b.conn
+        .request(
+            "presence.update",
+            json!({ "seq": 8, "self_sig": "cd".repeat(64) }),
+        )
+        .await
+        .expect("republish");
+    a.conn
+        .request(
+            "devices.rename",
+            json!({ "device_id": b.device_id, "name": "renamed-b" }),
+        )
+        .await
+        .expect("same-name rename");
+    let list = a
+        .conn
+        .request("devices.list", json!({}))
+        .await
+        .expect("devices.list");
+    assert_eq!(find_device(&list, &b.device_id)["seq"], 8);
+}
+
 #[tokio::test]
 async fn offline_keeps_attestation() {
     let env = TestEnv::start().await;

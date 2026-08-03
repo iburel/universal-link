@@ -577,11 +577,13 @@ async fn a_second_code_retires_the_first() {
         .expect("the code that IS on screen");
 }
 
-/// A device that answers to a server pairs through it. Both codes are refused by
-/// the device the other one is for — which is what a version tag is for, and why
-/// the answer is not a half-attempt.
+/// A `UL1` code names a rendezvous on a server, and a device with no server in
+/// its life has no way to go to it. (The mirror refusal this test used to pin —
+/// `UL2` on a device that answers to a server, `PAIRING_VIA_SERVER` — fell with
+/// the continuum: such a device now sponsors over the local network, which
+/// `continuum.rs` proves end to end.)
 #[tokio::test(flavor = "multi_thread")]
-async fn a_code_is_refused_by_the_device_the_other_kind_is_for() {
+async fn a_server_code_is_refused_where_no_server_answers() {
     let server = TestServer::start().await;
     let code = universallink_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
@@ -591,19 +593,6 @@ async fn a_code_is_refused_by_the_device_the_other_kind_is_for() {
     let mut sc = manager(&serverless).await;
     let mut dc = manager(&deployed).await;
 
-    let lan_code = sc
-        .request("pairing.offer", json!({}))
-        .await
-        .expect("pairing.offer")["code"]
-        .clone();
-    let refused = dc
-        .request("pairing.accept", json!({ "code": lan_code }))
-        .await
-        .expect_err("this device has a server to pair through");
-    assert_eq!(refused.app_code(), "PAIRING_VIA_SERVER");
-
-    // And the mirror: a code minted by a server is a rendezvous this device has no
-    // way to go to.
     let server_code = dc
         .request("pairing.offer", json!({}))
         .await

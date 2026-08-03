@@ -261,9 +261,10 @@
 //! - The initiator OFFERS its roster as well as reading the answer, so learning
 //!   goes both ways in one round trip. A record it already holds is not echoed
 //!   back: the answer is the roster the responder held BEFORE absorbing.
-//! - With a server, the records are unsigned and never leave the device — a roster
-//!   of TOMBSTONES ALONE still travels, which is what makes a revocation minted
-//!   with no server outlive a deployment that was never told.
+//! - With a server, a roster of TOMBSTONES ALONE always travels, which is what
+//!   makes a revocation minted with no server outlive a deployment that was never
+//!   told. (The records used to stay behind, unsigned; since the continuum —
+//!   block 6 below — the server's half countersigns and travels too.)
 //! - Rounds run on a LAN membership change, on a local `devices.rename` /
 //!   `devices.revoke`, and on a slow tick. An exchange that teaches nothing emits
 //!   no notification and does not rewrite `directory.json`; one that DOES teach
@@ -276,9 +277,10 @@
 //!   `UL2:<psk>:<epk>:<node_id>` — instead of answering `SERVER_UNREACHABLE`, and
 //!   `pairing.accept` of a `UL2` code dials that `node_id` on the data plane. The
 //!   `UL1` code (a server relays it) and the `UL2` code (the device is dialled) are
-//!   told apart by their tag, and each is refused by the device the other is for:
-//!   `UL2` where a server answers → `PAIRING_VIA_SERVER`, `UL1` with no server →
-//!   `SERVER_UNREACHABLE`.
+//!   told apart by their tag; a `UL1` code with no server → `SERVER_UNREACHABLE`.
+//!   (The mirror refusal — `UL2` where a server answers, `PAIRING_VIA_SERVER` —
+//!   fell with the continuum, block 6 below: such a device now scans and
+//!   sponsors.)
 //! - Frames on the existing ALPN: `lan_pair` (dialer → displayer), answered by
 //!   `lan_hello` or `lan_refused { reason }`; then `pair_grant { bundle, records,
 //!   revoked }` from the sponsor and `pair_roster { records, revoked }` back.
@@ -332,6 +334,40 @@
 //! - `pairing.accept` of a code shown by a struck-off `node_id` → `DEVICE_REVOKED`
 //!   before anything is dialled: the account's own decision, said as such, not a
 //!   pairing failure discovered after two humans compared a number for nothing.
+//!
+//! One account, half on a server and half not (the continuum, building block 6 —
+//! `continuum.rs`):
+//! - The account is the union the ACCOUNT KEY defines; a deployment lists the
+//!   subset that enrolled with it. Where a server names a device, the device
+//!   COUNTERSIGNS the description — the name stays the server's word (a rename
+//!   still goes through `devices.rename`), the signature is its own, minted at a
+//!   `seq` strictly above anything it carried before. Published to the server
+//!   like the attestation (`presence.update { seq, self_sig }`, both-or-neither,
+//!   opaque, rebroadcast in the records, dropped server-side on a rename), so a
+//!   record of the server's half proves itself and is RELAYED like any other —
+//!   a serverless-only sibling learns of devices the server enrolled from any
+//!   device of either half, and the server never learns that sibling exists.
+//! - The server's snapshot is MERGED, never swapped in: a record the account can
+//!   prove (signed + attested) survives every reconnection even where the server
+//!   does not list it, re-keyed by its `node_id` with the present-tense fields
+//!   dropped; a held proof is grafted onto the fresh record of a device both
+//!   halves know, when it still covers the description (a device renamed while
+//!   away goes unsigned until it countersigns — but keeps the PROVEN `seq` as
+//!   the floor its next countersignature must clear). A logout and a server-side
+//!   revocation of THIS device keep that provable half on disk
+//!   (`save_unrefreshed`); a Core with no trust root keeps nothing, as before.
+//! - `devices.revoke` through the server also mints the account's own TOMBSTONE
+//!   whenever this device holds the account key (never against itself); a device
+//!   the server never named — its label IS its `node_id` — is struck by the
+//!   account key alone, the server not asked. Without the key, the server's
+//!   strike stands alone, as before the continuum.
+//! - News crosses the halves within a sync round, not a tick: what a server
+//!   teaches a Core (`device.added`/`device.updated`, a fresh snapshot, a
+//!   countersigned rename) nudges `dirsync` at once.
+//! - `pairing.accept` of a `UL2` code on a device that answers to a server
+//!   sponsors over the local network; the joiner joins the ACCOUNT, not the
+//!   deployment. `pairing.offer` on that device still goes through the server —
+//!   the `UL1` path is what also enrolls the newcomer on the deployment.
 
 #![allow(dead_code)]
 
@@ -959,9 +995,51 @@ impl TestCore {
         .await
     }
 
+    /// Like `start_lan_only_on`, but under a key the CALLER generated, with the
+    /// account key stowed (this device can vouch and strike off), and with a
+    /// persisted directory already holding `records` — the enrolled half of a
+    /// continuum scenario, where each side must hold the other's record before
+    /// either Core exists (the same reason as `start_in_account_on`).
+    pub async fn start_enrolled_lan_only_holding(
+        server: &TestServer,
+        switchboard: &MemorySwitchboard,
+        code: &str,
+        key: DeviceKey,
+        records: &[Value],
+    ) -> TestCore {
+        let (dir, enrolled) = Self::seed_enrolled_as(server, key).await;
+        let node_id = enrolled.1.node_id();
+        seed_account_from_code(dir.path(), &node_id, code);
+        let ak = universallink_core::account_key::account_key_from_code(code).expect("valid code");
+        universallink_core::account_key::remember(
+            &universallink_core::FileSecretStore::new(dir.path()),
+            &ak,
+        )
+        .expect("stow the account key");
+        if !records.is_empty() {
+            seed_directory(dir.path(), records, 0);
+        }
+        let transport: Arc<dyn universallink_core::PeerTransport> =
+            switchboard.endpoint(node_id.clone(), None);
+        switchboard.join_lan(&node_id);
+        Self::spawn_in(
+            dir,
+            Some(enrolled),
+            Some(server_cfg(server)),
+            Some(transport),
+        )
+        .await
+    }
+
     async fn seed_enrolled(server: &TestServer) -> (tempfile::TempDir, (String, DeviceKey)) {
+        Self::seed_enrolled_as(server, DeviceKey::generate()).await
+    }
+
+    async fn seed_enrolled_as(
+        server: &TestServer,
+        key: DeviceKey,
+    ) -> (tempfile::TempDir, (String, DeviceKey)) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let key = DeviceKey::generate();
         let mut conn = server.connect_direct().await;
         let device_id = enroll_key(
             &mut conn,

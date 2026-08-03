@@ -419,6 +419,79 @@ pub(crate) fn carry_over(held: &mut Value, incoming: &Value) {
     }
 }
 
+/// Signs, with this device's own key, the description `record` ALREADY carries —
+/// the name included, which is the point: where a server names this device, the
+/// server keeps the name, and this device countersigns it rather than contest it.
+/// That one signature is what lets its record travel to siblings the server never
+/// met ([`shareable`]). The `seq` is minted strictly above whatever the record
+/// carried, so the countersigned description supersedes the one it replaces on
+/// every device that held it.
+///
+/// `false` — and the record untouched — when there is nothing here this device
+/// could stand behind: a description missing a field, or one whose `node_id` is
+/// not this device's own (we never sign another device's description; that rule
+/// belongs to [`crate::state::SessionState::absorb`] and holds here too).
+pub(crate) fn countersign_own(
+    record: &mut Value,
+    identity: &crate::identity::DeviceIdentity,
+) -> bool {
+    let field = |key: &str| record.get(key).and_then(Value::as_str).map(str::to_string);
+    let (Some(node_id), Some(name), Some(platform)) =
+        (field("node_id"), field("name"), field("platform"))
+    else {
+        return false;
+    };
+    if node_id != identity.node_id() {
+        return false;
+    }
+    let seq = next_seq(record.get("seq").and_then(Value::as_u64));
+    record["seq"] = json!(seq);
+    record["self_sig"] = json!(identity.sign(&record_message(&node_id, &name, &platform, seq)));
+    true
+}
+
+/// Carries a signed description this Core already HELD onto the fresh record a
+/// server just handed it — or keeps the fresh one's own, if it verifies. What it
+/// returns is the only question that matters downstream: does the record now
+/// stand behind its description? `false` strips `self_sig` from the fresh
+/// record rather than leave it wearing a signature that proves nothing — the
+/// honest state of a device renamed while it was away, until it countersigns.
+///
+/// The proof may not carry, but the ORDER does: a `seq` the held record had
+/// PROVEN stays on the fresh one as the floor the next countersignature must
+/// clear — without it, a re-signature in the same second would mint an equal
+/// `seq`, which no peer treats as fresher, and the new name would sit unheard
+/// until the clock moved. Only a proven `seq`, deliberately: the fresh record's
+/// own claim is exactly that, and a floor taken on a stranger's word could pin
+/// a device's real descriptions under an absurd number forever.
+pub(crate) fn graft_signature(fresh: &mut Value, held: &Value) -> bool {
+    if verify_record(fresh) {
+        return true;
+    }
+    if let (Some(seq), Some(sig)) = (held.get("seq"), held.get("self_sig")) {
+        fresh["seq"] = seq.clone();
+        fresh["self_sig"] = sig.clone();
+        if verify_record(fresh) {
+            return true;
+        }
+    }
+    let floor = verify_record(held)
+        .then(|| held.get("seq").and_then(Value::as_u64))
+        .flatten();
+    if let Some(record) = fresh.as_object_mut() {
+        record.remove("self_sig");
+        match floor {
+            Some(floor) => {
+                record.insert("seq".to_string(), json!(floor));
+            }
+            None => {
+                record.remove("seq");
+            }
+        }
+    }
+    false
+}
+
 /// A record for a device we had never heard of, as it enters OUR directory:
 /// keyed and labelled by its `node_id` (the one label a relayer cannot rewrite),
 /// and stripped of everything the relayer could not know first-hand. So a device
@@ -738,6 +811,112 @@ mod tests {
             record_message("ab12", "Ada|Bo", "", 7),
             "a field boundary must not be forgeable"
         );
+    }
+
+    /// Countersigning takes the description AS the record carries it — the name
+    /// is the server's word, the signature becomes ours — and mints its `seq`
+    /// strictly above whatever the record already carried, so the countersigned
+    /// description supersedes the stale one everywhere it has been seen.
+    #[test]
+    fn countersigning_signs_the_name_the_record_carries() {
+        let identity = identity();
+        let mut record = json!({
+            "device_id": "d_1", "node_id": identity.node_id(),
+            "name": "Named-By-The-Server", "platform": "linux",
+        });
+        assert!(countersign_own(&mut record, &identity));
+        assert_eq!(
+            record["name"],
+            json!("Named-By-The-Server"),
+            "not ours to change"
+        );
+        assert!(verify_record(&record), "{record}");
+
+        // A carried seq — however far ahead of the clock — is superseded, not
+        // ducked under: without this, a clock that walked backwards would leave
+        // us republishing descriptions peers consider older than the stale one.
+        let held_seq = record["seq"].as_u64().expect("a seq");
+        let mut renamed = record.clone();
+        renamed["name"] = json!("Renamed-By-The-Server");
+        renamed["seq"] = json!(held_seq + 3600);
+        assert!(countersign_own(&mut renamed, &identity));
+        assert!(
+            renamed["seq"].as_u64().expect("a seq") > held_seq + 3600,
+            "{renamed}"
+        );
+        assert!(verify_record(&renamed));
+
+        // Another device's description is not ours to sign — and a record with
+        // nothing signable in it is refused untouched, not half-signed.
+        let stranger = crate::identity::DeviceIdentity::from_test_seed(9);
+        let mut other = json!({
+            "node_id": stranger.node_id(), "name": "Not-Ours", "platform": "linux",
+        });
+        assert!(!countersign_own(&mut other, &identity));
+        assert!(other.get("self_sig").is_none(), "{other}");
+        let mut bare = json!({ "node_id": identity.node_id() });
+        assert!(!countersign_own(&mut bare, &identity));
+        assert!(bare.get("self_sig").is_none());
+    }
+
+    /// A held proof is grafted onto a fresh record only if the composite proves
+    /// itself — a record renamed since goes bare rather than wear a signature
+    /// that covers a description it no longer makes.
+    #[test]
+    fn a_grafted_signature_must_prove_the_composite_or_leave_it_bare() {
+        let identity = identity();
+        let held = own_record("d_1", own(&identity), None);
+
+        // The fresh record makes the same description: the proof carries over.
+        let same_description = || {
+            json!({
+                "device_id": "d_2", "node_id": identity.node_id(),
+                "name": "Office-PC", "platform": std::env::consts::OS,
+            })
+        };
+        let mut same = same_description();
+        assert!(graft_signature(&mut same, &held));
+        assert!(verify_record(&same), "{same}");
+
+        // Renamed since: the held proof covers a description this record no
+        // longer makes — the signature goes, never rebroadcast as if it proved
+        // it, but the PROVEN seq stays as the floor the countersignature must
+        // clear (a re-signature in the same second must still supersede).
+        let mut renamed = same_description();
+        renamed["name"] = json!("Renamed-By-The-Server");
+        assert!(!graft_signature(&mut renamed, &held));
+        assert!(renamed.get("self_sig").is_none(), "{renamed}");
+        assert_eq!(renamed["seq"], held["seq"], "the proven floor stays");
+        let floor = renamed["seq"].as_u64().expect("a floor");
+        assert!(countersign_own(&mut renamed, &identity));
+        assert!(
+            renamed["seq"].as_u64().expect("a seq") > floor,
+            "the countersignature clears the floor: {renamed}"
+        );
+
+        // A record that already proves itself is left exactly as it is.
+        let mut already = own_record("d_3", own(&identity), Some(99));
+        let before = already.clone();
+        assert!(graft_signature(&mut already, &json!({})));
+        assert_eq!(already, before);
+
+        // And one wearing a stale claim, with nothing held to replace it: the
+        // claim is stripped rather than passed along.
+        let mut stale = same;
+        stale["name"] = json!("Renamed-By-The-Server");
+        assert!(!graft_signature(&mut stale, &json!({})));
+        assert!(stale.get("self_sig").is_none() && stale.get("seq").is_none());
+
+        // A held record that does not PROVE itself lends no floor either: an
+        // unproven `seq` kept as a floor could pin a device's real descriptions
+        // under an absurd number forever.
+        let mut unproven = own_record("d_4", own(&identity), None);
+        unproven["self_sig"] = json!("junk");
+        unproven["seq"] = json!(u64::MAX);
+        let mut fresh = same_description();
+        fresh["name"] = json!("Renamed-By-The-Server");
+        assert!(!graft_signature(&mut fresh, &unproven));
+        assert!(fresh.get("seq").is_none(), "{fresh}");
     }
 
     /// `seq` orders a device's own descriptions, and nothing else has to be

@@ -10,6 +10,7 @@ mod account;
 mod clipboard;
 mod clipboard_net;
 mod components;
+mod continuum;
 mod dataplane;
 mod devices;
 mod dirsync;

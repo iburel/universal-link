@@ -1653,16 +1653,15 @@ async fn offer_lan(state: &Arc<AppState>) -> Result<Value, RpcErr> {
 /// read its screen, and settle who is joining. Returns as soon as that much is
 /// done — what follows waits on a human, and waits in a task of its own.
 async fn accept_lan(state: &Arc<AppState>, payload: LanPayload) -> Result<Value, RpcErr> {
-    // A device that answers to a server pairs THROUGH it. Handing the account key
-    // over here would put the other device in an account half of which the server
-    // has never heard, and nothing yet makes those two halves one — that is the
-    // continuum building block, and until it exists this is a refusal and not a
-    // gap. A code of its own rather than `PAIRING_STATE`: nothing is out of step
-    // here, and telling the user their code was answered by somebody else would be
-    // a sentence about the wrong problem.
-    if !crate::state::serverless(state) {
-        return Err(RpcErr::app("PAIRING_VIA_SERVER"));
-    }
+    // A device that answers to a server used to refuse this (`PAIRING_VIA_SERVER`):
+    // handing the account key over would have put the other device in an account
+    // half of which the server had never heard. The continuum made the two halves
+    // one — records that sign themselves travel by dirsync whichever half minted
+    // them — so this device may scan a `UL2` code and sponsor over the local
+    // network. What the joiner joins is the ACCOUNT, not the deployment: it is not
+    // enrolled on the server, which simply never lists it. Enrolling it there too
+    // is what the `UL1` code this device would itself display is for.
+    //
     // Our own code, read on the machine that is displaying it.
     if payload.node_id == state.identity.node_id() {
         return Err(RpcErr::invalid_params("code"));

@@ -42,25 +42,28 @@
 //!
 //! On a change of LAN membership (a sibling appears: the moment it becomes
 //! reachable is the moment to talk to it), on an explicit nudge
-//! (`AppState::dirsync_wake` — a local rename or revocation, which peers should
-//! not wait a quarter of an hour to hear), and on a slow tick as a safety net.
-//! Every peer with a route is synced with in the round, so on a LAN the account
-//! converges in one.
+//! (`AppState::dirsync_wake` — a local rename or revocation, a countersigned
+//! description, or news a SERVER just taught this device: none of it should
+//! wait a quarter of an hour), and on a slow tick as a safety net. Every peer
+//! with a route is synced with in the round, so on a LAN the account converges
+//! in one.
 //!
-//! # And where there IS a server
+//! # And where there IS a server (the continuum)
 //!
-//! The task runs the same, and gates on nothing — but what it can carry there is
-//! almost nothing, and that is the honest outcome rather than a special case: a
-//! record a server minted carries no self-signature, so it is not
-//! [`shareable`](crate::directory::shareable) and never leaves this device. What
-//! does travel is the tombstones, which are the account's own signatures and owe
-//! the server nothing. So a deployment keeps its authority over names by
-//! construction, and a device struck off with no server in sight stays struck off
-//! on a sibling that has one.
+//! The task runs the same, and gates on nothing — and since the continuum it
+//! carries the server's half too. Every device countersigns the description a
+//! server names it by ([`crate::directory::countersign_own`]), publishes the
+//! signature to the server the way it publishes its attestation (opaque,
+//! rebroadcast blind), and so holds — and relays — records that prove
+//! themselves wherever they came from. A device enrolled on a server and a
+//! device that never saw one are siblings of ONE account: the union the account
+//! key defines, of which a deployment lists the subset that enrolled with it.
 //!
-//! The consequence is the one to keep in view: a device enrolled on a server is
-//! invisible to this exchange, so the account cannot yet be half on a server and
-//! half not. Making the two halves one account is the continuum brick's job.
+//! The server keeps its authority over its half's names by construction —
+//! `devices.rename` still goes through it, and the renamed device is the one
+//! that re-signs — and the account keeps the last word on membership: a
+//! tombstone is the account's own signature, travels here, and outlives
+//! whatever a deployment still lists.
 
 use std::sync::Arc;
 use std::time::Duration;
