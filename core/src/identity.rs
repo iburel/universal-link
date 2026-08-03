@@ -59,4 +59,23 @@ impl DeviceIdentity {
     pub fn proof(&self, nonce: &str) -> String {
         hex::encode(self.key.sign(nonce.as_bytes()).to_bytes())
     }
+
+    /// Signature over a payload this project builds and domain-separates itself,
+    /// in hex — a directory record the device signs to stand behind its own
+    /// description (`directory::record_message`). Kept apart from [`proof`],
+    /// whose message is the server's nonce verbatim: a signature is only ever as
+    /// safe as the domain its message carries, and mixing the two would let one
+    /// be replayed as the other.
+    pub(crate) fn sign(&self, msg: &[u8]) -> String {
+        hex::encode(self.key.sign(msg).to_bytes())
+    }
+
+    /// A fixed identity for the unit tests: no file on disk, and a `node_id` an
+    /// assertion can name.
+    #[cfg(test)]
+    pub(crate) fn from_test_seed(seed: u8) -> DeviceIdentity {
+        DeviceIdentity {
+            key: SigningKey::from_bytes(&[seed; 32]),
+        }
+    }
 }

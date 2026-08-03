@@ -44,6 +44,14 @@ The config folder houses:
   + this device's attestation. **Not secret** — no private key in this file.
   Absent until the device has joined the account (`account.setup`/`join`);
 - `session.json` — present ⟺ a session is open;
+- `directory.json` — the account's device records, so a Core that starts with no
+  reachable server still recognizes its siblings. A cache where a server could
+  refresh it (7-day staleness bound); with no server configured it IS the
+  directory. Removed at logout;
+- `revoked.json` — the devices the account has struck off, each with the account
+  key's signature over that revocation. **Permanent**, and NOT removed at logout:
+  a struck-off device keeps a valid attestation for good, so this file is the only
+  thing that keeps it out. Deleting it takes those devices back into the account;
 - `secrets.json` (0600) — fallback when no keyring is reachable. What the keyring
   holds: the OIDC refresh token, and the account's **private** key
   (`account-key-seed`) — kept at rest so this device can vouch for a joining one

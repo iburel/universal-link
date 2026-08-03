@@ -5,23 +5,36 @@
 //! different things, and only the first is what the trust root, the directory and
 //! the data plane rest on (C7). This file pins that separation.
 //!
+//! It also pins what a record is worth once no server vouches for it: the device
+//! SIGNS its own description, and the account can strike a device off with a
+//! signature of its own (building block 2). What that buys is checked from both
+//! ends — here for the gestures with no server at all, and in `revocation.rs` for
+//! the property that matters most: a tombstone outlives what a server says.
+//!
 //! What it does NOT show yet: two serverless devices finding each other. A Core
-//! here knows the account and knows itself, which is the foundation the signed
-//! directory records and the LAN pairing build on — the following building
-//! blocks. Until then a serverless Core has exactly one device in its directory,
-//! and every peer check stays fail-closed.
+//! here knows the account and knows itself, which is the foundation the pairwise
+//! sync and the LAN pairing build on — the following building blocks. Until then
+//! a serverless Core learns of a sibling only from its own store, and every peer
+//! check stays fail-closed.
 
 use serde_json::json;
+use universallink_core::{FileSecretStore, SecretStore};
 
 use crate::support::*;
 
-/// A GUI-shaped component: manages the account and reads the directory.
+/// A GUI-shaped component: manages the account and the devices, reads the
+/// directory.
 async fn manager(core: &TestCore) -> TestComponent {
     spawn_component(
         core,
         "gui",
         "gui",
-        &["session.manage", "session.read", "devices.read"],
+        &[
+            "session.manage",
+            "session.read",
+            "devices.read",
+            "devices.manage",
+        ],
     )
     .await
 }
@@ -94,6 +107,128 @@ async fn an_account_is_created_with_no_server_at_all() {
     assert_eq!(own["online"], json!(true));
     assert_eq!(own["lan"], json!(false));
     assert_eq!(own["reachable"], json!(false));
+    // And the record stands on its own: signed by the very key its `node_id` is,
+    // so a peer can take the description from anyone and still know who wrote it.
+    assert!(
+        own["seq"].as_u64().is_some_and(|seq| seq > 0),
+        "an ordering token for its description: {own}"
+    );
+    assert!(
+        universallink_core::directory::verify_record(&own),
+        "the device signs what it says about itself: {own}"
+    );
+}
+
+/// A description is signed once and kept: the Core writes it down, and a restart
+/// hands the peers that already know this device the very record they hold — not a
+/// new one saying something else under a fresh `seq`. Renamed first, deliberately:
+/// a record re-minted at startup would carry the name this Core BOOTED with, which
+/// is exactly how a rename would be quietly undone.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_description_a_device_signed_survives_a_restart() {
+    let core = TestCore::start().await;
+    let mut c = manager(&core).await;
+    c.request("account.setup", json!({}))
+        .await
+        .expect("account.setup with no server");
+    let before = c
+        .request(
+            "devices.rename",
+            json!({ "device_id": core.node_id(), "name": "Atelier" }),
+        )
+        .await
+        .expect("devices.rename")["device"]
+        .clone();
+
+    let core = core.restart().await;
+    let mut c = manager(&core).await;
+
+    let after = only_device(&mut c).await;
+    assert_eq!(after["name"], json!("Atelier"), "not re-minted");
+    assert_eq!(after["seq"], before["seq"]);
+    assert_eq!(after["self_sig"], before["self_sig"]);
+    assert!(universallink_core::directory::verify_record(&after));
+    assert_eq!(after["online"], json!(true), "and it is running");
+}
+
+/// Renaming needs no server: this device is the authority on its own name. The
+/// new description carries a higher `seq` — which is what makes a peer prefer it
+/// over the one it already holds — and a signature over that name.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_renames_itself_with_no_server() {
+    let code = universallink_core::account_key::generate_recovery_code();
+    let core = TestCore::start_in_account(&code).await;
+    let mut c = manager(&core).await;
+    c.request("events.subscribe", json!({ "topics": ["devices"] }))
+        .await
+        .expect("events.subscribe");
+    let before = only_device(&mut c).await;
+
+    let renamed = c
+        .request(
+            "devices.rename",
+            json!({ "device_id": core.node_id(), "name": "Atelier" }),
+        )
+        .await
+        .expect("devices.rename with no server")["device"]
+        .clone();
+
+    assert_eq!(renamed["name"], json!("Atelier"));
+    assert_eq!(renamed["is_self"], json!(true));
+    assert!(
+        renamed["seq"].as_u64() > before["seq"].as_u64(),
+        "{renamed} must supersede {before}"
+    );
+    assert!(
+        universallink_core::directory::verify_record(&renamed),
+        "and be signed under the new name: {renamed}"
+    );
+    // Told to whoever subscribed, not just to the caller.
+    let event = c.expect_notification("device.updated").await;
+    assert_eq!(event["device"]["name"], json!("Atelier"));
+    assert_eq!(only_device(&mut c).await, renamed);
+
+    // And it is the name that comes back, with the same signature: a rename is a
+    // decision, not a runtime nicety.
+    let core = core.restart().await;
+    let mut c = manager(&core).await;
+    let after = only_device(&mut c).await;
+    assert_eq!(after["name"], json!("Atelier"));
+    assert_eq!(after["seq"], renamed["seq"]);
+    assert_eq!(after["self_sig"], renamed["self_sig"]);
+}
+
+/// Another device's description is signed by that device: renaming it means
+/// asking it, and the only thing that carries such an ask is the server. So the
+/// answer stays exactly what it was before this path existed.
+#[tokio::test(flavor = "multi_thread")]
+async fn renaming_another_device_still_needs_a_server() {
+    let code = universallink_core::account_key::generate_recovery_code();
+    let sibling = DeviceKey::generate();
+    let core = TestCore::start_in_account_holding(
+        &code,
+        &[peer_record(&sibling, "Old-Laptop", "linux", &code, 1)],
+    )
+    .await;
+    let mut c = manager(&core).await;
+
+    let refused = c
+        .request(
+            "devices.rename",
+            json!({ "device_id": sibling.node_id(), "name": "Not-Mine" }),
+        )
+        .await
+        .expect_err("not ours to sign");
+    assert_eq!(refused.app_code(), "SERVER_UNREACHABLE");
+    let list = c
+        .request("devices.list", json!({}))
+        .await
+        .expect("devices.list");
+    assert_eq!(
+        find_device(&list, &sibling.node_id())["name"],
+        json!("Old-Laptop"),
+        "and nothing changed locally either"
+    );
 }
 
 /// A serverless account is not a runtime accident: it comes back from disk, from
@@ -125,34 +260,15 @@ async fn a_serverless_directory_does_not_expire() {
     let code = universallink_core::account_key::generate_recovery_code();
     let core = TestCore::start_in_account(&code).await;
 
-    // A sibling of the same account — attested under the same key, as its own
-    // device would be — written into a store far older than the cache TTL.
-    let ak = universallink_core::account_key::account_key_from_code(&code).expect("valid code");
-    let sibling = "b".repeat(64);
-    let attestation = universallink_core::account_key::attest(&ak, &sibling);
-    let ancient = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_secs()
-        - 90 * 24 * 60 * 60;
-    let store = json!({
-        "saved_at": ancient,
-        "devices": {
-            "peer-1": {
-                "device_id": "peer-1",
-                "name": "Old-Laptop",
-                "platform": "linux",
-                "node_id": sibling,
-                "relay_url": null,
-                "attestation": attestation,
-                "online": false,
-                "status": null,
-                "last_seen": null,
-            }
-        }
-    });
-    std::fs::write(core.config_dir().join("directory.json"), store.to_string())
-        .expect("write the store");
+    // A sibling of the same account — attested under the same key, and signing its
+    // own description, as its own device would — written into a store far older
+    // than the cache TTL.
+    let sibling = DeviceKey::generate();
+    seed_directory(
+        core.config_dir(),
+        &[peer_record(&sibling, "Old-Laptop", "linux", &code, 1)],
+        90 * 24 * 60 * 60,
+    );
 
     let core = core.restart().await;
     let mut c = manager(&core).await;
@@ -167,7 +283,7 @@ async fn a_serverless_directory_does_not_expire() {
         2,
         "the sibling from the store, plus ourselves: {devices:?}"
     );
-    let peer = find_device(&list, "peer-1");
+    let peer = find_device(&list, &sibling.node_id());
     assert_eq!(peer["name"], json!("Old-Laptop"));
     assert_eq!(peer["is_self"], json!(false));
 }
@@ -246,6 +362,135 @@ async fn a_serverless_account_can_be_pointed_at_a_server_afterwards() {
         .expect("account.status");
     assert_eq!(after["fingerprint"], fingerprint);
     assert!(own["attestation"].as_str().is_some_and(|a| !a.is_empty()));
+}
+
+/// "Nothing configured" is not "no server": a session carries its own server URL,
+/// so a Core whose `config.json` went missing still answers to one — and so does
+/// every other device of the account. The local-only paths must not take over
+/// there, or this device would sign a name nobody else would ever hear about.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_without_a_configured_server_is_still_a_server() {
+    let server = TestServer::start().await;
+    let core = TestCore::start_enrolled_without_config(&server).await;
+    let mut c = manager(&core).await;
+    wait_server_connected(&mut c, true).await;
+    // Another device of the account, watching: it is the server that tells it, so
+    // it hears nothing at all if this rename stayed local.
+    let mut other = server.online_device("Other-PC", "linux").await;
+
+    let renamed = c
+        .request(
+            "devices.rename",
+            json!({ "device_id": core.device_id(), "name": "Atelier" }),
+        )
+        .await
+        .expect("devices.rename through the session")["device"]
+        .clone();
+
+    assert_eq!(renamed["name"], json!("Atelier"));
+    let event = other.conn.wait_notification("device.updated").await;
+    assert_eq!(event["device"]["name"], json!("Atelier"));
+    assert_eq!(event["device"]["device_id"], json!(core.device_id()));
+}
+
+/// Striking a device off with no server to strike it from: the account key signs
+/// a tombstone, and that is what keeps the device out afterwards — not the record
+/// being gone. The proof is to put the record back and start again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_is_struck_off_for_good_with_no_server() {
+    let code = universallink_core::account_key::generate_recovery_code();
+    let lost = DeviceKey::generate();
+    let lost_record = peer_record(&lost, "Lost-Phone", "android", &code, 1);
+    let core = TestCore::start_in_account_holding(&code, std::slice::from_ref(&lost_record)).await;
+    let mut c = manager(&core).await;
+    c.request("events.subscribe", json!({ "topics": ["devices"] }))
+        .await
+        .expect("events.subscribe");
+    let list = c
+        .request("devices.list", json!({}))
+        .await
+        .expect("devices.list");
+    assert_eq!(list.as_array().map(Vec::len), Some(2), "the two of them");
+
+    let done = c
+        .request("devices.revoke", json!({ "device_id": lost.node_id() }))
+        .await
+        .expect("devices.revoke with no server");
+
+    assert_eq!(done["status"], json!("done"));
+    let event = c.expect_notification("device.removed").await;
+    assert_eq!(event["device_id"], json!(lost.node_id()));
+    let own = only_device(&mut c).await;
+    assert_eq!(own["is_self"], json!(true), "only ourselves left");
+
+    // The record put back by hand, as a sibling's roster or a stale backup would
+    // put it back: the tombstone is what refuses it, and it is signed by a key no
+    // amount of directory editing produces.
+    seed_directory(core.config_dir(), &[lost_record, own], 0);
+    let core = core.restart().await;
+    let mut c = manager(&core).await;
+    let after = only_device(&mut c).await;
+    assert_eq!(after["is_self"], json!(true), "struck off is struck off");
+}
+
+/// The account strikes a device off, not this machine: without the account's
+/// PRIVATE key there is nothing to sign the tombstone with, and a device that
+/// holds the account without its key must say so rather than pretend.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_that_cannot_sign_cannot_strike_anyone_off() {
+    let code = universallink_core::account_key::generate_recovery_code();
+    let lost = DeviceKey::generate();
+    let core = TestCore::start_in_account_holding(
+        &code,
+        &[peer_record(&lost, "Lost-Phone", "android", &code, 1)],
+    )
+    .await;
+    // The state `holds_key: false` describes: in the account, keyring emptied.
+    FileSecretStore::new(core.config_dir()).delete("account-key-seed");
+    let mut c = manager(&core).await;
+
+    let refused = c
+        .request("devices.revoke", json!({ "device_id": lost.node_id() }))
+        .await
+        .expect_err("nothing to sign with");
+
+    assert_eq!(refused.app_code(), "NO_ACCOUNT_KEY");
+    let list = c
+        .request("devices.list", json!({}))
+        .await
+        .expect("devices.list");
+    assert_eq!(
+        list.as_array().map(Vec::len),
+        Some(2),
+        "and the device is still there: {list}"
+    );
+}
+
+/// Striking OURSELVES off would bar this installation from its own account with
+/// no way back — a tombstone cannot be withdrawn. Leaving the account is a logout
+/// plus erasing the trust root, not a signature against oneself.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_does_not_strike_itself_off() {
+    let code = universallink_core::account_key::generate_recovery_code();
+    let core = TestCore::start_in_account(&code).await;
+    let mut c = manager(&core).await;
+
+    let refused = c
+        .request("devices.revoke", json!({ "device_id": core.node_id() }))
+        .await
+        .expect_err("not against oneself");
+    assert_eq!(refused.app_code(), "CANNOT_REVOKE_SELF");
+
+    // A device it never knew is not a device it can strike off either: there is
+    // no `node_id` to sign about.
+    let refused = c
+        .request("devices.revoke", json!({ "device_id": "d_nobody" }))
+        .await
+        .expect_err("unknown device");
+    assert_eq!(refused.app_code(), "DEVICE_UNKNOWN");
+
+    let own = only_device(&mut c).await;
+    assert_eq!(own["is_self"], json!(true), "still itself, still in");
 }
 
 /// Logging out ends a session, not a membership: the trust root stays (a

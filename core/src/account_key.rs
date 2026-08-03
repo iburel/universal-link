@@ -45,9 +45,19 @@
 //! The attestation binds the `node_id` alone (a stable crypto identity), not
 //! the `device_id` (an ephemeral label re-minted by the server at each
 //! enrollment): it survives a re-login and says what matters — "this
-//! cryptographic device is one of ours". Revoking a specific device remains a
-//! server-side directory removal. The signed payload is versioned
+//! cryptographic device is one of ours". The signed payload is versioned
 //! (`ATTEST_DOMAIN`) to make a rotation possible later.
+//!
+//! **Taking it back.** An attestation cannot be withdrawn — a signature, once
+//! made, verifies forever, and the device holds a copy of it. Where there is a
+//! server, striking the device from its directory is what stops it (the peers
+//! only ever learn of devices the directory lists). Where there is none, the
+//! account key signs the withdrawal itself: a **revocation** ([`revoke`]) over
+//! the `node_id`, under a domain of its own so that neither signature can ever
+//! pass for the other. It is deliberately not dated and not countersignable —
+//! nothing later can contradict it, because a "cancel the revocation" statement
+//! would need a total order the account has no way to establish offline. A
+//! revoked device comes back only as a NEW device, with a fresh `node_id`.
 
 use std::path::Path;
 
@@ -68,6 +78,12 @@ const SEED_DOMAIN: &[u8] = b"universallink-account-key-v1";
 /// will sign under a bumped domain so an old attestation is never mistaken for
 /// a fresh one.
 const ATTEST_DOMAIN: &[u8] = b"ul-account-attest-v1:";
+
+/// Domain separation (and version) for a revocation. A domain of its own, not a
+/// flag inside the attestation's: an attestation must never read as a revocation
+/// — anyone holding a peer's record would then be able to strike it off — and a
+/// revocation must never read as an attestation.
+const REVOKE_DOMAIN: &[u8] = b"ul-account-revoke-v1:";
 
 /// Domain separation for the fingerprint (safety number) shown for out-of-band
 /// verification.
@@ -161,15 +177,43 @@ pub fn attest(ak: &SigningKey, node_id: &str) -> String {
 /// signature, invalid signature) answers `false`: *fail-closed*, no exception
 /// bubbles up to the authorization path.
 pub fn verify(ak_pub_hex: &str, node_id: &str, attestation_hex: &str) -> bool {
-    let Some(vk) = parse_public(ak_pub_hex) else {
+    verify_detached(ak_pub_hex, &attest_message(node_id), attestation_hex)
+}
+
+/// Strikes `node_id` off the account: the account key's signature over a
+/// statement no later one can contradict. This is what a device that never
+/// reaches a server has instead of a directory removal — it needs no authority to
+/// be checked, only the account's public key, which every device derived itself.
+///
+/// Permanent, by design. See the module header: un-revoking would need a total
+/// order the account cannot establish offline, so the way back for a struck-off
+/// device is a fresh `node_id`, attested anew.
+pub fn revoke(ak: &SigningKey, node_id: &str) -> String {
+    hex::encode(ak.sign(&revoke_message(node_id)).to_bytes())
+}
+
+/// Does `revocation_hex` prove, under `ak_pub_hex`, that the account struck
+/// `node_id` off? Fail-closed like [`verify`]: anything unreadable or unsigned
+/// answers `false` — we bar a device on a signature we checked, never on the
+/// mere presence of a file.
+pub fn verify_revocation(ak_pub_hex: &str, node_id: &str, revocation_hex: &str) -> bool {
+    verify_detached(ak_pub_hex, &revoke_message(node_id), revocation_hex)
+}
+
+/// Detached Ed25519 verification, fail-closed: an unreadable key, an unreadable
+/// signature or an invalid one all answer `false`, so no error ever bubbles up to
+/// an authorization path. The single place this project checks a signature it
+/// built itself, which is what makes `verify_strict` (small-order keys and
+/// signatures refused, like the server's proof-of-possession) the rule rather
+/// than a habit.
+pub(crate) fn verify_detached(public_hex: &str, msg: &[u8], sig_hex: &str) -> bool {
+    let Some(vk) = parse_public(public_hex) else {
         return false;
     };
-    let Some(sig) = parse_signature(attestation_hex) else {
+    let Some(sig) = parse_signature(sig_hex) else {
         return false;
     };
-    // `verify_strict`: rejects small-order keys/signatures (like the
-    // proof-of-possession on the server side).
-    vk.verify_strict(&attest_message(node_id), &sig).is_ok()
+    vk.verify_strict(msg, &sig).is_ok()
 }
 
 /// A human-readable fingerprint of AK_pub (safety number) — the anchor of
@@ -360,6 +404,12 @@ fn attest_message(node_id: &str) -> Vec<u8> {
     msg
 }
 
+fn revoke_message(node_id: &str) -> Vec<u8> {
+    let mut msg = REVOKE_DOMAIN.to_vec();
+    msg.extend_from_slice(node_id.as_bytes());
+    msg
+}
+
 fn derive_account_key(entropy: &[u8; CODE_ENTROPY]) -> SigningKey {
     let mut hasher = Sha512::new();
     hasher.update(SEED_DOMAIN);
@@ -512,6 +562,15 @@ mod tests {
             "bed950f5621357e89d478daf60bbbf5fbd4730068aba44c041fd2c6435a752c0\
              bfb1df9596e721ad82344ccf2f42caf7a782024078cd02c88d073beca6fb4109",
         );
+        // A revocation outlives everything else here: it is permanent, it is
+        // persisted, and it travels between devices. A version of this project
+        // that stopped verifying the ones already handed out would silently take
+        // struck-off devices back into the account.
+        assert_eq!(
+            revoke(&ak, &a_node_id()),
+            "049b7522a29c94a02c690b6498cf65e7fa6c70ee0855752ccde8c9f5d82d4ffee\
+             6ec8e25c92d04c42b3204209c7e5c51d50bd7afcdbf56d71002557b43d10d0b",
+        );
     }
 
     /// The seed a device persists, likewise pinned: `SigningKey::to_bytes` is
@@ -630,6 +689,48 @@ mod tests {
         // elsewhere).
         let other_ak = account_key_from_code(&generate_recovery_code()).unwrap();
         assert!(!verify(&public_hex(&other_ak), &node_id, &att));
+    }
+
+    /// A revocation is checked like an attestation — and, above all, is NOT one.
+    /// The two signatures are made by the same key over the same `node_id`, and
+    /// only their domain tells them apart: without that separation, every peer's
+    /// record would carry the means to strike that peer off.
+    #[test]
+    fn a_revocation_is_not_an_attestation() {
+        let ak = account_key_from_code(&generate_recovery_code()).unwrap();
+        let ak_pub = public_hex(&ak);
+        let node_id = a_node_id();
+        let att = attest(&ak, &node_id);
+        let tombstone = revoke(&ak, &node_id);
+
+        assert!(verify_revocation(&ak_pub, &node_id, &tombstone));
+        assert_ne!(att, tombstone, "same key, same node: different statements");
+        assert!(
+            !verify_revocation(&ak_pub, &node_id, &att),
+            "an attestation must never read as a revocation"
+        );
+        assert!(
+            !verify(&ak_pub, &node_id, &tombstone),
+            "a revocation must never read as an attestation"
+        );
+
+        // And it says nothing about another device, nor under another account's
+        // key: no one strikes off a device of an account they are not in.
+        let other_node = hex::encode(
+            SigningKey::from_bytes(&[9u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        assert!(!verify_revocation(&ak_pub, &other_node, &tombstone));
+        let other_ak = account_key_from_code(&generate_recovery_code()).unwrap();
+        assert!(!verify_revocation(
+            &public_hex(&other_ak),
+            &node_id,
+            &tombstone
+        ));
+        // Fail-closed on garbage, like everything else on this path.
+        assert!(!verify_revocation("not-hex", &node_id, "not-hex"));
+        assert!(!verify_revocation(&ak_pub, &node_id, ""));
     }
 
     #[test]

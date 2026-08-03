@@ -329,6 +329,9 @@ State files, in the config folder (§1.2):
 
 - `session.json` — present ⟺ a session is open (you are logged in).
 - `account-key.json` — present ⟺ the device has joined the account.
+- `directory.json` — the account's devices as last known (removed at logout).
+- `revoked.json` — the devices struck off, signed by the account key. Permanent,
+  and kept across a logout: deleting it takes those devices back in.
 - `ipc-token` — regenerated at every startup (the GUI's root of trust).
 - `secrets.json` — appears **only** on a machine with no system keyring (0600
   fallback). On Mac (Keychain) and Windows (Credential Manager), it should not exist.
@@ -342,7 +345,8 @@ Verification reminders:
 
 To start from scratch on a machine: stop the Core, delete `account-key.json`
 (otherwise `account.setup` answers `ACCOUNT_KEY_SET`) and possibly `session.json`,
-then resume at login. The account key stays in the keyring; drop its
+plus `directory.json` and `revoked.json` if you want no memory of the old account's
+devices at all, then resume at login. The account key stays in the keyring; drop its
 `account-key-seed` entry too (or `secrets.json` wholesale) to leave nothing
 behind. Beware: erasing all of this **everywhere** without having the recovery
 code cuts you off from the account.

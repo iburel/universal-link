@@ -110,6 +110,22 @@ On each PC:
      Until it exists, the manual equivalent is to erase the trust root and the
      stored key on **every** device and start over from `account.setup` — a new
      recovery code, and every device attested again.
+   - **Revocation with no server**: where there is no directory to strike a
+     device from, the account key signs the withdrawal itself — a **tombstone**
+     over the `node_id`, under a domain of its own so it can never be confused
+     with an attestation. Every device verifies it against the key it derived
+     itself, so it needs no authority to carry it, and it **outlives what a
+     server says**: a deployment that was never told keeps listing the device,
+     and the peers keep refusing it. It is permanent by design (un-revoking
+     would need a total order the account cannot establish offline): a device
+     struck off comes back only as a new one, with a fresh `node_id`.
+   - **A device signs what it says about itself**: its directory record carries
+     its own signature over `{node_id, name, platform, seq}`, so a description
+     can pass from device to device without the one relaying it being trusted
+     with it, and only its owner can raise the `seq` that makes a new
+     description supersede the one already known. What a device says in the
+     present tense — its relay, its liveness — is left unsigned, deliberately:
+     a signature over it would be a stale fact wearing a proof.
 
 4. **Push between long-lived processes, pull for ephemeral artifacts.**
    Server → Core → managers: subscriptions/events, in-memory caches always warm.

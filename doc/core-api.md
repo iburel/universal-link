@@ -177,13 +177,15 @@ end in the same `account-key.json` + keyring entry, and both go through the same
 rules (`account_key::install`) — a key other than the one already installed is
 refused either way.
 
-`account.setup`/`account.join` assume the server is reachable **when there is one
-configured** (`SERVER_UNREACHABLE` otherwise): joining publishes an attestation
-the account's other devices read from the server, and a device that could not
-publish it would be in the account for itself alone. With **no server configured**
-there is nothing to publish to and nothing to be unreachable for — the key, the
-root and this device's own record are all local, and that is how an account is
-created with no server at all. They return `ACCOUNT_KEY_SAVE_FAILED` if the key
+`account.setup`/`account.join` assume the server is reachable **when there is
+one** (`SERVER_UNREACHABLE` otherwise): joining publishes an attestation the
+account's other devices read from the server, and a device that could not publish
+it would be in the account for itself alone. With **no server at all** there is
+nothing to publish to and nothing to be unreachable for — the key, the root and
+this device's own record are all local, and that is how an account is created with
+no server at all. "No server at all" means nothing configured **and** no session:
+a session carries its own server URL, so a Core whose `config.json` went missing
+still answers to a server, and so does the rest of the account. They return `ACCOUNT_KEY_SAVE_FAILED` if the key
 or the root cannot be persisted — nothing is installed in that case. `holds_key`
 is answered by reading the keyring back, not by remembering the write: a keyring
 write can be queued, and a stored key that does not derive `ak_pub` is ignored
@@ -268,8 +270,8 @@ Core with three fields:
 | Method | Description |
 |---|---|
 | `devices.list {}` | → `[ device, … ]` (snapshot, includes the local device). `SERVER_UNREACHABLE` only for a Core that knows of no device at all — see below |
-| `devices.rename { device_id, name }` | proxy to the server |
-| `devices.revoke { device_id }` | → `{ status: "done" }` or `{ status: "reauth_required", auth_url }` (fresh ID token required by the server; the caller opens the URL, completion arrives via `device.removed`) |
+| `devices.rename { device_id, name }` | proxy to the server. With **no server at all**: renames THIS device (it re-signs its own record — see below); any other `device_id` → `SERVER_UNREACHABLE` |
+| `devices.revoke { device_id }` | → `{ status: "done" }` or `{ status: "reauth_required", auth_url }` (fresh ID token required by the server; the caller opens the URL, completion arrives via `device.removed`). With **no server at all**: strikes the device off locally and **for good** — see below |
 
 Notifications: `device.added / removed / online / offline / updated { … }` — same
 payloads as on the server side, with two Core-side additions. `device.offline`
@@ -289,6 +291,49 @@ has never logged in *and* never joined an account. A record a Core minted for
 itself carries `device_id` = its own `node_id` (no server has named it),
 `online: true` (its own liveness needs nobody) and `null` in the fields only a
 server fills: `relay_url`, `last_seen`, `status`.
+
+**A record a device minted for itself signs itself.** It carries two more fields:
+`seq` (u64) and `self_sig` — the device's own signature, under the key its
+`node_id` IS, over `{node_id, name, platform, seq}`. So a description can travel
+from device to device without the one relaying it being trusted with it, and `seq`
+— which only its owner can raise — is what makes one description supersede
+another. Deliberately NOT signed: `relay_url`, `online`, `last_seen`, `status`,
+`device_id`. Those are said in the present tense, and a signature over them would
+be a stale fact wearing a proof. A record the SERVER minted carries neither field:
+there the server owns the name (`devices.rename` may come from another device).
+
+The signed description is stable — a restart hands back the very record, `seq`
+included. `devices.rename` is the one thing that re-signs it, and with no server
+it only ever renames THIS device: another device's record is signed by that
+device, so renaming it means asking it, and the only thing that carries such an
+ask is the server. (One exception, at startup: a record that CLAIMS this device's
+signature without carrying it — `device.key` changed, or the store was edited — is
+minted again rather than republished, since a peer would refuse it and nothing
+local would notice.)
+
+**Revocation with no server: a tombstone.** `devices.revoke` normally strikes the
+device from the server's directory. With no server at all, the **account key**
+signs the withdrawal instead — a signature over the target's `node_id`, kept in
+`revoked.json`. It bars that `node_id` at every door into the directory (the store
+at startup, a server snapshot, a server `device.*` event), so it **outlives what a
+server says**: a deployment that was never told keeps listing the device, and the
+Core keeps refusing it. Three consequences worth stating plainly:
+
+- It is **permanent**. Nothing un-revokes a `node_id` — an "undo" would need a
+  total order the account cannot establish offline. A device struck off by mistake
+  comes back only as a new one: a fresh `device.key`, attested again.
+- It needs the account's **private** key: `NO_ACCOUNT_KEY` for a device that holds
+  the account without its key (`holds_key: false`). And it refuses this very
+  device (`CANNOT_REVOKE_SELF`) — barring your own installation from its own
+  account has no way back; leaving the account is a logout plus erasing the trust
+  root.
+- There is **no fresh-login gate**, unlike the server path: with no server there
+  is no OIDC to be fresh with. What stands between a component and this call is
+  the `devices.manage` scope, nothing more.
+
+`revoked.json` survives what `directory.json` does not: a logout, and a revocation
+of this device. The struck-off device keeps a valid attestation for good, so the
+tombstone is the only thing that keeps it out.
 
 ## `files.*`
 
@@ -596,7 +641,8 @@ Standard JSON-RPC codes + application codes in `error.data.code`:
 | `ACCOUNT_KEY_SET` | `account.setup` / `account.join` for an account key OTHER than the one already installed (rotation is a follow-up) |
 | `INVALID_CODE` | `account.join`: malformed or wrong recovery code (checksum) |
 | `ACCOUNT_KEY_SAVE_FAILED` | the account key or its root cannot be persisted (keyring refused, folder not writable) — nothing is installed |
-| `NO_ACCOUNT_KEY` | this device cannot vouch: it holds no account key (`pairing.accept` told to sponsor, `pairing.confirm`) |
+| `NO_ACCOUNT_KEY` | this device cannot sign for the account: it holds no account key (`pairing.accept` told to sponsor, `pairing.confirm`, `devices.revoke` with no server) |
+| `CANNOT_REVOKE_SELF` | `devices.revoke` aimed at this very device, with no server: a tombstone cannot be withdrawn, so this would bar the installation from its own account for good |
 | `PAIRING_UNKNOWN` / `PAIRING_STATE` / `PAIRING_LIMIT` | relayed from the server as-is: unknown/expired/spent session, wrong moment (confirming before anyone scanned, or from the joining side), too many sessions at once |
 | `DEVICE_UNKNOWN` / `DEVICE_OFFLINE` | target unknown / unreachable |
 | `TRANSFER_UNKNOWN` | unknown `transfer_id` |

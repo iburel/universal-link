@@ -111,11 +111,21 @@ pub struct ServerCmd {
 /// the name it carries, and its attestation under the account key (C7). Enough to
 /// hold its own directory record — through a startup with no session, and through
 /// the end of one.
+///
+/// The identity itself rather than just the `node_id`, because the record is
+/// SIGNED with it: what this device says about itself is only worth anything to a
+/// peer if it comes with the signature of the key that `node_id` is.
 #[derive(Clone, Copy)]
 pub struct OwnDevice<'a> {
-    pub node_id: &'a str,
+    pub identity: &'a crate::identity::DeviceIdentity,
     pub name: &'a str,
     pub attestation: &'a str,
+}
+
+impl OwnDevice<'_> {
+    pub fn node_id(&self) -> String {
+        self.identity.node_id()
+    }
 }
 
 /// State of the server session, published on the IPC (`session.status`,
@@ -136,6 +146,16 @@ pub struct SessionState {
     /// to a server (`adopt_own`). `None` while this Core knows of no device at
     /// all, its own included: there is then nothing honest to serve.
     pub devices: Option<BTreeMap<String, Value>>,
+    /// Whom the account has struck off, for good: `node_id` → the account key's
+    /// signature over that revocation (`account_key::revoke`). Signatures rather
+    /// than a set of ids, because a tombstone is checked before it bars anything
+    /// ([`SessionState::barred`]) and passed on to peers as what it is — a
+    /// statement anyone can verify.
+    ///
+    /// Held next to `devices` because the two are always consulted together, and
+    /// it survives everything the directory does not: a logout, a revocation of
+    /// THIS device, a stale store. See `directory` (`revoked.json`).
+    pub revoked: BTreeMap<String, String>,
     /// Sender toward the session task — present when the connection is
     /// established (the `devices.rename`… proxies go through it).
     pub server_tx: Option<mpsc::Sender<ServerCmd>>,
@@ -151,6 +171,7 @@ impl SessionState {
             server_connected: false,
             own_device_id: info.map(|i| i.device_id.clone()),
             devices: None,
+            revoked: BTreeMap::new(),
             server_tx: None,
             session_abort: None,
         }
@@ -183,19 +204,94 @@ impl SessionState {
     /// named. It has to be the same value `own_device_id` holds, since that is
     /// what `enrich_device` derives `is_self` from.
     ///
-    /// The name is NOT refreshed: while a session exists the server owns it
-    /// (`devices.rename` can come from another device), and our idea of it is the
-    /// one from startup.
+    /// The name is NOT refreshed, and neither is the signature over it: a record
+    /// already there is kept verbatim, `seq` included. While a session exists the
+    /// server owns the name (`devices.rename` can come from another device), and
+    /// with no server the description this device signed is the one its peers
+    /// have — re-minting it at every startup would hand them a "new" record each
+    /// boot, saying nothing new. Changing it is a rename ([`Self::rename_own`]).
+    ///
+    /// With one exception: a record that CLAIMS our signature without carrying it
+    /// is dropped and minted again. That is a record we could not stand behind —
+    /// `device.key` changed under us, or the store was edited — and peers verify a
+    /// self-signature against the `node_id` itself, so republishing it would mean
+    /// offering the account a description nobody accepts and nothing local
+    /// notices. A record with NO signature at all is left alone: that is a
+    /// server's, and there the server owns the name.
     pub fn adopt_own(&mut self, own: OwnDevice<'_>) {
+        let node_id = own.node_id();
         let id = self
             .own_device_id
-            .get_or_insert_with(|| own.node_id.to_string())
+            .get_or_insert_with(|| node_id.clone())
             .clone();
         let devices = self.devices.get_or_insert_with(BTreeMap::new);
-        let record = devices.entry(id.clone()).or_insert_with(|| {
-            crate::directory::own_record(&id, own.name, own.node_id, own.attestation)
+        let unsignable = devices.get(&id).is_some_and(|record| {
+            record.get("self_sig").is_some() && !crate::directory::verify_record(record)
         });
+        if unsignable {
+            tracing::warn!("our own directory record does not carry our signature: minted again");
+            devices.remove(&id);
+        }
+        let record = devices
+            .entry(id.clone())
+            .or_insert_with(|| crate::directory::own_record(&id, own, None));
         record["attestation"] = json!(own.attestation);
+        // Our own liveness is the one presence fact we know first-hand, and it is
+        // true by construction: this record is being written by the running Core.
+        // A stored record that said otherwise would have us report ourselves
+        // offline until something else corrected it.
+        record["online"] = json!(true);
+    }
+
+    /// This device renames ITSELF, with no server to ask: a fresh description
+    /// under a strictly higher `seq`, signed again — which is what makes a peer
+    /// that already knows us prefer the new one. Returns the record as it now
+    /// stands, or `None` if this Core holds no record of its own (nothing to
+    /// rename: it has neither joined an account nor been named by a server).
+    ///
+    /// Only our own: another device's description is not ours to sign, and the
+    /// caller is the one that refuses that (`conn::devices_rename`).
+    pub fn rename_own(&mut self, own: OwnDevice<'_>, name: &str) -> Option<Value> {
+        let id = self.own_device_id.clone()?;
+        let devices = self.devices.as_mut()?;
+        let previous = devices.get(&id)?.get("seq").and_then(Value::as_u64);
+        let renamed = crate::directory::own_record(&id, OwnDevice { name, ..own }, previous);
+        devices.insert(id, renamed.clone());
+        Some(renamed)
+    }
+
+    /// Has the account struck this `node_id` off? A tombstone counts only once
+    /// its signature verifies under `ak_pub` — the account's public key, which
+    /// this device derived itself. So a `revoked.json` someone else wrote bars
+    /// nobody, and a device with no trust root bars nobody either (it recognizes
+    /// nobody at all: fail-closed both ways).
+    pub fn barred(&self, ak_pub: &str, node_id: &str) -> bool {
+        self.revoked.get(node_id).is_some_and(|revocation| {
+            crate::account_key::verify_revocation(ak_pub, node_id, revocation)
+        })
+    }
+
+    /// Strikes a `node_id` off: keeps the tombstone, and evicts every record that
+    /// described it. Returns the `device_id`s that left, for the notifications.
+    ///
+    /// Both halves matter, and they answer different questions. The eviction is
+    /// what a component sees NOW; the tombstone is what refuses the record when it
+    /// comes back — from a peer's roster, from a server that was never told, or
+    /// from this Core's own store at the next startup.
+    pub fn strike_off(&mut self, node_id: &str, revocation: String) -> Vec<String> {
+        self.revoked.insert(node_id.to_string(), revocation);
+        let Some(devices) = self.devices.as_mut() else {
+            return Vec::new();
+        };
+        let struck: Vec<String> = devices
+            .iter()
+            .filter(|(_, record)| record.get("node_id").and_then(Value::as_str) == Some(node_id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &struck {
+            devices.remove(id);
+        }
+        struck
     }
 
     /// The server has just named this device (a login completed): our own record
@@ -231,6 +327,11 @@ impl SessionState {
     /// `device_id`, the server's label having left with the session. Taken as a
     /// parameter rather than read here, because `account_root` is a leaf lock and
     /// this runs under `session`.
+    ///
+    /// The tombstones stay untouched, for the same reason: a session ending says
+    /// nothing about whom the account struck off, and forgetting a revocation is
+    /// the one mistake that cannot be corrected later — the struck-off device
+    /// still holds a perfectly valid attestation.
     pub fn forget(
         &mut self,
         own: Option<OwnDevice<'_>>,
@@ -610,35 +711,186 @@ pub fn random_hex(bytes: usize) -> String {
 mod tests {
     use super::*;
 
-    /// What a Core in the account holds about itself before any server has named
-    /// it — the serverless startup state.
-    fn in_account_without_a_session() -> SessionState {
-        let mut s = SessionState::new(None);
-        s.adopt_own(OwnDevice {
-            node_id: "ab12",
+    /// The identity every test here belongs to, and the record it signs.
+    fn identity() -> crate::identity::DeviceIdentity {
+        crate::identity::DeviceIdentity::from_test_seed(7)
+    }
+
+    fn own_device(identity: &crate::identity::DeviceIdentity) -> OwnDevice<'_> {
+        OwnDevice {
+            identity,
             name: "Office-PC",
             attestation: "sig",
-        });
+        }
+    }
+
+    /// What a Core in the account holds about itself before any server has named
+    /// it — the serverless startup state.
+    fn in_account_without_a_session(identity: &crate::identity::DeviceIdentity) -> SessionState {
+        let mut s = SessionState::new(None);
+        s.adopt_own(own_device(identity));
         s
     }
 
     #[test]
     fn a_device_in_the_account_knows_itself_under_its_own_node_id() {
-        let s = in_account_without_a_session();
+        let identity = identity();
+        let s = in_account_without_a_session(&identity);
 
-        assert_eq!(s.own_device_id.as_deref(), Some("ab12"));
+        let node_id = identity.node_id();
+        assert_eq!(s.own_device_id.as_deref(), Some(node_id.as_str()));
         let devices = s.devices.expect("a directory");
-        let own = devices.get("ab12").expect("our own record");
-        assert_eq!(own["node_id"], json!("ab12"));
+        let own = devices.get(&node_id).expect("our own record");
+        assert_eq!(own["node_id"], json!(node_id));
         assert_eq!(own["name"], json!("Office-PC"));
         assert_eq!(own["attestation"], json!("sig"));
+        assert!(
+            crate::directory::verify_record(own),
+            "and stands behind that description with its own key: {own}"
+        );
+    }
+
+    /// A description already signed is kept as it is — name, `seq` and signature.
+    /// Re-minting it at every startup would hand peers a record to take in and
+    /// store again, saying nothing they did not know; worse, it would undo a
+    /// rename, since what this Core knows at startup is the name it booted with.
+    #[test]
+    fn a_description_already_signed_is_not_signed_again() {
+        let identity = identity();
+        let mut s = in_account_without_a_session(&identity);
+        // A record no fresh minting would produce: renamed, hence a name that is
+        // not the one `OwnDevice` carries and a `seq` past the current second.
+        s.rename_own(own_device(&identity), "Atelier")
+            .expect("our own record");
+        let before = s.devices.clone();
+
+        s.adopt_own(own_device(&identity));
+
+        assert_eq!(s.devices, before, "kept verbatim, rename included");
+    }
+
+    /// A description we cannot stand behind is not republished. Its signature is
+    /// checked against our own `node_id` — exactly as a peer would check it — and a
+    /// record claiming one it does not carry is minted again.
+    #[test]
+    fn a_description_we_cannot_sign_for_is_minted_again() {
+        let identity = identity();
+        let node_id = identity.node_id();
+        let mut s = SessionState::new(None);
+        s.own_device_id = Some(node_id.clone());
+        // Signed by ANOTHER device — a tampered store, or one carried over from an
+        // identity this machine no longer has.
+        let mut forged = crate::directory::own_record(
+            &node_id,
+            OwnDevice {
+                identity: &crate::identity::DeviceIdentity::from_test_seed(9),
+                name: "Someone-Else",
+                attestation: "sig",
+            },
+            None,
+        );
+        forged["node_id"] = json!(node_id);
+        assert!(!crate::directory::verify_record(&forged), "the premise");
+        s.devices = Some(BTreeMap::from([(node_id.clone(), forged)]));
+
+        s.adopt_own(own_device(&identity));
+
+        let record = &s.devices.as_ref().expect("a directory")[&node_id];
+        assert_eq!(record["name"], json!("Office-PC"), "ours again");
+        assert!(crate::directory::verify_record(record));
+    }
+
+    /// A record with NO signature is a server's, and the server owns the name
+    /// there: left exactly as it is.
+    #[test]
+    fn a_record_a_server_minted_is_left_alone() {
+        let identity = identity();
+        let mut s = SessionState::new(Some(&crate::session::SessionInfo {
+            server_url: "ws://server/ws".to_string(),
+            device_id: "d_7f3a".to_string(),
+            account: None,
+        }));
+        let from_server = json!({
+            "device_id": "d_7f3a", "node_id": identity.node_id(),
+            "name": "Named-By-The-Server", "platform": "linux", "online": true,
+        });
+        s.devices = Some(BTreeMap::from([("d_7f3a".to_string(), from_server)]));
+
+        s.adopt_own(own_device(&identity));
+
+        let record = &s.devices.as_ref().expect("a directory")["d_7f3a"];
+        assert_eq!(record["name"], json!("Named-By-The-Server"));
+        assert_eq!(record["attestation"], json!("sig"), "carried onto it");
+    }
+
+    /// The one thing `adopt_own` does assert about an existing record: this Core
+    /// is running, so it is online. A stored record that said otherwise would have
+    /// us reporting ourselves offline.
+    #[test]
+    fn adopting_our_own_record_asserts_that_we_are_running() {
+        let identity = identity();
+        let mut s = SessionState::new(None);
+        let node_id = identity.node_id();
+        s.own_device_id = Some(node_id.clone());
+        s.devices = Some(BTreeMap::from([(
+            node_id.clone(),
+            json!({ "device_id": node_id, "node_id": node_id, "online": false }),
+        )]));
+
+        s.adopt_own(own_device(&identity));
+
+        assert_eq!(
+            s.devices.as_ref().expect("a directory")[&node_id]["online"],
+            json!(true)
+        );
+    }
+
+    /// Renaming is the one thing that DOES re-sign: a fresh description, a
+    /// strictly higher `seq` (two renames in the same second still order), and a
+    /// signature a peer can check before preferring it.
+    #[test]
+    fn a_rename_supersedes_the_description_it_replaces() {
+        let identity = identity();
+        let mut s = in_account_without_a_session(&identity);
+        let before = s.devices.as_ref().expect("a directory")[&identity.node_id()].clone();
+
+        let first = s
+            .rename_own(own_device(&identity), "Laptop")
+            .expect("our own record to rename");
+        let second = s
+            .rename_own(own_device(&identity), "Laptop-2")
+            .expect("and again");
+
+        assert_eq!(first["name"], json!("Laptop"));
+        assert_eq!(second["name"], json!("Laptop-2"));
+        assert!(crate::directory::verify_record(&first));
+        assert!(crate::directory::verify_record(&second));
+        let seq = |record: &Value| record["seq"].as_u64().expect("a seq");
+        assert!(seq(&first) > seq(&before), "{first} over {before}");
+        assert!(seq(&second) > seq(&first), "{second} over {first}");
+        // And what the directory holds is the last one, under the same key.
+        let devices = s.devices.as_ref().expect("a directory");
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[&identity.node_id()], second);
+    }
+
+    /// A device with nothing of its own has nothing to rename — no silent
+    /// invention of a record here.
+    #[test]
+    fn a_device_with_no_record_of_its_own_renames_nothing() {
+        let identity = identity();
+        let mut s = SessionState::new(None);
+
+        assert!(s.rename_own(own_device(&identity), "Laptop").is_none());
+        assert!(s.devices.is_none());
     }
 
     /// The label the server hands out replaces the self-minted one, and the record
     /// follows it: a device must never appear in its own directory as a stranger.
     #[test]
     fn a_server_naming_this_device_carries_its_record_over() {
-        let mut s = in_account_without_a_session();
+        let identity = identity();
+        let mut s = in_account_without_a_session(&identity);
 
         s.rekey_own("d_7f3a".to_string());
 
@@ -659,27 +911,106 @@ mod tests {
             device_id: "d_7f3a".to_string(),
             account: None,
         }));
+        let identity = identity();
+        let node_id = identity.node_id();
         s.devices = Some(BTreeMap::from([(
             "d_7f3a".to_string(),
-            json!({ "device_id": "d_7f3a", "node_id": "ab12" }),
+            json!({ "device_id": "d_7f3a", "node_id": node_id }),
         )]));
-        let own = OwnDevice {
-            node_id: "ab12",
-            name: "Office-PC",
-            attestation: "sig",
-        };
+        // A device the account struck off while this session lived.
+        s.revoked = BTreeMap::from([("cd34".to_string(), "revocation".to_string())]);
 
-        let (payload, _) = s.forget(Some(own));
+        let (payload, _) = s.forget(Some(own_device(&identity)));
 
         assert_eq!(payload["logged_in"], json!(false));
         assert_eq!(
             s.own_device_id.as_deref(),
-            Some("ab12"),
+            Some(node_id.as_str()),
             "the server's label left with the session"
         );
         let devices = s.devices.as_ref().expect("still a directory");
         assert_eq!(devices.len(), 1);
-        assert!(devices.contains_key("ab12"));
+        assert!(devices.contains_key(&node_id));
+        assert!(
+            s.revoked.contains_key("cd34"),
+            "a session ends; a revocation does not"
+        );
+    }
+
+    /// A tombstone bars a device only once its signature checks out under the
+    /// account's own key — the one this device derived itself.
+    #[test]
+    fn only_a_signed_revocation_bars_a_device() {
+        let ak = crate::account_key::account_key_from_code(
+            &crate::account_key::generate_recovery_code(),
+        )
+        .expect("a valid code");
+        let ak_pub = crate::account_key::public_hex(&ak);
+        let struck = identity().node_id();
+        let mut s = SessionState::new(None);
+
+        assert!(!s.barred(&ak_pub, &struck), "nothing revoked yet");
+
+        // Someone wrote a tombstone they could not sign: it bars nobody.
+        s.revoked
+            .insert(struck.clone(), "de".repeat(64).to_string());
+        assert!(!s.barred(&ak_pub, &struck));
+
+        // The account's own signature: barred.
+        s.revoked
+            .insert(struck.clone(), crate::account_key::revoke(&ak, &struck));
+        assert!(s.barred(&ak_pub, &struck));
+        // And it says nothing about anyone else, nor under another account's key.
+        assert!(!s.barred(&ak_pub, "cd34"));
+        let other = crate::account_key::account_key_from_code(
+            &crate::account_key::generate_recovery_code(),
+        )
+        .expect("a valid code");
+        assert!(!s.barred(&crate::account_key::public_hex(&other), &struck));
+    }
+
+    /// Striking a device off does two things, and both are needed: what a
+    /// component sees now (the record leaves), and what refuses it later (the
+    /// tombstone stays).
+    #[test]
+    fn striking_a_device_off_evicts_its_records_and_keeps_the_tombstone() {
+        let mut s = SessionState::new(None);
+        s.devices = Some(BTreeMap::from([
+            (
+                "d_old".to_string(),
+                json!({ "device_id": "d_old", "node_id": "ab12" }),
+            ),
+            (
+                "d_new".to_string(),
+                json!({ "device_id": "d_new", "node_id": "ab12" }),
+            ),
+            (
+                "d_other".to_string(),
+                json!({ "device_id": "d_other", "node_id": "cd34" }),
+            ),
+        ]));
+
+        let struck = s.strike_off("ab12", "revocation".to_string());
+
+        // Both labels of the same crypto identity leave: the revocation is about
+        // the `node_id`, and a device may well be listed under more than one
+        // label (a re-enrollment, a self-minted one and a server's).
+        assert_eq!(struck, vec!["d_new".to_string(), "d_old".to_string()]);
+        let devices = s.devices.as_ref().expect("a directory");
+        assert_eq!(devices.len(), 1);
+        assert!(devices.contains_key("d_other"), "the others stay");
+        assert_eq!(s.revoked.get("ab12"), Some(&"revocation".to_string()));
+    }
+
+    /// Nothing to evict is not nothing to record: a Core that struck a device off
+    /// before ever holding a directory must still refuse it later.
+    #[test]
+    fn a_revocation_without_a_directory_is_still_recorded() {
+        let mut s = SessionState::new(None);
+
+        assert!(s.strike_off("ab12", "revocation".to_string()).is_empty());
+
+        assert_eq!(s.revoked.get("ab12"), Some(&"revocation".to_string()));
     }
 
     /// A device that never joined the account has nothing of its own to keep: the

@@ -14,7 +14,7 @@ mod conn;
 mod connector;
 mod datachannel;
 mod dataplane;
-mod directory;
+pub mod directory;
 mod discover;
 mod framing;
 mod http;
@@ -305,6 +305,10 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
         // makes expiry meaningful (see `directory`).
         _ => directory::load(&config.config_dir, config.server.is_some()),
     };
+    // Whom the account has struck off (signed tombstones). Read unconditionally
+    // and never expired: a revocation is permanent, and it is not the session's
+    // to lose — the struck-off device keeps a valid attestation for good.
+    let revoked = directory::load_revoked(&config.config_dir);
     let state = Arc::new(AppState {
         registry: Mutex::new(Registry::new(file_token)),
         session: Mutex::new(SessionState::new(session_info.as_ref())),
@@ -326,36 +330,47 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
         reconnect_base_delay: config.reconnect_base_delay,
         shutdown_request: tokio::sync::Notify::new(),
     });
-    if let Some(devices) = stored_devices {
-        // Seeded before any task exists — no reader can race it. The first
-        // successful session setup replaces it with the live snapshot.
-        state.session.lock().expect("lock session").devices = Some(devices);
-    }
-    // A device in the account knows at least ITSELF — session or not, server or
-    // not. Without this a Core that joined the account and never logged in would
-    // answer `SERVER_UNREACHABLE` to a component asking who is around, while
-    // holding everything needed to say "me".
-    //
-    // Cloned out of the leaf lock before taking `session` (lock ordering), and
-    // deliberately NOT persisted: writing the store here would refresh its
-    // `saved_at` at every startup and silently extend the staleness bound of
-    // records the server may have revoked meanwhile.
-    let own_attestation = state
+    // Cloned out of the leaf lock before taking `session` (lock ordering).
+    let root = state
         .account_root
         .lock()
         .expect("lock account_root")
-        .as_ref()
-        .map(|root| root.attestation.clone());
-    if let Some(attestation) = &own_attestation {
-        state
-            .session
-            .lock()
-            .expect("lock session")
-            .adopt_own(crate::state::OwnDevice {
-                node_id: &state.identity.node_id(),
+        .clone();
+    {
+        // Seeded before any task exists — no reader can race it. The first
+        // successful session setup replaces the records with the live snapshot;
+        // the tombstones, nothing replaces.
+        let mut s = state.session.lock().expect("lock session");
+        s.revoked = revoked;
+        if let Some(mut devices) = stored_devices {
+            // A struck-off device does not come back from the disk. This is what
+            // the store carries INSTEAD of a freshness bound where no server
+            // could ever refresh it (see `directory`).
+            if let Some(root) = &root {
+                devices.retain(|_, record| {
+                    record
+                        .get("node_id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none_or(|node_id| !s.barred(&root.ak_pub, node_id))
+                });
+            }
+            s.devices = Some(devices);
+        }
+        // A device in the account knows at least ITSELF — session or not, server
+        // or not. Without this a Core that joined the account and never logged in
+        // would answer `SERVER_UNREACHABLE` to a component asking who is around,
+        // while holding everything needed to say "me".
+        //
+        // Deliberately NOT persisted: writing the store here would refresh its
+        // `saved_at` at every startup and silently extend the staleness bound of
+        // records the server may have revoked meanwhile.
+        if let Some(root) = &root {
+            s.adopt_own(crate::state::OwnDevice {
+                identity: &state.identity,
                 name: &state.device_name,
-                attestation,
+                attestation: &root.attestation,
             });
+        }
     }
 
     if let Some(info) = session_info {

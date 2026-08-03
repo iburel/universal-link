@@ -1469,15 +1469,6 @@ fn received_files(core: &TestCore) -> Vec<PathBuf> {
     }
 }
 
-/// A temporary file to send (the `TempDir` must stay alive for the duration of
-/// the send — hence returning the pair).
-fn scratch_file(contents: &[u8]) -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("f.bin");
-    std::fs::write(&path, contents).expect("write the temporary file");
-    (dir, path)
-}
-
 /// A temporary source TREE to send, returning `(guard, top)`:
 ///   top/a.txt = "alpha", top/sub/b.bin = "beta bytes", top/empty/ (empty).
 /// The `TempDir` guard must outlive the send.

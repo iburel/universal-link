@@ -573,6 +573,9 @@ impl Conn {
     async fn devices_revoke(&mut self, params: &Value) -> Result<Value, RpcErr> {
         self.require_scope("devices.manage")?;
         let device_id = rpc::required_str(params, "device_id")?;
+        if self.serverless() {
+            return self.revoke_locally(&device_id);
+        }
         // With no server connection, neither the proxy nor re-auth would
         // succeed: no point spending the refresh token.
         if self
@@ -614,6 +617,67 @@ impl Conn {
         Ok(json!({ "status": "reauth_required", "auth_url": auth_url }))
     }
 
+    /// Revokes a device with no server in the picture: the ACCOUNT KEY signs a
+    /// tombstone against its `node_id` (`account_key::revoke`), the record leaves
+    /// the directory, and the tombstone stays — so nothing brings it back, here or
+    /// on any device this one later syncs with. This is what replaces "strike it
+    /// from the server directory" where there is no directory to strike it from.
+    ///
+    /// Three things it is honest to state plainly. It is **permanent**: nothing
+    /// can un-revoke a `node_id`, and a device struck off by mistake comes back
+    /// only as a new one (a fresh `device.key`, attested again). It needs the
+    /// account's PRIVATE key — the account is what strikes a device off, not this
+    /// machine — so a device that holds the account without its key cannot do it
+    /// (`NO_ACCOUNT_KEY`, the same answer it gives when asked to vouch). And there
+    /// is **no fresh-login gate**: with no server there is no OIDC to be fresh
+    /// with, so what stands between a component and this call is the
+    /// `devices.manage` scope, nothing more.
+    fn revoke_locally(&self, device_id: &str) -> Result<Value, RpcErr> {
+        // The keyring first: `recall` waits on an OS service (seconds, in the bad
+        // case) and no state lock may be held across it.
+        let ak_pub = self
+            .state
+            .account_root
+            .lock()
+            .expect("lock account_root")
+            .as_ref()
+            .map(|root| root.ak_pub.clone());
+        let ak = ak_pub
+            .as_deref()
+            .and_then(|ak_pub| crate::account_key::recall(&*self.state.secrets, ak_pub))
+            .ok_or_else(|| RpcErr::app("NO_ACCOUNT_KEY"))?;
+
+        let mut s = self.state.session.lock().expect("lock session");
+        let node_id = s
+            .devices
+            .as_ref()
+            .and_then(|devices| devices.get(device_id))
+            .and_then(|record| record.get("node_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| RpcErr::app("DEVICE_UNKNOWN"))?;
+        // Striking ourselves off would bar this installation from its own account
+        // with no way back — every peer would refuse it, and the tombstone cannot
+        // be withdrawn. Leaving the account is `session.logout` plus erasing the
+        // trust root, not a signature against oneself.
+        if node_id == self.state.identity.node_id() {
+            return Err(RpcErr::app("CANNOT_REVOKE_SELF"));
+        }
+        let struck = s.strike_off(&node_id, crate::account_key::revoke(&ak, &node_id));
+        // Disk before the notification, under the lock that mutated the state
+        // (state-then-disk): a component told a device is gone can rely on a
+        // restart still knowing it.
+        crate::directory::save_revoked(&self.state.config_dir, &s.revoked);
+        if let Some(devices) = s.devices.as_ref() {
+            crate::directory::save(&self.state.config_dir, devices);
+        }
+        let registry = self.state.registry.lock().expect("lock registry");
+        for id in struck {
+            registry.notify_topic("devices", "device.removed", &json!({ "device_id": id }));
+        }
+        Ok(json!({ "status": "done" }))
+    }
+
     /// Idempotent: outside a session there is nothing to close and nothing to
     /// say. Otherwise: session task stopped (the server sees the connection
     /// drop → offline), session.json removed, a single notification.
@@ -630,11 +694,10 @@ impl Conn {
             .expect("lock account_root")
             .as_ref()
             .map(|root| root.attestation.clone());
-        let node_id = self.state.identity.node_id();
         let own = own_attestation
             .as_deref()
             .map(|attestation| crate::state::OwnDevice {
-                node_id: &node_id,
+                identity: &self.state.identity,
                 name: &self.state.device_name,
                 attestation,
             });
@@ -721,7 +784,7 @@ impl Conn {
     /// to compare on the other devices.
     async fn account_setup(&mut self) -> Result<Value, RpcErr> {
         self.require_scope("session.manage")?;
-        self.require_server_if_configured()?;
+        self.require_server_if_there_is_one()?;
         let code = crate::account_key::generate_recovery_code();
         let ak = crate::account_key::account_key_from_code(&code)
             .expect("freshly generated code is valid");
@@ -741,7 +804,7 @@ impl Conn {
     /// has the account but not its key (see `install_account_root`).
     async fn account_join(&mut self, params: &Value) -> Result<Value, RpcErr> {
         self.require_scope("session.manage")?;
-        self.require_server_if_configured()?;
+        self.require_server_if_there_is_one()?;
         let code = rpc::required_str(params, "recovery_code")?;
         let ak = crate::account_key::account_key_from_code(&code)
             .map_err(|_| RpcErr::app("INVALID_CODE"))?;
@@ -764,24 +827,42 @@ impl Conn {
         })
     }
 
-    /// A **configured** server must be connected: joining the account publishes
-    /// an attestation, and session setup has already decided what to publish —
-    /// the device would otherwise stay unreachable for the whole session. Like
-    /// `devices.revoke`, an account operation on a deployment assumes the server
-    /// is reachable (and the user just logged in to get here).
+    /// Is there **no server in this device's life at all**? Nothing configured,
+    /// and no session either — a session carries its own server URL
+    /// (`session.json`), so a Core whose `config.json` went missing under its feet
+    /// still has a server it answers to, and every other device of the account
+    /// reads that server.
     ///
-    /// With **no server configured** there is nothing to publish to, and nothing
-    /// to be unreachable for: the trust root, the directory and this device's own
-    /// record are all local. Refusing here would mean an account could never be
-    /// created without a server, which is precisely what this path is for.
-    fn require_server_if_configured(&self) -> Result<(), RpcErr> {
+    /// This is what the local-only paths turn on. Getting it wrong the lenient way
+    /// would be the expensive mistake: this device would sign a name, or strike a
+    /// device off, in a way the server — and therefore the rest of the account —
+    /// would never hear about.
+    fn serverless(&self) -> bool {
         let configured = self
             .state
             .server_config
             .lock()
             .expect("lock server_config")
             .is_some();
-        if !configured {
+        if configured {
+            return false;
+        }
+        !self.state.session.lock().expect("lock session").logged_in
+    }
+
+    /// A server this device has must be connected: joining the account publishes
+    /// an attestation, and session setup has already decided what to publish —
+    /// the device would otherwise stay unreachable for the whole session. Like
+    /// `devices.revoke`, an account operation on a deployment assumes the server
+    /// is reachable (and the user just logged in to get here).
+    ///
+    /// With **no server at all** ([`Self::serverless`]) there is nothing to
+    /// publish to, and nothing to be unreachable for: the trust root, the
+    /// directory and this device's own record are all local. Refusing here would
+    /// mean an account could never be created without a server, which is precisely
+    /// what this path is for.
+    fn require_server_if_there_is_one(&self) -> Result<(), RpcErr> {
+        if self.serverless() {
             return Ok(());
         }
         if self
@@ -831,6 +912,9 @@ impl Conn {
         self.require_scope("devices.manage")?;
         let device_id = rpc::required_str(params, "device_id")?;
         let name = rpc::required_str(params, "name")?;
+        if self.serverless() {
+            return self.rename_own(&device_id, &name);
+        }
 
         let result = crate::session::proxy(
             &self.state,
@@ -851,6 +935,66 @@ impl Conn {
                 &lan,
             )
         };
+        Ok(json!({ "device": enriched }))
+    }
+
+    /// Renames this device with no server in the picture. A device is the
+    /// authority on its own description and on nothing else: it re-signs its
+    /// record under a higher `seq`, which is what makes a peer that already knows
+    /// it prefer the new name (`directory`).
+    ///
+    /// **Any other `device_id` answers `SERVER_UNREACHABLE`** — unchanged from
+    /// before this path existed. That is not a stopgap: another device's record is
+    /// signed by that device, so renaming it means asking it, and the only thing
+    /// that carries such an ask is the server. A name that only our directory
+    /// believed in would be worse than a refusal, because it would disagree with
+    /// every other device in the account and nothing would ever settle it.
+    fn rename_own(&self, device_id: &str, name: &str) -> Result<Value, RpcErr> {
+        // Read out of the leaf locks before taking `session` (lock ordering).
+        let attestation = self
+            .state
+            .account_root
+            .lock()
+            .expect("lock account_root")
+            .as_ref()
+            .map(|root| root.attestation.clone());
+        let lan: std::collections::BTreeSet<String> =
+            self.state.transport.lan_peers().into_iter().collect();
+        let unreachable = || RpcErr::app("SERVER_UNREACHABLE");
+        let attestation = attestation.ok_or_else(unreachable)?;
+        let own = crate::state::OwnDevice {
+            identity: &self.state.identity,
+            name: &self.state.device_name,
+            attestation: &attestation,
+        };
+
+        let mut s = self.state.session.lock().expect("lock session");
+        if s.own_device_id.as_deref() != Some(device_id) {
+            return Err(unreachable());
+        }
+        let record = s.rename_own(own, name).ok_or_else(unreachable)?;
+        let enriched = enrich_device(
+            &record,
+            s.own_device_id.as_deref(),
+            s.server_connected,
+            &lan,
+        );
+        if let Some(devices) = s.devices.as_ref() {
+            crate::directory::save(&self.state.config_dir, devices);
+        }
+        // Broadcast under the session lock (order: session then registry), like
+        // every directory change: the order of notifications is the order of
+        // states. And broadcast at all, unlike the server path — there the
+        // server's reply is what fans out to the other components.
+        self.state
+            .registry
+            .lock()
+            .expect("lock registry")
+            .notify_topic(
+                "devices",
+                "device.updated",
+                &json!({ "device": enriched.clone() }),
+            );
         Ok(json!({ "device": enriched }))
     }
 

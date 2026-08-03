@@ -184,11 +184,10 @@ fn drop_session(state: &AppState) {
         .expect("lock account_root")
         .as_ref()
         .map(|root| root.attestation.clone());
-    let node_id = state.identity.node_id();
     let own = own_attestation
         .as_deref()
         .map(|attestation| crate::state::OwnDevice {
-            node_id: &node_id,
+            identity: &state.identity,
             name: &state.device_name,
             attestation,
         });
@@ -348,12 +347,12 @@ async fn connect_and_serve(state: &Arc<AppState>, info: &SessionInfo) -> Outcome
     // republish it on EVERY (re)connection, before the snapshot — so our own
     // record comes back already carrying it, and peers receive it via the
     // `device.updated` the server broadcasts.
-    let attestation = state
+    let root = state
         .account_root
         .lock()
         .expect("lock account_root")
-        .as_ref()
-        .map(|root| root.attestation.clone());
+        .clone();
+    let attestation = root.as_ref().map(|root| root.attestation.clone());
     let setup = tokio::time::timeout(SETUP_TIMEOUT, async {
         let challenge = conn.request("auth.challenge", json!({})).await?;
         let nonce = challenge["nonce"].as_str().ok_or(SetupErr::Transport)?;
@@ -410,6 +409,19 @@ async fn connect_and_serve(state: &Arc<AppState>, info: &SessionInfo) -> Outcome
             return Outcome::Stop;
         }
         s.server_connected = true;
+        // A device the account struck off is not taken back on the server's
+        // word: the tombstone is signed by the account key (which the server
+        // does not hold), the snapshot is signed by nothing. A server that was
+        // never told about the revocation — or one that chose to forget it —
+        // therefore changes nothing here.
+        if let Some(root) = &root {
+            devices.retain(|_, record| {
+                record
+                    .get("node_id")
+                    .and_then(Value::as_str)
+                    .is_none_or(|node_id| !s.barred(&root.ak_pub, node_id))
+            });
+        }
         // The live snapshot replaces whatever the cache seeded, and goes to
         // disk under the same lock (state-then-disk, like session.json): the
         // file is never newer than the memory it mirrors.
@@ -610,13 +622,30 @@ fn apply_event(state: &Arc<AppState>, method: &str, params: &Value) {
         crate::pairing::on_server_event(state, method, params);
         return;
     }
+    // Both read BEFORE the session lock (lock ordering: the transport and
+    // `account_root` each have a lock of their own).
+    let lan: std::collections::BTreeSet<String> = state.transport.lan_peers().into_iter().collect();
+    let ak_pub = state
+        .account_root
+        .lock()
+        .expect("lock account_root")
+        .as_ref()
+        .map(|root| root.ak_pub.clone());
     let relayed = {
-        // Transport snapshot BEFORE the session lock (lock ordering).
-        let lan: std::collections::BTreeSet<String> =
-            state.transport.lan_peers().into_iter().collect();
         let mut s = state.session.lock().expect("lock session");
         let own = s.own_device_id.clone();
         let server_connected = s.server_connected;
+        // The device this event is about, when it carries a record: one the
+        // account struck off does not come back, whatever the server still
+        // lists. Checked here rather than in the arms below, which hold a
+        // mutable borrow of the map.
+        let subject = params.pointer("/device/node_id").and_then(Value::as_str);
+        if let (Some(ak_pub), Some(node_id)) = (&ak_pub, subject)
+            && s.barred(ak_pub, node_id)
+        {
+            tracing::warn!(%node_id, "the server offers a struck-off device: ignored");
+            return;
+        }
         let Some(devices) = &mut s.devices else {
             return;
         };
@@ -731,10 +760,9 @@ pub(crate) async fn publish_attestation(state: &AppState, root: &crate::account_
 /// reason as `set_own_relay`: what we publish about ourselves does not come back
 /// to us.
 pub(crate) fn adopt_own_record(state: &AppState, attestation: &str) {
-    let node_id = state.identity.node_id();
     let mut s = state.session.lock().expect("lock session");
     s.adopt_own(crate::state::OwnDevice {
-        node_id: &node_id,
+        identity: &state.identity,
         name: &state.device_name,
         attestation,
     });
