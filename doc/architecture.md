@@ -126,6 +126,18 @@ On each PC:
      description supersede the one already known. What a device says in the
      present tense — its relay, its liveness — is left unsigned, deliberately:
      a signature over it would be a stale fact wearing a proof.
+   - **The devices carry the directory between themselves.** Two devices that
+     already hold each other's record exchange rosters over the data plane (one
+     round trip, a frame type of its own on the existing ALPN): a device thereby
+     learns of a sibling it has never met, from a third one that has, and a
+     tombstone reaches the whole account. A relayer is a courier, never a
+     witness — every record must be signed by the device it describes AND
+     attested under the account key, so a compromised member cannot invent a
+     sibling, rename one, or bring a struck-off one back. What it can do is stay
+     silent, and silence costs nothing: an account is not made of what a peer
+     chooses to mention. What a courier could not witness (a route, a liveness)
+     is dropped on arrival, so a device learns of a sibling **known but not
+     reachable** until it hears it for itself.
 
 4. **Push between long-lived processes, pull for ephemeral artifacts.**
    Server → Core → managers: subscriptions/events, in-memory caches always warm.

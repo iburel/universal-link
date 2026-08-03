@@ -47,7 +47,9 @@ The config folder houses:
 - `directory.json` — the account's device records, so a Core that starts with no
   reachable server still recognizes its siblings. A cache where a server could
   refresh it (7-day staleness bound); with no server configured it IS the
-  directory. Removed at logout;
+  directory. What the devices teach each other over the LAN lands here too, and
+  does **not** reset that bound — only the server it is a bound against can.
+  Removed at logout;
 - `revoked.json` — the devices the account has struck off, each with the account
   key's signature over that revocation. **Permanent**, and NOT removed at logout:
   a struck-off device keeps a valid attestation for good, so this file is the only

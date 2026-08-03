@@ -30,42 +30,6 @@ fn lists(list: &Value, device_id: &str) -> bool {
         .any(|device| device["device_id"] == device_id)
 }
 
-/// A device of the account, enrolled and online on the server, publishing a
-/// perfectly valid attestation under `code` and a relay: everything a legitimate
-/// sibling has, so that the refusal under test can only be about the revocation.
-///
-/// Its connection comes back with it: a device that disconnects goes offline, and
-/// the server forgets the relay it just published.
-async fn attested_sibling(
-    server: &TestServer,
-    code: &str,
-    name: &str,
-) -> (DeviceKey, String, TestConn) {
-    let key = DeviceKey::generate();
-    let mut conn = server.connect_direct().await;
-    let device_id = enroll_key(
-        &mut conn,
-        &server.oidc,
-        &key,
-        TEST_SUB,
-        name,
-        std::env::consts::OS,
-    )
-    .await;
-    authenticate(&mut conn, &key, &device_id).await;
-    let ak = universallink_core::account_key::account_key_from_code(code).expect("valid code");
-    conn.request(
-        "presence.update",
-        json!({
-            "attestation": universallink_core::account_key::attest(&ak, &key.node_id()),
-            "relay_url": format!("iroh+memory://{}", key.node_id()),
-        }),
-    )
-    .await
-    .expect("presence.update");
-    (key, device_id, conn)
-}
-
 /// A GUI-shaped component: reads the directory and sends files.
 async fn gui(core: &TestCore) -> TestComponent {
     spawn_component(
@@ -94,9 +58,11 @@ async fn a_struck_off_device_stays_out_whatever_the_server_says() {
     // concerned: what follows is about the revocation and nothing else.
     wait_attested(&mut c, &struck_id).await;
 
-    // The account strikes it off. Through a restart, because a tombstone is what
-    // a sibling hands over (the wire that carries one between devices is a later
-    // building block) — what matters here is a Core that HOLDS one.
+    // The account strikes it off. Seeded and read back through a restart rather
+    // than minted here: what matters to this file is a Core that HOLDS a tombstone
+    // against a server that disagrees. Where one comes FROM — this Core's own
+    // `devices.revoke`, or a sibling's roster — is `serverless.rs` and
+    // `dirsync.rs`.
     seed_revocation(core.config_dir(), &code, &struck.node_id());
     let core = core.restart().await;
     let mut c = gui(&core).await;

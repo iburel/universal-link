@@ -47,6 +47,15 @@
 //! defect: with a server in the picture the server owns the name
 //! (`devices.rename` can come from another device). The self-signature is what
 //! the serverless half has instead.
+//!
+//! **What travels between devices.** A [`Roster`] is a directory as offered to a
+//! peer: the records it could verify on its own, plus the tombstones it could
+//! verify on its own — and nothing else. Both halves are filtered by the SAME
+//! predicate on the way out and on the way in ([`shareable`]), which is what
+//! makes relaying safe: whoever hands us a roster is never trusted with its
+//! contents, only with the trouble of carrying it. So a device learns of a
+//! sibling it has never met, from a third one that has — and that is
+//! [`crate::dirsync`], whose module header holds the protocol.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -77,7 +86,33 @@ const RECORD_DOMAIN: &[u8] = b"ul-dir-record-v1:";
 /// because a silently missing cache would look like a bug exactly when the
 /// user has no network to debug with.
 pub(crate) fn save(config_dir: &Path, devices: &BTreeMap<String, Value>) {
-    let payload = json!({ "saved_at": now_secs(), "devices": devices });
+    write_store(config_dir, devices, now_secs());
+}
+
+/// Persists the records WITHOUT moving `saved_at`: they changed, but nothing
+/// re-checked them against the authority the freshness bound is about.
+///
+/// A roster from a sibling ([`crate::dirsync`]) is exactly that case, and the
+/// distinction is not academic. It carries the account's tombstones, which is a
+/// revocation channel — but not a server-side `devices.revoke`, which mints no
+/// tombstone at all. Treating the exchange as a refresh would therefore extend,
+/// quietly and indefinitely, the window in which a device the SERVER revoked keeps
+/// being vouched for by a Core that has not reached that server in weeks. Two
+/// devices left talking to each other in a room must not be able to hold the bound
+/// open between them.
+///
+/// Where there is no server the timestamp means nothing either way (`load` does
+/// not expire the store), so this costs that case nothing.
+pub(crate) fn save_unrefreshed(config_dir: &Path, devices: &BTreeMap<String, Value>) {
+    let kept = std::fs::read_to_string(config_dir.join(FILE))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| value.get("saved_at")?.as_u64());
+    write_store(config_dir, devices, kept.unwrap_or_else(now_secs));
+}
+
+fn write_store(config_dir: &Path, devices: &BTreeMap<String, Value>, saved_at: u64) {
+    let payload = json!({ "saved_at": saved_at, "devices": devices });
     if let Err(e) = crate::write_private_file(&config_dir.join(FILE), &payload.to_string()) {
         tracing::warn!(error = %e, "failed to persist the directory cache");
     }
@@ -223,6 +258,163 @@ pub fn verify_record(record: &Value) -> bool {
     crate::account_key::verify_detached(node_id, &record_message(node_id, name, platform, seq), sig)
 }
 
+/// Entries a peer may hand us in one roster, records and tombstones together.
+/// The frame is already bounded (`dataplane::MAX_FRAME`); this bounds the WORK
+/// instead — every entry costs a signature verification, and two per record. Far
+/// above any real account, so it only ever bites a peer that is not describing an
+/// account.
+const MAX_ROSTER: usize = 512;
+
+/// The fields a peer's roster is allowed to carry onto a record we ALREADY hold:
+/// the signed description, and the attestation that came verified alongside it.
+///
+/// What is left out is left out on purpose. `device_id` is our own key for the
+/// record and is not covered by any signature — taking a peer's would let
+/// whoever relays a record re-label another device's entry. `relay_url`,
+/// `online`, `last_seen` and `status` are said in the present tense about a
+/// device the relayer is not: the record would arrive claiming a route and a
+/// liveness nobody could check, and a route that fails is worse than no route
+/// (it is one the user is told exists). What a peer says about ITSELF, first-hand,
+/// still reaches us the same way it always has — over its own authenticated
+/// stream, or from a server that owns those facts.
+const CARRIED: [&str; 5] = ["name", "platform", "seq", "self_sig", "attestation"];
+
+/// A directory as handed to a peer: the records and the tombstones, filtered down
+/// to what that peer can verify with the account key alone. Deliberately not a
+/// map — the receiver keys records itself, by `node_id`, since that is the only
+/// label a relayer cannot rewrite.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Roster {
+    pub records: Vec<Value>,
+    pub revoked: BTreeMap<String, String>,
+}
+
+impl Roster {
+    /// What this Core has to offer: every record it holds that a peer could
+    /// verify, and every tombstone it holds that a peer could verify. Filtered on
+    /// the way OUT as well as on the way in, because sending what the other side
+    /// will refuse is not generosity — it is a frame that says nothing and a log
+    /// line on the far end blaming us for it.
+    pub fn of(
+        devices: Option<&BTreeMap<String, Value>>,
+        revoked: &BTreeMap<String, String>,
+        ak_pub: &str,
+    ) -> Roster {
+        let records: Vec<Value> = devices
+            .into_iter()
+            .flat_map(|devices| devices.values())
+            .filter(|record| shareable(record, ak_pub))
+            .cloned()
+            .collect();
+        let revoked: BTreeMap<String, String> = revoked
+            .iter()
+            .filter(|(node_id, revocation)| {
+                crate::account_key::verify_revocation(ak_pub, node_id, revocation)
+            })
+            .map(|(node_id, revocation)| (node_id.clone(), revocation.clone()))
+            .collect();
+        if records.len() + revoked.len() > MAX_ROSTER {
+            tracing::warn!(
+                records = records.len(),
+                revoked = revoked.len(),
+                "our directory is larger than a roster may carry: peers will refuse it whole"
+            );
+        }
+        Roster { records, revoked }
+    }
+
+    /// Nothing to say. A Core with no trust root produces one of these, and never
+    /// opens a stream for it.
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty() && self.revoked.is_empty()
+    }
+
+    /// The roster as a frame body (the caller adds the `type`).
+    pub fn payload(&self) -> Value {
+        json!({ "records": self.records, "revoked": self.revoked })
+    }
+
+    /// Reads a roster off the wire. `revoked` may be absent (a peer with nothing
+    /// struck off) — but present and NOT an object refuses the whole frame rather
+    /// than reading as none: quietly ignoring a garbled tombstone set is exactly
+    /// how a struck-off device would walk back into the account.
+    ///
+    /// The individual entries are not checked here: they are checked where they
+    /// are absorbed, against the account key, which this module does not hold.
+    pub fn parse(value: &Value) -> Option<Roster> {
+        let records = value.get("records")?.as_array()?;
+        let revoked = match value.get("revoked") {
+            None | Some(Value::Null) => serde_json::Map::new(),
+            Some(Value::Object(map)) => map.clone(),
+            Some(_) => {
+                tracing::warn!("roster whose revocations are not an object: refused");
+                return None;
+            }
+        };
+        if records.len() + revoked.len() > MAX_ROSTER {
+            tracing::warn!(
+                records = records.len(),
+                revoked = revoked.len(),
+                "roster larger than {MAX_ROSTER} entries: refused"
+            );
+            return None;
+        }
+        Some(Roster {
+            records: records.clone(),
+            revoked: revoked
+                .iter()
+                .filter_map(|(node_id, revocation)| {
+                    Some((node_id.clone(), revocation.as_str()?.to_string()))
+                })
+                .collect(),
+        })
+    }
+}
+
+/// Can this record travel between devices? It has to say two things on its own,
+/// because the device that relays it vouches for neither: WHO it describes (its
+/// own signature over its description, verified against the `node_id` itself) and
+/// that the account admitted that `node_id` (an attestation under the account
+/// key). A record missing either is not a lesser record, it is one that proves
+/// nothing — a server's record among them, which is why a directory learned from
+/// a server does not fan out over the data plane.
+pub(crate) fn shareable(record: &Value, ak_pub: &str) -> bool {
+    let Some(node_id) = record.get("node_id").and_then(Value::as_str) else {
+        return false;
+    };
+    verify_record(record)
+        && record
+            .get("attestation")
+            .and_then(Value::as_str)
+            .is_some_and(|attestation| crate::account_key::verify(ak_pub, node_id, attestation))
+}
+
+/// Copies onto `held` what an incoming record is allowed to carry (see
+/// [`CARRIED`]) — the caller has already established that the incoming record is
+/// shareable and supersedes the one held.
+pub(crate) fn carry_over(held: &mut Value, incoming: &Value) {
+    for field in CARRIED {
+        if let Some(value) = incoming.get(field) {
+            held[field] = value.clone();
+        }
+    }
+}
+
+/// A record for a device we had never heard of, as it enters OUR directory:
+/// keyed and labelled by its `node_id` (the one label a relayer cannot rewrite),
+/// and stripped of everything the relayer could not know first-hand. So a device
+/// arrives known but not reachable — until the transport hears it on the local
+/// network, or a server that owns those facts fills them in.
+pub(crate) fn as_learned(record: &Value, node_id: &str) -> Value {
+    let mut learned = record.clone();
+    learned["device_id"] = json!(node_id);
+    learned["relay_url"] = Value::Null;
+    learned["online"] = json!(false);
+    learned["last_seen"] = Value::Null;
+    learned["status"] = Value::Null;
+    learned
+}
+
 /// The `seq` of a description we are minting now. Wall-clock seconds, so it
 /// survives a restart without a counter to persist — and strictly above
 /// `previous` whatever the clock says, so two renames in the same second still
@@ -274,6 +466,34 @@ pub(crate) fn own_record(
         "relay_url": Value::Null,
         "attestation": own.attestation,
         "online": true,
+        "status": Value::Null,
+        "last_seen": Value::Null,
+    })
+}
+
+/// A record as another device of the account would have signed it, at an EXACT
+/// `seq` — the one thing [`own_record`] cannot be asked for, since it mints `seq`
+/// from the clock (which is the point of it). Test-only; the integration harness
+/// keeps its own copy, built over the same published framing.
+#[cfg(test)]
+pub(crate) fn signed_record(
+    identity: &crate::identity::DeviceIdentity,
+    name: &str,
+    seq: u64,
+    attestation: &str,
+) -> Value {
+    let node_id = identity.node_id();
+    let platform = "linux";
+    json!({
+        "device_id": node_id,
+        "name": name,
+        "platform": platform,
+        "node_id": node_id,
+        "seq": seq,
+        "self_sig": identity.sign(&record_message(&node_id, name, platform, seq)),
+        "relay_url": Value::Null,
+        "attestation": attestation,
+        "online": false,
         "status": Value::Null,
         "last_seen": Value::Null,
     })
@@ -345,6 +565,35 @@ mod tests {
             load(dir.path(), false).is_some_and(|d| d.contains_key("d")),
             "with no server: still the directory"
         );
+    }
+
+    /// An exchange between two siblings changes the records without re-checking
+    /// them against a server, so it must not move the freshness bound. Otherwise
+    /// two devices in a room could hold that bound open between themselves
+    /// indefinitely — and a device the SERVER revoked (no tombstone minted) would
+    /// keep being vouched for.
+    #[test]
+    fn what_a_sibling_taught_us_does_not_refresh_the_bound() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stale = now_secs() - CACHE_TTL.as_secs() - 60;
+        let payload = json!({ "saved_at": stale, "devices": { "d": { "node_id": "ab" } } });
+        std::fs::write(dir.path().join(FILE), payload.to_string()).expect("write");
+
+        save_unrefreshed(dir.path(), &sample());
+
+        assert_eq!(load(dir.path(), true), None, "still past the TTL");
+        assert_eq!(
+            load(dir.path(), false),
+            Some(sample()),
+            "and the records ARE the ones we just learned"
+        );
+        // A server snapshot, by contrast, IS a refresh.
+        save(dir.path(), &sample());
+        assert_eq!(load(dir.path(), true), Some(sample()));
+        // With no store to carry a timestamp over from, now is the honest answer.
+        let fresh = tempfile::tempdir().expect("tempdir");
+        save_unrefreshed(fresh.path(), &sample());
+        assert_eq!(load(fresh.path(), true), Some(sample()));
     }
 
     #[test]
@@ -486,6 +735,134 @@ mod tests {
             now + 3601,
             "a clock that walked backwards must not un-order us"
         );
+    }
+
+    /// The account this device belongs to, and one it does not.
+    fn account() -> (ed25519_dalek::SigningKey, String) {
+        let ak = crate::account_key::account_key_from_code(
+            &crate::account_key::generate_recovery_code(),
+        )
+        .expect("a valid code");
+        let ak_pub = crate::account_key::public_hex(&ak);
+        (ak, ak_pub)
+    }
+
+    /// A roster carries what a peer can check for itself, and refuses to carry
+    /// anything else — the same predicate that filters what arrives, applied on the
+    /// way out. Sending the rest would be a frame that says nothing and a warning
+    /// on the far end with our name on it.
+    #[test]
+    fn a_roster_carries_only_what_a_peer_could_verify() {
+        let (ak, ak_pub) = account();
+        let (other_ak, _) = account();
+        let mine = crate::identity::DeviceIdentity::from_test_seed(7);
+        let sibling = crate::identity::DeviceIdentity::from_test_seed(8);
+        let stranger = crate::identity::DeviceIdentity::from_test_seed(9);
+        let attest = |identity: &crate::identity::DeviceIdentity| {
+            crate::account_key::attest(&ak, &identity.node_id())
+        };
+
+        let good = signed_record(&mine, "Office-PC", 5, &attest(&mine));
+        // Signed by itself, but attested under an account that is not ours.
+        let outsider = signed_record(
+            &stranger,
+            "Intruder",
+            5,
+            &crate::account_key::attest(&other_ak, &stranger.node_id()),
+        );
+        // Attested, but the description carries no signature — a server's record.
+        let from_server = json!({
+            "device_id": "d_7f3a", "node_id": sibling.node_id(),
+            "name": "Named-By-The-Server", "platform": "linux",
+            "attestation": attest(&sibling),
+        });
+        // Signed, attested — and then renamed by whoever relayed it.
+        let mut tampered = signed_record(&sibling, "Laptop", 5, &attest(&sibling));
+        tampered["name"] = json!("Not-What-It-Signed");
+
+        let devices = BTreeMap::from([
+            ("a".to_string(), good.clone()),
+            ("b".to_string(), outsider),
+            ("c".to_string(), from_server),
+            ("d".to_string(), tampered),
+        ]);
+        let struck = stranger.node_id();
+        let revoked = BTreeMap::from([
+            (struck.clone(), crate::account_key::revoke(&ak, &struck)),
+            // A tombstone the account never signed: it bars nobody here, so
+            // passing it on would only ask a peer to reject it too.
+            (
+                "ab12".to_string(),
+                crate::account_key::revoke(&other_ak, "ab12"),
+            ),
+        ]);
+
+        let roster = Roster::of(Some(&devices), &revoked, &ak_pub);
+
+        assert_eq!(roster.records, vec![good], "only the provable one");
+        assert_eq!(roster.revoked.keys().collect::<Vec<_>>(), vec![&struck]);
+        assert!(!roster.is_empty());
+        // A Core with nothing to say says nothing at all.
+        assert!(Roster::of(None, &BTreeMap::new(), &ak_pub).is_empty());
+    }
+
+    /// What comes off the wire is read fail-closed: a frame we cannot fully make
+    /// sense of is refused WHOLE. Half-reading a roster is how a struck-off device
+    /// walks back into the account.
+    #[test]
+    fn a_roster_off_the_wire_is_read_fail_closed() {
+        let (ak, ak_pub) = account();
+        let mine = crate::identity::DeviceIdentity::from_test_seed(7);
+        let record = signed_record(
+            &mine,
+            "Office-PC",
+            5,
+            &crate::account_key::attest(&ak, &mine.node_id()),
+        );
+        let revoked = BTreeMap::from([("ab12".to_string(), "revocation".to_string())]);
+        let full = Roster {
+            records: vec![record.clone()],
+            revoked: revoked.clone(),
+        };
+
+        // A roster round-trips through its own payload.
+        assert_eq!(Roster::parse(&full.payload()), Some(full));
+        // No records at all is not a roster.
+        assert_eq!(Roster::parse(&json!({ "revoked": {} })), None);
+        assert_eq!(Roster::parse(&json!({ "records": "many" })), None);
+        assert_eq!(Roster::parse(&Value::Null), None);
+        // Revocations may be absent — a peer with nothing struck off.
+        assert_eq!(
+            Roster::parse(&json!({ "records": [] })),
+            Some(Roster::default())
+        );
+        // Present and not an object: refused, rather than read as "none".
+        assert_eq!(
+            Roster::parse(&json!({ "records": [], "revoked": [] })),
+            None
+        );
+        // An entry that is not a signature at all is dropped, not stringified.
+        assert_eq!(
+            Roster::parse(&json!({ "records": [], "revoked": { "ab12": 7, "cd34": "sig" } })),
+            Some(Roster {
+                records: Vec::new(),
+                revoked: BTreeMap::from([("cd34".to_string(), "sig".to_string())]),
+            })
+        );
+        // Beyond what we will do the work for: refused whole.
+        let flood: Vec<Value> = std::iter::repeat_n(record, MAX_ROSTER + 1).collect();
+        assert_eq!(Roster::parse(&json!({ "records": flood })), None);
+        // And the two halves are counted together, so neither is a way around it.
+        let records: Vec<Value> = std::iter::repeat_n(json!({}), MAX_ROSTER).collect();
+        let revoked: serde_json::Map<String, Value> =
+            (0..2).map(|n| (format!("node{n}"), json!("sig"))).collect();
+        assert_eq!(
+            Roster::parse(&json!({ "records": records, "revoked": revoked })),
+            None
+        );
+        // The predicate that guards it all, in one line: our own key is not the
+        // account's, and a record proves nothing without both.
+        assert!(!shareable(&json!({}), &ak_pub));
     }
 
     #[test]

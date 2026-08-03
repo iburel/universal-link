@@ -675,6 +675,9 @@ impl Conn {
         for id in struck {
             registry.notify_topic("devices", "device.removed", &json!({ "device_id": id }));
         }
+        // The tombstone has to reach the account's other devices, and a struck-off
+        // device is the last thing to leave waiting for the next tick.
+        self.state.dirsync_wake.notify_one();
         Ok(json!({ "status": "done" }))
     }
 
@@ -995,6 +998,9 @@ impl Conn {
                 "device.updated",
                 &json!({ "device": enriched.clone() }),
             );
+        // A name only this device knows is a name nobody uses: the new description
+        // goes out to the account's other devices at once (`dirsync`).
+        self.state.dirsync_wake.notify_one();
         Ok(json!({ "device": enriched }))
     }
 

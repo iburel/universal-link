@@ -335,6 +335,54 @@ Core keeps refusing it. Three consequences worth stating plainly:
 of this device. The struck-off device keeps a valid attestation for good, so the
 tombstone is the only thing that keeps it out.
 
+**The devices tell each other whom they know.** Two devices of the account that
+already hold each other's record exchange rosters over the data plane — on a
+change of LAN membership, right after a local rename or revocation, and on a slow
+tick. So `device.added`, `device.updated` and `device.removed` may now arrive
+**with no server involved at all**: a device learns of a sibling it has never met
+from a third one that has, a rename catches up, and a tombstone reaches the whole
+account. Nothing else about those notifications changes — a subscriber cannot tell
+which side of the account taught the Core, and should not care.
+
+What a roster is allowed to teach is bounded, and the bound is what makes relaying
+safe:
+
+- A record must be **signed by the device it describes** and **attested under the
+  account key**. A peer is a courier, never a witness: it cannot invent a sibling,
+  rename one, or bring a struck-off one back. A tombstone must likewise be signed
+  by the account key.
+- The **highest `seq` wins**, and only among signed descriptions. A record this
+  Core holds *without* a `seq` was minted by a server, and there the server keeps
+  the name.
+- A device this Core has never heard of arrives **known but not reachable**: keyed
+  and labelled by its `node_id` (the one label a relayer cannot rewrite), with
+  `relay_url`, `last_seen` and `status` null and `online: false`. Those are
+  present-tense facts about a device the relayer is not — the transport hearing it
+  on the LAN, or a server that owns them, is what fills them in.
+- A record describing **this** device is never taken in, whatever its `seq`: what a
+  peer holds about us is at best what we told it.
+- An exchange that teaches nothing costs nothing — no notification, no disk write.
+  And one that DOES teach something still does not move `directory.json`'s
+  freshness stamp: a sibling's roster carries the account's tombstones, but not a
+  server-side `devices.revoke`, which mints none. Counting the exchange as a
+  refresh would let two devices left talking to each other in a room hold the
+  7-day staleness bound open between themselves — and keep vouching for a device
+  the server revoked.
+
+With a server in the picture this exchange carries almost nothing, by
+construction: the records the server minted are not signed, so they never leave
+the device. The tombstones do travel, because they are the account's own
+signatures. The consequence to keep in view is that an account cannot yet be half
+on a server and half not.
+
+One case the exchange deliberately does **not** handle: a tombstone naming *this*
+device. It is signed by the account key, so it is not hearsay — but obeying it
+means leaving the account (erasing the trust root, the account key, the session
+and the directory), a gesture the Core does not have yet, and storing it without
+that gesture would leave a Core barring itself at every door while still believing
+it belongs. So it is refused and logged at error level. The account's decision
+takes effect anyway: every peer holding that tombstone refuses this device.
+
 ## `files.*`
 
 | Method | Description |

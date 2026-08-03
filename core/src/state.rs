@@ -84,6 +84,12 @@ pub struct AppState {
     /// takes effect at once rather than at the next request. `notify_waiters`
     /// (not `notify_one`): all sessions must be cut.
     pub clipboard_reset: tokio::sync::Notify,
+    /// Nudges the directory sync task (`dirsync`) into a round right away: a
+    /// local rename or revocation is something the account's other devices should
+    /// hear now, not at the next tick. `notify_one` memorizes a single permit, so
+    /// a nudge landing between two rounds is not lost (same reasoning as a
+    /// transfer's cancel token).
+    pub dirsync_wake: tokio::sync::Notify,
     pub reconnect_base_delay: std::time::Duration,
     /// Fired by `system.shutdown` (the tray's Quit): a component asked the Core
     /// to stop. The library only signals — the binary awaits it next to the OS
@@ -125,6 +131,33 @@ pub struct OwnDevice<'a> {
 impl OwnDevice<'_> {
     pub fn node_id(&self) -> String {
         self.identity.node_id()
+    }
+}
+
+/// What taking in a peer's roster changed ([`SessionState::absorb`]) — the four
+/// things worth telling anyone about, and the only reasons to touch the disk.
+/// Empty is the common case: two devices that already agree exchange no state.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Absorbed {
+    /// Devices this Core had never heard of, as they now stand in the directory.
+    pub added: Vec<Value>,
+    /// Devices whose description this Core replaced with a fresher one.
+    pub updated: Vec<Value>,
+    /// `device_id`s that left the directory, a tombstone having caught up with
+    /// them.
+    pub removed: Vec<String>,
+    /// `node_id`s newly struck off — which is not the same list: the account may
+    /// strike off a device this Core never held, and that tombstone still has to
+    /// reach the disk so it bars the record when it eventually shows up.
+    pub barred: Vec<String>,
+}
+
+impl Absorbed {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty()
+            && self.updated.is_empty()
+            && self.removed.is_empty()
+            && self.barred.is_empty()
     }
 }
 
@@ -292,6 +325,112 @@ impl SessionState {
             devices.remove(id);
         }
         struck
+    }
+
+    /// Takes in what a peer knows of the account: the descriptions it holds and
+    /// the tombstones it holds. Returns what actually changed — nothing else is
+    /// broadcast, and nothing else is written to disk, so a sync round between two
+    /// devices that already agree is silent.
+    ///
+    /// The rules, and each one is load-bearing:
+    ///
+    /// - **Tombstones first.** A record for a device the same roster strikes off
+    ///   must not slip in on the way past.
+    /// - **The account key decides, never the relayer.** Every record must be
+    ///   [`shareable`](crate::directory::shareable) — signed by the device it
+    ///   describes AND attested under our account key — and every tombstone must
+    ///   verify under that same key. A peer that hands us anything else has handed
+    ///   us nothing.
+    /// - **We are the authority on ourselves.** A record describing this device is
+    ///   skipped, whatever its `seq`: what a peer holds about us is at best what we
+    ///   told it, and adopting a name we never chose is not a merge, it is an
+    ///   identity we would then re-sign and hand on.
+    /// - **The highest `seq` wins, and only among signed descriptions.** A record
+    ///   we hold WITHOUT a `seq` was minted by a server, and there the server owns
+    ///   the name (`devices.rename` can come from another device): we leave it
+    ///   alone rather than let the data plane overrule it. Equal `seq` changes
+    ///   nothing — two devices that agree exchange no state.
+    /// - **A device we did not know arrives keyed by its `node_id`**, and knowing
+    ///   itself only: see [`as_learned`](crate::directory::as_learned).
+    ///
+    /// `own_node_id` rather than `own_device_id`: the latter is the server's label
+    /// while a session lives, and what a roster names is the crypto identity.
+    pub fn absorb(
+        &mut self,
+        ak_pub: &str,
+        own_node_id: &str,
+        roster: &crate::directory::Roster,
+    ) -> Absorbed {
+        let mut out = Absorbed::default();
+        for (node_id, revocation) in &roster.revoked {
+            if self.revoked.contains_key(node_id) {
+                continue;
+            }
+            if node_id == own_node_id {
+                // The account striking THIS device off. It is signed by the
+                // account key, so it is not hearsay — and yet obeying it means a
+                // gesture this brick does not have: leaving the account (the trust
+                // root, the account key, the session, the directory). Storing the
+                // tombstone without that gesture would be the worst of both — a
+                // Core barring itself at every door while still believing it
+                // belongs. So: refused, loudly. The account has already had its
+                // effect anyway, since every peer holding this tombstone refuses
+                // us.
+                tracing::error!(
+                    "the account has struck THIS device off: peers will refuse it. \
+                     Re-join the account with the recovery code, or start over."
+                );
+                continue;
+            }
+            if !crate::account_key::verify_revocation(ak_pub, node_id, revocation) {
+                continue;
+            }
+            out.removed
+                .extend(self.strike_off(node_id, revocation.clone()));
+            out.barred.push(node_id.clone());
+        }
+
+        // Filtered before the map is borrowed mutably, and filtered against the
+        // tombstones just applied.
+        let acceptable: Vec<&Value> = roster
+            .records
+            .iter()
+            .filter(|record| {
+                let Some(node_id) = record.get("node_id").and_then(Value::as_str) else {
+                    return false;
+                };
+                node_id != own_node_id
+                    && !self.barred(ak_pub, node_id)
+                    && crate::directory::shareable(record, ak_pub)
+            })
+            .collect();
+        if acceptable.is_empty() {
+            return out;
+        }
+        let devices = self.devices.get_or_insert_with(BTreeMap::new);
+        for incoming in acceptable {
+            let node_id = incoming["node_id"].as_str().expect("filtered above");
+            let held = devices.iter().find_map(|(id, record)| {
+                (record.get("node_id").and_then(Value::as_str) == Some(node_id)).then(|| id.clone())
+            });
+            let Some(key) = held else {
+                let learned = crate::directory::as_learned(incoming, node_id);
+                devices.insert(node_id.to_string(), learned.clone());
+                out.added.push(learned);
+                continue;
+            };
+            // A description we hold and did not sign ourselves: only a strictly
+            // higher `seq` supersedes it, and only if ours is signed at all.
+            let ours = devices[&key].get("seq").and_then(Value::as_u64);
+            let theirs = incoming["seq"].as_u64().expect("shareable: a seq");
+            if !ours.is_some_and(|ours| theirs > ours) {
+                continue;
+            }
+            let record = devices.get_mut(&key).expect("just found");
+            crate::directory::carry_over(record, incoming);
+            out.updated.push(record.clone());
+        }
+        out
     }
 
     /// The server has just named this device (a login completed): our own record
@@ -1011,6 +1150,382 @@ mod tests {
         assert!(s.strike_off("ab12", "revocation".to_string()).is_empty());
 
         assert_eq!(s.revoked.get("ab12"), Some(&"revocation".to_string()));
+    }
+
+    // -- Taking in what a peer knows (`absorb`) -----------------------------
+
+    /// The account these tests belong to, and its public half.
+    fn account() -> (ed25519_dalek::SigningKey, String) {
+        let ak = crate::account_key::account_key_from_code(
+            &crate::account_key::generate_recovery_code(),
+        )
+        .expect("a valid code");
+        let ak_pub = crate::account_key::public_hex(&ak);
+        (ak, ak_pub)
+    }
+
+    fn key(seed: u8) -> crate::identity::DeviceIdentity {
+        crate::identity::DeviceIdentity::from_test_seed(seed)
+    }
+
+    /// A sibling's record, as that sibling signed it and the account attested it —
+    /// exactly what a peer would hand us in a roster.
+    fn sibling(seed: u8, name: &str, seq: u64, ak: &ed25519_dalek::SigningKey) -> Value {
+        let identity = key(seed);
+        let attestation = crate::account_key::attest(ak, &identity.node_id());
+        crate::directory::signed_record(&identity, name, seq, &attestation)
+    }
+
+    fn roster(records: Vec<Value>) -> crate::directory::Roster {
+        crate::directory::Roster {
+            records,
+            revoked: BTreeMap::new(),
+        }
+    }
+
+    /// A device arrives known and nothing more: what the relayer could not witness
+    /// is dropped, and the record is keyed by the one label nobody could rewrite.
+    #[test]
+    fn a_device_we_had_never_heard_of_arrives_knowing_only_itself() {
+        let (ak, ak_pub) = account();
+        let identity = identity();
+        let mut s = in_account_without_a_session(&identity);
+        let mut record = sibling(8, "Laptop", 5, &ak);
+        // Present-tense claims a courier is in no position to make, plus a label
+        // of its choosing.
+        record["relay_url"] = json!("https://relay.invalid");
+        record["online"] = json!(true);
+        record["last_seen"] = json!("2026-08-01T00:00:00Z");
+        record["status"] = json!("busy");
+        record["device_id"] = json!("d_whatever");
+
+        let changed = s.absorb(&ak_pub, &identity.node_id(), &roster(vec![record]));
+
+        let node_id = key(8).node_id();
+        assert_eq!(changed.added.len(), 1, "{changed:?}");
+        assert!(changed.updated.is_empty() && changed.removed.is_empty());
+        let devices = s.devices.as_ref().expect("a directory");
+        let learned = devices.get(&node_id).expect("keyed by its node_id");
+        assert_eq!(learned["name"], json!("Laptop"));
+        assert_eq!(learned["device_id"], json!(node_id), "labelled by it too");
+        assert_eq!(
+            learned["relay_url"],
+            json!(null),
+            "no route we can vouch for"
+        );
+        assert_eq!(learned["online"], json!(false), "we have never seen it");
+        assert_eq!(learned["last_seen"], json!(null));
+        assert_eq!(learned["status"], json!(null));
+        assert!(
+            crate::directory::verify_record(learned),
+            "and it still stands behind its own description: {learned}"
+        );
+        assert_eq!(&changed.added[0], learned);
+    }
+
+    /// `seq` is what orders two descriptions of one device. A strictly higher one
+    /// supersedes; anything else changes nothing, so two devices that agree
+    /// exchange no state.
+    #[test]
+    fn a_fresher_description_supersedes_the_one_we_hold() {
+        let (ak, ak_pub) = account();
+        let identity = identity();
+        let mut s = in_account_without_a_session(&identity);
+        let own = identity.node_id();
+        s.absorb(&ak_pub, &own, &roster(vec![sibling(8, "Laptop", 5, &ak)]));
+
+        // Older, and the same second: nothing.
+        let stale = s.absorb(
+            &ak_pub,
+            &own,
+            &roster(vec![
+                sibling(8, "Older-Name", 4, &ak),
+                sibling(8, "Same-Second", 5, &ak),
+            ]),
+        );
+        assert!(stale.is_empty(), "{stale:?}");
+        assert_eq!(
+            s.devices.as_ref().expect("a directory")[&key(8).node_id()]["name"],
+            json!("Laptop")
+        );
+
+        // Higher: the description is replaced, signature included.
+        let fresh = s.absorb(&ak_pub, &own, &roster(vec![sibling(8, "Atelier", 6, &ak)]));
+        assert_eq!(fresh.updated.len(), 1, "{fresh:?}");
+        assert!(fresh.added.is_empty(), "the same device, not a second one");
+        let devices = s.devices.as_ref().expect("a directory");
+        assert_eq!(devices.len(), 2, "ourselves and it: {devices:?}");
+        let record = &devices[&key(8).node_id()];
+        assert_eq!(record["name"], json!("Atelier"));
+        assert_eq!(record["seq"], json!(6));
+        assert!(crate::directory::verify_record(record));
+    }
+
+    /// What supersedes is the DESCRIPTION, and only it. The record's key, its route
+    /// and its presence stay ours — and the sharpest reason is `device_id`: nothing
+    /// signs it, `enrich_device` derives `is_self` from it, so a peer allowed to
+    /// carry one over could hand us a fresher description for ANOTHER device
+    /// wearing our own label, and this machine would see that device as itself.
+    #[test]
+    fn a_fresher_description_replaces_the_description_and_nothing_else() {
+        let (ak, ak_pub) = account();
+        let identity = identity();
+        let mut s = in_account_without_a_session(&identity);
+        let own = identity.node_id();
+        let node_id = key(8).node_id();
+        s.absorb(&ak_pub, &own, &roster(vec![sibling(8, "Laptop", 5, &ak)]));
+        // What we know first-hand about it since: a route, and that it is up.
+        let held = s
+            .devices
+            .as_mut()
+            .expect("a directory")
+            .get_mut(&node_id)
+            .expect("its record");
+        held["relay_url"] = json!("https://relay.example");
+        held["online"] = json!(true);
+        held["last_seen"] = json!("2026-08-01T00:00:00Z");
+
+        // A fresher description, carrying claims its relayer is in no position to
+        // make — our own label among them.
+        let mut poisoned = sibling(8, "Atelier", 6, &ak);
+        poisoned["device_id"] = json!(own);
+        poisoned["relay_url"] = json!("https://liar.example");
+        poisoned["online"] = json!(false);
+        poisoned["last_seen"] = json!("1999-01-01T00:00:00Z");
+        let changed = s.absorb(&ak_pub, &own, &roster(vec![poisoned]));
+
+        assert_eq!(changed.updated.len(), 1, "{changed:?}");
+        let devices = s.devices.as_ref().expect("a directory");
+        let record = &devices[&node_id];
+        assert_eq!(record["name"], json!("Atelier"), "the description moved");
+        assert_eq!(record["seq"], json!(6));
+        assert!(crate::directory::verify_record(record));
+        assert_eq!(
+            record["device_id"],
+            json!(node_id),
+            "and not our own label: {record}"
+        );
+        assert_eq!(record["relay_url"], json!("https://relay.example"));
+        assert_eq!(record["online"], json!(true));
+        assert_eq!(record["last_seen"], json!("2026-08-01T00:00:00Z"));
+        assert_eq!(devices.len(), 2, "ourselves and it: {devices:?}");
+    }
+
+    /// Where a server minted the record, the server owns the name — another device
+    /// may have chosen it (`devices.rename`). The data plane does not overrule that.
+    #[test]
+    fn a_description_a_server_minted_is_not_overruled_by_a_peer() {
+        let (ak, ak_pub) = account();
+        let identity = identity();
+        let mut s = in_account_without_a_session(&identity);
+        let node_id = key(8).node_id();
+        let from_server = json!({
+            "device_id": "d_7f3a", "node_id": node_id, "name": "Named-By-The-Server",
+            "platform": "linux", "online": true, "relay_url": "https://relay.example",
+            "attestation": crate::account_key::attest(&ak, &node_id),
+        });
+        s.devices
+            .as_mut()
+            .expect("a directory")
+            .insert("d_7f3a".to_string(), from_server.clone());
+
+        let changed = s.absorb(
+            &ak_pub,
+            &identity.node_id(),
+            &roster(vec![sibling(8, "Renamed-Over-The-Wire", u64::MAX, &ak)]),
+        );
+
+        assert!(changed.is_empty(), "{changed:?}");
+        let devices = s.devices.as_ref().expect("a directory");
+        assert_eq!(devices["d_7f3a"], from_server, "left exactly as it was");
+        assert!(
+            !devices.contains_key(&node_id),
+            "and not duplicated under its node_id either: {devices:?}"
+        );
+    }
+
+    /// A courier is not a witness: a record that does not prove, on its own, who it
+    /// describes and that the account admitted them, enters nothing.
+    #[test]
+    fn nothing_a_peer_cannot_prove_enters_the_directory() {
+        let (ak, ak_pub) = account();
+        let (other_ak, _) = account();
+        let identity = identity();
+        let mut s = in_account_without_a_session(&identity);
+
+        let stranger = key(9);
+        let mut renamed_in_transit = sibling(8, "Laptop", 5, &ak);
+        renamed_in_transit["name"] = json!("Not-What-It-Signed");
+        let records = vec![
+            // Signed by itself, attested under an account that is not ours.
+            crate::directory::signed_record(
+                &stranger,
+                "Intruder",
+                5,
+                &crate::account_key::attest(&other_ak, &stranger.node_id()),
+            ),
+            // Attested, but nothing signs the description (a server's record: the
+            // peer relaying it could have written any name on it).
+            json!({
+                "device_id": "d_1", "node_id": key(10).node_id(), "name": "Hearsay",
+                "platform": "linux",
+                "attestation": crate::account_key::attest(&ak, &key(10).node_id()),
+            }),
+            // Signed and attested, then rewritten by whoever carried it.
+            renamed_in_transit,
+            // Not a record at all.
+            json!({}),
+            Value::Null,
+        ];
+
+        let changed = s.absorb(&ak_pub, &identity.node_id(), &roster(records));
+
+        assert!(changed.is_empty(), "{changed:?}");
+        assert_eq!(
+            s.devices.as_ref().expect("a directory").len(),
+            1,
+            "still only ourselves"
+        );
+
+        // And a Core that knows of NO device at all does not end up with an empty
+        // directory instead of none: `devices.list` must keep answering
+        // `SERVER_UNREACHABLE` rather than "nobody, and I am sure of it".
+        let mut nothing = SessionState::new(None);
+        nothing.absorb(&ak_pub, &identity.node_id(), &roster(vec![json!({})]));
+        assert!(nothing.devices.is_none());
+    }
+
+    /// The label a record carries is not the key we file it under: taking it would
+    /// let whoever relays a record overwrite the entry of a DIFFERENT device.
+    #[test]
+    fn a_relayed_record_cannot_re_label_another_device() {
+        let (ak, ak_pub) = account();
+        let identity = identity();
+        let mut s = in_account_without_a_session(&identity);
+        let own = identity.node_id();
+        s.absorb(&ak_pub, &own, &roster(vec![sibling(8, "Laptop", 5, &ak)]));
+
+        // A record for another device, wearing the first one's label.
+        let mut intruder = sibling(9, "Impostor", 99, &ak);
+        intruder["device_id"] = json!(key(8).node_id());
+        let changed = s.absorb(&ak_pub, &own, &roster(vec![intruder]));
+
+        assert_eq!(changed.added.len(), 1);
+        let devices = s.devices.as_ref().expect("a directory");
+        assert_eq!(devices[&key(8).node_id()]["name"], json!("Laptop"));
+        assert_eq!(devices[&key(9).node_id()]["name"], json!("Impostor"));
+        assert_eq!(devices.len(), 3, "three devices, none overwritten");
+    }
+
+    /// A tombstone travels with the roster and takes effect on arrival — and the
+    /// record it names does not slip in alongside it.
+    #[test]
+    fn a_tombstone_from_a_peer_evicts_the_device_it_names() {
+        let (ak, ak_pub) = account();
+        let identity = identity();
+        let mut s = in_account_without_a_session(&identity);
+        let own = identity.node_id();
+        s.absorb(&ak_pub, &own, &roster(vec![sibling(8, "Laptop", 5, &ak)]));
+        let struck = key(8).node_id();
+
+        let changed = s.absorb(
+            &ak_pub,
+            &own,
+            &crate::directory::Roster {
+                // The same roster still describes it, under a FRESHER `seq` than
+                // the one held — so if the tombstone were applied second, that
+                // description would land first and show up as an update.
+                records: vec![sibling(8, "Laptop", 6, &ak), sibling(9, "Kept", 5, &ak)],
+                revoked: BTreeMap::from([
+                    (struck.clone(), crate::account_key::revoke(&ak, &struck)),
+                    // A tombstone the account never signed bars nobody.
+                    ("ab12".to_string(), "de".repeat(64)),
+                ]),
+            },
+        );
+
+        assert_eq!(changed.removed, vec![struck.clone()]);
+        assert_eq!(changed.barred, vec![struck.clone()]);
+        assert_eq!(changed.added.len(), 1, "the other one still arrives");
+        assert!(
+            changed.updated.is_empty(),
+            "the struck device's fresher description never landed: {changed:?}"
+        );
+        let devices = s.devices.as_ref().expect("a directory");
+        assert!(!devices.contains_key(&struck), "{devices:?}");
+        assert!(s.barred(&ak_pub, &struck));
+        assert!(!s.revoked.contains_key("ab12"), "unsigned: not kept");
+
+        // And it stays out, however often it is offered again — tombstone
+        // included: a revocation we already hold is not news, so a roster that
+        // repeats it changes nothing and writes nothing.
+        let again = s.absorb(
+            &ak_pub,
+            &own,
+            &crate::directory::Roster {
+                records: vec![sibling(8, "Laptop", 7, &ak)],
+                revoked: BTreeMap::from([(
+                    struck.clone(),
+                    crate::account_key::revoke(&ak, &struck),
+                )]),
+            },
+        );
+        assert!(again.is_empty(), "{again:?}");
+    }
+
+    /// This device is the authority on its own description. A peer's copy is at
+    /// best what we once told it — adopting it would mean re-signing, and handing
+    /// on, a name we never chose.
+    #[test]
+    fn a_device_never_takes_in_a_description_of_itself() {
+        let (ak, ak_pub) = account();
+        let identity = identity();
+        let mut s = in_account_without_a_session(&identity);
+        let before = s.devices.clone();
+
+        // Signed by our own key, and newer than anything we hold.
+        let changed = s.absorb(
+            &ak_pub,
+            &identity.node_id(),
+            &roster(vec![crate::directory::signed_record(
+                &identity,
+                "Name-A-Peer-Chose",
+                u64::MAX,
+                &crate::account_key::attest(&ak, &identity.node_id()),
+            )]),
+        );
+
+        assert!(changed.is_empty(), "{changed:?}");
+        assert_eq!(s.devices, before, "our own record, untouched");
+    }
+
+    /// The account striking THIS device off is not hearsay — it is signed by the
+    /// account key. But obeying it means leaving the account, a gesture this Core
+    /// does not have yet, and storing the tombstone without it would leave us
+    /// barring ourselves at every door while still believing we belong. So it is
+    /// refused, and said out loud (peers hold it anyway: they will refuse us).
+    #[test]
+    fn a_tombstone_against_this_very_device_is_refused() {
+        let (ak, ak_pub) = account();
+        let identity = identity();
+        let mut s = in_account_without_a_session(&identity);
+        let own = identity.node_id();
+
+        let changed = s.absorb(
+            &ak_pub,
+            &own,
+            &crate::directory::Roster {
+                records: Vec::new(),
+                revoked: BTreeMap::from([(own.clone(), crate::account_key::revoke(&ak, &own))]),
+            },
+        );
+
+        assert!(changed.is_empty(), "{changed:?}");
+        assert!(s.revoked.is_empty(), "not stored either");
+        assert!(
+            s.devices.as_ref().expect("a directory").contains_key(&own),
+            "and we still know ourselves"
+        );
     }
 
     /// A device that never joined the account has nothing of its own to keep: the

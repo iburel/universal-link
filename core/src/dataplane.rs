@@ -828,8 +828,9 @@ async fn write_ack(stream: &mut Box<dyn IoStream>) -> std::io::Result<()> {
 
 /// Serves an incoming stream: reads the first control frame and dispatches on
 /// its `type`. `offer` is a file transfer (below); `clip_announce` /
-/// `clip_session` are the clipboard network plane (`clipnet`). The peer is
-/// already vouched for by `peer_in_directory` (C7) at the accept loop.
+/// `clip_session` are the clipboard network plane (`clipnet`); `dir_sync` is the
+/// directory's (`dirsync`). The peer is already vouched for by
+/// `peer_in_directory` (C7) at the accept loop.
 async fn serve_incoming(state: Arc<AppState>, peer: String, mut stream: Box<dyn IoStream>) {
     let first = match bounded(STALL_TIMEOUT, read_control(&mut stream), "first frame").await {
         Ok(v) => v,
@@ -843,6 +844,7 @@ async fn serve_incoming(state: Arc<AppState>, peer: String, mut stream: Box<dyn 
         Some("clip_announce") => crate::clipnet::recv_announce(state, peer, first, stream).await,
         Some("clip_push") => crate::clipnet::recv_push(state, peer, first, stream).await,
         Some("clip_session") => crate::clipnet::serve_session(state, first, stream).await,
+        Some("dir_sync") => crate::dirsync::recv_sync(state, peer, first, stream).await,
         other => {
             tracing::debug!(peer = %peer, kind = ?other, "unknown incoming frame type: abandoned");
         }

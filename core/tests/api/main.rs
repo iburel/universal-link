@@ -12,6 +12,7 @@ mod clipboard_net;
 mod components;
 mod dataplane;
 mod devices;
+mod dirsync;
 mod enrollment;
 mod events;
 mod hello;

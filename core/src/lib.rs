@@ -15,6 +15,7 @@ mod connector;
 mod datachannel;
 mod dataplane;
 pub mod directory;
+mod dirsync;
 mod discover;
 mod framing;
 mod http;
@@ -151,6 +152,9 @@ pub struct CoreHandle {
     /// LAN presence → `device.updated` broadcasts. Same lifecycle as the
     /// accept loop; already finished on a transport without LAN discovery.
     lan_presence_task: tokio::task::JoinHandle<()>,
+    /// Directory exchanges with the account's other devices (`dirsync`). Same
+    /// lifecycle: it holds an `Arc<AppState>` and is `abort()`ed at drop.
+    dirsync_task: tokio::task::JoinHandle<()>,
     /// Dropped at `drop` — hence before a restart reclaims the socket.
     _instance: transport::InstanceGuard,
 }
@@ -203,6 +207,7 @@ impl Drop for CoreHandle {
         self.accept_task.abort();
         self.dataplane_task.abort();
         self.lan_presence_task.abort();
+        self.dirsync_task.abort();
         // Closes the established IPC connections: a cleanly stopped Core does
         // not leave its components on a mute socket (in a separate process the
         // problem does not exist, in an in-process lib the tasks would leak).
@@ -327,6 +332,7 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
         transfers: Mutex::new(Transfers::new()),
         clipboard: Mutex::new(crate::clipboard::ClipboardState::new()),
         clipboard_reset: tokio::sync::Notify::new(),
+        dirsync_wake: tokio::sync::Notify::new(),
         reconnect_base_delay: config.reconnect_base_delay,
         shutdown_request: tokio::sync::Notify::new(),
     });
@@ -385,6 +391,10 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
     let dataplane_task = tokio::spawn(dataplane::serve(state.clone()));
     // LAN presence: relays mDNS visibility changes onto the `devices` topic.
     let lan_presence_task = tokio::spawn(dataplane::watch_lan_presence(state.clone()));
+    // Directory sync: tells the account's other devices whom we know, and takes
+    // in whom they know. Independent of the server session, for the same reason
+    // the accept loop is.
+    let dirsync_task = tokio::spawn(dirsync::run(state.clone()));
 
     Ok(CoreHandle {
         ipc_path: config.ipc_path,
@@ -392,6 +402,7 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
         accept_task,
         dataplane_task,
         lan_presence_task,
+        dirsync_task,
         _instance: instance,
     })
 }

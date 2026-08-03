@@ -11,11 +11,12 @@
 //! ends — here for the gestures with no server at all, and in `revocation.rs` for
 //! the property that matters most: a tombstone outlives what a server says.
 //!
-//! What it does NOT show yet: two serverless devices finding each other. A Core
-//! here knows the account and knows itself, which is the foundation the pairwise
-//! sync and the LAN pairing build on — the following building blocks. Until then
-//! a serverless Core learns of a sibling only from its own store, and every peer
-//! check stays fail-closed.
+//! Every Core here is ALONE: what it knows, it knows from its own store. Two of
+//! them telling each other whom they know is `dirsync.rs` (building block 3), and
+//! the first introduction between two devices that have never met — the LAN
+//! pairing — is still to come. Until it does, a serverless device joins the
+//! account by having the recovery code typed into it, and every peer check stays
+//! fail-closed.
 
 use serde_json::json;
 use universallink_core::{FileSecretStore, SecretStore};
