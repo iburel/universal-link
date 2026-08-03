@@ -208,6 +208,10 @@ photograph of the screen is not enough either — but being faster than the
 legitimate scanner *is*, which is what the confirmation screen exists to catch
 (`doc/architecture.md`).
 
+Where there is **no server at all** the same four methods pair over the local
+network instead, and the difference is in the code: a `UL2` code names the device to
+dial ("Pairing with no server", below). Everything in this section holds for both.
+
 | Method | Description |
 |---|---|
 | `pairing.offer {}` | display a code → `{ pairing_id, code, role, expires_in }`. `code` is the string to render as a QR **and** to offer as copyable text; `expires_in` is in seconds |
@@ -245,13 +249,65 @@ replaces the previous one. A pairing is not tied to the connection that opened i
 (a GUI that restarts mid-dialog does not cancel it), so what bounds it is the
 deadline — both sides count it themselves.
 
-**The Core must be configured** (a server address) to pair at all —
-`SERVER_UNREACHABLE` otherwise, the same answer `session.login` gives. A device
+**A Core that HAS a server pairs through it**, and cannot pair while it cannot
+reach it (`SERVER_UNREACHABLE`, the same answer `session.login` gives). A device
 with no session opens a connection of its own for the pairing and enrolls on it;
 one already logged in pairs over its session connection, which is what tells the
 server its account (so a sponsor from another one is turned away). A device that
 enrolls this way has no OIDC refresh token: its first sensitive operation
 (`devices.revoke`, sponsoring in its turn) opens a browser once.
+
+### Pairing with no server
+
+A device with **no server in its life at all** — nothing configured and no session,
+the same condition `account.setup` and `devices.revoke` turn on — pairs over the
+local network. `pairing.offer` then mints a `UL2` code instead of answering
+`SERVER_UNREACHABLE`:
+
+| Code | Shape | Who is dialled |
+|---|---|---|
+| `UL1` | `UL1:<psk>:<epk>:<pairing_id>` | nobody — the server relays between the two |
+| `UL2` | `UL2:<psk>:<epk>:<node_id>` | the device that displays it, on the data plane |
+
+The tag is what tells them apart, and each is refused by the device the other is
+for: a `UL2` code on a device that answers to a server → `PAIRING_VIA_SERVER`, a
+`UL1` code with no server → `SERVER_UNREACHABLE`. Both tags are exported from the Core
+crate (`PAIRING_CODE_TAG`, `PAIRING_LAN_CODE_TAG`) for a camera that has to know
+which QR code in its view is a pairing code — the mobile scanner still looks for
+`UL1` alone, so a `UL2` code is pasted rather than scanned until it learns the
+second one.
+
+The methods and the notifications are the ones above, unchanged. What differs:
+
+- **`expires_in` is 180 seconds**, counted by both ends, and the deadline is also
+  how long this device will read a frame from a device outside its directory at
+  all — outside a window it reads none.
+- **`pairing.confirm` never answers `reauth_required`**: there is no OIDC to be
+  fresher with. `{ status: "done" }` means the yes was delivered to the exchange
+  already under way; `pairing.completed` / `pairing.failed` is still the outcome.
+- **Who sponsors** is whoever holds the account's private key (`account.status`'s
+  `holds_key`). Neither of them → `NO_ACCOUNT_KEY` for the caller and
+  `pairing.failed { reason: "no_account" }` on the other side. Two *different*
+  accounts → `ACCOUNT_KEY_SET` / `other_account`, refused before the key crosses.
+  Both holding the **same** key is not an error: it is what an account looks like
+  when the recovery code was typed into each machine in turn, the device that
+  displayed the code sponsors, and the exchange leaves the two of them knowing each
+  other — which is the point of it.
+- **`pairing.failed` gains one reason**, `no_account`; the others are the ones
+  above (`channel`, `bundle`, `other_account`, `install`, `declined`, `abandoned`,
+  `expired`, and `state` for an answer that is not the one the protocol expects at
+  that point). A dialer that never read the code, and one that arrives at a window
+  already taken, are refused on the wire (`proof`, `busy`) and end nobody's pairing:
+  they are what a stranger gets, not what the human waiting is told.
+- **`pairing.accept` can answer `DEVICE_OFFLINE`**: the device whose code was read
+  is not on this network, or not reachable on it.
+- **Both devices come out holding each other's record**, so `devices.list` on each
+  shows the other and the directory exchange runs from then on. With a server that
+  is the server's business; here it is what the pairing is for. Each side declares
+  its own SIGNED description and the other checks it against the `node_id` the
+  transport authenticated — a device does not get to describe another one, and a
+  description nobody signed could never travel any further anyway. A device that
+  answers otherwise is refused (`PAIRING_STATE` for the caller).
 
 ## `devices.*`
 
@@ -686,13 +742,14 @@ Standard JSON-RPC codes + application codes in `error.data.code`:
 | `SERVER_UNREACHABLE` | operation requiring the server, offline |
 | `NO_DESCRIPTOR` | `session.discover`: the address answered but publishes no deployment descriptor (server older than that endpoint, or not one of ours) |
 | `INVALID_DESCRIPTOR` | `session.discover`: a descriptor without what a login needs (the message names the field, never the response) |
-| `ACCOUNT_KEY_SET` | `account.setup` / `account.join` for an account key OTHER than the one already installed (rotation is a follow-up) |
+| `ACCOUNT_KEY_SET` | `account.setup` / `account.join` for an account key OTHER than the one already installed (rotation is a follow-up); `pairing.accept` on the local network when the two devices are in two different accounts |
 | `INVALID_CODE` | `account.join`: malformed or wrong recovery code (checksum) |
 | `ACCOUNT_KEY_SAVE_FAILED` | the account key or its root cannot be persisted (keyring refused, folder not writable) — nothing is installed |
-| `NO_ACCOUNT_KEY` | this device cannot sign for the account: it holds no account key (`pairing.accept` told to sponsor, `pairing.confirm`, `devices.revoke` with no server) |
+| `NO_ACCOUNT_KEY` | this device cannot sign for the account: it holds no account key (`pairing.accept` told to sponsor, `pairing.confirm`, `devices.revoke` with no server) — and, pairing on the local network, when NEITHER of the two devices holds one |
 | `CANNOT_REVOKE_SELF` | `devices.revoke` aimed at this very device, with no server: a tombstone cannot be withdrawn, so this would bar the installation from its own account for good |
-| `PAIRING_UNKNOWN` / `PAIRING_STATE` / `PAIRING_LIMIT` | relayed from the server as-is: unknown/expired/spent session, wrong moment (confirming before anyone scanned, or from the joining side), too many sessions at once |
-| `DEVICE_UNKNOWN` / `DEVICE_OFFLINE` | target unknown / unreachable |
+| `PAIRING_UNKNOWN` / `PAIRING_STATE` / `PAIRING_LIMIT` | relayed from the server as-is: unknown/expired/spent session, wrong moment (confirming before anyone scanned, or from the joining side), too many sessions at once. `PAIRING_STATE` is also the local answer for a pairing that is out of step: a code whose window is no longer the one on screen, a device that answers a dial with something other than the protocol's next frame, and confirming a pairing whose stream is gone |
+| `PAIRING_VIA_SERVER` | `pairing.accept` of a `UL2` (local-network) code on a device that answers to a server: it pairs through that server, and pairing here would put the other device in an account half of which the server has never heard |
+| `DEVICE_UNKNOWN` / `DEVICE_OFFLINE` | target unknown / unreachable (`pairing.accept` of a `UL2` code: the device that displayed it is not on this network) |
 | `TRANSFER_UNKNOWN` | unknown `transfer_id` |
 | `FORMAT_UNKNOWN` | format not present in the transaction |
 | `FILE_UNKNOWN` | `file_id` absent from the manifest — or a `dir` entry, which has no bytes to read |

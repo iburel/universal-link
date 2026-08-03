@@ -529,6 +529,28 @@ impl Transfers {
     }
 }
 
+/// Is there **no server in this device's life at all**? Nothing configured, and
+/// no session either — a session carries its own server URL (`session.json`), so a
+/// Core whose `config.json` went missing under its feet still has a server it
+/// answers to, and every other device of the account reads that server.
+///
+/// This is what every local-only path turns on: creating an account, renaming
+/// oneself, striking a device off, and pairing on the local network. Getting it
+/// wrong the lenient way would be the expensive mistake — this device would sign a
+/// name, strike a device off, or hand the account key to a new device in a way the
+/// server, and therefore the rest of the account, would never hear about.
+pub fn serverless(state: &AppState) -> bool {
+    let configured = state
+        .server_config
+        .lock()
+        .expect("lock server_config")
+        .is_some();
+    if configured {
+        return false;
+    }
+    !state.session.lock().expect("lock session").logged_in
+}
+
 /// A device record as served on the IPC: the server's, enriched with `is_self`
 /// (doc/core-api.md, "devices.*").
 pub fn enrich_device(

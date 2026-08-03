@@ -95,6 +95,10 @@ pub type HomeRelay<'a> = Pin<Box<dyn Future<Output = Option<String>> + Send + 'a
 /// The transport's clean shutdown, once complete.
 pub type Closing<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
+/// The transport listening, once it is. Same shape as `Closing`: there is nothing
+/// to report, only a moment to wait for.
+pub type Listening<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
 /// The Core's data plane: open streams to peers, accept theirs, and know its
 /// own relay to publish. `Debug` is mandatory (like `Connector`/`SecretStore`):
 /// `Config` derives it, and an `Arc<dyn PeerTransport>` without it would not
@@ -135,6 +139,23 @@ pub trait PeerTransport: Send + Sync + std::fmt::Debug {
     /// watch.
     fn lan_changes(&self) -> tokio::sync::watch::Receiver<u64> {
         tokio::sync::watch::channel(0).1
+    }
+
+    /// Makes this device reachable NOW, binding the transport if it binds
+    /// lazily.
+    ///
+    /// Every other path here belongs to a Core that already knows a peer, and
+    /// the daemon's transport leans on that: it binds nothing until the first
+    /// `open`/`home_relay`, so a Core that never enrolled emits no traffic at
+    /// all — no relay probes, no portmapper. A LAN pairing window is the one
+    /// place that reasoning breaks: the device has to be dialable by a device it
+    /// does not know yet, and nothing else it does would bind the endpoint. So
+    /// the radio comes on when a human opens that window, and not before.
+    ///
+    /// Default: nothing to do — an endpoint already bound, or an in-memory
+    /// transport that was never anything else.
+    fn listen(&self) -> Listening<'_> {
+        Box::pin(std::future::ready(()))
     }
 
     /// Closes the transport cleanly — at process shutdown, not at the drop of
@@ -232,11 +253,20 @@ pub(crate) async fn serve(state: Arc<AppState>) {
                     // attestation under OUR account key, C7). An unknown — even
                     // with the right ALPN — gets nothing: no byte read, no file
                     // written.
-                    if !peer_in_directory(&state, &peer) {
+                    let known = peer_in_directory(&state, &peer);
+                    // With ONE exception, and it is the exception the whole
+                    // account rests on: a device the human is pairing with has
+                    // no way to be in the directory yet — being put there is
+                    // what the pairing is for. So while a LAN pairing window is
+                    // open on this device, a stranger is let as far as its first
+                    // frame, and `serve_incoming` serves it nothing but the
+                    // pairing offer. Outside that window nothing changes: no
+                    // byte is read from a device we cannot place.
+                    if !known && !crate::pairing::lan_window_open(&state) {
                         tracing::warn!(peer = %peer, "incoming stream from a peer outside the directory: refused");
                         continue;
                     }
-                    handlers.spawn(serve_incoming(state.clone(), peer, stream));
+                    handlers.spawn(serve_incoming(state.clone(), peer, stream, known));
                 }
                 Err(e) => {
                     // Transport closed under our feet: the data plane is DEAD —
@@ -829,9 +859,19 @@ async fn write_ack(stream: &mut Box<dyn IoStream>) -> std::io::Result<()> {
 /// Serves an incoming stream: reads the first control frame and dispatches on
 /// its `type`. `offer` is a file transfer (below); `clip_announce` /
 /// `clip_session` are the clipboard network plane (`clipnet`); `dir_sync` is the
-/// directory's (`dirsync`). The peer is already vouched for by
-/// `peer_in_directory` (C7) at the accept loop.
-async fn serve_incoming(state: Arc<AppState>, peer: String, mut stream: Box<dyn IoStream>) {
+/// directory's (`dirsync`); `lan_pair` is a device asking for its first
+/// introduction (`pairing`).
+///
+/// `known`: is this peer a device of the account (`peer_in_directory`, C7)? Only
+/// `lan_pair` is served to one that is not — everything else here presupposes a
+/// device the account vouches for, and a stranger reached this far only because a
+/// pairing window is open (see `serve`).
+async fn serve_incoming(
+    state: Arc<AppState>,
+    peer: String,
+    mut stream: Box<dyn IoStream>,
+    known: bool,
+) {
     let first = match bounded(STALL_TIMEOUT, read_control(&mut stream), "first frame").await {
         Ok(v) => v,
         Err(e) => {
@@ -840,6 +880,15 @@ async fn serve_incoming(state: Arc<AppState>, peer: String, mut stream: Box<dyn 
         }
     };
     match first.get("type").and_then(Value::as_str) {
+        // The one frame a device outside the directory may send — and the one
+        // that puts it in there.
+        Some("lan_pair") => crate::pairing::recv_lan_pair(state, peer, first, stream).await,
+        other if !known => {
+            tracing::warn!(
+                peer = %peer, kind = ?other,
+                "a device outside the directory spoke something other than a pairing offer: refused"
+            );
+        }
         Some("offer") => serve_transfer(state, peer, first, stream).await,
         Some("clip_announce") => crate::clipnet::recv_announce(state, peer, first, stream).await,
         Some("clip_push") => crate::clipnet::recv_push(state, peer, first, stream).await,
@@ -1231,13 +1280,16 @@ fn unique_child_name(dir: &Path, name: &str, is_dir: bool) -> String {
 // ---------------------------------------------------------------------------
 
 /// Writes a CONTROL frame: the serialized JSON, framed.
-async fn write_control(stream: &mut Box<dyn IoStream>, value: &Value) -> std::io::Result<()> {
+pub(crate) async fn write_control(
+    stream: &mut Box<dyn IoStream>,
+    value: &Value,
+) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(value)?;
     write_frame(stream, &bytes).await
 }
 
 /// Reads a CONTROL frame and parses it as JSON.
-async fn read_control(stream: &mut Box<dyn IoStream>) -> std::io::Result<Value> {
+pub(crate) async fn read_control(stream: &mut Box<dyn IoStream>) -> std::io::Result<Value> {
     let bytes = read_frame(stream).await?;
     serde_json::from_slice(&bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))

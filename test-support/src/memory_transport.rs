@@ -29,6 +29,11 @@ type Wire = (String, DuplexStream);
 /// publish — `open` requires knowing it, like the real iroh.
 struct Route {
     relay_url: Option<String>,
+    /// Has this endpoint been asked to make itself reachable (`listen`)? Nothing
+    /// here binds anything — there is no socket — but the daemon's transport binds
+    /// LAZILY, so "a pairing window makes this device dialable" is a wiring fact
+    /// with a real consequence, and one only a double can pin from a test.
+    listened: Arc<std::sync::atomic::AtomicBool>,
     /// Announcing on the fake LAN (`join_lan`): visible to the other members
     /// and dialable with no relay — the double of a real endpoint whose mDNS
     /// discovery is on.
@@ -66,10 +71,12 @@ impl MemorySwitchboard {
         let node_id = node_id.into();
         let (tx, rx) = mpsc::unbounded_channel();
         let lan_gen = tokio::sync::watch::channel(0).0;
+        let listened = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.routes.lock().unwrap().insert(
             node_id.clone(),
             Route {
                 relay_url: relay_url.clone(),
+                listened: listened.clone(),
                 on_lan: false,
                 lan_gen: lan_gen.clone(),
                 tx,
@@ -78,10 +85,23 @@ impl MemorySwitchboard {
         Arc::new(MemoryTransport {
             node_id,
             relay_url,
+            listened,
             lan_gen,
             switchboard: self.clone(),
             inbox: tokio::sync::Mutex::new(rx),
         })
+    }
+
+    /// Has this endpoint been asked to make itself reachable? See
+    /// [`Route::listened`]. An unknown `node_id` is a test bug, so it panics.
+    pub fn listened(&self, node_id: &str) -> bool {
+        self.routes
+            .lock()
+            .unwrap()
+            .get(node_id)
+            .expect("listened: node_id unknown to the switchboard")
+            .listened
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Puts a device on the fake LAN: its `node_id` becomes visible to the
@@ -119,6 +139,7 @@ impl MemorySwitchboard {
 pub struct MemoryTransport {
     node_id: String,
     relay_url: Option<String>,
+    listened: Arc<std::sync::atomic::AtomicBool>,
     lan_gen: tokio::sync::watch::Sender<u64>,
     switchboard: MemorySwitchboard,
     inbox: tokio::sync::Mutex<mpsc::UnboundedReceiver<Wire>>,
@@ -210,5 +231,13 @@ impl PeerTransport for MemoryTransport {
 
     fn lan_changes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.lan_gen.subscribe()
+    }
+
+    fn listen(&self) -> universallink_core::Listening<'_> {
+        // Nothing to bind: this transport has been reachable since it was
+        // registered. Recorded, though — see `Route::listened`.
+        self.listened
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(std::future::ready(()))
     }
 }

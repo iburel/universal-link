@@ -830,27 +830,12 @@ impl Conn {
         })
     }
 
-    /// Is there **no server in this device's life at all**? Nothing configured,
-    /// and no session either — a session carries its own server URL
-    /// (`session.json`), so a Core whose `config.json` went missing under its feet
-    /// still has a server it answers to, and every other device of the account
-    /// reads that server.
-    ///
-    /// This is what the local-only paths turn on. Getting it wrong the lenient way
-    /// would be the expensive mistake: this device would sign a name, or strike a
-    /// device off, in a way the server — and therefore the rest of the account —
-    /// would never hear about.
+    /// Is there **no server in this device's life at all**? The rules, and why
+    /// getting them wrong the lenient way is the expensive mistake, are in
+    /// [`crate::state::serverless`] — the pairing turns on the same answer, and two
+    /// definitions of it would drift.
     fn serverless(&self) -> bool {
-        let configured = self
-            .state
-            .server_config
-            .lock()
-            .expect("lock server_config")
-            .is_some();
-        if configured {
-            return false;
-        }
-        !self.state.session.lock().expect("lock session").logged_in
+        crate::state::serverless(&self.state)
     }
 
     /// A server this device has must be connected: joining the account publishes

@@ -33,11 +33,13 @@ use std::sync::{Arc, Mutex};
 
 pub use crate::connector::{Connecting, Connector, IoStream, PlainConnector, Target};
 pub use crate::dataplane::{
-    ALPN, Closing, FileHeader, HomeRelay, Incoming, Opening, OutgoingFile, PeerAddr, PeerTransport,
-    read_offer, receive_bodies, send_transfer,
+    ALPN, Closing, FileHeader, HomeRelay, Incoming, Listening, Opening, OutgoingFile, PeerAddr,
+    PeerTransport, read_offer, receive_bodies, send_transfer,
 };
 pub use crate::identity::load_or_generate_device_seed;
-pub use crate::pairing::PAYLOAD_TAG as PAIRING_CODE_TAG;
+pub use crate::pairing::{
+    LAN_PAYLOAD_TAG as PAIRING_LAN_CODE_TAG, PAYLOAD_TAG as PAIRING_CODE_TAG,
+};
 pub use crate::secrets::{FileSecretStore, SecretStore};
 use crate::state::{AppState, Registry, SessionState, SpawnGrant, Transfers, random_hex};
 

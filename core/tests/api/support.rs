@@ -269,6 +269,41 @@
 //!   no notification and does not rewrite `directory.json`; one that DOES teach
 //!   something writes the records without moving `saved_at` — the 7-day bound is a
 //!   bound against the server, and only the server resets it.
+//!
+//! A device's first introduction, on the local network (serverless, building block
+//! 4 — `lanpair.rs`):
+//! - With NO server in this device's life, `pairing.offer` mints a `UL2` code —
+//!   `UL2:<psk>:<epk>:<node_id>` — instead of answering `SERVER_UNREACHABLE`, and
+//!   `pairing.accept` of a `UL2` code dials that `node_id` on the data plane. The
+//!   `UL1` code (a server relays it) and the `UL2` code (the device is dialled) are
+//!   told apart by their tag, and each is refused by the device the other is for:
+//!   `UL2` where a server answers → `PAIRING_VIA_SERVER`, `UL1` with no server →
+//!   `SERVER_UNREACHABLE`.
+//! - Frames on the existing ALPN: `lan_pair` (dialer → displayer), answered by
+//!   `lan_hello` or `lan_refused { reason }`; then `pair_grant { bundle, records,
+//!   revoked }` from the sponsor and `pair_roster { records, revoked }` back.
+//!   `lan_pair` is the ONE frame the data plane serves to a device outside the
+//!   directory, and only while a window is open — the window closes to newcomers
+//!   the instant it takes a dialer, and outside one nothing is read at all.
+//! - The dialer proves it read the code off a screen (a MAC over both public
+//!   halves and the `node_id`, keyed by the code's secret) BEFORE the displaying
+//!   side spends its ephemeral secret: a device that cannot prove it must not be
+//!   able to burn the window for the device that can.
+//! - Each side declares its OWN signed record (`directory::own_record`'s shape),
+//!   and a record whose `node_id` is not the one the transport authenticated — or
+//!   which is not signed — is refused (`record`). The sponsor attests that record
+//!   and takes it in through the same `absorb` a roster goes through, so both
+//!   devices end up holding each other and `dirsync` runs from then on.
+//! - Who sponsors: whoever holds the account's private key. Neither →
+//!   `no_account`; two different accounts → `other_account` (refused BEFORE the
+//!   seed crosses); BOTH holding the same key → the device that DISPLAYED the code
+//!   sponsors, the key that crosses is the one the other already has, and what the
+//!   two of them are really doing is swapping rosters.
+//! - `pairing.claimed` / `pairing.confirm` / `pairing.completed` / `pairing.failed`
+//!   are the server path's, unchanged, and both ends show the same `verification`.
+//!   `pairing.confirm` never answers `reauth_required` here (no OIDC to be fresh
+//!   with), and a declined or cancelled window tells the other device rather than
+//!   leaving it to time out. `expires_in` is 180 s, counted locally on both sides.
 
 #![allow(dead_code)]
 
@@ -681,6 +716,23 @@ impl TestCore {
             switchboard.endpoint(node_id.clone(), None);
         switchboard.join_lan(&node_id);
         Self::spawn_in(dir, Some((node_id.clone(), key)), None, Some(transport)).await
+    }
+
+    /// A Core that has joined NOTHING — no account, no server — on a shared
+    /// switchboard and on the fake LAN. What a machine is the first time it is
+    /// switched on, and the state the receiving end of a pairing starts from. The
+    /// key is the caller's, so a test can name the device before it exists.
+    pub async fn start_fresh_on(switchboard: &MemorySwitchboard, key: DeviceKey) -> TestCore {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("device.key"), key.seed_hex()).expect("seed device.key");
+        let node_id = key.node_id();
+        let transport: Arc<dyn universallink_core::PeerTransport> =
+            switchboard.endpoint(node_id.clone(), None);
+        switchboard.join_lan(&node_id);
+        // No `enrolled`: this device has no `device_id` and no account, and the
+        // accessors that would invent one keep saying so. `node_id()` reads
+        // `device.key` back, so it answers all the same.
+        Self::spawn_in(dir, None, None, Some(transport)).await
     }
 
     /// The config directory of a device that has joined the account with no server:
@@ -1579,6 +1631,35 @@ pub async fn pending_component(
         .expect("hello without a token");
     assert_eq!(r["status"], "pending");
     c
+}
+
+/// Writes a control frame the way the data plane frames one: a u32 big-endian
+/// length, then the JSON. For the tests that stand in for a peer and speak the
+/// protocol by hand.
+pub async fn peer_write(stream: &mut Box<dyn universallink_core::IoStream>, frame: &Value) {
+    let bytes = serde_json::to_vec(frame).expect("serialize");
+    stream
+        .write_all(&(bytes.len() as u32).to_be_bytes())
+        .await
+        .expect("frame length");
+    stream.write_all(&bytes).await.expect("frame body");
+    stream.flush().await.expect("flush");
+}
+
+/// Reads a control frame — or `None` when the stream ended first, which is how
+/// the data plane refuses a device it will not talk to at all.
+pub async fn peer_read(stream: &mut Box<dyn universallink_core::IoStream>) -> Option<Value> {
+    let mut len = [0u8; 4];
+    timeout(RESPONSE_TIMEOUT, stream.read_exact(&mut len))
+        .await
+        .expect("an answer or a close")
+        .ok()?;
+    let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+    timeout(RESPONSE_TIMEOUT, stream.read_exact(&mut body))
+        .await
+        .expect("the body of an announced frame")
+        .ok()?;
+    Some(serde_json::from_slice(&body).expect("the frame is JSON"))
 }
 
 /// Retries `attempt` (50 ms step) until `true`, within the limit of

@@ -206,7 +206,10 @@ async fn write_roster(
 /// What we have to offer. `None` without a trust root: we cannot tell a member
 /// from a stranger, so we have nothing to say about the account — fail-closed,
 /// like every other door the account key guards.
-fn our_roster(state: &AppState) -> Option<Roster> {
+///
+/// Shared with the pairing (`pairing::lan_tail`), which ends by handing the other
+/// device exactly this: the two halves of an introduction are a roster each.
+pub(crate) fn our_roster(state: &AppState) -> Option<Roster> {
     // Leaf lock released before taking `session` (lock ordering).
     let ak_pub = state
         .account_root
@@ -221,7 +224,13 @@ fn our_roster(state: &AppState) -> Option<Roster> {
 /// Takes in a peer's roster and tells the IPC what changed. Silent — not one
 /// notification, not one disk write — when it changed nothing, which is what a
 /// round between two devices that already agree costs.
-fn absorb(state: &Arc<AppState>, roster: &Roster) {
+///
+/// The single way a record from ANOTHER device enters this Core's directory: the
+/// rounds here, and the roster that ends a pairing (`pairing::lan_tail`). Which is
+/// why the rules live in [`crate::state::SessionState::absorb`] and not in either
+/// caller — a pairing that took a peer's word for something would be a second set
+/// of rules, and the weaker one would be the one that mattered.
+pub(crate) fn absorb(state: &Arc<AppState>, roster: &Roster) {
     // Both read before the session lock (lock ordering: the transport and
     // `account_root` each have a lock of their own).
     let lan: std::collections::BTreeSet<String> = state.transport.lan_peers().into_iter().collect();
