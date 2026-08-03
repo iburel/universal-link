@@ -245,6 +245,16 @@ pub(crate) fn absorb(state: &Arc<AppState>, roster: &Roster) {
 
     let mut s = state.session.lock().expect("lock session");
     let changed = s.absorb(&ak_pub, &own_node_id, roster);
+    if changed.struck_ourselves {
+        // The account's own signature, striking THIS device off. Obeyed — outside
+        // the session lock, because leaving takes every lock in the book, one at
+        // a time. Nothing else came out of that roster (`absorb` short-circuits),
+        // so there is nothing to save or announce besides the leave itself.
+        drop(s);
+        tracing::warn!("the account has struck this device off: leaving the account");
+        crate::account_key::leave(state);
+        return;
+    }
     if changed.is_empty() {
         return;
     }

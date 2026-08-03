@@ -254,17 +254,30 @@ pub(crate) async fn serve(state: Arc<AppState>) {
                     // with the right ALPN — gets nothing: no byte read, no file
                     // written.
                     let known = peer_in_directory(&state, &peer);
-                    // With ONE exception, and it is the exception the whole
-                    // account rests on: a device the human is pairing with has
-                    // no way to be in the directory yet — being put there is
-                    // what the pairing is for. So while a LAN pairing window is
-                    // open on this device, a stranger is let as far as its first
-                    // frame, and `serve_incoming` serves it nothing but the
-                    // pairing offer. Outside that window nothing changes: no
-                    // byte is read from a device we cannot place.
-                    if !known && !crate::pairing::lan_window_open(&state) {
-                        tracing::warn!(peer = %peer, "incoming stream from a peer outside the directory: refused");
-                        continue;
+                    if !known {
+                        // A device the ACCOUNT struck off is not a mere stranger:
+                        // it is answered its own tombstone — before the pairing
+                        // window is even consulted, because the one good outcome
+                        // left for that device is learning it is out (a tombstone
+                        // is permanent: it can never pair back in as itself). See
+                        // `answer_struck_off` for why the dial is the only place
+                        // this can happen.
+                        if let Some(revocation) = struck_off(&state, &peer) {
+                            handlers.spawn(answer_struck_off(peer, stream, revocation));
+                            continue;
+                        }
+                        // With ONE exception, and it is the exception the whole
+                        // account rests on: a device the human is pairing with has
+                        // no way to be in the directory yet — being put there is
+                        // what the pairing is for. So while a LAN pairing window is
+                        // open on this device, a stranger is let as far as its first
+                        // frame, and `serve_incoming` serves it nothing but the
+                        // pairing offer. Outside that window nothing changes: no
+                        // byte is read from a device we cannot place.
+                        if !crate::pairing::lan_window_open(&state) {
+                            tracing::warn!(peer = %peer, "incoming stream from a peer outside the directory: refused");
+                            continue;
+                        }
                     }
                     handlers.spawn(serve_incoming(state.clone(), peer, stream, known));
                 }
@@ -363,6 +376,60 @@ fn peer_in_directory(state: &AppState, node_id: &str) -> bool {
                 .and_then(Value::as_str)
                 .is_some_and(|att| crate::account_key::verify(&ak_pub, node_id, att))
     })
+}
+
+/// The account's signature striking `node_id` off, if this Core holds one that
+/// verifies. What tells a struck-off device apart from a mere stranger — and the
+/// ONLY thing the data plane will ever say to either. `pub(crate)` for the
+/// pairing too, which refuses to dial a code shown by a device the account has
+/// struck off.
+pub(crate) fn struck_off(state: &AppState, node_id: &str) -> Option<String> {
+    // Leaf lock released before taking `session` (lock ordering).
+    let ak_pub = {
+        let root = state.account_root.lock().expect("lock account_root");
+        root.as_ref()?.ak_pub.clone()
+    };
+    let s = state.session.lock().expect("lock session");
+    let revocation = s.revoked.get(node_id)?;
+    crate::account_key::verify_revocation(&ak_pub, node_id, revocation).then(|| revocation.clone())
+}
+
+/// Answers the dial of a device the account struck off: a `dir_roster` of one
+/// entry — its own tombstone — written without reading a byte, then the close.
+///
+/// This is what DELIVERS a revocation to the device it names, and the dial is
+/// the only place it can happen. It cannot arrive by gossip: absorbing the
+/// tombstone is what evicts the device from a sibling's directory, so every
+/// sibling that could carry it refuses that device's streams — and stops dialling
+/// it — from that moment on. Enforcing the revocation is exactly what blocks its
+/// delivery, and answering the refused dial is what breaks the circle.
+///
+/// It hands the peer nothing it does not already own: the tombstone names the
+/// very key the transport authenticated, is public account-signed data, and the
+/// frame is the same `dir_roster` the peer's own sync round asked for — the
+/// `absorb` that reads it is the one that obeys it (`account_key::leave`). A
+/// stream opened for anything else gets the same answer and fails its own
+/// protocol check, which costs the zombie one failed exchange until its next
+/// sync round learns the truth.
+async fn answer_struck_off(peer: String, mut stream: Box<dyn IoStream>, revocation: String) {
+    tracing::info!(peer = %peer, "a struck-off device dialled: answering its tombstone");
+    let mut revoked = serde_json::Map::new();
+    revoked.insert(peer.clone(), json!(revocation));
+    let frame = json!({ "type": "dir_roster", "records": [], "revoked": revoked });
+    if let Err(e) = bounded(
+        STALL_TIMEOUT,
+        write_control(&mut stream, &frame),
+        "tombstone",
+    )
+    .await
+    {
+        tracing::debug!(peer = %peer, error = %e, "the tombstone answer did not go out");
+        return;
+    }
+    // Held like every responder holds its reply: dropping now would abandon the
+    // frame in flight on the QUIC side.
+    let _ = stream.shutdown().await;
+    let _ = tokio::time::timeout(LINGER, drain(&mut stream)).await;
 }
 
 /// The `device_id` (server label) associated with a `node_id`, taken from the

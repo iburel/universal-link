@@ -41,6 +41,23 @@ pub fn load_or_generate_device_seed(config_dir: &Path) -> anyhow::Result<[u8; 32
     Ok(seed)
 }
 
+/// Erases `device.key`: the next startup mints a fresh identity. The one caller
+/// is a device leaving the account it was struck off from (`account_key::leave`)
+/// — a tombstone is permanent, so the `node_id` it names never returns, and the
+/// only way back is a new key, attested anew. This is what mints it. A failure
+/// is loud but not fatal: the old identity then survives the restart, and every
+/// door stays closed anyway (no trust root, and the peers hold the tombstone).
+pub(crate) fn remove(config_dir: &Path) {
+    let path = config_dir.join(KEY_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::error!(error = %e, "failed to erase device.key: the next startup keeps this identity");
+        }
+    }
+}
+
 impl DeviceIdentity {
     /// Re-reads the key from disk, or generates one at first startup.
     pub fn load_or_generate(config_dir: &Path) -> anyhow::Result<DeviceIdentity> {

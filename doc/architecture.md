@@ -119,6 +119,19 @@ On each PC:
      and the peers keep refusing it. It is permanent by design (un-revoking
      would need a total order the account cannot establish offline): a device
      struck off comes back only as a new one, with a fresh `node_id`.
+   - **The struck device obeys, once it hears.** A tombstone naming *this*
+     device, verified under the account key, is not refused — it is the account's
+     own word, and the device leaves: trust root, account key, session, directory
+     and `device.key`, all erased, so its next startup is a first startup under
+     the fresh identity that is the only way back. Delivering it takes a
+     mechanism of its own, because enforcement blocks gossip: absorbing a
+     tombstone evicts the struck device from a sibling's directory, so every
+     informed sibling refuses the very streams that could have carried it. The
+     data plane therefore answers the struck-off device's dial with a one-entry
+     roster — its own tombstone, nothing read in return — and the same absorb
+     that reads rosters is the one that obeys. Best-effort by construction: a
+     device that never dials again never learns, and loses nothing by it, since
+     the account already refuses it everywhere.
    - **A device signs what it says about itself**: its directory record carries
      its own signature over `{node_id, name, platform, seq}`, so a description
      can pass from device to device without the one relaying it being trusted
@@ -575,10 +588,22 @@ into each machine in turn: the device that displayed the code sponsors, the key 
 crosses is the one the other side already has, and what the two of them are really
 doing is swapping directories.
 
-Deliberately LAN-only, and not relayed: the code's secret travels by a screen and a
-camera, so the window it opens should be as narrow as the room. A code that carried
-a relay hint would work from anywhere, which is a different decision — one to take
-with the question of whose relay a serverless account uses, not by omission.
+And two refusals for a device the account struck off, one per direction. Its
+*dial* never reaches the window: the data plane answers it with its own tombstone
+instead (principle 3, "The struck device obeys") — the one good outcome left for
+that device is learning it is out. Its *code*, read on a healthy device, is
+refused before anything is dialled (`DEVICE_REVOKED`): a tombstone is permanent,
+so there is no pairing to attempt, and the refusal should say whose decision it
+was rather than surface later as a failed pairing.
+
+Deliberately LAN-only, and not relayed — decided, not omitted. The code's secret
+travels by a screen and a camera, so the window it opens should be as narrow as
+the room; a code that carried a relay hint would work from anywhere. The same
+decision bounds the serverless account as a whole: its records carry no relay,
+so two of its devices see each other where mDNS does, and nowhere else. If that
+reach is ever widened, the honest route is the directory itself (a device
+declaring its relay in its signed record) — never a public discovery that would
+announce every device's whereabouts to anyone holding its `node_id`.
 
 ### The fresh token, and what it proves
 

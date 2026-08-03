@@ -17,6 +17,7 @@ mod enrollment;
 mod events;
 mod hello;
 mod lanpair;
+mod leave;
 mod login;
 mod pairing;
 mod protocol;

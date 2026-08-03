@@ -386,6 +386,111 @@ fn stow_and_verify(
     Ok(())
 }
 
+/// Leaves the account: this device has been struck off (a verified tombstone
+/// naming its `node_id` — [`crate::state::SessionState::absorb`] is what heard
+/// it), and everything that made it a member goes. The trust root (memory and
+/// file), the account key, the session and its refresh token, the directory and
+/// the tombstones, and `device.key` itself. The last one is what makes the way
+/// back honest: a revocation is permanent, so the `node_id` it names never
+/// returns — erasing the key is what mints the fresh identity a re-pairing
+/// needs, at the next startup. Until that restart the running Core keeps its
+/// old identity in memory, and every door fails closed on its own: no trust
+/// root means nothing is authorized, served, offered or synced.
+///
+/// The human's data is not the account's: nothing but the account material is
+/// touched. And obeying is not what excludes the device — every peer holding
+/// the tombstone already refuses it — it is the device's own hygiene: a machine
+/// the account struck off must not keep the account's private key, and must not
+/// keep believing.
+pub(crate) fn leave(state: &std::sync::Arc<crate::state::AppState>) {
+    // The trust root's slot is the claim: `take()` hands it to exactly one
+    // caller, so two streams delivering the same tombstone in the same breath
+    // leave ONCE — a second `account.left` would tell the human the same thing
+    // twice. A leaf lock, taken and released alone, like everywhere. (A guard
+    // against a race no test can schedule: between honest Cores the second
+    // delivery is already turned away upstream, `dirsync::absorb` finding no
+    // trust root to verify against — this claim survives a mutation campaign
+    // for that reason, and is kept for the interleaving nobody arranges.)
+    if state
+        .account_root
+        .lock()
+        .expect("lock account_root")
+        .take()
+        .is_none()
+    {
+        return;
+    }
+    // The keyring next, before the session lock (its calls can block; and on the
+    // desktop a delete is queued — accepted, like `remember`'s write). The
+    // refresh token goes too: a session is part of the membership, exactly as
+    // `session.logout` treats it.
+    state.secrets.delete(crate::secrets::ACCOUNT_SEED);
+    state.secrets.delete(crate::secrets::REFRESH_TOKEN);
+    let path = state.config_dir.join(KEY_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // Loud but not fatal: at the next startup the root attests a node_id
+        // whose key is gone, and `spawn`'s filter ignores it — fail-closed.
+        Err(e) => tracing::error!(error = %e, "failed to erase the trust root file"),
+    }
+    crate::identity::remove(&state.config_dir);
+
+    let abort = {
+        let mut s = state.session.lock().expect("lock session");
+        let gone: Vec<String> = s
+            .devices
+            .as_ref()
+            .map(|devices| devices.keys().cloned().collect())
+            .unwrap_or_default();
+        // `forget(None)`: unlike a logout, nothing of this device survives — its
+        // own record was the account's too. The tombstones go with the rest: they
+        // were the account's signatures, and a device with no trust root can
+        // verify none of them anyway.
+        let (payload, abort) = s.forget(None);
+        s.revoked.clear();
+        // Disk under the lock that mutated the state (state-then-disk), like
+        // every directory write.
+        crate::session::remove_session_file(&state.config_dir);
+        crate::directory::remove(&state.config_dir);
+        crate::directory::remove_revoked(&state.config_dir);
+        // Broadcast under the session lock (order: session then registry): the
+        // order of notifications is the order of states, and nothing may slip a
+        // stale directory event in after these.
+        let registry = state.registry.lock().expect("lock registry");
+        for device_id in gone {
+            registry.notify_topic(
+                "devices",
+                "device.removed",
+                &serde_json::json!({ "device_id": device_id }),
+            );
+        }
+        registry.notify_topic("session", "session.changed", &payload);
+        // The one event that says WHY, for the sentence the interface owes the
+        // human: this was the account's decision, not a logout.
+        registry.notify_topic(
+            "session",
+            "account.left",
+            &serde_json::json!({ "reason": "struck_off" }),
+        );
+        abort
+    };
+    if let Some(abort) = abort {
+        abort.abort();
+    }
+    // A pending OIDC flow belonged to the membership that just ended.
+    if let Some(slot) = state.login.lock().expect("lock login").take() {
+        slot.abort.abort();
+    }
+    // A pairing in flight cannot end well anymore, on either end: this device
+    // has no account to sponsor into and no standing to join with. `no_account`
+    // is the truth of the matter, said in the vocabulary the interface knows.
+    crate::pairing::fail_current(state, "no_account");
+    // The account's read grants do not outlive it (same as the logout).
+    state.clipboard.lock().expect("lock clipboard").clear_all();
+    state.clipboard_reset.notify_waiters();
+}
+
 /// `OtherKey` if a root is already installed for a different account key.
 fn refuse_another_key(
     state: &crate::state::AppState,

@@ -626,14 +626,16 @@ async fn a_code_is_refused_by_the_device_the_other_kind_is_for() {
 // ---------------------------------------------------------------------------
 
 /// A device on the network that is in nobody's directory, dialling the data plane
-/// itself.
-struct Stranger {
-    key: DeviceKey,
+/// itself. `pub(crate)`: the leave tests (`leave.rs`) reuse it — as the struck-off
+/// device whose dial is answered its tombstone, and (its record seeded) as the
+/// compromised member whose forged rosters must wipe nothing.
+pub(crate) struct Stranger {
+    pub(crate) key: DeviceKey,
     transport: std::sync::Arc<universallink_test_support::memory_transport::MemoryTransport>,
 }
 
 impl Stranger {
-    fn join(switchboard: &MemorySwitchboard) -> Stranger {
+    pub(crate) fn join(switchboard: &MemorySwitchboard) -> Stranger {
         let key = DeviceKey::generate();
         let transport = switchboard.endpoint(key.node_id(), None);
         switchboard.join_lan(&key.node_id());
@@ -643,7 +645,7 @@ impl Stranger {
     /// Sends `frame` to `target` and returns its answer — `None` when the Core
     /// closed the stream without a word, which is how it refuses a device it will
     /// not talk to.
-    async fn say(&self, target: &TestCore, frame: Value) -> Option<Value> {
+    pub(crate) async fn say(&self, target: &TestCore, frame: Value) -> Option<Value> {
         let peer = PeerAddr {
             node_id: target.node_id(),
             relay_url: None,
@@ -660,14 +662,14 @@ impl Stranger {
     /// Its own signed description, as a legitimate device would declare it. The
     /// attestation in it is beside the point: a declaration is checked against the
     /// key that sent it, and the account key is what the SPONSOR adds.
-    fn record(&self, code: &str) -> Value {
+    pub(crate) fn record(&self, code: &str) -> Value {
         peer_record(&self.key, "Stranger", std::env::consts::OS, code, 1)
     }
 
     /// A code that names THIS device, so a real Core will dial it: the shape a
     /// serverless `pairing.offer` mints. What the two halves derive is nobody's
     /// business here — every test that dials a stranger is about the answer.
-    fn code(&self) -> String {
+    pub(crate) fn code(&self) -> String {
         // 16 bytes of "optical secret" and 32 of public key, which is what the
         // fields are: a code of any other shape is not a code at all, and would
         // never get as far as being answered.

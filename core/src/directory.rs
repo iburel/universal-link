@@ -182,6 +182,25 @@ pub(crate) fn remove(config_dir: &Path) {
     }
 }
 
+/// Removes the tombstones — the one caller is a device LEAVING the account
+/// (`account_key::leave`): the tombstones were the account's to keep, and a
+/// device out of the account keeps nothing of its. Same fallback as the cache;
+/// an empty file loads as no tombstones, which is what a device with no trust
+/// root effectively holds anyway (nothing verifies without the account key).
+pub(crate) fn remove_revoked(config_dir: &Path) {
+    let path = config_dir.join(REVOKED_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::error!(error = %e, "failed to remove the revocations: contents emptied instead");
+            if let Err(e) = crate::write_private_file(&path, "") {
+                tracing::error!(error = %e, "failed to erase the revocations");
+            }
+        }
+    }
+}
+
 /// The stored tombstones. An absent, corrupt or unreadable file
 /// reads as none: a tombstone bars a device only once its signature has been
 /// checked, so a missing file costs nothing here — it is the callers' checks that

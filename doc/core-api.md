@@ -114,7 +114,12 @@ against an older Core while simply not seeing that topic's events.
 | `session.reload {}` | re-reads `config.json` (which the GUI's setup screen has just written) and swaps the server config in place — no restart. → the fresh `session.status`. `INVALID_CONFIG` if the file is malformed / half-filled. The Core only READS the file; the GUI is its sole writer |
 | `session.discover { url }` | reads the **deployment descriptor** at an address the user typed and returns what to write into `config.json`: → `{ server_url, oidc_issuer, oidc_client_id, oidc_client_secret }` (the last one `null` when the IdP wants none). Writes nothing — the caller does that, then `session.reload`. Meaningful with nothing configured, which is the case it exists for. See below |
 
-Notification: `session.changed { logged_in, server_connected, account? }` — note it carries NO `configured` (a caller that needs it re-reads `session.status`, which a session change prompts anyway).
+Notifications (topic `session`):
+
+| Notification | Meaning |
+|---|---|
+| `session.changed { logged_in, server_connected, account? }` | every transition — note it carries NO `configured` (a caller that needs it re-reads `session.status`, which a session change prompts anyway) |
+| `account.left { reason }` | this device is out of the ACCOUNT — the membership ended, not just a session. The only `reason` today is `struck_off`: the account's own signature named this device, and the Core obeyed it (trust root, account key, session, directory and `device.key` all erased — the next startup is a first startup). Preceded by `device.removed` for every device served and by a `session.changed`, which is what a logout would also emit: this event is what tells the two apart, and the sentence the interface owes the human hangs on it |
 
 ### `session.discover`: one address instead of three fields
 
@@ -301,6 +306,13 @@ The methods and the notifications are the ones above, unchanged. What differs:
   they are what a stranger gets, not what the human waiting is told.
 - **`pairing.accept` can answer `DEVICE_OFFLINE`**: the device whose code was read
   is not on this network, or not reachable on it.
+- **`pairing.accept` answers `DEVICE_REVOKED`** for a code shown by a `node_id`
+  the account struck off — before anything is dialled. A tombstone is permanent,
+  so there is no pairing to attempt: the refusal is the account's own decision
+  said as such, not a failure discovered after two humans compared a number. The
+  mirror needs no code of its own: a struck-off *dialer* is answered its
+  tombstone by the displayer's data plane and never reaches the window (see
+  `devices.*`).
 - **Both devices come out holding each other's record**, so `devices.list` on each
   shows the other and the directory exchange runs from then on. With a server that
   is the server's business; here it is what the pairing is for. Each side declares
@@ -386,6 +398,14 @@ Core keeps refusing it. Three consequences worth stating plainly:
 - There is **no fresh-login gate**, unlike the server path: with no server there
   is no OIDC to be fresh with. What stands between a component and this call is
   the `devices.manage` scope, nothing more.
+- The struck device itself **obeys, once it hears**. The tombstone travels with
+  the rosters (`dir_sync`) like any other — and to the device it names, whose
+  streams every informed sibling now refuses, it travels as the answer to its own
+  refused dial. On hearing it, that device leaves the account whole
+  (`account.left { reason: "struck_off" }` — see `session.*`), erases its
+  `device.key`, and restarts as a first startup. Best-effort by construction: a
+  device that never dials again — stolen, dead — simply never learns, and loses
+  nothing by it, since the account already refuses it everywhere.
 
 `revoked.json` survives what `directory.json` does not: a logout, and a revocation
 of this device. The struck-off device keeps a valid attestation for good, so the
@@ -431,13 +451,31 @@ the device. The tombstones do travel, because they are the account's own
 signatures. The consequence to keep in view is that an account cannot yet be half
 on a server and half not.
 
-One case the exchange deliberately does **not** handle: a tombstone naming *this*
-device. It is signed by the account key, so it is not hearsay — but obeying it
-means leaving the account (erasing the trust root, the account key, the session
-and the directory), a gesture the Core does not have yet, and storing it without
-that gesture would leave a Core barring itself at every door while still believing
-it belongs. So it is refused and logged at error level. The account's decision
-takes effect anyway: every peer holding that tombstone refuses this device.
+One case ends the exchange instead of feeding it: a tombstone naming *this*
+device. It is signed by the account key, so it is not hearsay — and once that
+signature verifies, it is **obeyed**: the device leaves the account. Everything
+that made it a member goes — the trust root, the account key and the refresh
+token in the keyring, the session, `directory.json`, `revoked.json`, and
+`device.key` itself, so the next startup is a first startup under a fresh
+identity (a revocation is permanent: the struck `node_id` never returns, and only
+a new key can be attested again). Nothing of the human's is touched. The
+components hear, in order, `device.removed` for every device served,
+`session.changed`, then `account.left { reason: "struck_off" }` (topic
+`session`) — the one event that says it was the account's decision, not a logout.
+A pairing in flight fails with `no_account`; clipboard grants die as at a logout.
+A signature that does not verify wipes nothing, like any tombstone the account
+never signed.
+
+How it *reaches* the device is its own mechanism, because gossip cannot carry it:
+absorbing a tombstone is what evicts the struck device from a sibling's
+directory, so the siblings refuse the very streams that could have delivered it —
+enforcing the revocation is exactly what blocks its delivery. Instead, the data
+plane answers the struck-off device's dial (any dial, pairing window open or not,
+no byte of it read) with a one-entry `dir_roster` holding its own tombstone; the
+struck device's next sync round reads it through the same absorb that obeys it. A
+mere stranger still gets silence — the answer exists only for a `node_id` the
+account's signature names, and it tells that device nothing it does not already
+own.
 
 ## `files.*`
 
@@ -750,6 +788,7 @@ Standard JSON-RPC codes + application codes in `error.data.code`:
 | `PAIRING_UNKNOWN` / `PAIRING_STATE` / `PAIRING_LIMIT` | relayed from the server as-is: unknown/expired/spent session, wrong moment (confirming before anyone scanned, or from the joining side), too many sessions at once. `PAIRING_STATE` is also the local answer for a pairing that is out of step: a code whose window is no longer the one on screen, a device that answers a dial with something other than the protocol's next frame, and confirming a pairing whose stream is gone |
 | `PAIRING_VIA_SERVER` | `pairing.accept` of a `UL2` (local-network) code on a device that answers to a server: it pairs through that server, and pairing here would put the other device in an account half of which the server has never heard |
 | `DEVICE_UNKNOWN` / `DEVICE_OFFLINE` | target unknown / unreachable (`pairing.accept` of a `UL2` code: the device that displayed it is not on this network) |
+| `DEVICE_REVOKED` | `pairing.accept` of a `UL2` code shown by a `node_id` the account struck off: a tombstone is permanent, and that device can only come back under a fresh identity |
 | `TRANSFER_UNKNOWN` | unknown `transfer_id` |
 | `FORMAT_UNKNOWN` | format not present in the transaction |
 | `FILE_UNKNOWN` | `file_id` absent from the manifest — or a `dir` entry, which has no bytes to read |

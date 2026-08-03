@@ -150,6 +150,11 @@ pub struct Absorbed {
     /// strike off a device this Core never held, and that tombstone still has to
     /// reach the disk so it bars the record when it eventually shows up.
     pub barred: Vec<String>,
+    /// The roster carried the account's signature striking THIS device off, and
+    /// nothing else was taken in. The caller's next move is to leave the account
+    /// (`account_key::leave`) — everything else in that roster describes an
+    /// account this device is out of.
+    pub struck_ourselves: bool,
 }
 
 impl Absorbed {
@@ -158,6 +163,7 @@ impl Absorbed {
             && self.updated.is_empty()
             && self.removed.is_empty()
             && self.barred.is_empty()
+            && !self.struck_ourselves
     }
 }
 
@@ -362,24 +368,31 @@ impl SessionState {
         roster: &crate::directory::Roster,
     ) -> Absorbed {
         let mut out = Absorbed::default();
+        // The account striking THIS device off. Verified FIRST, under the account
+        // key — nothing a peer merely asserts may end an account — and then
+        // obeyed: the caller leaves (the trust root, the account key, the
+        // session, the directory, `device.key` itself — `account_key::leave`).
+        // A short-circuit, deliberately: the rest of the roster describes an
+        // account this device is out of, and absorbing it would be writing a
+        // directory the leave is about to erase — and announcing arrivals to
+        // components about to be told the account is gone. An unverifiable
+        // signature naming us falls through and dies at the same check as any
+        // other tombstone.
+        if let Some(revocation) = roster.revoked.get(own_node_id)
+            && crate::account_key::verify_revocation(ak_pub, own_node_id, revocation)
+        {
+            out.struck_ourselves = true;
+            return out;
+        }
         for (node_id, revocation) in &roster.revoked {
             if self.revoked.contains_key(node_id) {
                 continue;
             }
+            // Reached only by a signature that does NOT verify (the valid case
+            // returned above): skipped by the check below, like any tombstone the
+            // account never signed. Named anyway so `strike_off` can never grow a
+            // path that evicts our own record.
             if node_id == own_node_id {
-                // The account striking THIS device off. It is signed by the
-                // account key, so it is not hearsay — and yet obeying it means a
-                // gesture this brick does not have: leaving the account (the trust
-                // root, the account key, the session, the directory). Storing the
-                // tombstone without that gesture would be the worst of both — a
-                // Core barring itself at every door while still believing it
-                // belongs. So: refused, loudly. The account has already had its
-                // effect anyway, since every peer holding this tombstone refuses
-                // us.
-                tracing::error!(
-                    "the account has struck THIS device off: peers will refuse it. \
-                     Re-join the account with the recovery code, or start over."
-                );
                 continue;
             }
             if !crate::account_key::verify_revocation(ak_pub, node_id, revocation) {
@@ -1522,32 +1535,53 @@ mod tests {
     }
 
     /// The account striking THIS device off is not hearsay — it is signed by the
-    /// account key. But obeying it means leaving the account, a gesture this Core
-    /// does not have yet, and storing the tombstone without it would leave us
-    /// barring ourselves at every door while still believing we belong. So it is
-    /// refused, and said out loud (peers hold it anyway: they will refuse us).
+    /// account key, and once that signature VERIFIES it is obeyed: `absorb`
+    /// reports it and takes in nothing else, and the caller leaves the account
+    /// (`account_key::leave` — the state here is not `absorb`'s to erase). A
+    /// signature that does not verify wipes nothing, however squarely it names
+    /// us: the wipe rides on the same check as every tombstone.
     #[test]
-    fn a_tombstone_against_this_very_device_is_refused() {
+    fn a_tombstone_against_this_very_device_is_obeyed_once_it_verifies() {
         let (ak, ak_pub) = account();
         let identity = identity();
         let mut s = in_account_without_a_session(&identity);
         let own = identity.node_id();
+        let sibling = crate::identity::DeviceIdentity::from_test_seed(9);
 
-        let changed = s.absorb(
+        // Not the account's signature: nothing happens, not even the report.
+        let forged = s.absorb(
             &ak_pub,
             &own,
             &crate::directory::Roster {
                 records: Vec::new(),
-                revoked: BTreeMap::from([(own.clone(), crate::account_key::revoke(&ak, &own))]),
+                revoked: BTreeMap::from([(own.clone(), "de".repeat(64))]),
             },
         );
-
-        assert!(changed.is_empty(), "{changed:?}");
+        assert!(forged.is_empty(), "{forged:?}");
+        assert!(!forged.struck_ourselves);
         assert!(s.revoked.is_empty(), "not stored either");
-        assert!(
-            s.devices.as_ref().expect("a directory").contains_key(&own),
-            "and we still know ourselves"
+
+        // The account's own word: reported for the caller to obey — and it
+        // eclipses the rest of the roster, tombstones included, because every
+        // remaining entry describes an account this device is out of.
+        let struck = s.absorb(
+            &ak_pub,
+            &own,
+            &crate::directory::Roster {
+                records: Vec::new(),
+                revoked: BTreeMap::from([
+                    (own.clone(), crate::account_key::revoke(&ak, &own)),
+                    (
+                        sibling.node_id(),
+                        crate::account_key::revoke(&ak, &sibling.node_id()),
+                    ),
+                ]),
+            },
         );
+        assert!(struck.struck_ourselves);
+        assert!(!struck.is_empty(), "being struck IS a change");
+        assert!(struck.barred.is_empty(), "{struck:?}");
+        assert!(s.revoked.is_empty(), "nothing else was taken in");
     }
 
     /// A device that never joined the account has nothing of its own to keep: the

@@ -1085,8 +1085,10 @@ fn settle(state: &Arc<AppState>, pairing_id: &str, method: &str, mut params: Val
     notify(state, method, params);
 }
 
-/// Ends the current pairing, whatever it is, and says why.
-fn fail_current(state: &Arc<AppState>, reason: &str) {
+/// Ends the current pairing, whatever it is, and says why. `pub(crate)` for one
+/// outside caller: a device leaving the account (`account_key::leave`), whose
+/// pairing — either end of it — has just lost its standing.
+pub(crate) fn fail_current(state: &Arc<AppState>, reason: &str) {
     let Some(p) = state.pairing.lock().expect("lock pairing").take() else {
         return;
     };
@@ -1664,6 +1666,18 @@ async fn accept_lan(state: &Arc<AppState>, payload: LanPayload) -> Result<Value,
     // Our own code, read on the machine that is displaying it.
     if payload.node_id == state.identity.node_id() {
         return Err(RpcErr::invalid_params("code"));
+    }
+    // A code shown by a device the account has struck off. A tombstone is
+    // permanent — the `node_id` it names never returns, and a device that reset
+    // itself would show a fresh one — so there is no pairing here to attempt:
+    // this device would refuse everything the other declared at the absorb
+    // anyway, after the humans had confirmed a number for nothing. Said as what
+    // it is (the account's own decision) rather than left to end as a pairing
+    // failure. The mirror case needs no check of ours: a struck-off DIALER is
+    // answered its tombstone by the displayer's data plane before the offer is
+    // even read (`dataplane::serve`).
+    if crate::dataplane::struck_off(state, &payload.node_id).is_some() {
+        return Err(RpcErr::app("DEVICE_REVOKED"));
     }
     let epoch = EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
     let mut channel = Channel::scanning(payload.psk);

@@ -256,8 +256,8 @@
 //! - An unknown device arrives keyed and labelled by its `node_id`, with
 //!   `relay_url`/`last_seen`/`status` null and `online: false`: known, not
 //!   reachable. A record describing THIS device is never taken in, whatever its
-//!   `seq`; a tombstone naming this device is refused and logged (leaving the
-//!   account is a gesture the Core does not have yet).
+//!   `seq`; a tombstone naming this device, once it verifies, is OBEYED — the
+//!   device leaves the account (building block 5 below).
 //! - The initiator OFFERS its roster as well as reading the answer, so learning
 //!   goes both ways in one round trip. A record it already holds is not echoed
 //!   back: the answer is the roster the responder held BEFORE absorbing.
@@ -304,6 +304,34 @@
 //!   `pairing.confirm` never answers `reauth_required` here (no OIDC to be fresh
 //!   with), and a declined or cancelled window tells the other device rather than
 //!   leaving it to time out. `expires_in` is 180 s, counted locally on both sides.
+//!
+//! Being struck off, heard and obeyed (serverless, building block 5 — `leave.rs`):
+//! - A tombstone naming THIS device, once its signature verifies under the account
+//!   key, is OBEYED: the device leaves the account. Everything that made it a
+//!   member goes — the trust root (`account-key.json`, memory included), the
+//!   account key and the refresh token in the keyring, `session.json`,
+//!   `directory.json`, `revoked.json`, and `device.key` itself — so the next
+//!   startup is a first startup, under a FRESH identity: the struck `node_id` is
+//!   barred for good, and only a new key can be attested again. The human's files
+//!   are not the account's: nothing else is touched. One that does NOT verify
+//!   wipes nothing, like any tombstone the account never signed.
+//! - What the components hear, in that order: `device.removed` for every device
+//!   served, `session.changed`, then `account.left { reason: "struck_off" }`
+//!   (topic `session`) — the one event that says it was the account's decision,
+//!   not a logout. A pairing in flight — either end — fails with `no_account`;
+//!   clipboard grants die as they do at a logout. Nothing else of the roster that
+//!   carried the tombstone is absorbed.
+//! - Delivery is the answer to a dial, not gossip: absorbing a tombstone is what
+//!   evicts the struck device from a sibling's directory, so the siblings refuse
+//!   the very streams that could have carried it — and stop dialling it. Instead,
+//!   the data plane answers the struck-off device's dial (ANY dial, a pairing
+//!   window open or not, no byte of it read) with a one-entry `dir_roster`
+//!   holding its own tombstone — which its own sync round reads through the same
+//!   absorb that obeys it. A mere stranger still gets silence: the answer exists
+//!   only for a `node_id` the account's signature names.
+//! - `pairing.accept` of a code shown by a struck-off `node_id` → `DEVICE_REVOKED`
+//!   before anything is dialled: the account's own decision, said as such, not a
+//!   pairing failure discovered after two humans compared a number for nothing.
 
 #![allow(dead_code)]
 
@@ -716,6 +744,25 @@ impl TestCore {
             switchboard.endpoint(node_id.clone(), None);
         switchboard.join_lan(&node_id);
         Self::spawn_in(dir, Some((node_id.clone(), key)), None, Some(transport)).await
+    }
+
+    /// `start_in_account_on`, but in a config directory the CALLER prepared — for
+    /// state that must pre-date the Core, like a tombstone against a device it
+    /// never held a record for (`seed_revocation`). The seeding writes everything
+    /// membership means and touches nothing else, so whatever the test put there
+    /// first is what the Core wakes up to.
+    pub async fn start_in_account_in(
+        dir: tempfile::TempDir,
+        code: &str,
+        switchboard: &MemorySwitchboard,
+    ) -> TestCore {
+        let key = DeviceKey::generate();
+        Self::seed_in_account(dir.path(), &key, code, &[]);
+        let node_id = key.node_id();
+        let transport: Arc<dyn universallink_core::PeerTransport> =
+            switchboard.endpoint(node_id.clone(), None);
+        switchboard.join_lan(&node_id);
+        Self::spawn_in(dir, Some((node_id, key)), None, Some(transport)).await
     }
 
     /// A Core that has joined NOTHING — no account, no server — on a shared
