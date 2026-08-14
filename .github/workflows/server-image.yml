@@ -23,6 +23,10 @@ name: Server image
 on:
   push:
     tags: ["v*"]
+    # TEMPORARY, removed before merge: a workflow not yet on the default
+    # branch cannot be workflow_dispatch-ed, so the pre-merge proof of the
+    # whole chain (an `edge` publish) rides the branch push instead.
+    branches: ["server-image"]
   workflow_dispatch:
     inputs:
       promote:
