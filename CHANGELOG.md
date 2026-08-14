@@ -45,6 +45,42 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   frame on the network, so the app asks exactly while it has a window in
   front or a transfer in flight — and stops listening the rest of the time,
   which is the part where a phone is in a pocket.
+- **An account can now exist with no server at all.** The first screen offers
+  a second door: *"Or use UniversalLink without a server"*. Taking it creates
+  the account right on the device, recovery code included, with no sign-in and
+  nothing leaving the machine. Membership is proven the same way it always
+  was: every device carries a record signed under the account key, so trust
+  works exactly as it does with a server, minus the server.
+- **Adding a device works without a server too, on the local network.** Any
+  device already on the account can vouch for a new one, session or not: the
+  same show-a-code gesture, a code of its own kind, and an introduction that
+  happens entirely between the two machines on the LAN. The phone's scanner
+  reads both kinds of code and tells them apart on its own.
+- **The devices carry the account's directory between themselves.** Two
+  attested devices exchange whom they know whenever they talk, so a device
+  learns of a sibling it has never met from a third one that has. Each device
+  signs what it says about itself (its name, its platform), which lets a
+  description travel through a middleman without trusting it, and only the
+  owner can publish a newer one.
+- **Removing a device no longer needs a directory to strike it from.** The
+  account key signs the withdrawal itself: a permanent tombstone that travels
+  device to device and outlives whatever a server still lists. The struck
+  device obeys its own tombstone: once it hears it, it erases the account from
+  itself, and its next startup is a first startup.
+- **One account, half on a server, half not.** Serverless is not a separate
+  mode: devices enrolled through a server and devices paired in the room form
+  a single account, and each half proves itself to the other the same way.
+  Where a server names a device, the device countersigns, so the name survives
+  the server's absence; the server's view is merged into the account's own,
+  never swapped in; logging out keeps what the account can prove by itself;
+  and revoking through the server also mints the account's own tombstone, so
+  the strike reaches devices that server never met.
+- **And the interface only offers what can succeed.** Gestures that need a
+  session say so instead of failing; a server gone unreachable takes away
+  exactly one gesture, *showing* a code (which needs it), while reading a code
+  from a device on this network keeps working, and the screen says which is
+  which; a device the account struck off explains itself in one clear
+  sentence.
 
 ### Fixed
 
