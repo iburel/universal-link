@@ -2,12 +2,12 @@
 // Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
 
 //! Harness for the supervisor's tests: a REAL in-process Core, REAL child
-//! processes (the `ul-fake-component` binary), and an on-disk log that the
+//! processes (the `1device-fake-component` binary), and an on-disk log that the
 //! fixture fills and the test reads back.
 //!
 //! Contract frozen by this suite (see also the header of `supervisor.rs`):
 //!
-//! - The Core's path arrives via `UNIVERSALLINK_IPC_PATH`, the spawn token via
+//! - The Core's path arrives via `ONEDEVICE_IPC_PATH`, the spawn token via
 //!   the FIRST LINE of standard input. Never via `argv` nor the environment:
 //!   the one is readable by all, the other is inherited by all descendants.
 //! - Standard input stays open; its EOF is the graceful-shutdown request. It
@@ -23,8 +23,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use universallink_core::{Config, CoreHandle, FileSecretStore, PlainConnector};
-use universallink_daemon::supervisor::{ChildSpec, Policy, Supervisor};
+use onedevice_core::{Config, CoreHandle, FileSecretStore, PlainConnector};
+use onedevice_daemon::supervisor::{ChildSpec, Policy, Supervisor};
 
 /// All of this suite's waits are bounded ACTIVE waits: a test never sleeps
 /// "long enough", it loops until the condition holds, or gives up.
@@ -32,7 +32,7 @@ pub const DEADLINE: Duration = Duration::from_secs(10);
 
 /// The fixture binary, built by cargo alongside the suite.
 pub fn fixture() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_ul-fake-component"))
+    PathBuf::from(env!("CARGO_BIN_EXE_1device-fake-component"))
 }
 
 pub struct TestDaemon {
@@ -56,12 +56,12 @@ impl TestDaemon {
             connector: Arc::new(PlainConnector),
             // These tests exercise the supervisor, not the data plane: an
             // isolated in-memory transport is enough (nobody uses it).
-            transport: universallink_test_support::memory_transport::MemorySwitchboard::new()
+            transport: onedevice_test_support::memory_transport::MemorySwitchboard::new()
                 .endpoint("test-daemon", None),
             receive_dir: config_dir.path().join("received"),
             reconnect_base_delay: Duration::from_millis(50),
         };
-        let core = universallink_core::spawn(config)
+        let core = onedevice_core::spawn(config)
             .await
             .expect("starting the Core");
         TestDaemon {
@@ -148,7 +148,7 @@ impl TestDaemon {
 }
 
 /// The fixture, as the supervisor will launch it. Its settings go through the
-/// arguments: the supervisor only sets `UNIVERSALLINK_IPC_PATH`, and two
+/// arguments: the supervisor only sets `ONEDEVICE_IPC_PATH`, and two
 /// parallel tests cannot have two environments.
 pub fn spec(daemon: &TestDaemon, mode: &str, extra: &[(&str, &str)]) -> ChildSpec {
     let role = "tray";
@@ -181,7 +181,7 @@ fn ipc_path_for(_dir: &Path) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     PathBuf::from(format!(
-        r"\\.\pipe\universallink-daemon-test-{}-{}",
+        r"\\.\pipe\onedevice-daemon-test-{}-{}",
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ))

@@ -59,11 +59,7 @@ async fn topic_without_scope_never_connects() {
     // Subscribing to the devices topic without the scope: the cycle's
     // subscribe fails with SCOPE_DENIED — never Connected (faulty config,
     // fail-closed).
-    let (_client, mut events) = universallink_ipc_client::spawn(client_config(
-        &core,
-        "gui",
-        &["session.read"],
-        &["devices"],
-    ));
+    let (_client, mut events) =
+        onedevice_ipc_client::spawn(client_config(&core, "gui", &["session.read"], &["devices"]));
     assert_no_event(&mut events).await;
 }

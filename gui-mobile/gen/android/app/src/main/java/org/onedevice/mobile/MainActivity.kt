@@ -1,4 +1,4 @@
-package org.universallink.mobile
+package org.onedevice.mobile
 
 import android.Manifest
 import android.content.Intent

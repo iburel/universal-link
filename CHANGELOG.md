@@ -9,7 +9,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - **Machines on the same network now find each other directly.** Each desktop
-  announces itself over mDNS (as `universallink`, UDP 5353) and resolves its
+  announces itself over mDNS (as `1device`, UDP 5353) and resolves its
   siblings the same way — and being visible on the local network now *counts as
   reachable*: sends and the shared clipboard take the local route even for a
   machine that has no relay at all, and no longer depend on the relay to get
@@ -46,7 +46,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   front or a transfer in flight — and stops listening the rest of the time,
   which is the part where a phone is in a pocket.
 - **An account can now exist with no server at all.** The first screen offers
-  a second door: *"Or use UniversalLink without a server"*. Taking it creates
+  a second door: *"Or use 1Device without a server"*. Taking it creates
   the account right on the device, recovery code included, with no sign-in and
   nothing leaving the machine. Membership is proven the same way it always
   was: every device carries a record signed under the account key, so trust
@@ -82,6 +82,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   which; a device the account struck off explains itself in one clear
   sentence.
 
+### Changed
+
+- **The project is now called 1Device.** One name, one identity, everywhere:
+  the app and its installers, the binaries (`1device-core`, `1device-server`),
+  the config and state directories, the environment variables (`ONEDEVICE_*`),
+  the server's descriptor path (`/.well-known/1device.json`), the pairing-code
+  prefixes (`1D1:`, `1D2:`) and every wire identifier. This is a clean identity
+  break, said plainly: a device on this release and a device on an earlier one
+  cannot talk to each other, and no code path bridges them. What to do about
+  it: update every machine, reinstall the app on Android (its application id
+  changed), redeploy the server (new binary name, new variables), then enroll
+  the devices again; macOS asks once more for the Local Network permission.
+  Earlier releases and the git history keep the name they shipped under; this
+  page describes those same releases under the product's one name.
+
 ### Fixed
 
 - **Android: a repeating log line no longer buries the log.** Android's log is
@@ -107,11 +122,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The tray shipped as a plain executable inside the app bundle, and to macOS a
   process started from there *is* the application: it took the app's identity, so
   from the moment the background service started the tray, the system considered
-  UniversalLink to be already running and every launch just brought the tray to
+  1Device to be already running and every launch just brought the tray to
   the front. It now ships as a helper application of its own inside the bundle,
   which is how the same problem is solved in Chrome and in every Electron app.
   Two things follow: the icon opens the window again, and the second
-  "UniversalLink" that sat in the Dock — the tray, wearing the app's name — is
+  "1Device" that sat in the Dock — the tray, wearing the app's name — is
   gone, as a menu-bar item should be. It also stops taking the focus from
   whatever you are doing when it starts at login. Windows and Linux were never
   affected.
@@ -151,10 +166,10 @@ for the next.
 - **Setting up a device takes one field: the server's address.** The issuer and
   the OpenID Connect client describe the *deployment*, not the user — identical on
   every device of one server, yet retyped on each machine and each phone. The
-  server now publishes them at `GET /.well-known/universallink.json`, the Core
+  server now publishes them at `GET /.well-known/1device.json`, the Core
   reads them from an address in any shape (a bare host, or the `wss://…/ws` you
   paste from another device), and the setup screen writes them for you. Set the
-  secret on the server with `UNIVERSALLINK_OIDC_CLIENT_SECRET` — Google's clients
+  secret on the server with `ONEDEVICE_OIDC_CLIENT_SECRET` — Google's clients
   need one, other IdPs may not — and it is served with the rest deliberately: for
   an installed application it identifies the app rather than authenticating it,
   and it already shipped inside every client's configuration.
@@ -201,7 +216,7 @@ for the next.
 - **Server** — both features above need the deployment updated too. It gained the
   `pairing.*` methods that bring the two devices together (a server still on 0.5.0
   does not know them, so the dialog fails against it) and the descriptor at
-  `/.well-known/universallink.json` that makes the one-field setup possible. What
+  `/.well-known/1device.json` that makes the one-field setup possible. What
   the two devices exchange stays sealed to the channel their code establishes: the
   server relays that bundle without being able to read it, and so never learns the
   account key. It does learn that two devices paired, and when — as it already
@@ -259,7 +274,7 @@ installers, riding the device list and `files.send` that were already there.
   appears only for a device that is online, attested and reachable, and they all
   disappear while the Core has no server connection — the menu never offers a
   destination it cannot reach. Per desktop:
-  - **Windows** — a `UniversalLink ▸ PC` submenu in the classic shortcut menu, for
+  - **Windows** — a `1Device ▸ PC` submenu in the classic shortcut menu, for
     a file selection and for a folder, plus one entry per device under "Send to".
   - **Linux** — an entry in Dolphin's menu (KDE ServiceMenu) and a submenu of
     Nautilus scripts.
@@ -430,7 +445,7 @@ binary.
 
 - **Nothing is baked into the released binaries** — no server URL, OIDC client,
   or secret. The deployment is entered on the first-run screen and read at
-  runtime from `config.json` / `UNIVERSALLINK_*`. `session.status` reports a
+  runtime from `config.json` / `ONEDEVICE_*`. `session.status` reports a
   `configured` flag so the app tells "not set up yet" apart from "server
   unreachable"; an invalid configuration is rejected with `INVALID_CONFIG`.
 - Updated dependencies (`sha2`, `tokio-tungstenite`, and CI actions).

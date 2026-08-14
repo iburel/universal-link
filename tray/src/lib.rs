@@ -4,7 +4,7 @@
 //! The system-tray component: the async brain and its testable pieces.
 //!
 //! A supervised component must (see `daemon/src/supervisor.rs`, "Contract of a
-//! supervised component"): find the Core at `UNIVERSALLINK_IPC_PATH`, read its
+//! supervised component"): find the Core at `ONEDEVICE_IPC_PATH`, read its
 //! spawn token from the first line of standard input, keep that standard input
 //! open (its EOF means "stop"), and **exit if it loses its IPC connection** —
 //! the spawn token is single-use, so a reconnection would fail; exiting lets
@@ -16,9 +16,9 @@
 
 use std::future::Future;
 
+use onedevice_ipc_client::{Client, Event};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use universallink_ipc_client::{Client, Event};
 
 /// Why the brain's loop ended — mapped by `main` to a process exit code.
 #[derive(Debug, PartialEq, Eq)]
@@ -40,7 +40,7 @@ pub enum Outcome {
 /// A command from the tray UI (a menu click) to the async brain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiCommand {
-    /// "Open UniversalLink" — bring up the GUI (wired in a later block).
+    /// "Open 1Device" — bring up the GUI (wired in a later block).
     Open,
     /// "Quit" — stop the whole Core (its teardown then closes our stdin).
     Quit,
@@ -60,11 +60,11 @@ impl TrayStatus {
     /// Tooltip shown on hover.
     pub fn tooltip(self) -> &'static str {
         match self {
-            TrayStatus::Connecting => "UniversalLink — connecting…",
-            TrayStatus::NotConfigured => "UniversalLink — not set up",
-            TrayStatus::SignedOut => "UniversalLink — signed out",
-            TrayStatus::Offline => "UniversalLink — offline",
-            TrayStatus::Online => "UniversalLink — connected",
+            TrayStatus::Connecting => "1Device — connecting…",
+            TrayStatus::NotConfigured => "1Device — not set up",
+            TrayStatus::SignedOut => "1Device — signed out",
+            TrayStatus::Offline => "1Device — offline",
+            TrayStatus::Online => "1Device — connected",
         }
     }
 
@@ -172,8 +172,8 @@ pub async fn run(
 /// the Core's durable copy and cannot otherwise find it). Best-effort and
 /// fire-and-forget; a missing or stale record just means nothing opens.
 fn open_gui() {
-    let Some(endpoint) = universallink_paths::production_endpoint() else {
-        eprintln!("[universallink-tray] cannot resolve the config directory");
+    let Some(endpoint) = onedevice_paths::production_endpoint() else {
+        eprintln!("[1device-tray] cannot resolve the config directory");
         return;
     };
     let record = endpoint.gui_launch_path();
@@ -181,7 +181,7 @@ fn open_gui() {
         Ok(target) if !target.trim().is_empty() => target.trim().to_string(),
         _ => {
             eprintln!(
-                "[universallink-tray] no recorded GUI launch path ({})",
+                "[1device-tray] no recorded GUI launch path ({})",
                 record.display()
             );
             return;
@@ -190,9 +190,9 @@ fn open_gui() {
     // macOS: `open` activates an existing instance rather than duplicating it —
     // which is what we want, and which only holds because this process is not
     // itself registered as that application. It ships in a bundle of its own
-    // (`Contents/Frameworks/UniversalLinkTray.app`, see
+    // (`Contents/Frameworks/1DeviceTray.app`, see
     // `daemon::supervisor::helper_bundle_program`); a tray running from
-    // `Contents/MacOS` *is* `org.universallink.gui` to Launch Services, and this
+    // `Contents/MacOS` *is* `org.onedevice.gui` to Launch Services, and this
     // `open` would then activate us and raise no window at all.
     //
     // Elsewhere: run the recorded target directly. Detached from our standard
@@ -206,7 +206,7 @@ fn open_gui() {
     };
     command.stdin(std::process::Stdio::null());
     if let Err(e) = command.spawn() {
-        eprintln!("[universallink-tray] cannot launch the GUI ({target}): {e}");
+        eprintln!("[1device-tray] cannot launch the GUI ({target}): {e}");
     }
 }
 
@@ -295,7 +295,7 @@ mod tests {
             TrayStatus::Offline,
             TrayStatus::Online,
         ] {
-            assert!(status.tooltip().contains("UniversalLink"));
+            assert!(status.tooltip().contains("1Device"));
         }
     }
 }

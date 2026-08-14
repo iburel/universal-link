@@ -13,9 +13,9 @@ use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::sync::{Arc, Mutex};
 
+use onedevice_core::{HomeRelay, Incoming, IoStream, Opening, PeerAddr, PeerTransport};
 use tokio::io::DuplexStream;
 use tokio::sync::mpsc;
-use universallink_core::{HomeRelay, Incoming, IoStream, Opening, PeerAddr, PeerTransport};
 
 /// Buffer of each in-memory pipe. Generous: the tests exchange small
 /// messages, never enough to fill it (otherwise a `write_all` before the
@@ -233,7 +233,7 @@ impl PeerTransport for MemoryTransport {
         self.lan_gen.subscribe()
     }
 
-    fn listen(&self) -> universallink_core::Listening<'_> {
+    fn listen(&self) -> onedevice_core::Listening<'_> {
         // Nothing to bind: this transport has been reachable since it was
         // registered. Recorded, though — see `Route::listened`.
         self.listened

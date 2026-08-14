@@ -71,7 +71,7 @@ use crate::state::{AppState, ServerCmd};
 /// needs it outside the Core: a camera scanner has to know which QR code in its
 /// view is a pairing code, and that question has exactly one right answer per
 /// version of this format.
-pub const PAYLOAD_TAG: &str = "UL1";
+pub const PAYLOAD_TAG: &str = "1D1";
 
 /// Bytes of pre-shared secret in the payload. 128 bits: unguessable, and short
 /// enough to keep the QR code small.
@@ -79,10 +79,10 @@ const PSK_LEN: usize = 16;
 
 /// Domain separation for the channel key. Versioned like the rest of the
 /// project's derivations (`account_key`).
-const CHANNEL_DOMAIN: &[u8] = b"ul-pairing-channel-v1";
+const CHANNEL_DOMAIN: &[u8] = b"1device-pairing-channel-v1";
 
 /// Domain separation for the confirmation number (see [`verification`]).
-const SAS_DOMAIN: &[u8] = b"ul-pairing-sas-v1";
+const SAS_DOMAIN: &[u8] = b"1device-pairing-sas-v1";
 
 /// Depth of the request queue toward a pairing's own connection. Tiny: the
 /// exchange is a handful of sequential calls.
@@ -280,7 +280,7 @@ struct Payload {
 }
 
 impl Payload {
-    /// `UL1:<psk>:<public key>:<pairing_id>` — the two fixed-length fields
+    /// `1D1:<psk>:<public key>:<pairing_id>` — the two fixed-length fields
     /// first, base64url, and the id LAST so that whatever the server puts in it
     /// (a separator included) survives the split untouched.
     fn encode(&self) -> String {
@@ -488,7 +488,7 @@ pub(crate) async fn offer(state: &Arc<AppState>) -> Result<Value, RpcErr> {
 /// claiming it about someone else's session.
 pub(crate) async fn accept(state: &Arc<AppState>, code: &str) -> Result<Value, RpcErr> {
     // The code's own version tag decides which scheme this is — that is what a
-    // version tag is for, and it is why a LAN code is `UL2` and not a `UL1` with a
+    // version tag is for, and it is why a LAN code is `1D2` and not a `1D1` with a
     // field missing.
     if let Some(payload) = LanPayload::parse(code) {
         return accept_lan(state, payload).await;
@@ -1290,20 +1290,20 @@ async fn request(
 // swapping rosters, which is the whole point.
 
 /// Version tag of the payload a code carries when there is no server to be the
-/// rendezvous. A version of its own rather than a `UL1` with a field standing for
+/// rendezvous. A version of its own rather than a `1D1` with a field standing for
 /// something else: the two schemes derive different keys, and a code that
 /// half-parses is worse than one that does not parse at all.
-pub const LAN_PAYLOAD_TAG: &str = "UL2";
+pub const LAN_PAYLOAD_TAG: &str = "1D2";
 
 /// Domain separation for the channel key of a pairing with no server in it.
-const LAN_CHANNEL_DOMAIN: &[u8] = b"ul-lanpair-channel-v1";
+const LAN_CHANNEL_DOMAIN: &[u8] = b"1device-lanpair-channel-v1";
 
 /// Domain separation for the dialer's proof that it read the code off a screen.
-const LAN_PROOF_DOMAIN: &[u8] = b"ul-lanpair-proof-v1";
+const LAN_PROOF_DOMAIN: &[u8] = b"1device-lanpair-proof-v1";
 
 /// Domain separation for the mark that tells two devices whether they are in the
 /// same account without either of them naming it.
-const LAN_ACCOUNT_DOMAIN: &[u8] = b"ul-lanpair-account-v1";
+const LAN_ACCOUNT_DOMAIN: &[u8] = b"1device-lanpair-account-v1";
 
 /// Frame types. `lan_pair` is the one a device outside the directory may send.
 const LAN_OFFER: &str = "lan_pair";
@@ -1343,7 +1343,7 @@ struct LanPayload {
 }
 
 impl LanPayload {
-    /// `UL2:<psk>:<public key>:<node_id>` — the shape of a `UL1` code with the
+    /// `1D2:<psk>:<public key>:<node_id>` — the shape of a `1D1` code with the
     /// device to dial where the session id was, and the `node_id` LAST for the
     /// same reason the id was: whatever is in it survives the split untouched.
     fn encode(&self) -> String {
@@ -1649,7 +1649,7 @@ async fn offer_lan(state: &Arc<AppState>) -> Result<Value, RpcErr> {
     }))
 }
 
-/// `pairing.accept` of a `UL2` code: dial the device that displayed it, prove we
+/// `pairing.accept` of a `1D2` code: dial the device that displayed it, prove we
 /// read its screen, and settle who is joining. Returns as soon as that much is
 /// done — what follows waits on a human, and waits in a task of its own.
 async fn accept_lan(state: &Arc<AppState>, payload: LanPayload) -> Result<Value, RpcErr> {
@@ -1657,10 +1657,10 @@ async fn accept_lan(state: &Arc<AppState>, payload: LanPayload) -> Result<Value,
     // handing the account key over would have put the other device in an account
     // half of which the server had never heard. The continuum made the two halves
     // one — records that sign themselves travel by dirsync whichever half minted
-    // them — so this device may scan a `UL2` code and sponsor over the local
+    // them — so this device may scan a `1D2` code and sponsor over the local
     // network. What the joiner joins is the ACCOUNT, not the deployment: it is not
     // enrolled on the server, which simply never lists it. Enrolling it there too
-    // is what the `UL1` code this device would itself display is for.
+    // is what the `1D1` code this device would itself display is for.
     //
     // Our own code, read on the machine that is displaying it.
     if payload.node_id == state.identity.node_id() {
@@ -2388,7 +2388,7 @@ mod tests {
             "".to_string(),
             "hello".to_string(),
             // Another scheme's payload, or a future version of ours.
-            sound.replacen(PAYLOAD_TAG, "UL2", 1),
+            sound.replacen(PAYLOAD_TAG, "1D2", 1),
             sound.replacen(PAYLOAD_TAG, "ul1", 1),
             // A field short, a field too many is fine (absorbed by the id), but
             // an empty id is not a session.
@@ -2508,8 +2508,8 @@ mod tests {
     // read as an intruder.
     #[test]
     fn the_number_is_derived_the_way_it_always_was() {
-        assert_eq!(verification(&[7u8; 32]), "150 048");
-        assert_eq!(verification(&[0u8; 32]), "695 908");
+        assert_eq!(verification(&[7u8; 32]), "777 373");
+        assert_eq!(verification(&[0u8; 32]), "075 824");
     }
 
     #[test]

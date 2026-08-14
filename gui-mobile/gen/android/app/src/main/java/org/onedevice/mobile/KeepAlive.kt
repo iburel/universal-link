@@ -1,4 +1,4 @@
-package org.universallink.mobile
+package org.onedevice.mobile
 
 import android.content.Context
 import android.util.Log
@@ -26,7 +26,7 @@ import android.util.Log
  * Recents list. OxygenOS answers that gesture by tearing the service down and
  * killing the process in the same millisecond
  * (`UserAwareMgr: process killed … flags='bg'`), foreground service or not — a
- * 300 MiB transfer died 31 s in. The guard in [UlForegroundService.onTaskRemoved]
+ * 300 MiB transfer died 31 s in. The guard in [OneDeviceForegroundService.onTaskRemoved]
  * is the right thing on a platform that honours the AOSP contract, and costs
  * nothing here; on this one, HOME is what a transfer survives, not a swipe.
  */
@@ -60,7 +60,7 @@ object KeepAlive {
         // The Tauri runtime's `Rust` object loads this library too, but only when
         // its class is initialized; loading it again is a no-op and keeps this
         // seam independent of that ordering.
-        System.loadLibrary("universallink_gui_mobile")
+        System.loadLibrary("onedevice_gui_mobile")
     }
 
     /** Hands this class to the Rust side. See `keepalive.rs`. */
@@ -93,9 +93,9 @@ object KeepAlive {
         LanMulticast.work(context, kind != NONE)
         try {
             if (kind == NONE) {
-                UlForegroundService.stop(context)
+                OneDeviceForegroundService.stop(context)
             } else {
-                UlForegroundService.start(context, kind)
+                OneDeviceForegroundService.start(context, kind)
             }
         } catch (t: Throwable) {
             // Android 12+ refuses a foreground service started from the

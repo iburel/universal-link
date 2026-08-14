@@ -10,15 +10,15 @@
 //! **refuse to start**. And all errors are reported at once — not one per
 //! restart.
 //!
-//! Required: `UNIVERSALLINK_SERVER_BIND`, `UNIVERSALLINK_OIDC_ISSUER`,
-//! `UNIVERSALLINK_OIDC_CLIENT_ID`. The other settings have defaults aligned with
+//! Required: `ONEDEVICE_SERVER_BIND`, `ONEDEVICE_OIDC_ISSUER`,
+//! `ONEDEVICE_OIDC_CLIENT_ID`. The other settings have defaults aligned with
 //! the guidance in `doc/server-api.md`.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use universallink_server::{Config, OidcConfig};
+use onedevice_server::{Config, OidcConfig};
 
 const DEFAULT_HEARTBEAT_SECS: u64 = 30;
 const DEFAULT_HEARTBEAT_MAX_MISSED: u32 = 2;
@@ -38,62 +38,62 @@ pub fn load() -> Result<Config, String> {
 fn load_from(env: &dyn Fn(&str) -> Option<String>) -> Result<Config, String> {
     let mut errors: Vec<String> = Vec::new();
 
-    let bind_addr = required(env, "UNIVERSALLINK_SERVER_BIND", &mut errors)
-        .and_then(|v| parse::<SocketAddr>("UNIVERSALLINK_SERVER_BIND", &v, &mut errors));
+    let bind_addr = required(env, "ONEDEVICE_SERVER_BIND", &mut errors)
+        .and_then(|v| parse::<SocketAddr>("ONEDEVICE_SERVER_BIND", &v, &mut errors));
 
     // The scheme is checked here rather than discovered on the first OIDC
     // connection: otherwise a typo would give an opaque authentication failure.
-    let issuer_url = required(env, "UNIVERSALLINK_OIDC_ISSUER", &mut errors).filter(|v| {
+    let issuer_url = required(env, "ONEDEVICE_OIDC_ISSUER", &mut errors).filter(|v| {
         if v.starts_with("http://") || v.starts_with("https://") {
             true
         } else {
             errors.push(format!(
-                "UNIVERSALLINK_OIDC_ISSUER must start with http:// or https:// : {v}"
+                "ONEDEVICE_OIDC_ISSUER must start with http:// or https:// : {v}"
             ));
             false
         }
     });
 
-    let client_id = required(env, "UNIVERSALLINK_OIDC_CLIENT_ID", &mut errors);
+    let client_id = required(env, "ONEDEVICE_OIDC_CLIENT_ID", &mut errors);
 
     // Optional: the server never uses it, it advertises it in the deployment
     // descriptor so the clients do not have to be told by hand. An IdP that
     // conforms to RFC 7636 needs none; Google asks for one even under PKCE.
-    let client_secret = non_empty(env, "UNIVERSALLINK_OIDC_CLIENT_SECRET");
+    let client_secret = non_empty(env, "ONEDEVICE_OIDC_CLIENT_SECRET");
 
     let heartbeat_interval = optional_secs(
         env,
-        "UNIVERSALLINK_HEARTBEAT_SECS",
+        "ONEDEVICE_HEARTBEAT_SECS",
         DEFAULT_HEARTBEAT_SECS,
         &mut errors,
     );
     let heartbeat_max_missed = optional_u32(
         env,
-        "UNIVERSALLINK_HEARTBEAT_MAX_MISSED",
+        "ONEDEVICE_HEARTBEAT_MAX_MISSED",
         DEFAULT_HEARTBEAT_MAX_MISSED,
         &mut errors,
     );
     let nonce_ttl = optional_secs(
         env,
-        "UNIVERSALLINK_NONCE_TTL_SECS",
+        "ONEDEVICE_NONCE_TTL_SECS",
         DEFAULT_NONCE_TTL_SECS,
         &mut errors,
     );
     let pairing_ttl = optional_secs(
         env,
-        "UNIVERSALLINK_PAIRING_TTL_SECS",
+        "ONEDEVICE_PAIRING_TTL_SECS",
         DEFAULT_PAIRING_TTL_SECS,
         &mut errors,
     );
     let max_fresh_token_age = optional_secs(
         env,
-        "UNIVERSALLINK_FRESH_TOKEN_MAX_AGE_SECS",
+        "ONEDEVICE_FRESH_TOKEN_MAX_AGE_SECS",
         DEFAULT_FRESH_TOKEN_MAX_AGE_SECS,
         &mut errors,
     );
     let jwks_refresh_min_interval = optional_secs(
         env,
-        "UNIVERSALLINK_JWKS_REFRESH_MIN_SECS",
+        "ONEDEVICE_JWKS_REFRESH_MIN_SECS",
         DEFAULT_JWKS_REFRESH_MIN_SECS,
         &mut errors,
     );
@@ -182,7 +182,7 @@ fn optional_rate_limit(
     env: &dyn Fn(&str) -> Option<String>,
     errors: &mut Vec<String>,
 ) -> Option<Option<u32>> {
-    const KEY: &str = "UNIVERSALLINK_MAX_REQUESTS_PER_MINUTE";
+    const KEY: &str = "ONEDEVICE_MAX_REQUESTS_PER_MINUTE";
     match non_empty(env, KEY) {
         None => Some(Some(DEFAULT_MAX_REQUESTS_PER_MINUTE)),
         Some(raw) => match parse::<u32>(KEY, &raw, errors) {
@@ -200,19 +200,19 @@ fn non_empty(env: &dyn Fn(&str) -> Option<String>, key: &str) -> Option<String> 
         .filter(|v| !v.is_empty())
 }
 
-/// Path of the persisted directory file (`UNIVERSALLINK_SERVER_STATE`).
-/// Optional: defaults to `universallink-directory.json` in the current folder.
+/// Path of the persisted directory file (`ONEDEVICE_SERVER_STATE`).
+/// Optional: defaults to `1device-directory.json` in the current folder.
 /// On a deployment, point it at a volume
-/// (`UNIVERSALLINK_SERVER_STATE=/data/directory.json`). Any path is valid — so
+/// (`ONEDEVICE_SERVER_STATE=/data/directory.json`). Any path is valid — so
 /// never a configuration error.
 pub fn state_path() -> PathBuf {
     state_path_from(&|key| std::env::var(key).ok())
 }
 
 fn state_path_from(env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
-    non_empty(env, "UNIVERSALLINK_SERVER_STATE")
+    non_empty(env, "ONEDEVICE_SERVER_STATE")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("universallink-directory.json"))
+        .unwrap_or_else(|| PathBuf::from("1device-directory.json"))
 }
 
 #[cfg(test)]
@@ -228,12 +228,9 @@ mod tests {
     }
 
     const REQUIRED: &[(&str, &str)] = &[
-        ("UNIVERSALLINK_SERVER_BIND", "0.0.0.0:8080"),
-        ("UNIVERSALLINK_OIDC_ISSUER", "https://accounts.google.com"),
-        (
-            "UNIVERSALLINK_OIDC_CLIENT_ID",
-            "abc.apps.googleusercontent.com",
-        ),
+        ("ONEDEVICE_SERVER_BIND", "0.0.0.0:8080"),
+        ("ONEDEVICE_OIDC_ISSUER", "https://accounts.google.com"),
+        ("ONEDEVICE_OIDC_CLIENT_ID", "abc.apps.googleusercontent.com"),
     ];
 
     #[test]
@@ -259,31 +256,31 @@ mod tests {
     fn all_missing_required_are_reported_together() {
         // All errors at once: we don't want to discover them one per restart.
         let err = load_from(&env_of(&[])).expect_err("must fail");
-        assert!(err.contains("UNIVERSALLINK_SERVER_BIND"), "{err}");
-        assert!(err.contains("UNIVERSALLINK_OIDC_ISSUER"), "{err}");
-        assert!(err.contains("UNIVERSALLINK_OIDC_CLIENT_ID"), "{err}");
+        assert!(err.contains("ONEDEVICE_SERVER_BIND"), "{err}");
+        assert!(err.contains("ONEDEVICE_OIDC_ISSUER"), "{err}");
+        assert!(err.contains("ONEDEVICE_OIDC_CLIENT_ID"), "{err}");
     }
 
     #[test]
     fn an_empty_variable_counts_as_missing() {
         let mut vars = REQUIRED.to_vec();
-        vars[0] = ("UNIVERSALLINK_SERVER_BIND", "   ");
+        vars[0] = ("ONEDEVICE_SERVER_BIND", "   ");
         let err = load_from(&env_of(&vars)).expect_err("must fail");
-        assert!(err.contains("UNIVERSALLINK_SERVER_BIND"), "{err}");
+        assert!(err.contains("ONEDEVICE_SERVER_BIND"), "{err}");
     }
 
     #[test]
     fn a_bad_bind_address_is_refused() {
         let mut vars = REQUIRED.to_vec();
-        vars[0] = ("UNIVERSALLINK_SERVER_BIND", "not-an-address");
+        vars[0] = ("ONEDEVICE_SERVER_BIND", "not-an-address");
         let err = load_from(&env_of(&vars)).expect_err("must fail");
-        assert!(err.contains("UNIVERSALLINK_SERVER_BIND"), "{err}");
+        assert!(err.contains("ONEDEVICE_SERVER_BIND"), "{err}");
     }
 
     #[test]
     fn the_issuer_scheme_is_checked() {
         let mut vars = REQUIRED.to_vec();
-        vars[1] = ("UNIVERSALLINK_OIDC_ISSUER", "accounts.google.com");
+        vars[1] = ("ONEDEVICE_OIDC_ISSUER", "accounts.google.com");
         let err = load_from(&env_of(&vars)).expect_err("must fail");
         assert!(err.contains("http"), "{err}");
     }
@@ -291,13 +288,13 @@ mod tests {
     #[test]
     fn tuning_knobs_can_be_overridden() {
         let mut vars = REQUIRED.to_vec();
-        vars.push(("UNIVERSALLINK_HEARTBEAT_SECS", "10"));
-        vars.push(("UNIVERSALLINK_HEARTBEAT_MAX_MISSED", "5"));
-        vars.push(("UNIVERSALLINK_NONCE_TTL_SECS", "15"));
-        vars.push(("UNIVERSALLINK_PAIRING_TTL_SECS", "300"));
-        vars.push(("UNIVERSALLINK_FRESH_TOKEN_MAX_AGE_SECS", "600"));
-        vars.push(("UNIVERSALLINK_JWKS_REFRESH_MIN_SECS", "90"));
-        vars.push(("UNIVERSALLINK_MAX_REQUESTS_PER_MINUTE", "300"));
+        vars.push(("ONEDEVICE_HEARTBEAT_SECS", "10"));
+        vars.push(("ONEDEVICE_HEARTBEAT_MAX_MISSED", "5"));
+        vars.push(("ONEDEVICE_NONCE_TTL_SECS", "15"));
+        vars.push(("ONEDEVICE_PAIRING_TTL_SECS", "300"));
+        vars.push(("ONEDEVICE_FRESH_TOKEN_MAX_AGE_SECS", "600"));
+        vars.push(("ONEDEVICE_JWKS_REFRESH_MIN_SECS", "90"));
+        vars.push(("ONEDEVICE_MAX_REQUESTS_PER_MINUTE", "300"));
         let config = load_from(&env_of(&vars)).expect("valid config");
         assert_eq!(config.heartbeat_interval, Duration::from_secs(10));
         assert_eq!(config.heartbeat_max_missed, 5);
@@ -316,7 +313,7 @@ mod tests {
     #[test]
     fn the_oidc_client_secret_is_optional() {
         let mut vars = REQUIRED.to_vec();
-        vars.push(("UNIVERSALLINK_OIDC_CLIENT_SECRET", "GOCSPX-secret"));
+        vars.push(("ONEDEVICE_OIDC_CLIENT_SECRET", "GOCSPX-secret"));
         let config = load_from(&env_of(&vars)).expect("valid config");
         assert_eq!(config.oidc.client_secret.as_deref(), Some("GOCSPX-secret"));
 
@@ -324,7 +321,7 @@ mod tests {
         // NOT as an empty secret, which would be sent at the token exchange and
         // rejected by the IdP.
         let mut blank = REQUIRED.to_vec();
-        blank.push(("UNIVERSALLINK_OIDC_CLIENT_SECRET", "  "));
+        blank.push(("ONEDEVICE_OIDC_CLIENT_SECRET", "  "));
         let config = load_from(&env_of(&blank)).expect("valid config");
         assert_eq!(config.oidc.client_secret, None);
     }
@@ -332,7 +329,7 @@ mod tests {
     #[test]
     fn a_zero_rate_limit_means_unlimited() {
         let mut vars = REQUIRED.to_vec();
-        vars.push(("UNIVERSALLINK_MAX_REQUESTS_PER_MINUTE", "0"));
+        vars.push(("ONEDEVICE_MAX_REQUESTS_PER_MINUTE", "0"));
         let config = load_from(&env_of(&vars)).expect("valid config");
         assert_eq!(config.max_requests_per_minute, None);
     }
@@ -340,19 +337,19 @@ mod tests {
     #[test]
     fn a_bad_numeric_is_refused() {
         let mut vars = REQUIRED.to_vec();
-        vars.push(("UNIVERSALLINK_NONCE_TTL_SECS", "many"));
+        vars.push(("ONEDEVICE_NONCE_TTL_SECS", "many"));
         let err = load_from(&env_of(&vars)).expect_err("must fail");
-        assert!(err.contains("UNIVERSALLINK_NONCE_TTL_SECS"), "{err}");
+        assert!(err.contains("ONEDEVICE_NONCE_TTL_SECS"), "{err}");
     }
 
     #[test]
     fn the_state_path_defaults_and_can_be_overridden() {
         assert_eq!(
             state_path_from(&env_of(&[])),
-            PathBuf::from("universallink-directory.json")
+            PathBuf::from("1device-directory.json")
         );
         assert_eq!(
-            state_path_from(&env_of(&[("UNIVERSALLINK_SERVER_STATE", "/data/a.json")])),
+            state_path_from(&env_of(&[("ONEDEVICE_SERVER_STATE", "/data/a.json")])),
             PathBuf::from("/data/a.json")
         );
     }

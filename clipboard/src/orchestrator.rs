@@ -38,11 +38,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::{Value, json};
-use tokio::sync::{broadcast, mpsc};
-use universallink_ipc_client::{
+use onedevice_ipc_client::{
     ChannelError, Client, ConsumerChannel, Event, ProviderChannel, RequestError, RequestId,
 };
+use serde_json::{Value, json};
+use tokio::sync::{broadcast, mpsc};
 
 use crate::backend::{BackendEvent, ClipboardBackend, FileFetcher, Format, RemoteClip, RemoteFile};
 
@@ -769,7 +769,7 @@ fn build_remote_clip(params: &Value) -> RemoteClip {
 }
 
 fn warn(message: &str) {
-    eprintln!("[universallink-clipboard] {message}");
+    eprintln!("[1device-clipboard] {message}");
 }
 
 #[cfg(test)]

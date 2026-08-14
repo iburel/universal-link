@@ -320,9 +320,9 @@ mod bridge {
     /// Java thread, which is exactly what `nativeInit` is.
     static SEAM: OnceLock<(jni::JavaVM, GlobalRef)> = OnceLock::new();
 
-    /// `org.universallink.mobile.KeepAlive.nativeInit` — see `KeepAlive.kt`.
+    /// `org.onedevice.mobile.KeepAlive.nativeInit` — see `KeepAlive.kt`.
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_org_universallink_mobile_KeepAlive_nativeInit(
+    pub extern "system" fn Java_org_onedevice_mobile_KeepAlive_nativeInit(
         env: JNIEnv<'_>,
         class: JClass<'_>,
     ) {

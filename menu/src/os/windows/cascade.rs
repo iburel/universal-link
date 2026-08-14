@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
 
-//! The classic shortcut menu's cascading entry: `UniversalLink ▸ PC A`.
+//! The classic shortcut menu's cascading entry: `1Device ▸ PC A`.
 //!
 //! Two registrations of the same list, one per class Explorer asks about:
 //! `*` for a selection of files, `Directory` for a folder. They are separate
@@ -11,16 +11,16 @@
 //! # The shape of one cascade
 //!
 //! ```text
-//! HKCU\Software\Classes\*\shell\UniversalLink
-//!     MUIVerb                 = UniversalLink
-//!     ExtendedSubCommandsKey  = *\shell\UniversalLink        (relative to HKCR)
+//! HKCU\Software\Classes\*\shell\1Device
+//!     MUIVerb                 = 1Device
+//!     ExtendedSubCommandsKey  = *\shell\1Device        (relative to HKCR)
 //!     MultiSelectModel        = Player
-//!     UniversalLinkGenerated  = universallink-menu:generated
+//!     1DeviceGenerated  = 1device-menu:generated
 //!   \shell\000-d_3a4424d810ba6c27
 //!     MUIVerb                 = Anges-MacBook-Pro.local
 //!     MultiSelectModel        = Player
 //!     \command
-//!         (default)           = "C:\…\universallink-menu.exe" --send d_3a44… -- "%1"
+//!         (default)           = "C:\…\1device-menu.exe" --send d_3a44… -- "%1"
 //! ```
 //!
 //! Each key is there for a reason, and the reason is what shipping software does on
@@ -48,9 +48,9 @@ use super::{MARKER, VERB, command_prefix, menu_label};
 use crate::surface::{HelperCommand, MenuSurface, Target};
 
 /// Value that marks the cascade as ours. Nothing without it is ever deleted.
-const MARKER_VALUE: &str = "UniversalLinkGenerated";
+const MARKER_VALUE: &str = "1DeviceGenerated";
 /// Label of the submenu itself.
-const SUBMENU: &str = "UniversalLink";
+const SUBMENU: &str = "1Device";
 /// One invocation for a whole selection, rather than one process per file.
 const MULTI_SELECT: &str = "Player";
 
@@ -59,7 +59,7 @@ pub struct Cascade {
     /// `Software\Classes\*\shell` — where the verb key lives, and what has to be
     /// opened to delete it.
     parent: String,
-    /// `Software\Classes\*\shell\UniversalLink`
+    /// `Software\Classes\*\shell\1Device`
     key: String,
     /// What `ExtendedSubCommandsKey` must say. Relative to `HKEY_CLASSES_ROOT` by
     /// definition, so it never carries the root the keys are written under — which
@@ -275,15 +275,15 @@ mod tests {
         let targets = [target("d_aaa", "PC-A"), target("d_bbb", "PC-B")];
         cascade.apply(&targets).expect("apply");
 
-        let key = format!(r"{}\*\shell\UniversalLink", root.classes());
-        assert_eq!(value(&key, "MUIVerb"), "UniversalLink");
+        let key = format!(r"{}\*\shell\1Device", root.classes());
+        assert_eq!(value(&key, "MUIVerb"), "1Device");
         assert_eq!(
             value(&key, "ExtendedSubCommandsKey"),
-            r"*\shell\UniversalLink",
+            r"*\shell\1Device",
             "without this the entry is a command, not a submenu"
         );
         assert_eq!(value(&key, "MultiSelectModel"), "Player");
-        assert_eq!(value(&key, "UniversalLinkGenerated"), MARKER);
+        assert_eq!(value(&key, "1DeviceGenerated"), MARKER);
 
         // One child per target, in the order the targets came in.
         let children = Key::open(&format!(r"{key}\shell"))
@@ -297,7 +297,7 @@ mod tests {
         assert_eq!(value(&format!(r"{key}\shell\001-d_bbb"), "MUIVerb"), "PC-B");
         assert_eq!(
             value(&format!(r"{key}\shell\001-d_bbb\command"), ""),
-            r#""C:\Program Files\UL\universallink-menu.exe" --send d_bbb -- "%1""#,
+            r#""C:\Program Files\UL\1device-menu.exe" --send d_bbb -- "%1""#,
             "the command must name the clicked device and end with the selection"
         );
     }
@@ -310,15 +310,12 @@ mod tests {
         let mut cascade = Cascade::folders(root.classes(), helper());
         cascade.apply(&[target("d_aaa", "PC-A")]).expect("apply");
 
-        let key = format!(r"{}\Directory\shell\UniversalLink", root.classes());
+        let key = format!(r"{}\Directory\shell\1Device", root.classes());
         assert_eq!(
             value(&key, "ExtendedSubCommandsKey"),
-            r"Directory\shell\UniversalLink"
+            r"Directory\shell\1Device"
         );
-        assert!(absent(&format!(
-            r"{}\*\shell\UniversalLink",
-            root.classes()
-        )));
+        assert!(absent(&format!(r"{}\*\shell\1Device", root.classes())));
     }
 
     /// No manager, no entry: the fail-closed rule. `apply(&[])` is what runs at
@@ -330,10 +327,7 @@ mod tests {
         cascade.apply(&[target("d_aaa", "PC-A")]).expect("apply");
         cascade.apply(&[]).expect("clear");
 
-        assert!(absent(&format!(
-            r"{}\*\shell\UniversalLink",
-            root.classes()
-        )));
+        assert!(absent(&format!(r"{}\*\shell\1Device", root.classes())));
         // Twice is fine: an empty list is applied at every startup.
         cascade.apply(&[]).expect("clear again");
     }
@@ -349,7 +343,7 @@ mod tests {
             .expect("apply");
         cascade.apply(&[target("d_bbb", "PC-B")]).expect("reapply");
 
-        let key = format!(r"{}\*\shell\UniversalLink", root.classes());
+        let key = format!(r"{}\*\shell\1Device", root.classes());
         let children = Key::open(&format!(r"{key}\shell"))
             .expect("open")
             .expect("children");
@@ -366,7 +360,7 @@ mod tests {
     #[test]
     fn a_key_of_the_same_name_that_is_not_ours_is_never_touched() {
         let root = TestRoot::new("foreign");
-        let key = format!(r"{}\*\shell\UniversalLink", root.classes());
+        let key = format!(r"{}\*\shell\1Device", root.classes());
         let foreign = Key::create(&format!(r"{key}\shell\theirs")).expect("create");
         foreign
             .set_string("MUIVerb", "Someone else's")
@@ -399,7 +393,7 @@ mod tests {
     fn a_cascade_of_ours_under_an_older_name_is_swept() {
         let root = TestRoot::new("stale");
         let shell = format!(r"{}\*\shell", root.classes());
-        let older = format!(r"{shell}\UniversalLinkSend");
+        let older = format!(r"{shell}\1DeviceSend");
         let plant = || {
             let stale = Key::create(&older).expect("create");
             stale.set_string(MARKER_VALUE, MARKER).expect("set");
@@ -422,12 +416,12 @@ mod tests {
             "the older name survived a render with a list"
         );
         assert!(
-            !absent(&format!(r"{shell}\UniversalLink")),
+            !absent(&format!(r"{shell}\1Device")),
             "our own verb must not be swept with it"
         );
 
         cascade.apply(&[]).expect("clear");
-        assert!(absent(&format!(r"{shell}\UniversalLink")));
+        assert!(absent(&format!(r"{shell}\1Device")));
         assert_eq!(
             value(&format!(r"{shell}\SomeoneElseSend"), "MUIVerb"),
             "Theirs",
@@ -450,7 +444,7 @@ mod tests {
             .apply(&[target("d_aaa", hostile)])
             .expect("a name is data, and must never fail a write");
 
-        let key = format!(r"{}\*\shell\UniversalLink", root.classes());
+        let key = format!(r"{}\*\shell\1Device", root.classes());
         let label = value(&format!(r"{key}\shell\000-d_aaa"), "MUIVerb");
         assert_eq!(label, "PC\" && del /q C:\\* && echo  owned");
 
@@ -459,7 +453,7 @@ mod tests {
         assert_eq!(
             crate::os::windows::tests::parse_command_line(&command),
             [
-                r"C:\Program Files\UL\universallink-menu.exe",
+                r"C:\Program Files\UL\1device-menu.exe",
                 "--send",
                 "d_aaa",
                 "--",
@@ -481,7 +475,7 @@ mod tests {
         let root = TestRoot::new("keyname");
         let mut cascade = Cascade::files(root.classes(), helper());
         cascade.apply(&[target(r"d_1\Run", "PC-A")]).expect("apply");
-        let children = Key::open(&format!(r"{}\*\shell\UniversalLink\shell", root.classes()))
+        let children = Key::open(&format!(r"{}\*\shell\1Device\shell", root.classes()))
             .expect("open")
             .expect("children");
         assert_eq!(children.subkeys().expect("subkeys"), ["000-d_1_Run"]);
@@ -496,11 +490,11 @@ mod tests {
         let targets = [target("d_aaa", "PC-A")];
         cascade.apply(&targets).expect("apply");
 
-        let key = Key::open(&format!(r"{}\*\shell\UniversalLink", root.classes()))
+        let key = Key::open(&format!(r"{}\*\shell\1Device", root.classes()))
             .expect("open")
             .expect("key");
         assert!(
-            !key.set_string("MUIVerb", "UniversalLink").expect("set"),
+            !key.set_string("MUIVerb", "1Device").expect("set"),
             "an identical value must not be rewritten"
         );
         assert!(
@@ -509,7 +503,7 @@ mod tests {
         );
         cascade.apply(&targets).expect("reapply");
         assert!(
-            !key.set_string("MUIVerb", "UniversalLink").expect("set"),
+            !key.set_string("MUIVerb", "1Device").expect("set"),
             "the reapply must have put the label back"
         );
     }

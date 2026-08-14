@@ -25,10 +25,10 @@ use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use onedevice_clipboard::os;
+use onedevice_clipboard::{BackendEvent, ClipboardBackend, Format, RemoteClip};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
-use universallink_clipboard::os;
-use universallink_clipboard::{BackendEvent, ClipboardBackend, Format, RemoteClip};
 use xcb::{Xid, x};
 
 /// Serializes access to the per-display global CLIPBOARD selection.
@@ -154,7 +154,7 @@ impl Requestor {
         let clipboard = intern(&conn, b"CLIPBOARD");
         let utf8 = intern(&conn, b"UTF8_STRING");
         let string = intern(&conn, b"STRING");
-        let prop = intern(&conn, b"UNIVERSALLINK_TEST_REPLY");
+        let prop = intern(&conn, b"ONEDEVICE_TEST_REPLY");
         let incr = intern(&conn, b"INCR");
         Requestor {
             conn,
@@ -516,7 +516,7 @@ fn spawn_unsupported_owner() -> (std_mpsc::Sender<()>, thread::JoinHandle<()>) {
         let window = create_window(&conn, screen_num);
         let clipboard = intern(&conn, b"CLIPBOARD");
         let targets = intern(&conn, b"TARGETS");
-        let unsupported = intern(&conn, b"application/x-universallink-unsupported");
+        let unsupported = intern(&conn, b"application/x-1device-unsupported");
 
         conn.send_request(&x::SetSelectionOwner {
             owner: window,

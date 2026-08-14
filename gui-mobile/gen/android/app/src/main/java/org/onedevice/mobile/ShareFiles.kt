@@ -1,4 +1,4 @@
-package org.universallink.mobile
+package org.onedevice.mobile
 
 import android.content.ContentResolver
 import android.content.Context
@@ -63,7 +63,7 @@ object ShareFiles {
      * report a share whose paths do not exist. Serializing keeps that invariant
      * true instead of weakening the sweep.
      */
-    private val worker = Executors.newSingleThreadExecutor { r -> Thread(r, "ul-share-copy") }
+    private val worker = Executors.newSingleThreadExecutor { r -> Thread(r, "1device-share-copy") }
 
     /**
      * Takes over `intent` if it carries files, reporting progress through

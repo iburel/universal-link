@@ -15,7 +15,7 @@ const CONNECTED: ConnectionStatus = {
 };
 
 /** A code of the shape the Core really mints: version, secret, key, session. */
-const CODE = `UL1:${"A".repeat(22)}:${"B".repeat(43)}:p_${"9".repeat(32)}`;
+const CODE = `1D1:${"A".repeat(22)}:${"B".repeat(43)}:p_${"9".repeat(32)}`;
 
 let store: CoreStore;
 

@@ -6,7 +6,7 @@
 //! The flattest surface there is — the shell shows each file in that folder as a
 //! menu entry, labelled with the file's own display name (a `.lnk`'s extension is
 //! always hidden). Which decides two things:
-//! - the entries carry the product's name themselves, `PC A (UniversalLink)`,
+//! - the entries carry the product's name themselves, `PC A (1Device)`,
 //!   because there is no submenu to put them in (decision 3 of the plan);
 //! - the label IS a file name, so it is sanitized rather than escaped — the same
 //!   answer the Nautilus scripts needed, for the same reason, with Windows' own
@@ -52,7 +52,7 @@ use crate::surface::{HelperCommand, MenuSurface, Target};
 
 /// Longest a shortcut's name may be before the suffix and the extension, in UTF-16
 /// units. A file name is capped at 255 of them; this leaves room for
-/// ` (UniversalLink).lnk` and for a disambiguating id.
+/// ` (1Device).lnk` and for a disambiguating id.
 const BASE_BUDGET: usize = 180;
 /// And how much of a device id may appear in a name. Ids are `d_` plus 16 hex
 /// digits; this is only a bound on what a hostile directory could make us write.
@@ -167,7 +167,7 @@ fn plan(helper: &HelperCommand, targets: &[Target]) -> Vec<(String, Shortcut)> {
                 target: helper.program.to_string_lossy().into_owned(),
                 arguments,
                 description: format!(
-                    "Send the selection to {} with UniversalLink. {MARKER} — do not edit.",
+                    "Send the selection to {} with 1Device. {MARKER} — do not edit.",
                     file_label(&target.name)
                 ),
             };
@@ -344,9 +344,9 @@ mod tests {
         let mut surface = SendTo::new(dir.path(), helper());
         surface.apply(&[target("d_aaa", "PC-A")]).expect("apply");
 
-        let path = dir.path().join("PC-A (UniversalLink).lnk");
+        let path = dir.path().join("PC-A (1Device).lnk");
         let link = read_shortcut(&path).expect("the shortcut must be readable");
-        assert_eq!(link.target, r"C:\Program Files\UL\universallink-menu.exe");
+        assert_eq!(link.target, r"C:\Program Files\UL\1device-menu.exe");
         assert!(
             link.description.contains(MARKER),
             "without the marker it could never be pruned: {}",
@@ -357,7 +357,7 @@ mod tests {
         assert_eq!(
             parse_command_line(&format!(r#""{}" {}"#, link.target, link.arguments)),
             [
-                r"C:\Program Files\UL\universallink-menu.exe",
+                r"C:\Program Files\UL\1device-menu.exe",
                 "--send",
                 "d_aaa",
                 "--"
@@ -379,7 +379,7 @@ mod tests {
         let mut surface = SendTo::new(dir.path(), helper);
         surface.apply(&[target("d_aaa", "PC-A")]).expect("apply");
 
-        let link = read_shortcut(&dir.path().join("PC-A (UniversalLink).lnk")).expect("readable");
+        let link = read_shortcut(&dir.path().join("PC-A (1Device).lnk")).expect("readable");
         assert_eq!(
             parse_command_line(&format!(r#""{}" {}"#, link.target, link.arguments)),
             [
@@ -403,8 +403,8 @@ mod tests {
             .apply(&[target("d_1111", "   "), target("d_2222", "...")])
             .expect("apply");
 
-        assert!(dir.path().join("d_1111 (UniversalLink).lnk").exists());
-        assert!(dir.path().join("d_2222 (UniversalLink).lnk").exists());
+        assert!(dir.path().join("d_1111 (1Device).lnk").exists());
+        assert!(dir.path().join("d_2222 (1Device).lnk").exists());
     }
 
     /// The folder can be open in Explorer, and the applier re-applies the list it
@@ -416,7 +416,7 @@ mod tests {
         let targets = [target("d_aaa", "PC-A")];
         surface.apply(&targets).expect("apply");
 
-        let path = dir.path().join("PC-A (UniversalLink).lnk");
+        let path = dir.path().join("PC-A (1Device).lnk");
         let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
         std::fs::File::options()
             .write(true)
@@ -443,7 +443,7 @@ mod tests {
             .expect("apply");
 
         // What the user's own SendTo folder really holds.
-        let theirs = dir.path().join("Bluetooth (UniversalLink).lnk");
+        let theirs = dir.path().join("Bluetooth (1Device).lnk");
         write_shortcut(
             &theirs,
             &Shortcut {
@@ -458,8 +458,8 @@ mod tests {
 
         surface.apply(&[]).expect("clear");
 
-        assert!(!dir.path().join("PC-A (UniversalLink).lnk").exists());
-        assert!(!dir.path().join("PC-B (UniversalLink).lnk").exists());
+        assert!(!dir.path().join("PC-A (1Device).lnk").exists());
+        assert!(!dir.path().join("PC-B (1Device).lnk").exists());
         assert!(
             theirs.exists(),
             "a shortcut without our marker was deleted, even with our own naming"
@@ -475,11 +475,11 @@ mod tests {
     #[test]
     fn a_stale_entry_of_ours_is_swept() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let stale = dir.path().join("Old-PC (UniversalLink).lnk");
+        let stale = dir.path().join("Old-PC (1Device).lnk");
         write_shortcut(
             &stale,
             &Shortcut {
-                target: r"C:\Program Files\UL\universallink-menu.exe".into(),
+                target: r"C:\Program Files\UL\1device-menu.exe".into(),
                 arguments: "--send d_gone --".into(),
                 description: format!("stale. {MARKER} — do not edit."),
             },
@@ -502,9 +502,9 @@ mod tests {
             .apply(&[target("d_1111", "PC"), target("d_2222", "PC")])
             .expect("apply");
 
-        assert!(dir.path().join("PC (1111) (UniversalLink).lnk").exists());
-        assert!(dir.path().join("PC (2222) (UniversalLink).lnk").exists());
-        assert!(!dir.path().join("PC (UniversalLink).lnk").exists());
+        assert!(dir.path().join("PC (1111) (1Device).lnk").exists());
+        assert!(dir.path().join("PC (2222) (1Device).lnk").exists());
+        assert!(!dir.path().join("PC (1Device).lnk").exists());
     }
 
     /// And the case that is Windows' alone: the file system does not distinguish
@@ -533,10 +533,7 @@ mod tests {
         files.sort();
         assert_eq!(
             files,
-            [
-                "PC (1111) (UniversalLink).lnk",
-                "pc (2222) (UniversalLink).lnk"
-            ],
+            ["PC (1111) (1Device).lnk", "pc (2222) (1Device).lnk"],
             "the two entries must be symmetrical, and there must be two"
         );
     }
@@ -559,12 +556,12 @@ mod tests {
             .expect("name")
             .to_string_lossy()
             .into_owned();
-        assert_eq!(name, "..-..-Startup-evil- & del -.- (UniversalLink).lnk");
+        assert_eq!(name, "..-..-Startup-evil- & del -.- (1Device).lnk");
         let link = read_shortcut(&files[0]).expect("readable");
         assert_eq!(
             parse_command_line(&format!(r#""{}" {}"#, link.target, link.arguments)),
             [
-                r"C:\Program Files\UL\universallink-menu.exe",
+                r"C:\Program Files\UL\1device-menu.exe",
                 "--send",
                 "d_aaa",
                 "--"

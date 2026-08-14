@@ -46,9 +46,9 @@ use crate::surface::{HelperCommand, MenuSurface, Target};
 /// Distinctive on purpose: KIO deduplicates service menus by FILE NAME across
 /// every data directory (`serviceMenuFilePaths`), so a generic name risks being
 /// shadowed by a distribution's own file — or shadowing it.
-const FILE_NAME: &str = "universallink-send.desktop";
+const FILE_NAME: &str = "1device-send.desktop";
 /// Decision 3: a submenu where the surface allows one.
-const SUBMENU: &str = "UniversalLink";
+const SUBMENU: &str = "1Device";
 /// A stock freedesktop icon name, so the entries have an icon on a plain install:
 /// we install no icon theme of our own on Linux (the AppImage keeps its icon
 /// inside the bundle). A name a theme does not carry simply shows no icon.
@@ -146,7 +146,7 @@ fn desktop_file(helper: &HelperCommand, targets: &[Target]) -> String {
 /// identifier. Ours, positional, never the device's — a device name is whatever
 /// the user typed, and `Actions=` is a `;`-separated list.
 fn action_name(index: usize) -> String {
-    format!("universallink-send-{index}")
+    format!("1device-send-{index}")
 }
 
 /// Escapes a value for the Desktop Entry format: the spec's general string rule.
@@ -228,7 +228,7 @@ mod tests {
 
     fn helper() -> HelperCommand {
         HelperCommand {
-            program: PathBuf::from("/opt/universallink/universallink-menu"),
+            program: PathBuf::from("/opt/1device/1device-menu"),
             extra_args: vec![],
         }
     }
@@ -252,28 +252,28 @@ mod tests {
 
         assert_eq!(lines[0], "[Desktop Entry]");
         assert!(
-            lines.contains(&"Actions=universallink-send-0;universallink-send-1;"),
+            lines.contains(&"Actions=1device-send-0;1device-send-1;"),
             "{content}"
         );
         assert!(
-            lines.contains(&"[Desktop Action universallink-send-0]"),
+            lines.contains(&"[Desktop Action 1device-send-0]"),
             "{content}"
         );
         assert!(lines.contains(&"Name=PC A"), "{content}");
         assert!(
-            lines.contains(&"[Desktop Action universallink-send-1]"),
+            lines.contains(&"[Desktop Action 1device-send-1]"),
             "{content}"
         );
         assert!(lines.contains(&"Name=Le Mac"), "{content}");
         assert!(
-            lines.contains(&"Exec=/opt/universallink/universallink-menu --send d_1 -- %F"),
+            lines.contains(&"Exec=/opt/1device/1device-menu --send d_1 -- %F"),
             "{content}"
         );
         // The keys that decide whether the entry appears at all.
         for required in [
             "MimeType=all/all;",
             "X-KDE-Protocol=file",
-            "X-KDE-Submenu=UniversalLink",
+            "X-KDE-Submenu=1Device",
         ] {
             assert!(lines.contains(&required), "missing {required}: {content}");
         }
@@ -299,7 +299,7 @@ mod tests {
         let execs: Vec<&str> = content.lines().filter(|l| l.starts_with("Exec=")).collect();
         assert_eq!(
             execs,
-            ["Exec=/opt/universallink/universallink-menu --send d_1 -- %F"],
+            ["Exec=/opt/1device/1device-menu --send d_1 -- %F"],
             "the name smuggled in a key: {content}"
         );
         let names: Vec<&str> = content.lines().filter(|l| l.starts_with("Name=")).collect();
@@ -349,10 +349,7 @@ mod tests {
     #[test]
     fn exec_arguments_are_quoted_exactly_as_the_spec_says() {
         assert_eq!(exec_arg("--send"), "--send");
-        assert_eq!(
-            exec_arg("/opt/universallink-menu"),
-            "/opt/universallink-menu"
-        );
+        assert_eq!(exec_arg("/opt/1device-menu"), "/opt/1device-menu");
         assert_eq!(exec_arg(""), r#""""#);
         assert_eq!(exec_arg("/opt/My Apps/menu"), r#""/opt/My Apps/menu""#);
         // The four the spec singles out inside double quotes.
@@ -406,7 +403,7 @@ mod tests {
             dir.path()
                 .join("kio")
                 .join("servicemenus")
-                .join("universallink-send.desktop")
+                .join("1device-send.desktop")
         );
 
         surface.apply(&[target("d_1", "PC A")]).expect("apply");
@@ -438,10 +435,10 @@ mod tests {
         let servicemenus = dir.path().join("kio").join("servicemenus");
         std::fs::create_dir_all(&servicemenus).expect("mkdir");
 
-        let stale = servicemenus.join("universallink-menu.desktop");
+        let stale = servicemenus.join("1device-menu.desktop");
         std::fs::write(&stale, desktop_file(&helper(), &[target("d_old", "Ghost")]))
             .expect("write the older name");
-        let theirs = servicemenus.join("universallink-send.desktop.orig");
+        let theirs = servicemenus.join("1device-send.desktop.orig");
         std::fs::write(&theirs, "[Desktop Entry]\nName=Theirs\n").expect("write");
 
         surface.apply(&[target("d_1", "PC A")]).expect("apply");

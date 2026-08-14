@@ -16,8 +16,8 @@
 //! below pin both, plus the way back in for a device that has the account and not
 //! its key.
 
+use onedevice_test_support::memory_transport::MemorySwitchboard;
 use serde_json::json;
-use universallink_test_support::memory_transport::MemorySwitchboard;
 
 use crate::support::*;
 
@@ -116,7 +116,7 @@ async fn setup_then_join_converge_on_one_fingerprint() {
     // follow-up building block — and it is the surface an attacker with
     // `session.manage` would use to re-attest this device under a key of their
     // own choosing.
-    let elsewhere = universallink_core::account_key::generate_recovery_code();
+    let elsewhere = onedevice_core::account_key::generate_recovery_code();
     let rotate = bc
         .request("account.join", json!({ "recovery_code": elsewhere }))
         .await
@@ -141,7 +141,7 @@ async fn setup_then_join_converge_on_one_fingerprint() {
 async fn a_device_without_the_key_gets_it_back_from_the_code() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     // The harness seeds `account-key.json` alone — the state of a device whose
     // keyring no longer holds the seed.
     let core = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
@@ -198,12 +198,12 @@ async fn a_planted_seed_is_not_taken_for_the_account_key() {
 
     // Someone with write access to the keyring — and nothing else — swaps the
     // stored seed for the key of an account of their own.
-    let theirs = universallink_core::account_key::account_key_from_code(
-        &universallink_core::account_key::generate_recovery_code(),
+    let theirs = onedevice_core::account_key::account_key_from_code(
+        &onedevice_core::account_key::generate_recovery_code(),
     )
     .expect("valid code");
-    let keyring = universallink_core::FileSecretStore::new(core.config_dir());
-    universallink_core::account_key::remember(&keyring, &theirs).expect("plant the seed");
+    let keyring = onedevice_core::FileSecretStore::new(core.config_dir());
+    onedevice_core::account_key::remember(&keyring, &theirs).expect("plant the seed");
 
     let status = c
         .request("account.status", json!({}))

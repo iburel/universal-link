@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
 
-//! UniversalLink Core — client daemon: a local IPC server for the components,
+//! 1Device Core — client daemon: a local IPC server for the components,
 //! server session, device identity, transfers.
 //!
 //! Spec: `doc/core-api.md`. The exact schemas are pinned down by the

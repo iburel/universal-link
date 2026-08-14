@@ -6,16 +6,16 @@
 
   The tray's own bundle identity on macOS.
 
-  It exists because a process started from `UniversalLink.app/Contents/MacOS` IS
+  It exists because a process started from `1Device.app/Contents/MacOS` IS
   the application as far as Launch Services is concerned: it takes the enclosing
   bundle's identifier. The tray owns a status item, so it checks in as a GUI
-  application — and from the moment the Core spawned it, `org.universallink.gui`
+  application — and from the moment the Core spawned it, `org.onedevice.gui`
   was "already running". Every `open` of the app (the Dock, the Finder, the
   Launchpad, and the tray's own Open item) then merely activated the tray, which
   has no window: clicking the icon did nothing at all.
 
   So the tray ships in a nested application bundle of its own, assembled in
-  `release.yml` and copied to `Contents/Frameworks/UniversalLinkTray.app` — the
+  `release.yml` and copied to `Contents/Frameworks/1DeviceTray.app` — the
   layout Chromium and Electron helpers have always used, and one code signing
   treats as nested code. `daemon/src/supervisor.rs` looks for it there first.
 
@@ -25,11 +25,11 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleExecutable</key>
-	<string>universallink-tray</string>
+	<string>1device-tray</string>
 	<key>CFBundleIdentifier</key>
-	<string>org.universallink.tray</string>
+	<string>org.onedevice.tray</string>
 	<key>CFBundleName</key>
-	<string>UniversalLink Tray</string>
+	<string>1Device Tray</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -40,7 +40,7 @@
 	<string>11.0</string>
 	<!-- A menu-bar-only agent: no Dock icon, no entry in the application
 	     switcher. Inheriting the app's Info.plist gave it both, so a second
-	     "UniversalLink" sat in the Dock that was in truth the tray. -->
+	     "1Device" sat in the Dock that was in truth the tray. -->
 	<key>LSUIElement</key>
 	<true/>
 	<!-- Kept from what it inherited: the status item's template image is drawn

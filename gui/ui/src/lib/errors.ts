@@ -134,7 +134,7 @@ const SCAN_REASONS: Record<string, string | null> = {
   cancelled: null,
   busy: null,
   denied:
-    "UniversalLink needs the camera to read a code. Allow it in Android settings, or paste the code instead.",
+    "1Device needs the camera to read a code. Allow it in Android settings, or paste the code instead.",
   no_camera: "This device has no camera — paste the code instead.",
   failed: "The camera could not be opened. Paste the code instead.",
 };

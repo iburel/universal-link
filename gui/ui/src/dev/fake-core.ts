@@ -88,7 +88,7 @@ export function installFakeCore(): void {
   let components: Component[] = [
     {
       component_id: "c_gui",
-      name: "universallink-gui",
+      name: "1device-gui",
       role: "gui",
       scopes: ["session.read", "devices.read", "components.approve"],
       connected: true,
@@ -199,13 +199,13 @@ export function installFakeCore(): void {
         pairing_id,
         role,
         expires_in: 120,
-        code: `UL1:${"A".repeat(22)}:${"B".repeat(43)}:${pairing_id}`,
+        code: `1D1:${"A".repeat(22)}:${"B".repeat(43)}:${pairing_id}`,
       };
     },
-    // Either tag: `UL2` names a device on the local network instead of a server
+    // Either tag: `1D2` names a device on the local network instead of a server
     // rendezvous, and this fake plays the flow the same either way.
     "pairing.accept": ({ code }) => {
-      if (!code?.startsWith("UL1:") && !code?.startsWith("UL2:")) {
+      if (!code?.startsWith("1D1:") && !code?.startsWith("1D2:")) {
         throw { kind: "rpc", message: "invalid params: code", code: -32602 };
       }
       const pairing_id = code.slice(code.lastIndexOf(":") + 1);
@@ -302,7 +302,7 @@ export function installFakeCore(): void {
           setTimeout(
             () =>
               resolve({
-                code: `UL1:${"A".repeat(22)}:${"B".repeat(43)}:${pairing_id}`,
+                code: `1D1:${"A".repeat(22)}:${"B".repeat(43)}:${pairing_id}`,
               }),
             1200,
           ),

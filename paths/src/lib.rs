@@ -10,20 +10,20 @@
 //!
 //! | OS      | socket / pipe                                          | config directory |
 //! |---------|--------------------------------------------------------|------------------|
-//! | Linux   | `$XDG_RUNTIME_DIR/universallink/core.sock`              | `$XDG_CONFIG_HOME` (default `~/.config`) `/universallink` |
-//! | macOS   | `~/Library/Application Support/UniversalLink/core.sock` | same as the socket |
-//! | Windows | `\\.\pipe\universallink-core-<USERDOMAIN>-<USERNAME>`   | `%APPDATA%\UniversalLink` |
+//! | Linux   | `$XDG_RUNTIME_DIR/1device/core.sock`              | `$XDG_CONFIG_HOME` (default `~/.config`) `/1device` |
+//! | macOS   | `~/Library/Application Support/1Device/core.sock` | same as the socket |
+//! | Windows | `\\.\pipe\1device-core-<USERDOMAIN>-<USERNAME>`   | `%APPDATA%\1Device` |
 //!
 //! The config directory holds `ipc-token`, `device.key`, `session.json`,
 //! `secrets.json` (keyring fallback) and `config.json`. The single-instance
 //! lock, for its part, lives next to the socket (`core.sock.lock`): it is the
-//! socket it protects — see `universallink_core::transport`.
+//! socket it protects — see `onedevice_core::transport`.
 //!
 //! One component listens too, and so appears here: the contextual-menu manager
-//! (`menu.sock` / `universallink-menu-…`, next to the Core's own). It is the
+//! (`menu.sock` / `1device-menu-…`, next to the Core's own). It is the
 //! only endpoint a process discovers with NOTHING from us in its environment —
 //! the click helper is started by the file manager, which passes it neither
-//! `UNIVERSALLINK_IPC_PATH` nor anything else — so it has to be a convention
+//! `ONEDEVICE_IPC_PATH` nor anything else — so it has to be a convention
 //! rather than a hand-off.
 
 use std::path::PathBuf;
@@ -75,7 +75,7 @@ fn log_dir_from(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
     let state = xdg("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| xdg("HOME").map(|home| PathBuf::from(home).join(".local").join("state")))?;
-    Some(state.join("universallink").join("logs"))
+    Some(state.join("1device").join("logs"))
 }
 
 #[cfg(target_os = "macos")]
@@ -85,7 +85,7 @@ fn log_dir_from(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
         PathBuf::from(home)
             .join("Library")
             .join("Logs")
-            .join("UniversalLink"),
+            .join("1Device"),
     )
 }
 
@@ -94,7 +94,7 @@ fn log_dir_from(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
     // LOCALAPPDATA and not APPDATA: a log has no business in a roaming
     // profile.
     let local = env("LOCALAPPDATA").filter(|v| !v.is_empty())?;
-    Some(PathBuf::from(local).join("UniversalLink").join("logs"))
+    Some(PathBuf::from(local).join("1Device").join("logs"))
 }
 
 #[cfg(target_os = "android")]
@@ -116,10 +116,10 @@ fn endpoint_from(env: &dyn Fn(&str) -> Option<String>) -> Option<Endpoint> {
     let config = xdg("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| xdg("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    let runtime = PathBuf::from(runtime).join("universallink");
+    let runtime = PathBuf::from(runtime).join("1device");
     Some(Endpoint {
         ipc_path: runtime.join("core.sock"),
-        config_dir: config.join("universallink"),
+        config_dir: config.join("1device"),
         menu_channel: runtime.join("menu.sock"),
     })
 }
@@ -130,7 +130,7 @@ fn endpoint_from(env: &dyn Fn(&str) -> Option<String>) -> Option<Endpoint> {
     let dir = PathBuf::from(home)
         .join("Library")
         .join("Application Support")
-        .join("UniversalLink");
+        .join("1Device");
     Some(Endpoint {
         ipc_path: dir.join("core.sock"),
         menu_channel: dir.join("menu.sock"),
@@ -150,9 +150,9 @@ fn endpoint_from(env: &dyn Fn(&str) -> Option<String>) -> Option<Endpoint> {
     let user = var("USERNAME")?;
     let appdata = var("APPDATA")?;
     Some(Endpoint {
-        ipc_path: PathBuf::from(format!(r"\\.\pipe\universallink-core-{domain}-{user}")),
-        config_dir: PathBuf::from(appdata).join("UniversalLink"),
-        menu_channel: PathBuf::from(format!(r"\\.\pipe\universallink-menu-{domain}-{user}")),
+        ipc_path: PathBuf::from(format!(r"\\.\pipe\1device-core-{domain}-{user}")),
+        config_dir: PathBuf::from(appdata).join("1Device"),
+        menu_channel: PathBuf::from(format!(r"\\.\pipe\1device-menu-{domain}-{user}")),
     })
 }
 
@@ -180,16 +180,13 @@ mod tests {
     #[test]
     fn linux_logs_go_to_the_state_dir() {
         let dir = log_dir_from(&env_of(&[("HOME", "/home/u")])).expect("logs directory");
-        assert_eq!(
-            dir,
-            PathBuf::from("/home/u/.local/state/universallink/logs")
-        );
+        assert_eq!(dir, PathBuf::from("/home/u/.local/state/1device/logs"));
         let dir = log_dir_from(&env_of(&[
             ("XDG_STATE_HOME", "/state"),
             ("HOME", "/home/u"),
         ]))
         .expect("logs directory");
-        assert_eq!(dir, PathBuf::from("/state/universallink/logs"));
+        assert_eq!(dir, PathBuf::from("/state/1device/logs"));
         assert!(log_dir_from(&env_of(&[])).is_none());
     }
 
@@ -197,7 +194,7 @@ mod tests {
     #[test]
     fn macos_logs_go_to_library_logs() {
         let dir = log_dir_from(&env_of(&[("HOME", "/Users/u")])).expect("logs directory");
-        assert_eq!(dir, PathBuf::from("/Users/u/Library/Logs/UniversalLink"));
+        assert_eq!(dir, PathBuf::from("/Users/u/Library/Logs/1Device"));
         assert!(log_dir_from(&env_of(&[])).is_none());
     }
 
@@ -210,7 +207,7 @@ mod tests {
             .expect("logs directory");
         assert_eq!(
             dir,
-            PathBuf::from(r"C:\Users\iwan\AppData\Local\UniversalLink\logs")
+            PathBuf::from(r"C:\Users\iwan\AppData\Local\1Device\logs")
         );
         assert!(log_dir_from(&env_of(&[("APPDATA", r"C:\x")])).is_none());
     }
@@ -226,17 +223,17 @@ mod tests {
         .expect("endpoint");
         assert_eq!(
             e.ipc_path,
-            PathBuf::from("/run/user/1000/universallink/core.sock")
+            PathBuf::from("/run/user/1000/1device/core.sock")
         );
         assert_eq!(
             e.token_path(),
-            PathBuf::from("/home/u/.config-custom/universallink/ipc-token")
+            PathBuf::from("/home/u/.config-custom/1device/ipc-token")
         );
         // The menu manager listens in the same private runtime folder as the
         // Core: the click helper resolves it from the environment alone.
         assert_eq!(
             e.menu_channel,
-            PathBuf::from("/run/user/1000/universallink/menu.sock")
+            PathBuf::from("/run/user/1000/1device/menu.sock")
         );
 
         // Without XDG_CONFIG_HOME: ~/.config. Without XDG_RUNTIME_DIR: refusal.
@@ -247,7 +244,7 @@ mod tests {
         .expect("endpoint");
         assert_eq!(
             e.token_path(),
-            PathBuf::from("/home/u/.config/universallink/ipc-token")
+            PathBuf::from("/home/u/.config/1device/ipc-token")
         );
         assert!(endpoint_from(&env_of(&[("HOME", "/home/u")])).is_none());
 
@@ -261,7 +258,7 @@ mod tests {
         .expect("endpoint");
         assert_eq!(
             e.token_path(),
-            PathBuf::from("/home/u/.config/universallink/ipc-token")
+            PathBuf::from("/home/u/.config/1device/ipc-token")
         );
         let e = endpoint_from(&env_of(&[
             ("XDG_RUNTIME_DIR", "/run/user/1000"),
@@ -271,7 +268,7 @@ mod tests {
         .expect("endpoint");
         assert_eq!(
             e.token_path(),
-            PathBuf::from("/home/u/.config/universallink/ipc-token")
+            PathBuf::from("/home/u/.config/1device/ipc-token")
         );
         assert!(
             endpoint_from(&env_of(&[("XDG_RUNTIME_DIR", ""), ("HOME", "/home/u")])).is_none(),
@@ -285,15 +282,15 @@ mod tests {
         let e = endpoint_from(&env_of(&[("HOME", "/Users/u")])).expect("endpoint");
         assert_eq!(
             e.ipc_path,
-            PathBuf::from("/Users/u/Library/Application Support/UniversalLink/core.sock")
+            PathBuf::from("/Users/u/Library/Application Support/1Device/core.sock")
         );
         assert_eq!(
             e.token_path(),
-            PathBuf::from("/Users/u/Library/Application Support/UniversalLink/ipc-token")
+            PathBuf::from("/Users/u/Library/Application Support/1Device/ipc-token")
         );
         assert_eq!(
             e.menu_channel,
-            PathBuf::from("/Users/u/Library/Application Support/UniversalLink/menu.sock")
+            PathBuf::from("/Users/u/Library/Application Support/1Device/menu.sock")
         );
         assert!(endpoint_from(&env_of(&[])).is_none());
     }
@@ -311,17 +308,17 @@ mod tests {
         // domain account do not share the same pipe.
         assert_eq!(
             e.ipc_path,
-            PathBuf::from(r"\\.\pipe\universallink-core-PC-IWAN-iwan")
+            PathBuf::from(r"\\.\pipe\1device-core-PC-IWAN-iwan")
         );
         assert_eq!(
             e.token_path(),
-            PathBuf::from(r"C:\Users\iwan\AppData\Roaming\UniversalLink\ipc-token")
+            PathBuf::from(r"C:\Users\iwan\AppData\Roaming\1Device\ipc-token")
         );
         // Per-user for the same reason as the Core's pipe — the namespace is
         // machine-global.
         assert_eq!(
             e.menu_channel,
-            PathBuf::from(r"\\.\pipe\universallink-menu-PC-IWAN-iwan")
+            PathBuf::from(r"\\.\pipe\1device-menu-PC-IWAN-iwan")
         );
         // An indispensable variable absent or empty: refusal.
         assert!(

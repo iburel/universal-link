@@ -29,7 +29,7 @@ async fn connection_state_follows_the_core() {
     core.restart().await;
     let snap = shell.expect_connection("connected").await;
     assert_eq!(snap["api_version"], 1);
-    assert_eq!(snap["granted_scopes"], json!(universallink_gui::GUI_SCOPES));
+    assert_eq!(snap["granted_scopes"], json!(onedevice_gui::GUI_SCOPES));
     assert_eq!(shell.connection_status().await["status"], "connected");
 
     // Loss of the Core: back to "connecting" — never a lying state.

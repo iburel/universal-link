@@ -504,7 +504,7 @@ define_class!(
     // - This class overrides no `dealloc`/`Drop` in an unsound way, and every
     //   ivar is `Send`+`Sync`, so the class is not `MainThreadOnly`.
     #[unsafe(super(NSObject))]
-    #[name = "UniversalLinkClipboardPasteboardOwner"]
+    #[name = "1DeviceClipboardPasteboardOwner"]
     #[ivars = OwnerIvars]
     struct Owner;
 
@@ -638,10 +638,8 @@ impl ScopedTempDir {
         use std::os::unix::fs::DirBuilderExt;
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "universallink-clip-files-{}-{n}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("1device-clip-files-{}-{n}", std::process::id()));
         std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
         Ok(Self { path: dir })
     }
@@ -828,7 +826,7 @@ define_class!(
     // - No unsound `dealloc`/`Drop`; every ivar is `Send`+`Sync`, so the class is
     //   not `MainThreadOnly` (callbacks arrive on the instance's serial queue).
     #[unsafe(super(NSObject))]
-    #[name = "UniversalLinkClipboardFilePresenter"]
+    #[name = "1DeviceClipboardFilePresenter"]
     #[ivars = PresenterIvars]
     struct FilePresenter;
 
@@ -1467,7 +1465,7 @@ impl Backend {
 }
 
 fn warn(message: &str) {
-    eprintln!("[universallink-clipboard] {message}");
+    eprintln!("[1device-clipboard] {message}");
 }
 
 /// Connects to the general pasteboard and builds the pinned backend plus the
@@ -1643,7 +1641,7 @@ mod tests {
     #[test]
     fn build_skeleton_creates_empty_tree_leaves_and_roots() {
         let base = std::env::temp_dir().join(format!(
-            "universallink-clip-skel-test-{}-{:p}",
+            "1device-clip-skel-test-{}-{:p}",
             std::process::id(),
             &0u8
         ));
@@ -1695,7 +1693,7 @@ mod tests {
     #[test]
     fn build_skeleton_dir_only_manifest_has_no_leaves() {
         let base = std::env::temp_dir().join(format!(
-            "universallink-clip-skel-dironly-{}-{:p}",
+            "1device-clip-skel-dironly-{}-{:p}",
             std::process::id(),
             &1u8
         ));

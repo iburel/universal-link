@@ -4,7 +4,7 @@
 //! The deployable control-plane binary. It only wires things up: logging,
 //! reading the environment configuration, loading the persisted directory,
 //! starting the server, shutting down on signal. All the logic lives in
-//! `universallink-server`.
+//! `1device-server`.
 //!
 //! Accepted limitation at this stage (follow-up building block): TLS is
 //! terminated upstream (reverse proxy) — the server listens in the clear on its
@@ -13,8 +13,8 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use universallink_server_daemon::config;
-use universallink_server_daemon::store::FileStore;
+use onedevice_server_daemon::config;
+use onedevice_server_daemon::store::FileStore;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -34,7 +34,7 @@ async fn main() -> ExitCode {
     tracing::info!(directory = %state_path.display(), "persisted directory");
     let store = Arc::new(FileStore::new(state_path));
 
-    let mut server = match universallink_server::spawn_with_store(config, store).await {
+    let mut server = match onedevice_server::spawn_with_store(config, store).await {
         Ok(server) => server,
         Err(e) => {
             tracing::error!(error = format!("{e:#}"), "could not start listening");
@@ -64,11 +64,11 @@ async fn main() -> ExitCode {
 fn init_logging() {
     use tracing_subscriber::EnvFilter;
 
-    // `UNIVERSALLINK_LOG` (not `RUST_LOG`, too shared), like the Core.
+    // `ONEDEVICE_LOG` (not `RUST_LOG`, too shared), like the Core.
     // Output on stderr: a container collects the standard stream.
     let filter = EnvFilter::builder()
         .with_default_directive(tracing::Level::INFO.into())
-        .with_env_var("UNIVERSALLINK_LOG")
+        .with_env_var("ONEDEVICE_LOG")
         .from_env_lossy();
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }

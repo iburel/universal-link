@@ -5,7 +5,7 @@
 //!
 //! Before this brick the two halves could not see each other — a record a server
 //! minted carried no self-signature, so it never left the device that held it,
-//! and a `UL2` code was refused outright on a device that answered to a server.
+//! and a `1D2` code was refused outright on a device that answered to a server.
 //! What ties the halves together now is that every device stands behind its own
 //! description WHEREVER it was named: the server keeps naming its half
 //! (`devices.rename` still goes through it), and the named device countersigns —
@@ -21,11 +21,11 @@
 //! the attestation) so its half can relay devices it never met in person; a
 //! rename through the server reaching the serverless half re-signed; a
 //! revocation through the server minting the account's own tombstone besides
-//! the server's strike; and a `UL2` pairing sponsored by a device that answers
+//! the server's strike; and a `1D2` pairing sponsored by a device that answers
 //! to a server — the joiner joining the account, not the deployment.
 
+use onedevice_test_support::memory_transport::MemorySwitchboard;
 use serde_json::{Value, json};
-use universallink_test_support::memory_transport::MemorySwitchboard;
 
 use crate::support::*;
 
@@ -124,7 +124,7 @@ async fn server_directory(server: &TestServer) -> Vec<Value> {
 async fn the_two_halves_of_the_account_see_each_other() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let (enrolled, nomad) = two_halves(&server, &switchboard, &code).await;
     let mut ec = watching(&enrolled).await;
     let mut nc = watching(&nomad).await;
@@ -139,7 +139,7 @@ async fn the_two_halves_of_the_account_see_each_other() {
         .find(|d| d["node_id"] == json!(enrolled.key().node_id()))
         .expect("the enrolled Core in the server's directory");
     assert!(
-        universallink_core::directory::verify_record(own),
+        onedevice_core::directory::verify_record(own),
         "the server carries the countersigned description: {own}"
     );
     // And the serverless device is nowhere in it.
@@ -158,7 +158,7 @@ async fn the_two_halves_of_the_account_see_each_other() {
             record_of(&mut nc, &enrolled.key().node_id())
                 .await
                 .is_some_and(|record| {
-                    universallink_core::directory::verify_record(&record)
+                    onedevice_core::directory::verify_record(&record)
                         && record["seq"].as_u64().is_some_and(|seq| seq > 1)
                 })
         },
@@ -168,7 +168,7 @@ async fn the_two_halves_of_the_account_see_each_other() {
     let nomad_seen = record_of(&mut ec, &nomad.key().node_id())
         .await
         .expect("the serverless sibling in the enrolled Core's directory");
-    assert!(universallink_core::directory::verify_record(&nomad_seen));
+    assert!(onedevice_core::directory::verify_record(&nomad_seen));
 
     // And the sibling SURVIVES the server: a reconnection replays the snapshot,
     // which now merges instead of replacing.
@@ -190,7 +190,7 @@ async fn the_two_halves_of_the_account_see_each_other() {
 async fn the_servers_half_relays_a_sibling_it_never_met_in_person() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
 
     // A: enrolled, with a relay — off the LAN, so D can never hear it directly.
     let a = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
@@ -215,7 +215,7 @@ async fn the_servers_half_relays_a_sibling_it_never_met_in_person() {
         async || {
             record_of(&mut cc, &a.key().node_id())
                 .await
-                .is_some_and(|record| universallink_core::directory::verify_record(&record))
+                .is_some_and(|record| onedevice_core::directory::verify_record(&record))
         },
         "A's record, server-carried, to prove itself on C",
     )
@@ -226,7 +226,7 @@ async fn the_servers_half_relays_a_sibling_it_never_met_in_person() {
         async || {
             record_of(&mut dc, &a.key().node_id())
                 .await
-                .is_some_and(|record| universallink_core::directory::verify_record(&record))
+                .is_some_and(|record| onedevice_core::directory::verify_record(&record))
         },
         "A's record to reach D through C",
     )
@@ -240,7 +240,7 @@ async fn the_servers_half_relays_a_sibling_it_never_met_in_person() {
 async fn renaming_through_the_server_reaches_the_serverless_half() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let (enrolled, nomad) = two_halves(&server, &switchboard, &code).await;
     let mut ec = manager(&enrolled).await;
     let mut nc = watching(&nomad).await;
@@ -269,7 +269,7 @@ async fn renaming_through_the_server_reaches_the_serverless_half() {
                 .await
                 .is_some_and(|record| {
                     record["name"] == json!("Atelier")
-                        && universallink_core::directory::verify_record(&record)
+                        && onedevice_core::directory::verify_record(&record)
                 })
         },
         "the server's rename, countersigned, to reach the serverless half",
@@ -287,7 +287,7 @@ async fn renaming_through_the_server_reaches_the_serverless_half() {
             list.as_array().expect("a list").iter().any(|d| {
                 d["node_id"] == json!(enrolled.key().node_id())
                     && d["name"] == json!("Atelier")
-                    && universallink_core::directory::verify_record(d)
+                    && onedevice_core::directory::verify_record(d)
             })
         },
         "the republished signature to reach the server",
@@ -304,7 +304,7 @@ async fn renaming_through_the_server_reaches_the_serverless_half() {
 async fn a_rename_that_happened_while_away_is_countersigned_at_reconnection() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let (enrolled, nomad) = two_halves(&server, &switchboard, &code).await;
     let mut ec = manager(&enrolled).await;
     let mut nc = manager(&nomad).await;
@@ -337,7 +337,7 @@ async fn a_rename_that_happened_while_away_is_countersigned_at_reconnection() {
             list.as_array().expect("a list").iter().any(|d| {
                 d["node_id"] == json!(enrolled.key().node_id())
                     && d["name"] == json!("Away-Name")
-                    && universallink_core::directory::verify_record(d)
+                    && onedevice_core::directory::verify_record(d)
             })
         },
         "the countersigned rename to reach the server",
@@ -350,7 +350,7 @@ async fn a_rename_that_happened_while_away_is_countersigned_at_reconnection() {
                 .await
                 .is_some_and(|record| {
                     record["name"] == json!("Away-Name")
-                        && universallink_core::directory::verify_record(&record)
+                        && onedevice_core::directory::verify_record(&record)
                 })
         },
         "the countersigned rename to reach the serverless half",
@@ -366,7 +366,7 @@ async fn a_rename_that_happened_while_away_is_countersigned_at_reconnection() {
 async fn a_device_the_account_knew_first_is_rekeyed_when_the_server_names_it() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let late_key = DeviceKey::generate();
     let late_record = peer_record(&late_key, "Latecomer", std::env::consts::OS, &code, 1);
     let enrolled = TestCore::start_enrolled_lan_only_holding(
@@ -431,7 +431,7 @@ async fn a_device_the_account_knew_first_is_rekeyed_when_the_server_names_it() {
 async fn a_self_revocation_through_the_server_mints_no_tombstone() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let enrolled = TestCore::start_enrolled_lan_only_holding(
         &server,
         &switchboard,
@@ -474,7 +474,7 @@ async fn a_self_revocation_through_the_server_mints_no_tombstone() {
 async fn revoking_through_the_server_strikes_the_serverless_half_too() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let (enrolled, nomad) = two_halves(&server, &switchboard, &code).await;
     let mut ec = manager(&enrolled).await;
     let mut nc = watching(&nomad).await;
@@ -492,7 +492,7 @@ async fn revoking_through_the_server_strikes_the_serverless_half_too() {
             "presence.update",
             json!({
                 "seq": seq,
-                "self_sig": victim_key.sign(&universallink_core::directory::record_message(
+                "self_sig": victim_key.sign(&onedevice_core::directory::record_message(
                     &victim_node,
                     "PC-Victim",
                     std::env::consts::OS,
@@ -543,11 +543,11 @@ async fn revoking_through_the_server_strikes_the_serverless_half_too() {
     let tombstone = revoked["revoked"][&victim_node]
         .as_str()
         .expect("the victim's tombstone");
-    let ak_pub = universallink_core::account_key::public_hex(
-        &universallink_core::account_key::account_key_from_code(&code).expect("valid code"),
+    let ak_pub = onedevice_core::account_key::public_hex(
+        &onedevice_core::account_key::account_key_from_code(&code).expect("valid code"),
     );
     assert!(
-        universallink_core::account_key::verify_revocation(&ak_pub, &victim_node, tombstone),
+        onedevice_core::account_key::verify_revocation(&ak_pub, &victim_node, tombstone),
         "and it is the account's own signature"
     );
 
@@ -562,7 +562,7 @@ async fn revoking_through_the_server_strikes_the_serverless_half_too() {
             "presence.update",
             json!({
                 "seq": seq2,
-                "self_sig": victim2_key.sign(&universallink_core::directory::record_message(
+                "self_sig": victim2_key.sign(&onedevice_core::directory::record_message(
                     &victim2_node,
                     "PC-Victim-2",
                     std::env::consts::OS,
@@ -596,7 +596,7 @@ async fn revoking_through_the_server_strikes_the_serverless_half_too() {
 async fn revoking_a_device_the_server_never_named_goes_by_the_account() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let (enrolled, nomad) = two_halves(&server, &switchboard, &code).await;
     let mut ec = watching(&enrolled).await;
     wait_server_connected(&mut ec, true).await;
@@ -620,14 +620,14 @@ async fn revoking_a_device_the_server_never_named_goes_by_the_account() {
     assert!(revoked.contains(&nomad_node), "{revoked}");
 }
 
-/// A device that answers to a server sponsors over the local network: the `UL2`
+/// A device that answers to a server sponsors over the local network: the `1D2`
 /// refusal (`PAIRING_VIA_SERVER`) fell with the continuum. The joiner joins the
 /// ACCOUNT — key, roster, directory — and the deployment simply never lists it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_with_a_server_sponsors_over_the_local_network() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let enrolled = TestCore::start_enrolled_lan_only_holding(
         &server,
         &switchboard,
@@ -648,11 +648,11 @@ async fn a_device_with_a_server_sponsors_over_the_local_network() {
         .await
         .expect("pairing.offer on the fresh device");
     let code_shown = offer["code"].as_str().expect("a code").to_string();
-    assert!(code_shown.starts_with("UL2:"), "{code_shown}");
+    assert!(code_shown.starts_with("1D2:"), "{code_shown}");
     let claim = ec
         .request("pairing.accept", json!({ "code": code_shown }))
         .await
-        .expect("a device with a server may scan a UL2 code now");
+        .expect("a device with a server may scan a 1D2 code now");
     assert_eq!(claim["role"], json!("sponsor"), "it holds the account key");
     assert_eq!(
         claim["device"]["node_id"],

@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use universallink_server::{DirectoryStore, DurableState};
+use onedevice_server::{DirectoryStore, DurableState};
 
 pub struct FileStore {
     path: PathBuf,
@@ -55,7 +55,7 @@ impl DirectoryStore for FileStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use universallink_server::DurableDevice;
+    use onedevice_server::DurableDevice;
 
     #[test]
     fn round_trips_through_disk() {

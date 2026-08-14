@@ -1,10 +1,10 @@
 <resources>
-    <string name="app_name">"UniversalLink"</string>
-    <string name="main_activity_title">"UniversalLink"</string>
+    <string name="app_name">"1Device"</string>
+    <string name="main_activity_title">"1Device"</string>
     <!-- The scanner (ScanActivity). The rest of the app's words live in the
          shared Svelte UI; these are the ones outside its window. -->
     <string name="scan_title">Read a code</string>
     <string name="scan_hint">Point the camera at the code shown on your other device.</string>
-    <string name="scan_foreign">That is not a UniversalLink code — look for the one on your other device.</string>
+    <string name="scan_foreign">That is not a 1Device code — look for the one on your other device.</string>
     <string name="scan_cancel">Cancel</string>
 </resources>

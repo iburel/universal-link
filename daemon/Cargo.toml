@@ -1,28 +1,28 @@
 [package]
-name = "universallink-daemon"
+name = "onedevice-daemon"
 version = "0.6.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 publish = false
 
 # The Core process: this crate produces the executable launched at session
-# login. It plugs into the `universallink-core` library everything the library
+# login. It plugs into the `onedevice-core` library everything the library
 # cannot carry — TLS, the OS keyring, logging, signals — and
 # supervises the official components it spawns.
 #
 # Why a separate crate and not a `[[bin]]` in `core/`: the library is
-# cross-checked from Linux (`cargo check -p universallink-core --target
+# cross-checked from Linux (`cargo check -p onedevice-core --target
 # x86_64-pc-windows-msvc`), yet rustls and keyring do not cross-compile. The
 # daemon, by contrast, is only compiled natively — by the three CI jobs.
 
 [[bin]]
-name = "universallink-core"
+name = "1device-core"
 path = "src/main.rs"
 
 # Supervisor test fixture: a component that actually connects to the
 # Core using the token received on its standard input. Not a distributed artifact.
 [[bin]]
-name = "ul-fake-component"
+name = "1device-fake-component"
 path = "src/bin/fake_component.rs"
 
 [features]
@@ -54,8 +54,8 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-universallink-core = { path = "../core" }
-universallink-paths = { path = "../paths" }
+onedevice-core = { path = "../core" }
+onedevice-paths = { path = "../paths" }
 
 # OS keyring. Default features: on Linux the zbus backend is pure
 # Rust (no libdbus at build time), macOS uses the Keychain, Windows
@@ -87,12 +87,12 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 tempfile = "3"
-universallink-ipc-client = { path = "../client" }
+onedevice-ipc-client = { path = "../client" }
 # In-memory transport for the supervisor tests (a real Core without iroh).
-universallink-test-support = { path = "../test-support" }
+onedevice-test-support = { path = "../test-support" }
 # Local relay: test two real iroh endpoints offline, without depending on the
 # public relays.
 iroh = { version = "1", features = ["test-utils"] }
 # Dev-dependency on itself: enables `test-utils` (hence `bind_test`) for
 # the tests WITHOUT enabling it in the production build.
-universallink-daemon = { path = ".", features = ["test-utils"] }
+onedevice-daemon = { path = ".", features = ["test-utils"] }

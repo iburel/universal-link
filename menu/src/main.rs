@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
 
-//! The `universallink-menu` binary: one executable, two jobs.
+//! The `1device-menu` binary: one executable, two jobs.
 //!
 //! - **manager** (no mode flag) — what the Core's supervisor launches. It holds
 //!   the IPC connection, keeps the target list, rewrites the OS menu surfaces,
@@ -32,13 +32,13 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use onedevice_ipc_client::{ClientConfig, TokenSource};
+use onedevice_menu::channel::{self, Request, Response};
+use onedevice_menu::{HelperCommand, Outcome, os, run};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use universallink_ipc_client::{ClientConfig, TokenSource};
-use universallink_menu::channel::{self, Request, Response};
-use universallink_menu::{HelperCommand, Outcome, os, run};
 
 /// Set by the supervisor: the Core's listening endpoint.
-const IPC_PATH_ENV: &str = "UNIVERSALLINK_IPC_PATH";
+const IPC_PATH_ENV: &str = "ONEDEVICE_IPC_PATH";
 /// Barely matters: a spawn token is single-use, so we exit on the first loss
 /// rather than let the client retry.
 const RECONNECT_BASE_DELAY: Duration = Duration::from_millis(500);
@@ -100,7 +100,7 @@ fn main() {
             Ok(arg) => args.push(arg),
             Err(bad) => {
                 note!(
-                    "[universallink-menu] argument is not valid UTF-8: {}",
+                    "[1device-menu] argument is not valid UTF-8: {}",
                     bad.display()
                 );
                 std::process::exit(1);
@@ -110,7 +110,7 @@ fn main() {
     let args = match parse_args(&args) {
         Ok(args) => args,
         Err(message) => {
-            note!("[universallink-menu] {message}");
+            note!("[1device-menu] {message}");
             note!("{USAGE}");
             std::process::exit(2);
         }
@@ -137,9 +137,9 @@ fn main() {
 }
 
 const USAGE: &str = "usage:
-  universallink-menu                                  run the manager (launched by the Core)
-  universallink-menu --send <device_id> -- <paths…>    send paths to a device (a menu click)
-  universallink-menu --targets                         print the manager's current targets
+  1device-menu                                  run the manager (launched by the Core)
+  1device-menu --send <device_id> -- <paths…>    send paths to a device (a menu click)
+  1device-menu --targets                         print the manager's current targets
 options:
   --channel <path>   talk to a manager on this channel instead of the default";
 
@@ -214,7 +214,7 @@ fn channel_path(override_path: Option<PathBuf>) -> Result<PathBuf, String> {
     if let Some(path) = override_path {
         return Ok(path);
     }
-    universallink_paths::production_endpoint()
+    onedevice_paths::production_endpoint()
         .map(|endpoint| endpoint.menu_channel)
         .ok_or_else(|| "cannot resolve the local channel path from the environment".to_string())
 }
@@ -227,7 +227,7 @@ async fn courier(args: Args) -> i32 {
     let path = match channel_path(args.channel) {
         Ok(path) => path,
         Err(message) => {
-            note!("[universallink-menu] {message}");
+            note!("[1device-menu] {message}");
             return 1;
         }
     };
@@ -237,12 +237,12 @@ async fn courier(args: Args) -> i32 {
             let paths = match absolute_paths(paths) {
                 Ok(paths) => paths,
                 Err(message) => {
-                    note!("[universallink-menu] {message}");
+                    note!("[1device-menu] {message}");
                     return 1;
                 }
             };
             if paths.is_empty() {
-                note!("[universallink-menu] nothing to send");
+                note!("[1device-menu] nothing to send");
                 return 1;
             }
             Request::Send { device_id, paths }
@@ -261,11 +261,11 @@ async fn courier(args: Args) -> i32 {
             0
         }
         Ok(Response::Failed { error }) => {
-            note!("[universallink-menu] refused: {error}");
+            note!("[1device-menu] refused: {error}");
             1
         }
         Err(message) => {
-            note!("[universallink-menu] {message}");
+            note!("[1device-menu] {message}");
             1
         }
     }
@@ -309,22 +309,20 @@ fn absolute_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, String> {
 
 async fn manager(channel_override: Option<PathBuf>) -> i32 {
     let Ok(ipc_path) = std::env::var(IPC_PATH_ENV) else {
-        note!(
-            "[universallink-menu] {IPC_PATH_ENV} is not set: the manager is launched by the Core"
-        );
+        note!("[1device-menu] {IPC_PATH_ENV} is not set: the manager is launched by the Core");
         return 1;
     };
     let program = match std::env::current_exe() {
         Ok(program) => program,
         Err(e) => {
-            note!("[universallink-menu] cannot resolve our own path: {e}");
+            note!("[1device-menu] cannot resolve our own path: {e}");
             return 1;
         }
     };
     let path = match channel_path(channel_override.clone()) {
         Ok(path) => path,
         Err(message) => {
-            note!("[universallink-menu] {message}");
+            note!("[1device-menu] {message}");
             return 1;
         }
     };
@@ -343,7 +341,7 @@ async fn manager(channel_override: Option<PathBuf>) -> i32 {
         Err(e) => {
             // Not a failure: this platform has no surface yet (or no desktop).
             // Exiting 0 tells the supervisor we are done, not broken.
-            note!("[universallink-menu] {e}");
+            note!("[1device-menu] {e}");
             return 0;
         }
     };
@@ -351,11 +349,11 @@ async fn manager(channel_override: Option<PathBuf>) -> i32 {
     let listener = match channel::bind(&path) {
         Ok(listener) => listener,
         Err(channel::BindError::AlreadyRunning) => {
-            note!("[universallink-menu] another manager already owns the local channel");
+            note!("[1device-menu] another manager already owns the local channel");
             return 0;
         }
         Err(e) => {
-            note!("[universallink-menu] {e}");
+            note!("[1device-menu] {e}");
             return 1;
         }
     };
@@ -370,16 +368,16 @@ async fn manager(channel_override: Option<PathBuf>) -> i32 {
     match stdin.read_line(&mut token).await {
         Ok(_) if !token.trim().is_empty() => {}
         _ => {
-            note!("[universallink-menu] no spawn token on standard input");
+            note!("[1device-menu] no spawn token on standard input");
             return 1;
         }
     }
     let token = token.trim().to_string();
 
-    let (client, events) = universallink_ipc_client::spawn(ClientConfig {
+    let (client, events) = onedevice_ipc_client::spawn(ClientConfig {
         ipc_path: PathBuf::from(ipc_path),
         token: TokenSource::Spawn(token),
-        name: "universallink-menu".into(),
+        name: "1device-menu".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         role: ROLE.into(),
         scopes: SCOPES.iter().map(|s| (*s).to_string()).collect(),

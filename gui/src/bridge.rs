@@ -7,9 +7,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+use onedevice_ipc_client::{Client, ClientConfig, Event, RequestError};
 use serde_json::{Value, json};
 use tauri::{AppHandle, Builder, Emitter, Manager, Runtime, State};
-use universallink_ipc_client::{Client, ClientConfig, Event, RequestError};
 
 /// Managed state: the client only exists once the bridge task is started —
 /// before that, every request is `not_connected` (same fail-closed as before
@@ -61,7 +61,7 @@ pub fn shell<R: Runtime>(
             get_server_config
         ])
         .plugin(
-            tauri::plugin::Builder::<R, ()>::new("universallink-bridge")
+            tauri::plugin::Builder::<R, ()>::new("1device-bridge")
                 .setup(move |app, _api| {
                     tauri::async_runtime::spawn(bridge_loop(app.clone(), config));
                     Ok(())
@@ -74,7 +74,7 @@ pub fn shell<R: Runtime>(
 /// the terminal state then stays shown by the snapshot). Public so the mobile
 /// shell can start it after spawning the embedded Core.
 pub async fn bridge_loop<R: Runtime>(app: AppHandle<R>, config: ClientConfig) {
-    let (client, mut events) = universallink_ipc_client::spawn(config);
+    let (client, mut events) = onedevice_ipc_client::spawn(config);
     let _ = app.state::<CoreState>().client.set(client);
     while let Some(event) = events.recv().await {
         if let Event::Notification { method, params } = event {
@@ -273,7 +273,7 @@ fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use universallink_ipc_client::RpcError;
+    use onedevice_ipc_client::RpcError;
 
     use super::*;
 

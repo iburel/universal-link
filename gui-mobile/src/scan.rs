@@ -53,7 +53,7 @@ const BACKSTOP: Duration = Duration::from_secs(300);
 static PENDING: Mutex<Option<oneshot::Sender<Value>>> = Mutex::new(None);
 
 /// What a code must start with to be one of ours — the Core's own constants
-/// (`UL1` pairs through a server, `UL2` over the local network — either may be
+/// (`1D1` pairs through a server, `1D2` over the local network — either may be
 /// on the screen in front of the camera), so the format lives in exactly one
 /// place. Comma-separated: the list crosses to Kotlin in the one intent extra,
 /// and neither tag can carry a comma. The scanner is handed these and keeps
@@ -63,8 +63,8 @@ static PENDING: Mutex<Option<oneshot::Sender<Value>>> = Mutex::new(None);
 fn tags() -> String {
     format!(
         "{}:,{}:",
-        universallink_core::PAIRING_CODE_TAG,
-        universallink_core::PAIRING_LAN_CODE_TAG
+        onedevice_core::PAIRING_CODE_TAG,
+        onedevice_core::PAIRING_LAN_CODE_TAG
     )
 }
 
@@ -117,12 +117,12 @@ fn clear() {
     *PENDING.lock().expect("lock the pending scan") = None;
 }
 
-/// `org.universallink.mobile.ScanBridge.onScanResult` — see `ScanBridge.kt`.
+/// `org.onedevice.mobile.ScanBridge.onScanResult` — see `ScanBridge.kt`.
 ///
 /// Called from Kotlin's main thread, once per scan.
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_universallink_mobile_ScanBridge_onScanResult(
+pub extern "system" fn Java_org_onedevice_mobile_ScanBridge_onScanResult(
     mut env: tauri::tao::platform::android::prelude::JNIEnv<'_>,
     _class: tauri::tao::platform::android::prelude::JClass<'_>,
     json: tauri::tao::platform::android::prelude::JString<'_>,
@@ -211,9 +211,9 @@ mod bridge {
     /// Whether the device has a camera, as Kotlin found it (`PackageManager`).
     static CAMERA: AtomicBool = AtomicBool::new(false);
 
-    /// `org.universallink.mobile.ScanBridge.nativeInit` — see `ScanBridge.kt`.
+    /// `org.onedevice.mobile.ScanBridge.nativeInit` — see `ScanBridge.kt`.
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_org_universallink_mobile_ScanBridge_nativeInit(
+    pub extern "system" fn Java_org_onedevice_mobile_ScanBridge_nativeInit(
         env: JNIEnv<'_>,
         class: JClass<'_>,
         has_camera: jni::sys::jboolean,
@@ -293,14 +293,14 @@ mod bridge {
 mod tests {
     use super::*;
 
-    const TAGS: &str = "UL1:,UL2:";
+    const TAGS: &str = "1D1:,1D2:";
 
     // Both kinds of pairing code pass: the one a server relays and the one that
     // names a device on the local network. Which is which is the Core's
     // business — the camera's job ends at "one of ours".
     #[test]
     fn a_code_carrying_either_tag_is_passed_on_as_it_stands() {
-        for code in ["UL1:aaaa:bbbb:p_1", "UL2:aaaa:bbbb:node_1"] {
+        for code in ["1D1:aaaa:bbbb:p_1", "1D2:aaaa:bbbb:node_1"] {
             assert_eq!(
                 normalize(&json!({ "code": code }).to_string(), TAGS),
                 json!({ "code": code }),
@@ -360,13 +360,13 @@ mod tests {
     }
 
     // The tags come from the Core, and each is the tag of a CODE, not of a
-    // family of them: `UL10:` must not pass for `UL1:`, nor `UL20:` for `UL2:`.
+    // family of them: `1D10:` must not pass for `1D1:`, nor `1D20:` for `1D2:`.
     #[test]
     fn the_tags_are_the_ones_the_core_mints() {
-        assert_eq!(tags(), "UL1:,UL2:");
+        assert_eq!(tags(), "1D1:,1D2:");
         for family in [
-            r#"{"code":"UL10:aaaa:bbbb:p_1"}"#,
-            r#"{"code":"UL20:aaaa:bbbb:node_1"}"#,
+            r#"{"code":"1D10:aaaa:bbbb:p_1"}"#,
+            r#"{"code":"1D20:aaaa:bbbb:node_1"}"#,
         ] {
             assert_eq!(
                 normalize(family, &tags()),
@@ -422,10 +422,10 @@ mod tests {
             assert_eq!(block_on(scan_code()), json!({ "reason": "busy" }));
 
             assert!(rx.try_recv().is_err(), "the first scan was answered");
-            report(r#"{"code":"UL1:a:b:p_1"}"#);
+            report(r#"{"code":"1D1:a:b:p_1"}"#);
             assert_eq!(
                 block_on(rx).expect("the first scan still had its sender"),
-                json!({ "code": "UL1:a:b:p_1" })
+                json!({ "code": "1D1:a:b:p_1" })
             );
         });
     }
@@ -450,7 +450,7 @@ mod tests {
     #[test]
     fn an_outcome_nobody_waits_for_is_dropped() {
         with_slot(|| {
-            report(r#"{"code":"UL1:a:b:p_1"}"#);
+            report(r#"{"code":"1D1:a:b:p_1"}"#);
             assert!(PENDING.lock().expect("lock").is_none());
         });
     }

@@ -434,7 +434,7 @@ test.each([
 });
 
 // The Core's definition of "can vouch" names no session: a serverless sponsor
-// shows a `UL2` code. Gating on the session would keep the whole serverless
+// shows a `1D2` code. Gating on the session would keep the whole serverless
 // account from ever growing past one device.
 test("a serverless device that can vouch is offered to add another", () => {
   store.session = { logged_in: false, server_connected: false, configured: false };

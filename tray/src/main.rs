@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
 
-//! The `universallink-tray` binary: the platform tray (a `tao` event loop on
+//! The `1device-tray` binary: the platform tray (a `tao` event loop on
 //! the main thread — macOS requires it, Linux needs gtk which tao initializes)
 //! plus the async IPC brain (a tokio runtime on a side thread). The two are
 //! bridged by an `EventLoopProxy` (status updates, exit) and a command channel
@@ -10,17 +10,17 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use onedevice_ipc_client::{ClientConfig, TokenSource};
+use onedevice_tray::{Outcome, TrayStatus, UiCommand, run};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::mpsc;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
-use universallink_ipc_client::{ClientConfig, TokenSource};
-use universallink_tray::{Outcome, TrayStatus, UiCommand, run};
 
 /// Set by the supervisor: the Core's listening endpoint.
-const IPC_PATH_ENV: &str = "UNIVERSALLINK_IPC_PATH";
+const IPC_PATH_ENV: &str = "ONEDEVICE_IPC_PATH";
 /// Barely matters: a spawn token is single-use, so we exit on the first loss
 /// rather than let the client retry.
 const RECONNECT_BASE_DELAY: Duration = Duration::from_millis(500);
@@ -58,7 +58,7 @@ fn main() {
     }
 
     // Menu built now that tao has initialized gtk; ids captured to match clicks.
-    let open_item = MenuItem::new("Open UniversalLink", true, None);
+    let open_item = MenuItem::new("Open 1Device", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
     let open_id = open_item.id().clone();
     let quit_id = quit_item.id().clone();
@@ -157,10 +157,10 @@ async fn brain(cmd_rx: mpsc::Receiver<UiCommand>, proxy: EventLoopProxy<UserEven
     }
     let token = token.trim().to_string();
 
-    let (client, events) = universallink_ipc_client::spawn(ClientConfig {
+    let (client, events) = onedevice_ipc_client::spawn(ClientConfig {
         ipc_path: PathBuf::from(ipc_path),
         token: TokenSource::Spawn(token),
-        name: "universallink-tray".into(),
+        name: "1device-tray".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         role: "tray".into(),
         // session.read for the status icon, system.shutdown for the Quit — both

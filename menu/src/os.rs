@@ -117,7 +117,7 @@ mod tests {
     #[test]
     fn linux_offers_both_surfaces() {
         let surfaces =
-            create(helper(std::path::PathBuf::from("/opt/universallink-menu"))).expect("surfaces");
+            create(helper(std::path::PathBuf::from("/opt/1device-menu"))).expect("surfaces");
         let names: Vec<&str> = surfaces.iter().map(|s| s.name()).collect();
         assert_eq!(names, ["kde-servicemenu", "nautilus-scripts"]);
     }
@@ -128,7 +128,7 @@ mod tests {
     #[test]
     fn windows_offers_both_cascades_and_send_to() {
         let surfaces = create(helper(std::path::PathBuf::from(
-            r"C:\Program Files\UL\universallink-menu.exe",
+            r"C:\Program Files\UL\1device-menu.exe",
         )))
         .expect("surfaces");
         let names: Vec<&str> = surfaces.iter().map(|s| s.name()).collect();
@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn macos_offers_the_services_surface() {
         let surfaces = create(helper(std::path::PathBuf::from(
-            "/Applications/UniversalLink.app/universallink-menu",
+            "/Applications/1Device.app/1device-menu",
         )))
         .expect("surfaces");
         let names: Vec<&str> = surfaces.iter().map(|s| s.name()).collect();

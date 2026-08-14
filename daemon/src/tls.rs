@@ -12,8 +12,8 @@
 
 use std::sync::Arc;
 
+use onedevice_core::{Connecting, Connector, IoStream, Target};
 use tokio_rustls::rustls::pki_types::ServerName;
-use universallink_core::{Connecting, Connector, IoStream, Target};
 
 /// Opens in plaintext or in TLS depending on what the URL scheme required.
 pub struct TlsConnector {

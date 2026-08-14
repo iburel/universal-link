@@ -1,5 +1,5 @@
 [package]
-name = "universallink-ipc-client"
+name = "onedevice-ipc-client"
 version = "0.6.0"
 edition = "2024"
 license = "AGPL-3.0-only"
@@ -25,6 +25,6 @@ tokio = { version = "1", features = [
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
-universallink-core = { path = "../core" }
-universallink-server = { path = "../server" }
-universallink-test-support = { path = "../test-support" }
+onedevice-core = { path = "../core" }
+onedevice-server = { path = "../server" }
+onedevice-test-support = { path = "../test-support" }

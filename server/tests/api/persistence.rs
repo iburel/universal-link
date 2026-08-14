@@ -11,7 +11,7 @@ use std::sync::Arc;
 use serde_json::json;
 
 use crate::support::*;
-use universallink_server::MemoryStore;
+use onedevice_server::MemoryStore;
 
 #[tokio::test]
 async fn enrolled_device_survives_a_restart() {

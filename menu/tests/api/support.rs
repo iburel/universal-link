@@ -3,8 +3,8 @@
 
 //! Test harness for the contextual-menu manager.
 //!
-//! The whole chain is real and in-process: manager → `universallink-ipc-client` →
-//! a real Core → a real `universallink-server` + `FakeOidc`. No scripted Core
+//! The whole chain is real and in-process: manager → `onedevice-ipc-client` →
+//! a real Core → a real `1device-server` + `FakeOidc`. No scripted Core
 //! here, and that is the point — every rule the manager applies is about *device
 //! records*, so the records have to be genuine: enrolled through the real
 //! enrollment, brought online by a real `auth.authenticate`, and given a real
@@ -37,15 +37,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde_json::{Value, json};
-use tokio::sync::oneshot;
-use universallink_core::CoreHandle;
-use universallink_ipc_client::{ClientConfig, Event, TokenSource};
-use universallink_menu::channel::{self, Request, Response};
-use universallink_menu::{MenuSurface, Outcome, Target};
-use universallink_test_support::{
+use onedevice_core::CoreHandle;
+use onedevice_ipc_client::{ClientConfig, Event, TokenSource};
+use onedevice_menu::channel::{self, Request, Response};
+use onedevice_menu::{MenuSurface, Outcome, Target};
+use onedevice_test_support::{
     Device, FakeOidc, TEST_CLIENT_ID, TEST_SUB, authenticate, browse, enroll_device_at,
 };
+use serde_json::{Value, json};
+use tokio::sync::oneshot;
 
 /// Deliberately generous. This suite stands up a server, a fake IdP, a Core and
 /// a real OIDC round trip per test, and nextest runs each test in its own process
@@ -79,7 +79,7 @@ fn ipc_path_for(dir: &Path) -> PathBuf {
 #[cfg(windows)]
 fn ipc_path_for(_dir: &Path) -> PathBuf {
     PathBuf::from(format!(
-        r"\\.\pipe\universallink-menu-test-core-{}-{}",
+        r"\\.\pipe\1device-menu-test-core-{}-{}",
         std::process::id(),
         next_seq()
     ))
@@ -93,7 +93,7 @@ fn channel_path_for(dir: &Path) -> PathBuf {
 #[cfg(windows)]
 fn channel_path_for(_dir: &Path) -> PathBuf {
     PathBuf::from(format!(
-        r"\\.\pipe\universallink-menu-test-channel-{}-{}",
+        r"\\.\pipe\1device-menu-test-channel-{}-{}",
         std::process::id(),
         next_seq()
     ))
@@ -112,16 +112,16 @@ fn next_seq() -> u64 {
 
 pub struct TestServer {
     pub oidc: FakeOidc,
-    _server: universallink_server::ServerHandle,
+    _server: onedevice_server::ServerHandle,
     url: String,
 }
 
 impl TestServer {
     pub async fn start() -> TestServer {
         let oidc = FakeOidc::start().await;
-        let config = universallink_server::Config {
+        let config = onedevice_server::Config {
             bind_addr: "127.0.0.1:0".parse().expect("addr"),
-            oidc: universallink_server::OidcConfig {
+            oidc: onedevice_server::OidcConfig {
                 issuer_url: oidc.issuer(),
                 client_id: TEST_CLIENT_ID.into(),
                 client_secret: None,
@@ -134,7 +134,7 @@ impl TestServer {
             pairing_ttl: Duration::from_secs(120),
             max_requests_per_minute: None,
         };
-        let server = universallink_server::spawn(config)
+        let server = onedevice_server::spawn(config)
             .await
             .expect("server startup");
         let url = format!("ws://{}/ws", server.local_addr());
@@ -145,8 +145,8 @@ impl TestServer {
         }
     }
 
-    pub fn core_cfg(&self) -> universallink_core::ServerConfig {
-        universallink_core::ServerConfig {
+    pub fn core_cfg(&self) -> onedevice_core::ServerConfig {
+        onedevice_core::ServerConfig {
             url: self.url.clone(),
             oidc_issuer: self.oidc.issuer(),
             oidc_client_id: TEST_CLIENT_ID.into(),
@@ -177,9 +177,9 @@ impl TestServer {
 /// real account key derived from the recovery code — the same primitive the Core
 /// uses, so the Core genuinely accepts it.
 pub async fn attest(device: &mut Device, recovery_code: &str) {
-    let ak = universallink_core::account_key::account_key_from_code(recovery_code)
+    let ak = onedevice_core::account_key::account_key_from_code(recovery_code)
         .expect("account key from the recovery code");
-    let attestation = universallink_core::account_key::attest(&ak, &device.key.node_id());
+    let attestation = onedevice_core::account_key::attest(&ak, &device.key.node_id());
     device
         .conn
         .request(
@@ -205,26 +205,24 @@ impl TestCore {
         let dir = tempfile::tempdir().expect("tempdir");
         let ipc_path = ipc_path_for(dir.path());
         let server_cfg = server.core_cfg();
-        let config = universallink_core::Config {
+        let config = onedevice_core::Config {
             ipc_path: ipc_path.clone(),
             config_dir: dir.path().to_path_buf(),
             server: Some(server_cfg.clone()),
             reload_server: Arc::new(move || Ok::<_, String>(Some(server_cfg.clone()))),
             device_name: CORE_DEVICE_NAME.into(),
-            secret_store: Arc::new(universallink_core::FileSecretStore::new(dir.path())),
-            connector: Arc::new(universallink_core::PlainConnector),
+            secret_store: Arc::new(onedevice_core::FileSecretStore::new(dir.path())),
+            connector: Arc::new(onedevice_core::PlainConnector),
             // The menu suite never runs a transfer: a click is proven by the
             // `files.send` the Core accepts, not by bytes moving (that is T2's
             // suite). An isolated in-memory transport keeps this suite off the
             // cross-reactor contention that needs nextest serialization.
-            transport: universallink_test_support::memory_transport::MemorySwitchboard::new()
+            transport: onedevice_test_support::memory_transport::MemorySwitchboard::new()
                 .endpoint("menu-test", None),
             receive_dir: dir.path().join("received"),
             reconnect_base_delay: Duration::from_millis(50),
         };
-        let handle = universallink_core::spawn(config)
-            .await
-            .expect("Core startup");
+        let handle = onedevice_core::spawn(config).await.expect("Core startup");
         TestCore {
             handle: Some(handle),
             dir,
@@ -260,7 +258,7 @@ impl TestCore {
 /// accept.
 pub async fn login(core: &TestCore) -> String {
     let token = core.mint("gui", &["session.read", "session.manage", "devices.read"]);
-    let (client, mut events) = universallink_ipc_client::spawn(ClientConfig {
+    let (client, mut events) = onedevice_ipc_client::spawn(ClientConfig {
         ipc_path: core.ipc_path(),
         token: TokenSource::Spawn(token),
         name: "harness-gui".into(),
@@ -421,10 +419,10 @@ impl Manager {
         let listener = channel::bind(&channel_path).expect("bind the local channel");
         let mut surfaces = surfaces(&channel_path);
 
-        let (client, events) = universallink_ipc_client::spawn(ClientConfig {
+        let (client, events) = onedevice_ipc_client::spawn(ClientConfig {
             ipc_path: core.ipc_path(),
             token: TokenSource::Spawn(core.mint(ROLE, SCOPES)),
-            name: "universallink-menu".into(),
+            name: "1device-menu".into(),
             version: "0".into(),
             role: ROLE.into(),
             scopes: SCOPES.iter().map(|s| (*s).to_string()).collect(),
@@ -437,7 +435,7 @@ impl Manager {
 
         let (stop_tx, stop_rx) = oneshot::channel();
         surfaces.push(Box::new(FakeSurface(renders.clone())));
-        let task = tokio::spawn(universallink_menu::run(
+        let task = tokio::spawn(onedevice_menu::run(
             client,
             events,
             async move {
@@ -541,13 +539,13 @@ impl Manager {
 /// (`core/src/dataplane.rs`), so it arrives even though the harness peer is not a
 /// real endpoint.
 pub struct TransferWatcher {
-    _client: universallink_ipc_client::Client,
+    _client: onedevice_ipc_client::Client,
     events: tokio::sync::mpsc::Receiver<Event>,
 }
 
 impl TransferWatcher {
     pub async fn connect(core: &TestCore) -> TransferWatcher {
-        let (client, mut events) = universallink_ipc_client::spawn(ClientConfig {
+        let (client, mut events) = onedevice_ipc_client::spawn(ClientConfig {
             ipc_path: core.ipc_path(),
             token: TokenSource::Spawn(core.mint("custom", &["transfers.read"])),
             name: "harness-transfers".into(),
@@ -647,7 +645,7 @@ pub async fn run_courier(
     device_id: &str,
     paths: &[PathBuf],
 ) -> std::process::Output {
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_universallink-menu"));
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_1device-menu"));
     command
         .arg("--channel")
         .arg(channel)

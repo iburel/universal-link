@@ -10,9 +10,9 @@
 //! data-channel connections that must make progress at the same time (as in the
 //! client crate's channel suite).
 
+use onedevice_clipboard::{BackendEvent, Format, LocalClip, run};
+use onedevice_ipc_client::{ChannelError, ConsumerChannel, ErrorCode};
 use serde_json::json;
-use universallink_clipboard::{BackendEvent, Format, LocalClip, run};
-use universallink_ipc_client::{ChannelError, ConsumerChannel, ErrorCode};
 
 use crate::support::*;
 

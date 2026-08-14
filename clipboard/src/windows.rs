@@ -511,7 +511,7 @@ impl Backend {
         unsafe {
             let hinstance = GetModuleHandleW(std::ptr::null());
             let class_name = wide(&format!(
-                "universallink-clipboard-window-{}",
+                "1device-clipboard-window-{}",
                 CLASS_SEQ.fetch_add(1, Ordering::Relaxed)
             ));
             let wc = WNDCLASSW {
@@ -523,7 +523,7 @@ impl Backend {
             if RegisterClassW(&wc) == 0 {
                 return Err("RegisterClassW failed".into());
             }
-            let window_name = wide("universallink-clipboard");
+            let window_name = wide("1device-clipboard");
             let hwnd = CreateWindowExW(
                 0,
                 class_name.as_ptr(),
@@ -1219,7 +1219,7 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 fn warn(message: &str) {
-    eprintln!("[universallink-clipboard] {message}");
+    eprintln!("[1device-clipboard] {message}");
 }
 
 // --- DIB ↔ PNG codec (pure; round-tripped in the unit tests) ---------------

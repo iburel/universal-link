@@ -42,11 +42,11 @@ use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, RelayUrl, SecretKey};
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use n0_future::{Stream, StreamExt};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::mpsc;
-use universallink_core::{
+use onedevice_core::{
     ALPN, Closing, HomeRelay, Incoming, IoStream, Listening, Opening, PeerAddr, PeerTransport,
 };
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::mpsc;
 
 /// Maximum wait for the endpoint to become reachable via a relay, after which
 /// `home_relay` returns `None` (offline, no relay to publish).
@@ -107,10 +107,10 @@ impl Drop for IrohTransport {
 }
 
 /// The mDNS service name endpoints announce themselves under
-/// (`<node_id>._universallink._udp.local`). Ours rather than the crate's
-/// default `irohv1`: only UniversalLink devices answer each other, and a
+/// (`<node_id>._1device._udp.local`). Ours rather than the crate's
+/// default `irohv1`: only 1Device devices answer each other, and a
 /// packet capture names the protocol honestly.
-const MDNS_SERVICE: &str = "universallink";
+const MDNS_SERVICE: &str = "1device";
 
 impl IrohTransport {
     /// Production endpoint. `relay`: the deployment's relay (self-hosted) if it
@@ -270,7 +270,7 @@ pub async fn multicast_reaches_the_wire() -> bool {
     let Ok(tx) = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await else {
         return false;
     };
-    let beacon = b"universallink multicast probe";
+    let beacon = b"1device multicast probe";
     // Two beacons: the first can race the group join on a slow stack.
     for _ in 0..2 {
         let _ = tx.send_to(beacon, (group, local.port())).await;
@@ -320,7 +320,7 @@ fn lan_dark_notice(os: &str) -> &'static str {
     match os {
         "macos" => {
             "LAN discovery is on, but multicast does not reach the wire — macOS is \
-             likely denying local network access: allow UniversalLink under System \
+             likely denying local network access: allow 1Device under System \
              Settings → Privacy & Security → Local Network. Until then this device \
              neither sees nor is seen on its own network; server and relay are \
              unaffected."
@@ -613,7 +613,7 @@ impl LazyIrohTransport {
             .get_or_try_init(|| async {
                 // The device key is read HERE, on the first use — never before
                 // the Core's instance lock.
-                let seed = universallink_core::load_or_generate_device_seed(&self.config_dir)
+                let seed = onedevice_core::load_or_generate_device_seed(&self.config_dir)
                     .map_err(|e| wrap("device identity", format!("{e:#}")))?;
                 let transport = IrohTransport::bind_with_gen(
                     seed,

@@ -1,4 +1,4 @@
-# Deploying the UniversalLink server
+# Deploying the 1Device server
 
 The **server** is the *control plane*: it authenticates accounts (OIDC), holds the
 directory of devices, presence, and relays the signaling information that lets two
@@ -7,7 +7,7 @@ via iroh, directly between peers) and does not decide account membership on its 
 (see the threat model below).
 
 This document describes how **you** host it for your own devices. The binary
-(`universallink-server`, crate `server-daemon`) is configured through the
+(`1device-server`, crate `server-daemon`) is configured through the
 environment — see [`server-daemon/src/config.rs`](../server-daemon/src/config.rs)
 for the source of truth and [`server-api.md`](server-api.md) for the protocol.
 
@@ -110,8 +110,8 @@ network.
 ```sh
 cd deploy
 cp .env.example .env
-# Edit .env: UNIVERSALLINK_DOMAIN, UNIVERSALLINK_OIDC_ISSUER,
-# UNIVERSALLINK_OIDC_CLIENT_ID (+ UNIVERSALLINK_OIDC_CLIENT_SECRET with Google).
+# Edit .env: ONEDEVICE_DOMAIN, ONEDEVICE_OIDC_ISSUER,
+# ONEDEVICE_OIDC_CLIENT_ID (+ ONEDEVICE_OIDC_CLIENT_SECRET with Google).
 docker compose up -d --build
 ```
 
@@ -142,7 +142,7 @@ curl https://your-server.example.com/health         # -> ok
 
 # The deployment descriptor: what a client reads to configure itself. Check the
 # issuer and the client here — a device is then set up with this address alone.
-curl https://your-server.example.com/.well-known/universallink.json
+curl https://your-server.example.com/.well-known/1device.json
 
 # The WebSocket handshake must answer 101 (Switching Protocols). `--http1.1` is
 # not optional: this is an HTTP/1.1 Upgrade, and those headers are meaningless
@@ -164,18 +164,18 @@ If you prefer the bare binary behind a reverse proxy you already manage:
 
 1. Compile the server:
    ```sh
-   cargo build --release --locked -p universallink-server-daemon --bin universallink-server
+   cargo build --release --locked -p onedevice-server-daemon --bin 1device-server
    ```
 2. Install the binary, the system user, and the unit — see the header of
-   [`deploy/universallink-server.service`](../deploy/universallink-server.service).
+   [`deploy/1device-server.service`](../deploy/1device-server.service).
    The unit makes the server listen on loopback; fill in
-   `/etc/universallink/server.env`:
+   `/etc/1device/server.env`:
    ```sh
-   UNIVERSALLINK_SERVER_BIND=127.0.0.1:8080
-   UNIVERSALLINK_OIDC_ISSUER=https://accounts.google.com
-   UNIVERSALLINK_OIDC_CLIENT_ID=…apps.googleusercontent.com
+   ONEDEVICE_SERVER_BIND=127.0.0.1:8080
+   ONEDEVICE_OIDC_ISSUER=https://accounts.google.com
+   ONEDEVICE_OIDC_CLIENT_ID=…apps.googleusercontent.com
    ```
-   (Do not put `UNIVERSALLINK_SERVER_STATE` there: the unit already sets it via
+   (Do not put `ONEDEVICE_SERVER_STATE` there: the unit already sets it via
    `StateDirectory`. An `EnvironmentFile` would take precedence over that setting.)
 3. Put your reverse proxy in front. With **nginx**, the WebSocket upgrade must be
    relayed explicitly — template in
@@ -186,8 +186,8 @@ If you prefer the bare binary behind a reverse proxy you already manage:
 
 ## Backup and loss of the directory
 
-The directory is a JSON file (`UNIVERSALLINK_SERVER_STATE`), in the `directory`
-volume under Docker or `/var/lib/universallink/` under systemd. Back it up with the
+The directory is a JSON file (`ONEDEVICE_SERVER_STATE`), in the `directory`
+volume under Docker or `/var/lib/1device/` under systemd. Back it up with the
 rest of the machine.
 
 **Losing it is not catastrophic**: each device still holds its account key locally.
@@ -197,19 +197,19 @@ names, not the ability to link up again.
 
 ## Settings
 
-Required: `UNIVERSALLINK_SERVER_BIND`, `UNIVERSALLINK_OIDC_ISSUER`,
-`UNIVERSALLINK_OIDC_CLIENT_ID`. Optional (defaults in parentheses):
-`UNIVERSALLINK_OIDC_CLIENT_SECRET` (none; the server never uses it itself — it
+Required: `ONEDEVICE_SERVER_BIND`, `ONEDEVICE_OIDC_ISSUER`,
+`ONEDEVICE_OIDC_CLIENT_ID`. Optional (defaults in parentheses):
+`ONEDEVICE_OIDC_CLIENT_SECRET` (none; the server never uses it itself — it
 advertises it in the deployment descriptor, and Google's clients need it at the
-token exchange), `UNIVERSALLINK_SERVER_STATE` (`universallink-directory.json`),
-`UNIVERSALLINK_HEARTBEAT_SECS` (30), `UNIVERSALLINK_HEARTBEAT_MAX_MISSED` (2),
-`UNIVERSALLINK_NONCE_TTL_SECS` (60), `UNIVERSALLINK_PAIRING_TTL_SECS` (120; how
+token exchange), `ONEDEVICE_SERVER_STATE` (`1device-directory.json`),
+`ONEDEVICE_HEARTBEAT_SECS` (30), `ONEDEVICE_HEARTBEAT_MAX_MISSED` (2),
+`ONEDEVICE_NONCE_TTL_SECS` (60), `ONEDEVICE_PAIRING_TTL_SECS` (120; how
 long a QR code stays claimable — paced by a human walking to another device,
-scanning and confirming), `UNIVERSALLINK_FRESH_TOKEN_MAX_AGE_SECS` (300), `UNIVERSALLINK_JWKS_REFRESH_MIN_SECS` (60; shortest delay between two
+scanning and confirming), `ONEDEVICE_FRESH_TOKEN_MAX_AGE_SECS` (300), `ONEDEVICE_JWKS_REFRESH_MIN_SECS` (60; shortest delay between two
 JWKS fetches — the issuer's signing keys are re-fetched on a key-id miss, i.e. a
 key rotation, but no more often than this),
-`UNIVERSALLINK_MAX_REQUESTS_PER_MINUTE` (120; `0` = unlimited),
-`UNIVERSALLINK_LOG` (log level). Detail and semantics:
+`ONEDEVICE_MAX_REQUESTS_PER_MINUTE` (120; `0` = unlimited),
+`ONEDEVICE_LOG` (log level). Detail and semantics:
 [`server-daemon/src/config.rs`](../server-daemon/src/config.rs) and
 [`server-api.md`](server-api.md).
 

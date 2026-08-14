@@ -617,7 +617,7 @@ impl WebDavServer {
 
         let accept_shared = shared.clone();
         let accept_join = thread::Builder::new()
-            .name("universallink-webdav".into())
+            .name("1device-webdav".into())
             .spawn(move || {
                 while !accept_shared.stop.load(Ordering::Relaxed) {
                     match listener.accept() {
@@ -631,7 +631,7 @@ impl WebDavServer {
                             // Detached connection thread: ends via stop / EOF
                             // (unmount) / end of copy.
                             let _ = thread::Builder::new()
-                                .name("universallink-webdav-conn".into())
+                                .name("1device-webdav-conn".into())
                                 .spawn(move || handle_conn(stream, conn_shared));
                         }
                         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -837,7 +837,7 @@ impl Drop for WebDavMount {
 }
 
 fn warn(message: &str) {
-    eprintln!("[universallink-clipboard] {message}");
+    eprintln!("[1device-clipboard] {message}");
 }
 
 #[cfg(test)]

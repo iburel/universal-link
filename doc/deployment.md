@@ -4,7 +4,7 @@ This document describes the Core process as it installs and runs on a user's
 machine: where it listens, what it reads, what it writes, and what it expects from
 the components it launches.
 
-The binary is called `universallink-core` and lives in the `daemon/` crate.
+The binary is called `1device-core` and lives in the `daemon/` crate.
 
 ## One process per user
 
@@ -25,9 +25,9 @@ the next Core removes the stale socket itself.
 
 | | Linux | macOS | Windows |
 |---|---|---|---|
-| listening endpoint | `$XDG_RUNTIME_DIR/universallink/core.sock` | `~/Library/Application Support/UniversalLink/core.sock` | `\\.\pipe\universallink-core-<USERDOMAIN>-<USERNAME>` |
-| config folder | `$XDG_CONFIG_HOME` (default `~/.config`) `/universallink` | `~/Library/Application Support/UniversalLink` | `%APPDATA%\UniversalLink` |
-| log | `$XDG_STATE_HOME` (default `~/.local/state`) `/universallink/logs` | `~/Library/Logs/UniversalLink` | `%LOCALAPPDATA%\UniversalLink\logs` |
+| listening endpoint | `$XDG_RUNTIME_DIR/1device/core.sock` | `~/Library/Application Support/1Device/core.sock` | `\\.\pipe\1device-core-<USERDOMAIN>-<USERNAME>` |
+| config folder | `$XDG_CONFIG_HOME` (default `~/.config`) `/1device` | `~/Library/Application Support/1Device` | `%APPDATA%\1Device` |
+| log | `$XDG_STATE_HOME` (default `~/.local/state`) `/1device/logs` | `~/Library/Logs/1Device` | `%LOCALAPPDATA%\1Device\logs` |
 
 The Windows pipe name carries the domain **and** the user name: a local account
 `john` and a domain account `CORP\john` are two distinct users with the same
@@ -99,16 +99,16 @@ startup like the rest: a typo is a `problem`, not a silently mute data plane.
 [`iroh-relay`]: https://github.com/n0-computer/iroh
 
 `receive_dir` is optional: where received files land (`files.send` from another
-device). Without it, `<Downloads>/UniversalLink` (`$XDG_DOWNLOAD_DIR` or
+device). Without it, `<Downloads>/1Device` (`$XDG_DOWNLOAD_DIR` or
 `~/Downloads` on Linux, `~/Downloads` on macOS, `%USERPROFILE%\Downloads` on
 Windows); and if the environment does not even allow determining it,
 `<config folder>/received` — the Core always receives. Each file is written via a
 temporary renamed at the end; a name collision is suffixed "(n)", never an
 overwrite.
 
-The variables `UNIVERSALLINK_SERVER_URL`, `UNIVERSALLINK_OIDC_ISSUER`,
-`UNIVERSALLINK_OIDC_CLIENT_ID`, `UNIVERSALLINK_DEVICE_NAME`,
-`UNIVERSALLINK_RELAY_URL`, and `UNIVERSALLINK_RECEIVE_DIR` override the file — a
+The variables `ONEDEVICE_SERVER_URL`, `ONEDEVICE_OIDC_ISSUER`,
+`ONEDEVICE_OIDC_CLIENT_ID`, `ONEDEVICE_DEVICE_NAME`,
+`ONEDEVICE_RELAY_URL`, and `ONEDEVICE_RECEIVE_DIR` override the file — a
 variable that is defined but empty overrides nothing. Completeness is checked
 **after** the merge: a partial file that the environment completes is valid.
 
@@ -119,8 +119,8 @@ to the Core…" forever, without ever being able to say why.
 
 ## Log
 
-Daily rotation, seven files kept. The level is set by `UNIVERSALLINK_LOG` (and not
-`RUST_LOG`, too widely shared): `UNIVERSALLINK_LOG=debug`. The error output is
+Daily rotation, seven files kept. The level is set by `ONEDEVICE_LOG` (and not
+`RUST_LOG`, too widely shared): `ONEDEVICE_LOG=debug`. The error output is
 mirrored only if it is attached to a terminal — a Core launched at login has no one
 to talk to.
 
@@ -132,7 +132,7 @@ answers: each send fails with `No route to host`, so LAN discovery is deaf and
 mute while the rest of the data plane (server, relay) works normally. The Core
 probes the wire when it starts with LAN discovery on and, if nothing comes
 back, writes one log line naming the cure — System Settings → Privacy &
-Security → Local Network → UniversalLink.
+Security → Local Network → 1Device.
 
 The grant is tied to the binary's code-signing identity. Two consequences for
 unsigned (ad-hoc) builds: every update is a fresh identity and asks again, and
@@ -209,7 +209,7 @@ from the next login on.
 
 On **Linux** the installed form is an AppImage, whose mount is ephemeral: a path
 inside it is dead the moment the app closes. The GUI therefore copies the Core
-**and its sidecars** into `$XDG_DATA_HOME/universallink/` and registers *that*
+**and its sidecars** into `$XDG_DATA_HOME/1device/` and registers *that*
 copy. The list of sidecars to copy is in `gui/src/supervise.rs`
 (`STAGED_SIDECARS`) — one absent from it is simply never launched on a real Linux
 install.
@@ -222,12 +222,12 @@ and takes them with it when it stops. A missing component is ignored: a Core wit
 a tray is still a Core that works.
 
 Three of them ship (`daemon/src/supervisor.rs`, `official_components`), each with
-its own scopes: `universallink-tray`, `universallink-clipboard` (a per-OS
-backend, on all three desktops) and `universallink-menu` (the contextual menu).
+its own scopes: `1device-tray`, `1device-clipboard` (a per-OS
+backend, on all three desktops) and `1device-menu` (the contextual menu).
 The GUI is not in that list — the user launches it.
 
 One exception to "next to its binary": on macOS the tray lives in a nested
-application bundle, `UniversalLink.app/Contents/Frameworks/UniversalLinkTray.app`,
+application bundle, `1Device.app/Contents/Frameworks/1DeviceTray.app`,
 and the supervisor looks there first. It has to — a process started from
 `Contents/MacOS` is *the application* to Launch Services, and a tray holding the
 app's identity made `open` activate the tray instead of opening the window. See
@@ -235,7 +235,7 @@ app's identity made `open` activate the tray instead of opening the window. See
 
 The contract of a supervised component:
 
-1. It finds the Core at the path passed in `UNIVERSALLINK_IPC_PATH`.
+1. It finds the Core at the path passed in `ONEDEVICE_IPC_PATH`.
 2. It reads its **spawn token** on the first line of its standard input. Not
    `argv` (readable by all), nor the environment (inherited by all its
    descendants).

@@ -120,14 +120,14 @@ use crate::surface::{HelperCommand, MenuSurface};
 /// Load-bearing: pruning enumerates `~/Library/Services` — a directory shared with
 /// every other application's services — and deletes from it. Anything without this
 /// is left strictly alone.
-pub(crate) const MARKER: &str = "universallink-menu:generated";
+pub(crate) const MARKER: &str = "1device-menu:generated";
 /// The `Info.plist` key it is the value of. Invisible in menus (nothing reads an
 /// unknown key) and it travels with the bundle.
-pub(crate) const MARKER_KEY: &str = "UniversalLinkGenerated";
+pub(crate) const MARKER_KEY: &str = "1DeviceGenerated";
 
 /// Name of the temporary file the atomic writes go through, hidden so that a crash
 /// between the write and the rename cannot leave a plist half-parsed.
-const TMP_NAME: &str = ".universallink-menu.tmp";
+const TMP_NAME: &str = ".1device-menu.tmp";
 
 /// The one macOS surface, rooted at `services` (`~/Library/Services` in
 /// production).

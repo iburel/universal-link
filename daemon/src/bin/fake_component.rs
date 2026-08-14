@@ -12,7 +12,7 @@
 //!
 //! Configured by its ARGUMENTS (not by its environment: the tests run in
 //! parallel within a single process, which cannot hold two environments at
-//! once). Only `UNIVERSALLINK_IPC_PATH` comes from the environment — the
+//! once). Only `ONEDEVICE_IPC_PATH` comes from the environment — the
 //! supervisor is the one that sets it.
 //!
 //! - `--dir=<path>`     : where to write `journal` and the heartbeat files.
@@ -142,8 +142,8 @@ fn journal(dir: &Path, line: &str) {
 /// `hello` in JSON-RPC 2.0, LSP framing, on the Core's listening endpoint.
 /// Returns the granted scopes, or the application error code.
 fn hello(token: &str, role: &str, scopes: &[String]) -> Result<Vec<String>, String> {
-    let path = std::env::var("UNIVERSALLINK_IPC_PATH")
-        .map_err(|_| "UNIVERSALLINK_IPC_PATH not set".to_string())?;
+    let path = std::env::var("ONEDEVICE_IPC_PATH")
+        .map_err(|_| "ONEDEVICE_IPC_PATH not set".to_string())?;
     let mut stream = connect(&path)?;
 
     let scopes_json = scopes

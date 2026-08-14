@@ -13,7 +13,7 @@
 //!
 //! On Linux and Windows our entries live in a submenu of our own, so a label only
 //! has to name a device. Here they land among everybody else's services, so each one
-//! has to say what it does AND that it is ours: `Send to <device> (UniversalLink)`.
+//! has to say what it does AND that it is ours: `Send to <device> (1Device)`.
 //! The suffix is the same convention as the Windows "Send to" shortcuts, for the
 //! same reason — an entry sitting in a shared list must be attributable.
 //!
@@ -42,13 +42,13 @@ use crate::surface::{HelperCommand, MenuSurface, Target};
 const EXTENSION: &str = ".workflow";
 /// And begins with this, so a human looking at `~/Library/Services` can see whose
 /// bundles these are without opening one.
-const PREFIX: &str = "UniversalLink-";
+const PREFIX: &str = "1Device-";
 /// What tells the user, in a menu full of other applications' services, which
 /// application put this one there.
-const SUFFIX: &str = " (UniversalLink)";
+const SUFFIX: &str = " (1Device)";
 /// Prefix of a bundle's reverse-DNS identifier, spelled like the Core's LaunchAgent
 /// (`gui/src/supervise.rs`).
-const IDENTIFIER: &str = "org.universallink.menu.";
+const IDENTIFIER: &str = "org.onedevice.menu.";
 /// The action the document runs, and its identifier — both read off the real bundle
 /// on a real macOS. The engine resolves the action by PATH (measured: a wrong
 /// `BundleIdentifier` still ran), but a wrong identifier in a file a human may open
@@ -450,7 +450,7 @@ mod tests {
 
     fn helper() -> HelperCommand {
         HelperCommand {
-            program: PathBuf::from("/Applications/UniversalLink.app/universallink-menu"),
+            program: PathBuf::from("/Applications/1Device.app/1device-menu"),
             extra_args: vec![],
         }
     }
@@ -508,14 +508,11 @@ mod tests {
         let targets = [target("d_1", "PC A"), target("d_2", "Le Mac")];
         assert_eq!(
             bundle_names(&targets),
-            ["UniversalLink-d_1.workflow", "UniversalLink-d_2.workflow"]
+            ["1Device-d_1.workflow", "1Device-d_2.workflow"]
         );
         assert_eq!(
             labels_of(&targets),
-            [
-                "Send to PC A (UniversalLink)",
-                "Send to Le Mac (UniversalLink)"
-            ]
+            ["Send to PC A (1Device)", "Send to Le Mac (1Device)"]
         );
     }
 
@@ -524,13 +521,10 @@ mod tests {
     /// identifier with it.
     #[test]
     fn the_identifier_follows_the_bundle_name() {
-        assert_eq!(
-            identifier("UniversalLink-d_1.workflow"),
-            "org.universallink.menu.d_1"
-        );
+        assert_eq!(identifier("1Device-d_1.workflow"), "org.onedevice.menu.d_1");
         assert_ne!(
-            identifier("UniversalLink-d_1.workflow"),
-            identifier("UniversalLink-1-d_1.workflow")
+            identifier("1Device-d_1.workflow"),
+            identifier("1Device-1-d_1.workflow")
         );
     }
 
@@ -551,10 +545,7 @@ mod tests {
         let labels = labels_of(&[target("d_aaaa1111", "PC"), target("d_bbbb2222", "PC")]);
         assert_eq!(
             labels,
-            [
-                "Send to PC (1111) (UniversalLink)",
-                "Send to PC (2222) (UniversalLink)"
-            ]
+            ["Send to PC (1111) (1Device)", "Send to PC (2222) (1Device)"]
         );
     }
 
@@ -579,11 +570,11 @@ mod tests {
     fn a_name_with_nothing_showable_in_it_falls_back_to_the_id() {
         assert_eq!(
             labels_of(&[target("d_abcd", "   ")]),
-            ["Send to d_abcd (UniversalLink)"]
+            ["Send to d_abcd (1Device)"]
         );
         assert_eq!(
             labels_of(&[target("d_abcd", "\u{1}\u{2}")]),
-            ["Send to d_abcd (UniversalLink)"]
+            ["Send to d_abcd (1Device)"]
         );
     }
 
@@ -594,7 +585,7 @@ mod tests {
     fn a_label_loses_the_whitespace_around_the_name() {
         assert_eq!(
             labels_of(&[target("d_1", "  PC A \t")]),
-            ["Send to PC A (UniversalLink)"]
+            ["Send to PC A (1Device)"]
         );
     }
 
@@ -605,13 +596,13 @@ mod tests {
     #[test]
     fn an_id_that_could_escape_the_directory_is_reduced_to_one_name() {
         let names = bundle_names(&[target("d_../../evil", "PC")]);
-        assert_eq!(names, ["UniversalLink-d_.._.._evil.workflow"]);
+        assert_eq!(names, ["1Device-d_.._.._evil.workflow"]);
         assert!(
             !names[0].contains('/'),
             "{:?} still holds a separator",
             names[0]
         );
-        assert_eq!(identifier(&names[0]), "org.universallink.menu.d_.._.._evil");
+        assert_eq!(identifier(&names[0]), "org.onedevice.menu.d_.._.._evil");
     }
 
     /// A long name is cut on a CHARACTER boundary — slicing a `str` anywhere else
@@ -666,7 +657,7 @@ mod tests {
         let mut surface = Services::new(dir.path(), helper());
         surface.apply(&[target("d_42", "PC A")]).expect("apply");
 
-        let bundle = dir.path().join("UniversalLink-d_42.workflow");
+        let bundle = dir.path().join("1Device-d_42.workflow");
         let info = bundle.join("Contents").join("Info.plist");
         let document = bundle
             .join("Contents")
@@ -677,7 +668,7 @@ mod tests {
 
         assert_eq!(
             plist_value(&info, "NSServices.0.NSMenuItem.default"),
-            "Send to PC A (UniversalLink)"
+            "Send to PC A (1Device)"
         );
         assert_eq!(
             plist_value(&info, "NSServices.0.NSMessage"),
@@ -690,7 +681,7 @@ mod tests {
         assert_eq!(plist_value(&info, MARKER_KEY), MARKER);
         assert_eq!(
             plist_value(&info, "CFBundleIdentifier"),
-            "org.universallink.menu.d_42"
+            "org.onedevice.menu.d_42"
         );
         assert_eq!(
             plist_value(&document, "actions.0.action.ActionParameters.inputMethod"),
@@ -717,13 +708,13 @@ mod tests {
 
         let info = dir
             .path()
-            .join("UniversalLink-d_1.workflow")
+            .join("1Device-d_1.workflow")
             .join("Contents")
             .join("Info.plist");
         lint(&info);
         assert_eq!(
             plist_value(&info, "NSServices.0.NSMenuItem.default"),
-            format!("Send to {hostile} (UniversalLink)")
+            format!("Send to {hostile} (1Device)")
         );
     }
 
@@ -740,13 +731,13 @@ mod tests {
 
         let info = dir
             .path()
-            .join("UniversalLink-d_1.workflow")
+            .join("1Device-d_1.workflow")
             .join("Contents")
             .join("Info.plist");
         lint(&info);
         assert_eq!(
             plist_value(&info, "NSServices.0.NSMenuItem.default"),
-            "Send to PC A B C (UniversalLink)"
+            "Send to PC A B C (1Device)"
         );
     }
 
@@ -758,7 +749,7 @@ mod tests {
         let mut surface = Services::new(
             dir.path(),
             HelperCommand {
-                program: PathBuf::from("/Apps/it's <mine> & yours/universallink-menu"),
+                program: PathBuf::from("/Apps/it's <mine> & yours/1device-menu"),
                 extra_args: vec![],
             },
         );
@@ -766,7 +757,7 @@ mod tests {
 
         let document = dir
             .path()
-            .join("UniversalLink-d_1.workflow")
+            .join("1Device-d_1.workflow")
             .join("Contents")
             .join("Resources")
             .join("document.wflow");
@@ -776,7 +767,7 @@ mod tests {
             "actions.0.action.ActionParameters.COMMAND_STRING",
         );
         assert!(
-            script.contains(r"exec '/Apps/it'\''s <mine> & yours/universallink-menu' "),
+            script.contains(r"exec '/Apps/it'\''s <mine> & yours/1device-menu' "),
             "{script}"
         );
     }
@@ -788,7 +779,7 @@ mod tests {
         let mut surface = Services::new(
             Path::new("/nonexistent"),
             HelperCommand {
-                program: PathBuf::from("/Apps/bell\u{7}/universallink-menu"),
+                program: PathBuf::from("/Apps/bell\u{7}/1device-menu"),
                 extra_args: vec![],
             },
         );
@@ -807,7 +798,7 @@ mod tests {
         assert!(one.contains(MARKER));
         assert!(
             one.contains(
-                "exec '/Applications/UniversalLink.app/universallink-menu' '--send' 'd_1' '--' \"$@\"\n"
+                "exec '/Applications/1Device.app/1device-menu' '--send' 'd_1' '--' \"$@\"\n"
             ),
             "{one}"
         );
@@ -864,7 +855,7 @@ mod tests {
         surface.apply(&[target("d_1", "PC A")]).expect("apply");
         let script = plist_value(
             &dir.path()
-                .join("UniversalLink-d_1.workflow")
+                .join("1Device-d_1.workflow")
                 .join("Contents")
                 .join("Resources")
                 .join("document.wflow"),
@@ -925,9 +916,9 @@ mod tests {
 
         assert_eq!(
             listing(dir.path()),
-            ["UniversalLink-d_1.workflow", "UniversalLink-d_2.workflow"]
+            ["1Device-d_1.workflow", "1Device-d_2.workflow"]
         );
-        for name in ["UniversalLink-d_1.workflow", "UniversalLink-d_2.workflow"] {
+        for name in ["1Device-d_1.workflow", "1Device-d_2.workflow"] {
             let contents = dir.path().join(name).join("Contents");
             assert!(contents.join("Info.plist").is_file());
             assert!(
@@ -948,7 +939,7 @@ mod tests {
             .expect("apply");
         surface.apply(&[target("d_1", "Bureau")]).expect("reapply");
 
-        assert_eq!(listing(dir.path()), ["UniversalLink-d_1.workflow"]);
+        assert_eq!(listing(dir.path()), ["1Device-d_1.workflow"]);
     }
 
     /// No manager, no entry — but the services directory itself is the system's, not
@@ -988,10 +979,10 @@ mod tests {
         std::fs::write(&loose, "not a bundle").expect("write");
         // And something shaped like nothing we write, but carrying our marker: only
         // what looks like one of our bundles is ours to delete.
-        let odd = dir.path().join("UniversalLink-d_1.something-else");
+        let odd = dir.path().join("1Device-d_1.something-else");
         write_if_changed(
             &odd.join("Contents").join("Info.plist"),
-            &info_plist("org.universallink.menu.d_1", "Send to Odd"),
+            &info_plist("org.onedevice.menu.d_1", "Send to Odd"),
         )
         .expect("write");
 
@@ -1002,7 +993,7 @@ mod tests {
             odd.is_dir(),
             "something that is not one of our bundles was deleted"
         );
-        assert!(!dir.path().join("UniversalLink-d_1.workflow").exists());
+        assert!(!dir.path().join("1Device-d_1.workflow").exists());
     }
 
     /// A bundle left by a previous run — a device that is no longer online, a name
@@ -1010,10 +1001,10 @@ mod tests {
     #[test]
     fn a_bundle_from_a_previous_run_is_swept_at_startup() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let ghost = dir.path().join("UniversalLink-d_ghost.workflow");
+        let ghost = dir.path().join("1Device-d_ghost.workflow");
         write_if_changed(
             &ghost.join("Contents").join("Info.plist"),
-            &info_plist("org.universallink.menu.d_ghost", "Send to Ghost"),
+            &info_plist("org.onedevice.menu.d_ghost", "Send to Ghost"),
         )
         .expect("write");
 
@@ -1029,10 +1020,7 @@ mod tests {
     #[test]
     fn the_plist_that_registers_the_service_is_written_last() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let contents = dir
-            .path()
-            .join("UniversalLink-d_1.workflow")
-            .join("Contents");
+        let contents = dir.path().join("1Device-d_1.workflow").join("Contents");
         std::fs::create_dir_all(&contents).expect("mkdir");
         // A file where the document's directory has to go: the document cannot be
         // written, whatever the rest does.
@@ -1059,7 +1047,7 @@ mod tests {
 
         let info = dir
             .path()
-            .join("UniversalLink-d_1.workflow")
+            .join("1Device-d_1.workflow")
             .join("Contents")
             .join("Info.plist");
         let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);

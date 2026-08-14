@@ -1,4 +1,4 @@
-# UniversalLink — Core public API (local IPC)
+# 1Device — Core public API (local IPC)
 
 > Specification of the API between the Core and the components (official and
 > third-party). Complements [architecture.md](architecture.md) and
@@ -128,7 +128,7 @@ device of one server, and the server publishes them
 ([server-api.md](server-api.md#deployment-descriptor)). So `url` is whatever the
 user typed and the Core derives the rest of it:
 
-- **No scheme means TLS.** `host` → `https://host/.well-known/universallink.json`,
+- **No scheme means TLS.** `host` → `https://host/.well-known/1device.json`,
   and the returned `server_url` is `wss://host/ws`. `http://` and `ws://` are
   honored when written out — a cleartext deployment is accepted everywhere else in
   the Core — but they are never a default: this answer decides where the login
@@ -214,7 +214,7 @@ legitimate scanner *is*, which is what the confirmation screen exists to catch
 (`doc/architecture.md`).
 
 Where there is **no server at all** the same four methods pair over the local
-network instead, and the difference is in the code: a `UL2` code names the device to
+network instead, and the difference is in the code: a `1D2` code names the device to
 dial ("Pairing with no server", below). Everything in this section holds for both.
 
 | Method | Description |
@@ -266,20 +266,20 @@ enrolls this way has no OIDC refresh token: its first sensitive operation
 
 A device with **no server in its life at all** — nothing configured and no session,
 the same condition `account.setup` and `devices.revoke` turn on — pairs over the
-local network. `pairing.offer` then mints a `UL2` code instead of answering
+local network. `pairing.offer` then mints a `1D2` code instead of answering
 `SERVER_UNREACHABLE`:
 
 | Code | Shape | Who is dialled |
 |---|---|---|
-| `UL1` | `UL1:<psk>:<epk>:<pairing_id>` | nobody — the server relays between the two |
-| `UL2` | `UL2:<psk>:<epk>:<node_id>` | the device that displays it, on the data plane |
+| `1D1` | `1D1:<psk>:<epk>:<pairing_id>` | nobody — the server relays between the two |
+| `1D2` | `1D2:<psk>:<epk>:<node_id>` | the device that displays it, on the data plane |
 
-The tag is what tells them apart. A `UL1` code with no server is a rendezvous this
-device has no way to go to → `SERVER_UNREACHABLE`. A `UL2` code, since the
+The tag is what tells them apart. A `1D1` code with no server is a rendezvous this
+device has no way to go to → `SERVER_UNREACHABLE`. A `1D2` code, since the
 continuum, is accepted by ANY device that can play its part in it — including one
 that answers to a server, which may scan it and sponsor over the local network.
 The joiner then joins the **account**, not the deployment: it is not enrolled on
-the server, which simply never lists it (the server-relayed `UL1` pairing is what
+the server, which simply never lists it (the server-relayed `1D1` pairing is what
 enrolls a device on the deployment too). Both tags are exported from the Core
 crate (`PAIRING_CODE_TAG`, `PAIRING_LAN_CODE_TAG`) for a camera that has to know
 which QR code in its view is a pairing code — the mobile scanner looks for
@@ -521,7 +521,7 @@ returned, failures (connection, disk, a target that has shrunk) go through
 
 Reception: **auto-accepted in v1** (these are the user's devices, authenticated by
 the account key). The bytes land in the configured receive folder (see
-[deployment.md](deployment.md), `UNIVERSALLINK_RECEIVE_DIR`), each file via a
+[deployment.md](deployment.md), `ONEDEVICE_RECEIVE_DIR`), each file via a
 temporary renamed atomically **at the end** of the transfer — nothing partial is
 ever exposed, and a cancellation/error leaves no trace of it. Name collision →
 "(n)" suffix, never an overwrite. The received name must be a **simple basename**:
@@ -813,8 +813,8 @@ Standard JSON-RPC codes + application codes in `error.data.code`:
 | `NO_ACCOUNT_KEY` | this device cannot sign for the account: it holds no account key (`pairing.accept` told to sponsor, `pairing.confirm`, `devices.revoke` with no server) — and, pairing on the local network, when NEITHER of the two devices holds one |
 | `CANNOT_REVOKE_SELF` | `devices.revoke` aimed at this very device, with no server: a tombstone cannot be withdrawn, so this would bar the installation from its own account for good |
 | `PAIRING_UNKNOWN` / `PAIRING_STATE` / `PAIRING_LIMIT` | relayed from the server as-is: unknown/expired/spent session, wrong moment (confirming before anyone scanned, or from the joining side), too many sessions at once. `PAIRING_STATE` is also the local answer for a pairing that is out of step: a code whose window is no longer the one on screen, a device that answers a dial with something other than the protocol's next frame, and confirming a pairing whose stream is gone |
-| `DEVICE_UNKNOWN` / `DEVICE_OFFLINE` | target unknown / unreachable (`pairing.accept` of a `UL2` code: the device that displayed it is not on this network) |
-| `DEVICE_REVOKED` | `pairing.accept` of a `UL2` code shown by a `node_id` the account struck off: a tombstone is permanent, and that device can only come back under a fresh identity |
+| `DEVICE_UNKNOWN` / `DEVICE_OFFLINE` | target unknown / unreachable (`pairing.accept` of a `1D2` code: the device that displayed it is not on this network) |
+| `DEVICE_REVOKED` | `pairing.accept` of a `1D2` code shown by a `node_id` the account struck off: a tombstone is permanent, and that device can only come back under a fresh identity |
 | `TRANSFER_UNKNOWN` | unknown `transfer_id` |
 | `FORMAT_UNKNOWN` | format not present in the transaction |
 | `FILE_UNKNOWN` | `file_id` absent from the manifest — or a `dir` entry, which has no bytes to read |

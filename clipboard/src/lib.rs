@@ -5,14 +5,14 @@
 //! the per-OS backends plug into.
 //!
 //! A supervised component must (see `daemon/src/supervisor.rs`, "Contract of a
-//! supervised component"): find the Core at `UNIVERSALLINK_IPC_PATH`, read its
+//! supervised component"): find the Core at `ONEDEVICE_IPC_PATH`, read its
 //! spawn token from the first line of standard input, keep that standard input
 //! open (its EOF means "stop"), and exit if it loses its IPC connection — the
 //! spawn token is single-use, so a reconnection would fail; exiting lets the
 //! supervisor restart it with a fresh token.
 //!
 //! Two seams meet in [`run`]:
-//! - the **Core** side, over [`universallink_ipc_client`]: it announces local
+//! - the **Core** side, over [`onedevice_ipc_client`]: it announces local
 //!   copies (`clipboard.updated`), serves inline pastes (`clipboard.get_data` →
 //!   a provider channel), learns of remote copies (`clipboard.remote_updated`),
 //!   and pulls remote bytes at paste time (`transactions.open` → a consumer

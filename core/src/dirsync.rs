@@ -16,7 +16,7 @@
 //! One round trip, both frames the same shape ([`Roster`]), both sides absorbing
 //! what they received. No new ALPN: the data plane dispatches on the first
 //! frame's `type` (`offer`, `clip_*`, and now this), so a peer that speaks
-//! `ul/data/1` already has a stream to say it on.
+//! `1device/data/1` already has a stream to say it on.
 //!
 //! The responder answers with the roster it held BEFORE absorbing. Replying
 //! afterwards would echo back what the initiator has just told it — a second

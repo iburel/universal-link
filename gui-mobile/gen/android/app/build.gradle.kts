@@ -46,10 +46,10 @@ if (signRelease) {
 
 android {
     compileSdk = 36
-    namespace = "org.universallink.mobile"
+    namespace = "org.onedevice.mobile"
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
-        applicationId = "org.universallink.mobile"
+        applicationId = "org.onedevice.mobile"
         minSdk = 24
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()

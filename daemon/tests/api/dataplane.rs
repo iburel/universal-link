@@ -14,13 +14,11 @@ use std::time::Duration;
 
 use iroh::test_utils::run_relay_server;
 use iroh::{RelayUrl, SecretKey};
-use tokio::time::timeout;
-use universallink_core::{
+use onedevice_core::{
     OutgoingFile, PeerAddr, PeerTransport, read_offer, receive_bodies, send_transfer,
 };
-use universallink_daemon::dataplane::{
-    IrohTransport, LazyIrohTransport, multicast_reaches_the_wire,
-};
+use onedevice_daemon::dataplane::{IrohTransport, LazyIrohTransport, multicast_reaches_the_wire};
+use tokio::time::timeout;
 
 fn node_id(seed: &[u8; 32]) -> String {
     hex::encode(SecretKey::from_bytes(seed).public().as_bytes())

@@ -11,7 +11,7 @@
 use crate::support::*;
 use serde_json::Value;
 
-const PATH: &str = "/.well-known/universallink.json";
+const PATH: &str = "/.well-known/1device.json";
 
 async fn descriptor(env: &TestEnv) -> (u16, String, Value) {
     let (status, headers, body) = env.http_get(PATH).await;

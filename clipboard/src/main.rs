@@ -1,30 +1,30 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
 
-//! The `universallink-clipboard` binary: the platform clipboard OS loop on the
+//! The `1device-clipboard` binary: the platform clipboard OS loop on the
 //! main thread (X11 pins its non-`Send` connection there; Windows pins its
 //! message-only window and pump there; macOS pins its `NSPasteboard` + run-loop
 //! pump there), plus the async IPC brain (a tokio runtime on a side thread)
 //! running the OS-agnostic orchestrator. The two are
 //! bridged by the `Clone` backend handle (downcalls + `request_exit`) and a
-//! `BackendEvent` channel (upcalls). Mirrors the `universallink-tray` shape; all
+//! `BackendEvent` channel (upcalls). Mirrors the `1device-tray` shape; all
 //! the testable logic lives in the lib.
 //!
 //! Supervised-component contract (see `daemon/src/supervisor.rs`): find the
-//! Core at `UNIVERSALLINK_IPC_PATH`, read the single-use spawn token from the
+//! Core at `ONEDEVICE_IPC_PATH`, read the single-use spawn token from the
 //! first line of standard input, keep that standard input open (its EOF means
 //! "stop"), and exit if the IPC connection drops (the token is single-use, so a
 //! reconnection would fail — exiting lets the supervisor restart us fresh).
 
 use std::process::ExitCode;
 
-use universallink_clipboard::os;
+use onedevice_clipboard::os;
 
 fn main() -> ExitCode {
     match os::create() {
         Err(os::Unsupported) => {
             eprintln!(
-                "universallink-clipboard: no clipboard backend for this platform \
+                "1device-clipboard: no clipboard backend for this platform \
                  (or no X server); nothing to run."
             );
             ExitCode::SUCCESS
@@ -65,18 +65,18 @@ fn main() -> ExitCode {
 /// Returns the process exit code. Generic over the backend so it never has to
 /// name the platform handle type (which lives in a private module).
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-async fn brain<B: universallink_clipboard::ClipboardBackend>(
+async fn brain<B: onedevice_clipboard::ClipboardBackend>(
     backend: B,
-    backend_events: tokio::sync::mpsc::Receiver<universallink_clipboard::BackendEvent>,
+    backend_events: tokio::sync::mpsc::Receiver<onedevice_clipboard::BackendEvent>,
 ) -> i32 {
     use std::path::PathBuf;
     use std::time::Duration;
 
+    use onedevice_clipboard::{Outcome, run};
+    use onedevice_ipc_client::{ClientConfig, TokenSource};
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-    use universallink_clipboard::{Outcome, run};
-    use universallink_ipc_client::{ClientConfig, TokenSource};
 
-    const IPC_PATH_ENV: &str = "UNIVERSALLINK_IPC_PATH";
+    const IPC_PATH_ENV: &str = "ONEDEVICE_IPC_PATH";
 
     let Ok(ipc_path) = std::env::var(IPC_PATH_ENV) else {
         eprintln!("{IPC_PATH_ENV} is not set: the clipboard backend is launched by the Core");
@@ -115,10 +115,10 @@ async fn brain<B: universallink_clipboard::ClipboardBackend>(
         topics.push("transfers".into());
     }
 
-    let (client, events) = universallink_ipc_client::spawn(ClientConfig {
+    let (client, events) = onedevice_ipc_client::spawn(ClientConfig {
         ipc_path: PathBuf::from(&ipc_path),
         token: TokenSource::Spawn(token),
-        name: "universallink-clipboard".into(),
+        name: "1device-clipboard".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         role: "clipboard-backend".into(),
         scopes,

@@ -117,16 +117,16 @@ test("the app shows its own version", () => {
   store.session = { logged_in: false, server_connected: false };
   const app = render(App, { store });
 
-  expect(textOf(app)).toContain(`UniversalLink ${appVersion}`);
+  expect(textOf(app)).toContain(`1Device ${appVersion}`);
   // Same reason as the connection line: inside the <nav> it would become a
   // fifth item of the narrow layout's bottom tab bar.
-  expect(app.querySelector("nav")?.textContent).not.toContain("UniversalLink");
+  expect(app.querySelector("nav")?.textContent).not.toContain("1Device");
 
   // And on the screen that asks the user to update, which no navigation reaches.
   cleanup();
   store.connection = { status: "incompatible", api_version: 9 };
   expect(textOf(render(App, { store }))).toContain(
-    `UniversalLink ${appVersion}`,
+    `1Device ${appVersion}`,
   );
 });
 
@@ -339,7 +339,7 @@ test("a serverless device already in its account is not pushed into setup", () =
 test("an unconfigured Core still asks for a server first", () => {
   store.primed = true;
   store.session = { logged_in: false, server_connected: false, configured: false };
-  store.pairing = { pairing_id: "p_1", role: "joiner", phase: "showing", code: "UL1:a:b:p_1" };
+  store.pairing = { pairing_id: "p_1", role: "joiner", phase: "showing", code: "1D1:a:b:p_1" };
   vi.spyOn(store, "loadServerConfig").mockResolvedValue({
     server_url: "",
     oidc_issuer: "",

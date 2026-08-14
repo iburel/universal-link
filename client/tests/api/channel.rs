@@ -11,11 +11,11 @@
 //! same time — on a single-threaded runtime macOS's kqueue readiness ordering
 //! can starve one of them (Linux's epoll happens not to).
 
-use serde_json::json;
-use tokio::sync::mpsc;
-use universallink_ipc_client::{
+use onedevice_ipc_client::{
     ChannelError, Client, ConsumerChannel, ErrorCode, Event, ProviderChannel,
 };
+use serde_json::json;
+use tokio::sync::mpsc;
 
 use crate::support::*;
 
@@ -24,7 +24,7 @@ async fn backend(core: &TestCore, served: &[&str]) -> (Client, mpsc::Receiver<Ev
     let scopes = ["clipboard.read", "clipboard.write"];
     let mut cfg = client_config(core, "clipboard-backend", &scopes, &[]);
     cfg.served_methods = served.iter().map(|s| s.to_string()).collect();
-    let (client, mut events) = universallink_ipc_client::spawn(cfg);
+    let (client, mut events) = onedevice_ipc_client::spawn(cfg);
     expect_connected(&mut events, &scopes).await;
     (client, events)
 }

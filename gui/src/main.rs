@@ -6,13 +6,13 @@
 
 use std::time::Duration;
 
-use universallink_ipc_client::{ClientConfig, TokenSource};
+use onedevice_ipc_client::{ClientConfig, TokenSource};
 
 fn main() {
     #[cfg(target_os = "linux")]
     nvidia_workarounds();
 
-    let endpoint = universallink_paths::production_endpoint()
+    let endpoint = onedevice_paths::production_endpoint()
         .expect("incomplete environment (XDG_RUNTIME_DIR / HOME / APPDATA)");
 
     // The Core is a per-user agent, bundled alongside the GUI: we register it
@@ -25,35 +25,35 @@ fn main() {
     // pointing at a `target/debug/` binary, nor spawn behind the developer's
     // back.
     if !cfg!(debug_assertions)
-        && let Some(bundled) = universallink_gui::bundled_core_path()
+        && let Some(bundled) = onedevice_gui::bundled_core_path()
     {
         // On Linux/AppImage the bundled path is an ephemeral mount: stabilize
         // it to a durable per-user copy so autostart survives logout. A no-op
         // elsewhere (and outside an AppImage).
-        let core_path = universallink_gui::stabilize_core_path(&bundled);
-        universallink_gui::register_autostart(&core_path);
-        universallink_gui::spawn_core(&core_path);
+        let core_path = onedevice_gui::stabilize_core_path(&bundled);
+        onedevice_gui::register_autostart(&core_path);
+        onedevice_gui::spawn_core(&core_path);
         // Record how the tray should relaunch us: it runs from the Core's
         // durable copy and cannot otherwise find the GUI (a loose AppImage on
         // Linux).
-        universallink_gui::record_launch_target(&endpoint.gui_launch_path());
+        onedevice_gui::record_launch_target(&endpoint.gui_launch_path());
     }
 
     let config = ClientConfig {
         token: TokenSource::File(endpoint.token_path()),
         ipc_path: endpoint.ipc_path,
-        name: "universallink-gui".into(),
+        name: "1device-gui".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         role: "gui".into(),
-        scopes: universallink_gui::GUI_SCOPES
+        scopes: onedevice_gui::GUI_SCOPES
             .iter()
             .map(|s| s.to_string())
             .collect(),
-        topics: universallink_gui::GUI_TOPICS
+        topics: onedevice_gui::GUI_TOPICS
             .iter()
             .map(|s| s.to_string())
             .collect(),
-        optional_topics: universallink_gui::GUI_OPTIONAL_TOPICS
+        optional_topics: onedevice_gui::GUI_OPTIONAL_TOPICS
             .iter()
             .map(|s| s.to_string())
             .collect(),
@@ -62,7 +62,7 @@ fn main() {
         request_timeout: Duration::from_secs(30),
     };
 
-    universallink_gui::shell(tauri::Builder::default(), config, endpoint.config_dir)
+    onedevice_gui::shell(tauri::Builder::default(), config, endpoint.config_dir)
         .plugin(tauri_plugin_opener::init())
         .run(tauri::generate_context!())
         .expect("Tauri app startup");

@@ -27,7 +27,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 /// In-memory data-plane transport (double of the Core's `PeerTransport`).
 pub mod memory_transport;
 
-pub const TEST_CLIENT_ID: &str = "universallink-tests";
+pub const TEST_CLIENT_ID: &str = "1device-tests";
 /// The default test account — the one the fake OIDC's browser flow
 /// authenticates until `FakeOidc::set_user` decides otherwise.
 pub const TEST_SUB: &str = "test-user";

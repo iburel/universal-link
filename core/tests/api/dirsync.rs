@@ -19,10 +19,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use onedevice_core::{PeerAddr, PeerTransport};
+use onedevice_test_support::memory_transport::{MemorySwitchboard, MemoryTransport};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use universallink_core::{PeerAddr, PeerTransport};
-use universallink_test_support::memory_transport::{MemorySwitchboard, MemoryTransport};
 
 use crate::support::*;
 
@@ -122,7 +122,7 @@ async fn lan_pair(code: &str, a_knows: &[Value], b_knows: &[Value]) -> (TestCore
 /// be the user's job.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_learns_of_a_sibling_it_has_never_met() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let third = DeviceKey::generate();
     let c_record = peer_record(&third, "Phone", "android", &code, 4);
     let (a, b) = lan_pair(&code, &[c_record], &[]).await;
@@ -142,7 +142,7 @@ async fn a_device_learns_of_a_sibling_it_has_never_met() {
     assert_eq!(learned["platform"], json!("android"));
     assert_eq!(learned["seq"], json!(4));
     assert!(
-        universallink_core::directory::verify_record(&learned),
+        onedevice_core::directory::verify_record(&learned),
         "and it still stands behind it: {learned}"
     );
     // Known is not reachable: this device is nowhere near us, and the record
@@ -172,7 +172,7 @@ async fn a_device_learns_of_a_sibling_it_has_never_met() {
 /// the second.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rename_reaches_the_other_device() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let (a, b) = lan_pair(&code, &[], &[]).await;
     let mut ca = manager(&a).await;
     let mut cb = subscribed(&b).await;
@@ -198,15 +198,15 @@ async fn a_rename_reaches_the_other_device() {
     let seq = |record: &Value| record["seq"].as_u64().expect("a seq");
     assert!(seq(&first) > 1, "over the description it replaced: {first}");
     assert!(seq(&second) > seq(&first), "{second} over {first}");
-    assert!(universallink_core::directory::verify_record(&first));
-    assert!(universallink_core::directory::verify_record(&second));
+    assert!(onedevice_core::directory::verify_record(&first));
+    assert!(onedevice_core::directory::verify_record(&second));
 }
 
 /// `seq` decides, not who spoke last: the fresher description wins in whichever
 /// direction it travels, and the staler one overwrites nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_fresher_description_wins_whichever_way_it_travels() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let third = DeviceKey::generate();
     // A holds a description B has already superseded.
     let stale = peer_record(&third, "Old-Name", "android", &code, 2);
@@ -223,7 +223,7 @@ async fn the_fresher_description_wins_whichever_way_it_travels() {
 
     let caught_up = record_of(&mut ca, &third.node_id()).await;
     assert_eq!(caught_up["seq"], json!(9));
-    assert!(universallink_core::directory::verify_record(&caught_up));
+    assert!(onedevice_core::directory::verify_record(&caught_up));
     // And the fresher end never regressed to what the other was holding.
     let held = record_of(&mut cb, &third.node_id()).await;
     assert_eq!(held["name"], json!("New-Name"));
@@ -238,7 +238,7 @@ async fn the_fresher_description_wins_whichever_way_it_travels() {
 /// be carried by the nudge `devices.revoke` gives.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_revocation_reaches_the_other_device_and_outlives_it() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let (first, second) = (DeviceKey::generate(), DeviceKey::generate());
     let records = [
         peer_record(&first, "Lost-Phone", "android", &code, 4),
@@ -291,7 +291,7 @@ async fn a_revocation_reaches_the_other_device_and_outlives_it() {
 async fn a_roster_of_tombstones_alone_still_travels() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     // Legitimate as far as the server and C7 are concerned: what follows is about
     // the revocation and nothing else.
     let (struck, struck_id, _conn) = attested_sibling(&server, &code, "Lost-Phone").await;
@@ -446,8 +446,8 @@ async fn core_with_raw_peer(code: &str, holding: &[Value]) -> (TestCore, RawPeer
 /// comes back, so a hostile roster is refused, not fatal.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_roster_it_cannot_prove_teaches_the_receiver_nothing() {
-    let code = universallink_core::account_key::generate_recovery_code();
-    let other_code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
+    let other_code = onedevice_core::account_key::generate_recovery_code();
     let third = DeviceKey::generate();
     let held = peer_record(&third, "Phone", "android", &code, 4);
     let (core, raw) = core_with_raw_peer(&code, &[held]).await;
@@ -460,8 +460,8 @@ async fn a_roster_it_cannot_prove_teaches_the_receiver_nothing() {
     let unsigned = json!({
         "device_id": "d_1", "node_id": intruder.node_id(), "name": "Hearsay",
         "platform": "linux",
-        "attestation": universallink_core::account_key::attest(
-            &universallink_core::account_key::account_key_from_code(&code).expect("code"),
+        "attestation": onedevice_core::account_key::attest(
+            &onedevice_core::account_key::account_key_from_code(&code).expect("code"),
             &intruder.node_id(),
         ),
     });
@@ -500,7 +500,7 @@ async fn a_roster_it_cannot_prove_teaches_the_receiver_nothing() {
 /// extending the staleness bound of records nobody re-checked.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_exchange_that_teaches_nothing_touches_nothing() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let (core, raw) = core_with_raw_peer(&code, &[]).await;
     let mut c = subscribed(&core).await;
     let store = core.config_dir().join("directory.json");
@@ -528,7 +528,7 @@ async fn an_exchange_that_teaches_nothing_touches_nothing() {
 /// own roster back — for nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_answer_is_what_the_responder_held_not_what_it_just_learned() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let (core, raw) = core_with_raw_peer(&code, &[]).await;
     let mut c = manager(&core).await;
     let third = DeviceKey::generate();
@@ -557,7 +557,7 @@ async fn the_answer_is_what_the_responder_held_not_what_it_just_learned() {
 /// the peer the Core dialled, the offer must carry what the Core knows.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_offer_carries_what_this_device_knows() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let third = DeviceKey::generate();
     let (core, raw) =
         core_with_raw_peer(&code, &[peer_record(&third, "Phone", "android", &code, 4)]).await;
@@ -584,7 +584,7 @@ async fn the_offer_carries_what_this_device_knows() {
     );
     for record in offer["records"].as_array().expect("records") {
         assert!(
-            universallink_core::directory::verify_record(record),
+            onedevice_core::directory::verify_record(record),
             "every record offered is one we could check: {record}"
         );
     }
@@ -598,7 +598,7 @@ async fn the_offer_carries_what_this_device_knows() {
 /// device the server revoked.
 #[tokio::test(flavor = "multi_thread")]
 async fn what_a_sibling_taught_us_does_not_refresh_the_store() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let (core, raw) = core_with_raw_peer(&code, &[]).await;
     let mut c = manager(&core).await;
     let store = core.config_dir().join("directory.json");
@@ -636,11 +636,11 @@ async fn what_a_sibling_taught_us_does_not_refresh_the_store() {
 /// still has to reach the disk, or the record walks in the moment it shows up.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tombstone_for_an_unknown_device_is_kept_for_when_it_shows_up() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let (core, raw) = core_with_raw_peer(&code, &[]).await;
     let mut c = manager(&core).await;
     let stranger = DeviceKey::generate();
-    let ak = universallink_core::account_key::account_key_from_code(&code).expect("code");
+    let ak = onedevice_core::account_key::account_key_from_code(&code).expect("code");
 
     let answer = raw
         .offer(
@@ -649,7 +649,7 @@ async fn a_tombstone_for_an_unknown_device_is_kept_for_when_it_shows_up() {
                 "records": [],
                 "revoked": {
                     stranger.node_id():
-                        universallink_core::account_key::revoke(&ak, &stranger.node_id()),
+                        onedevice_core::account_key::revoke(&ak, &stranger.node_id()),
                 },
             }),
         )
@@ -682,7 +682,7 @@ async fn a_tombstone_for_an_unknown_device_is_kept_for_when_it_shows_up() {
 /// usual.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_answer_that_is_not_a_roster_teaches_nothing() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let (core, raw) = core_with_raw_peer(&code, &[]).await;
     let mut c = manager(&core).await;
     let sneak = DeviceKey::generate();

@@ -16,8 +16,8 @@
 //! Minting a tombstone with no server in sight is `serverless.rs`; what is under
 //! test here is a Core that holds one AND a server that disagrees.
 
+use onedevice_test_support::memory_transport::MemorySwitchboard;
 use serde_json::{Value, json};
-use universallink_test_support::memory_transport::MemorySwitchboard;
 
 use crate::support::*;
 
@@ -49,7 +49,7 @@ async fn gui(core: &TestCore) -> TestComponent {
 async fn a_struck_off_device_stays_out_whatever_the_server_says() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let core = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
     let (struck, struck_id, mut struck_conn) = attested_sibling(&server, &code, "Lost-Phone").await;
     let mut c = gui(&core).await;

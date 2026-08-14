@@ -1,4 +1,4 @@
-package org.universallink.mobile
+package org.onedevice.mobile
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -29,15 +29,15 @@ import android.os.IBinder
  * is merely open, and work outlives the app leaving the foreground. A swipe out of
  * the Recents list is a different matter on this OEM — see [KeepAlive].
  */
-class UlForegroundService : Service() {
+class OneDeviceForegroundService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val channelId = "universallink.active"
+        val channelId = "1device.active"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 channelId,
-                "UniversalLink activity",
+                "1Device activity",
                 NotificationManager.IMPORTANCE_LOW,
             )
             channel.setShowBadge(false)
@@ -49,7 +49,7 @@ class UlForegroundService : Service() {
         // is the only truth we have left.
         val kind = intent?.getIntExtra(EXTRA_WORK, KeepAlive.work) ?: KeepAlive.work
         val notification: Notification = Notification.Builder(this, channelId)
-            .setContentTitle("UniversalLink")
+            .setContentTitle("1Device")
             .setContentText(text(kind))
             .setSmallIcon(applicationInfo.icon)
             .setOngoing(true)
@@ -109,7 +109,7 @@ class UlForegroundService : Service() {
         private const val EXTRA_WORK = "work"
 
         fun start(context: Context, kind: Int) {
-            val intent = Intent(context, UlForegroundService::class.java)
+            val intent = Intent(context, OneDeviceForegroundService::class.java)
                 .putExtra(EXTRA_WORK, kind)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
@@ -119,7 +119,7 @@ class UlForegroundService : Service() {
         }
 
         fun stop(context: Context) {
-            context.stopService(Intent(context, UlForegroundService::class.java))
+            context.stopService(Intent(context, OneDeviceForegroundService::class.java))
         }
     }
 }

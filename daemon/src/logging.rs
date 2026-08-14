@@ -20,7 +20,7 @@ use tracing_subscriber::prelude::*;
 
 /// Default level, and its override. `RUST_LOG` is too widely shared: a
 /// developer who exports it for another tool must not make our daemon chatty.
-const LOG_ENV: &str = "UNIVERSALLINK_LOG";
+const LOG_ENV: &str = "ONEDEVICE_LOG";
 
 /// Installs the collector. Keep the guard, do not throw it away.
 #[must_use]
@@ -190,13 +190,13 @@ fn summary(line: &str, held: u64, window: Duration) -> String {
 }
 
 fn file_writer() -> Option<(tracing_appender::non_blocking::NonBlocking, WorkerGuard)> {
-    let dir = universallink_paths::log_dir()?;
+    let dir = onedevice_paths::log_dir()?;
     std::fs::create_dir_all(&dir).ok()?;
     // Daily rotation, seven files kept: enough to understand yesterday's
     // incident, not enough to fill a disk.
     let appender = tracing_appender::rolling::Builder::new()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix("universallink")
+        .filename_prefix("1device")
         .filename_suffix("log")
         .max_log_files(7)
         .build(&dir)

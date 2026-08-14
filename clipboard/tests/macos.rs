@@ -11,7 +11,7 @@
 //! so they are NOT part of the automated suite — they are validated MANUALLY on a
 //! real Mac desktop with:
 //!
-//!     cargo test -p universallink-clipboard --test macos -- --ignored --test-threads=1
+//!     cargo test -p onedevice-clipboard --test macos -- --ignored --test-threads=1
 //!
 //! The general pasteboard is process-global, so the tests serialize on
 //! [`PASTEBOARD_LOCK`] and must run single-threaded.
@@ -45,12 +45,12 @@ use objc2_app_kit::{
 use objc2_foundation::{
     NSArray, NSData, NSError, NSFileCoordinator, NSFileCoordinatorReadingOptions, NSString, NSURL,
 };
-use tokio::sync::Mutex;
-use tokio::sync::mpsc;
-use universallink_clipboard::os;
-use universallink_clipboard::{
+use onedevice_clipboard::os;
+use onedevice_clipboard::{
     BackendEvent, ClipboardBackend, FileFetcher, Format, RemoteClip, RemoteFile,
 };
+use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 
 /// Serializes the process-global general pasteboard.
 static PASTEBOARD_LOCK: Mutex<()> = Mutex::const_new(());
@@ -494,7 +494,7 @@ async fn a_foreign_files_copy_is_detected() {
     let (handle, mut events, loop_thread) = skip_if_unsupported!(spawn_backend!());
 
     // Real temp files: macOS canonicalizes the paths at write time.
-    let dir = std::env::temp_dir().join(format!("ul-clip-src-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("1device-clip-src-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let a = dir.join("a.txt");
     let b = dir.join("b.txt");
@@ -701,7 +701,7 @@ async fn a_files_offer_publishes_file_urls() {
 
     let path = wait_for_published_path().expect("a file URL must be published");
     assert!(
-        path.to_string_lossy().contains("universallink-clip-files"),
+        path.to_string_lossy().contains("1device-clip-files"),
         "the published URL must point into the skeleton, got {path:?}"
     );
     // The published top-level element is the directory `folder`.
@@ -740,7 +740,7 @@ async fn a_sensitive_files_offer_marks_the_pasteboard_concealed() {
     // The URLs are still published (the marker does not wipe the writeObjects: content).
     let path = wait_for_published_path().expect("a file URL must be published");
     assert!(
-        path.to_string_lossy().contains("universallink-clip-files"),
+        path.to_string_lossy().contains("1device-clip-files"),
         "the published URL must point into the skeleton, got {path:?}"
     );
     // The concealed marker composed with writeObjects: and is present in types().

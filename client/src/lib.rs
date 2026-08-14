@@ -7,7 +7,7 @@
 //!
 //! Protocol spec: `doc/core-api.md`. The crate's exact contract is frozen
 //! by the integration suite (`tests/api/`), which consumes it against the
-//! real `universallink-core` lib.
+//! real `1device-core` lib.
 //!
 //! Model: [`spawn`] starts a task that maintains the connection to the Core
 //! (hello, subscriptions, reconnection with backoff) and publishes [`Event`]s;

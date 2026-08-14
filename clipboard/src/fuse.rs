@@ -120,8 +120,8 @@ impl FuseMount {
         let config = {
             let mut config = Config::default();
             config.mount_options = vec![
-                MountOption::FSName("universallink".to_string()),
-                MountOption::Subtype("universallink-clip".to_string()),
+                MountOption::FSName("1device".to_string()),
+                MountOption::Subtype("1device-clip".to_string()),
                 MountOption::RO,
                 MountOption::NoSuid,
                 MountOption::NoDev,
@@ -195,7 +195,7 @@ fn unique_mount_dir() -> std::io::Result<PathBuf> {
         .filter(|p| p.is_dir())
         .unwrap_or_else(std::env::temp_dir);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = base.join(format!("universallink-clip-{}-{}", std::process::id(), n));
+    let dir = base.join(format!("1device-clip-{}-{}", std::process::id(), n));
     std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
     Ok(dir)
 }
@@ -368,5 +368,5 @@ impl Filesystem for ClipboardFs {
 }
 
 fn warn(message: &str) {
-    eprintln!("[universallink-clipboard] {message}");
+    eprintln!("[1device-clipboard] {message}");
 }

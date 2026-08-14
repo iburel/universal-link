@@ -5,7 +5,7 @@
 //! that is already in it, instead of having the recovery code typed into it
 //! (doc/core-api.md, `pairing.*`).
 //!
-//! Every test here runs against the **real server** (`universallink-server`), so
+//! Every test here runs against the **real server** (`1device-server`), so
 //! what is exercised is the whole chain: the code displayed on one side, the
 //! sealed bundle relayed by a server that cannot read it, the confirmation gated
 //! by a fresh ID token, and the enrollment on the grant. The two directions the
@@ -24,8 +24,8 @@
 
 use std::time::Duration;
 
+use onedevice_core::{FileSecretStore, SecretStore};
 use serde_json::{Value, json};
-use universallink_core::{FileSecretStore, SecretStore};
 
 use crate::support::*;
 
@@ -118,7 +118,7 @@ async fn a_new_device_joins_by_being_confirmed_on_another() {
         .expect("pairing_id")
         .to_string();
     assert!(
-        code.starts_with("UL1:") && code.ends_with(&pairing_id),
+        code.starts_with("1D1:") && code.ends_with(&pairing_id),
         "the code carries its version and its session: {code}"
     );
     assert_eq!(offer["expires_in"], 120);
@@ -288,7 +288,7 @@ async fn a_device_that_cannot_vouch_gets_the_key_by_pairing() {
 
     // Same account key, seeded on disk as a lost keyring leaves it: the root, and
     // nothing to vouch with.
-    let switchboard = universallink_test_support::memory_transport::MemorySwitchboard::new();
+    let switchboard = onedevice_test_support::memory_transport::MemorySwitchboard::new();
     let old = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
     let mut oc = manager(&old).await;
     wait_server_connected(&mut oc, true).await;
@@ -360,8 +360,8 @@ async fn a_seed_for_another_account_key_is_refused() {
     let mut gc = giver.c;
 
     // Attested under a key of its own — a recovery code the sponsor never had.
-    let elsewhere = universallink_core::account_key::generate_recovery_code();
-    let switchboard = universallink_test_support::memory_transport::MemorySwitchboard::new();
+    let elsewhere = onedevice_core::account_key::generate_recovery_code();
+    let switchboard = onedevice_test_support::memory_transport::MemorySwitchboard::new();
     let mine = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&elsewhere)).await;
     let mut mc = manager(&mine).await;
     wait_server_connected(&mut mc, true).await;
@@ -407,8 +407,8 @@ async fn a_seed_for_another_account_key_is_refused() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_that_cannot_vouch_gives_the_session_back() {
     let server = TestServer::start().await;
-    let code_of_the_account = universallink_core::account_key::generate_recovery_code();
-    let switchboard = universallink_test_support::memory_transport::MemorySwitchboard::new();
+    let code_of_the_account = onedevice_core::account_key::generate_recovery_code();
+    let switchboard = onedevice_test_support::memory_transport::MemorySwitchboard::new();
     // Enrolled and attested, but holding no key: it is in the account without
     // being able to give it.
     let keyless =
@@ -450,7 +450,7 @@ async fn a_device_that_never_joined_the_account_gets_in_by_pairing() {
     let (mut gc, fingerprint) = (giver.c, giver.fingerprint);
 
     // Enrolled and logged in, with no trust root whatsoever.
-    let switchboard = universallink_test_support::memory_transport::MemorySwitchboard::new();
+    let switchboard = onedevice_test_support::memory_transport::MemorySwitchboard::new();
     let outsider = TestCore::start_enrolled_on_with_code(&server, &switchboard, None).await;
     let mut oc = manager(&outsider).await;
     wait_server_connected(&mut oc, true).await;
@@ -743,7 +743,7 @@ async fn what_pairing_refuses() {
     let mut gc = giver.c;
 
     // A code that is not one never reaches the server.
-    for wrong in ["", "nope", "UL2:a:b:c"] {
+    for wrong in ["", "nope", "1D2:a:b:c"] {
         let err = gc
             .request("pairing.accept", json!({ "code": wrong }))
             .await

@@ -18,9 +18,9 @@
 
 use std::path::{Path, PathBuf};
 
-use universallink_menu::os::windows::registry::Key;
-use universallink_menu::os::windows::{Cascade, SendTo};
-use universallink_menu::{HelperCommand, MenuSurface, Outcome};
+use onedevice_menu::os::windows::registry::Key;
+use onedevice_menu::os::windows::{Cascade, SendTo};
+use onedevice_menu::{HelperCommand, MenuSurface, Outcome};
 
 use crate::support::*;
 
@@ -35,7 +35,7 @@ impl Desktop {
     fn new(tag: &str) -> Desktop {
         Desktop {
             classes: format!(
-                r"Software\UniversalLink-menu-api\{tag}-{}\Classes",
+                r"Software\1Device-menu-api\{tag}-{}\Classes",
                 std::process::id()
             ),
             send_to: tempfile::tempdir().expect("tempdir"),
@@ -44,7 +44,7 @@ impl Desktop {
 
     /// Where the cascade for a file selection lives.
     fn cascade(&self) -> String {
-        format!(r"{}\*\shell\UniversalLink", self.classes)
+        format!(r"{}\*\shell\1Device", self.classes)
     }
 
     /// The real surfaces, whose entries start the real courier binary and point it
@@ -52,7 +52,7 @@ impl Desktop {
     /// another class, and its own keys are unit-tested.
     fn surfaces(&self, channel: &Path) -> Vec<Box<dyn MenuSurface>> {
         let helper = HelperCommand {
-            program: PathBuf::from(env!("CARGO_BIN_EXE_universallink-menu")),
+            program: PathBuf::from(env!("CARGO_BIN_EXE_1device-menu")),
             extra_args: vec!["--channel".into(), channel.to_string_lossy().into_owned()],
         };
         vec![
@@ -111,10 +111,7 @@ impl Desktop {
         let mut labels: Vec<String> = entries
             .filter_map(Result::ok)
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter_map(|name| {
-                name.strip_suffix(" (UniversalLink).lnk")
-                    .map(str::to_string)
-            })
+            .filter_map(|name| name.strip_suffix(" (1Device).lnk").map(str::to_string))
             .collect();
         labels.sort();
         labels
@@ -173,7 +170,7 @@ impl Drop for Desktop {
         if let Ok(Some(key)) = Key::open(parent) {
             let _ = key.delete_subtree(name);
         }
-        if let Ok(Some(key)) = Key::open(r"Software\UniversalLink-menu-api") {
+        if let Ok(Some(key)) = Key::open(r"Software\1Device-menu-api") {
             let _ = key.delete_subtree(
                 parent
                     .rsplit_once('\\')

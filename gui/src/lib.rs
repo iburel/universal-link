@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
 
 //! Tauri shell of the GUI: a thin bridge between the webview and the Core via
-//! `universallink-ipc-client`. Contract pinned by the `tests/api/` suite.
+//! `onedevice-ipc-client`. Contract pinned by the `tests/api/` suite.
 //!
 //! The shell has NO business logic. `core_request` proxies the JSON-RPC in
 //! full — the Core is the sole authority (validation, scopes): a method added

@@ -100,11 +100,11 @@ test("a scanned code comes back as the shell reports it", async () => {
   const seen: string[] = [];
   mockIPC((cmd) => {
     seen.push(cmd);
-    return cmd === "scan_supported" ? true : { code: "UL1:a:b:p_1" };
+    return cmd === "scan_supported" ? true : { code: "1D1:a:b:p_1" };
   });
 
   expect(await scanSupported()).toBe(true);
-  expect(await scanCode()).toEqual({ code: "UL1:a:b:p_1" });
+  expect(await scanCode()).toEqual({ code: "1D1:a:b:p_1" });
   expect(seen).toEqual(["scan_supported", "scan_code"]);
 });
 

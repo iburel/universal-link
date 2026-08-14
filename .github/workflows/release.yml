@@ -50,10 +50,10 @@ jobs:
             bundles: dmg
             bundle_glob: target/release/bundle/dmg/*.dmg
             tauri_config: >-
-              {"bundle":{"externalBin":["binaries/universallink-core","binaries/universallink-clipboard","binaries/universallink-menu"],
+              {"bundle":{"externalBin":["binaries/1device-core","binaries/1device-clipboard","binaries/1device-menu"],
               "macOS":{"files":{
-              "Frameworks/UniversalLinkTray.app/Contents/Info.plist":"helpers/UniversalLinkTray.app/Contents/Info.plist",
-              "Frameworks/UniversalLinkTray.app/Contents/MacOS/universallink-tray":"helpers/UniversalLinkTray.app/Contents/MacOS/universallink-tray"}}}}
+              "Frameworks/1DeviceTray.app/Contents/Info.plist":"helpers/1DeviceTray.app/Contents/Info.plist",
+              "Frameworks/1DeviceTray.app/Contents/MacOS/1device-tray":"helpers/1DeviceTray.app/Contents/MacOS/1device-tray"}}}}
           # Windows x64.
           - os: windows-latest
             triple: x86_64-pc-windows-msvc
@@ -61,7 +61,7 @@ jobs:
             bundles: nsis
             bundle_glob: target/release/bundle/nsis/*-setup.exe
             tauri_config: >-
-              {"bundle":{"externalBin":["binaries/universallink-core","binaries/universallink-tray","binaries/universallink-clipboard","binaries/universallink-menu"]}}
+              {"bundle":{"externalBin":["binaries/1device-core","binaries/1device-tray","binaries/1device-clipboard","binaries/1device-menu"]}}
           # Linux x64. Built on 22.04 (NOT ubuntu-latest/24.04): an AppImage
           # links against the build host's glibc, so building on the newer
           # image would refuse to start on Debian 12 / Ubuntu 22.04. 22.04 =
@@ -73,7 +73,7 @@ jobs:
             bundles: appimage
             bundle_glob: target/release/bundle/appimage/*.AppImage
             tauri_config: >-
-              {"bundle":{"externalBin":["binaries/universallink-core","binaries/universallink-tray","binaries/universallink-clipboard","binaries/universallink-menu"]}}
+              {"bundle":{"externalBin":["binaries/1device-core","binaries/1device-tray","binaries/1device-clipboard","binaries/1device-menu"]}}
     steps:
       # Actions pinned to a SHA (the only immutable reference), as in ci.yml.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -139,13 +139,13 @@ jobs:
       # config.json; the Core only reads it). This is deliberate — the released
       # binaries must carry no credentials.
       - name: Build the Core (sidecar)
-        run: cargo build -p universallink-daemon --bin universallink-core --release --locked
+        run: cargo build -p onedevice-daemon --bin 1device-core --release --locked
 
       # The tray, a second sidecar next to the Core. Same flags; on Linux it
       # dlopens libappindicator at runtime, so there is no extra build-time
       # system dependency here.
       - name: Build the tray (sidecar)
-        run: cargo build -p universallink-tray --bin universallink-tray --release --locked
+        run: cargo build -p onedevice-tray --bin 1device-tray --release --locked
 
       # The clipboard backend, a third sidecar. The Core's supervisor looks it up
       # next to itself and spawns it (`official_components`); without it the Core
@@ -153,7 +153,7 @@ jobs:
       # loaded at runtime, not linked-and-bundled here: on Linux the host libxcb
       # (build dep above), on Windows/macOS the OS Win32/AppKit already present.
       - name: Build the clipboard backend (sidecar)
-        run: cargo build -p universallink-clipboard --bin universallink-clipboard --release --locked
+        run: cargo build -p onedevice-clipboard --bin 1device-clipboard --release --locked
 
       # The contextual menu, a fourth sidecar: it writes the "send to PC X" entries
       # into the file managers' own menus and answers the click. Built and bundled
@@ -164,7 +164,7 @@ jobs:
       # surface is a file or a registry value written at runtime, and the Win32 calls
       # for the shortcuts come from crates the lock already carries.
       - name: Build the contextual menu (sidecar)
-        run: cargo build -p universallink-menu --bin universallink-menu --release --locked
+        run: cargo build -p onedevice-menu --bin 1device-menu --release --locked
 
       # Tauri expects each sidecar named with the target triple, next to the GUI.
       # All four on every platform, uniformly: on macOS the tray copy staged here
@@ -174,22 +174,22 @@ jobs:
         shell: bash
         run: |
           mkdir -p gui/binaries
-          cp "target/release/universallink-core${{ matrix.bin_ext }}" \
-             "gui/binaries/universallink-core-${{ matrix.triple }}${{ matrix.bin_ext }}"
-          cp "target/release/universallink-tray${{ matrix.bin_ext }}" \
-             "gui/binaries/universallink-tray-${{ matrix.triple }}${{ matrix.bin_ext }}"
-          cp "target/release/universallink-clipboard${{ matrix.bin_ext }}" \
-             "gui/binaries/universallink-clipboard-${{ matrix.triple }}${{ matrix.bin_ext }}"
-          cp "target/release/universallink-menu${{ matrix.bin_ext }}" \
-             "gui/binaries/universallink-menu-${{ matrix.triple }}${{ matrix.bin_ext }}"
+          cp "target/release/1device-core${{ matrix.bin_ext }}" \
+             "gui/binaries/1device-core-${{ matrix.triple }}${{ matrix.bin_ext }}"
+          cp "target/release/1device-tray${{ matrix.bin_ext }}" \
+             "gui/binaries/1device-tray-${{ matrix.triple }}${{ matrix.bin_ext }}"
+          cp "target/release/1device-clipboard${{ matrix.bin_ext }}" \
+             "gui/binaries/1device-clipboard-${{ matrix.triple }}${{ matrix.bin_ext }}"
+          cp "target/release/1device-menu${{ matrix.bin_ext }}" \
+             "gui/binaries/1device-menu-${{ matrix.triple }}${{ matrix.bin_ext }}"
 
       # macOS only: the tray does not ride along in `Contents/MacOS` like the other
       # sidecars — it gets a nested application bundle of its own.
       #
-      # Why: a process started from `UniversalLink.app/Contents/MacOS` IS the
+      # Why: a process started from `1Device.app/Contents/MacOS` IS the
       # application as far as Launch Services is concerned, and takes the enclosing
       # bundle's identifier. The tray owns a status item, so it checks in as a GUI
-      # application — and from the moment the Core spawned it, `org.universallink.gui`
+      # application — and from the moment the Core spawned it, `org.onedevice.gui`
       # was "already running". Every `open` of the app (the Dock, the Finder, the
       # Launchpad, and the tray's own Open item) then merely activated the tray, which
       # has no window: clicking the icon did nothing at all, silently. Its own bundle,
@@ -200,7 +200,7 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          helper="gui/helpers/UniversalLinkTray.app/Contents"
+          helper="gui/helpers/1DeviceTray.app/Contents"
           mkdir -p "$helper/MacOS"
           cp tray/macos/Info.plist "$helper/Info.plist"
           # One product, one version: `lsappinfo` shows this bundle's own, and two
@@ -210,11 +210,11 @@ jobs:
           /usr/libexec/PlistBuddy \
             -c "Set :CFBundleShortVersionString $version" \
             -c "Set :CFBundleVersion $version" "$helper/Info.plist"
-          cp target/release/universallink-tray "$helper/MacOS/universallink-tray"
+          cp target/release/1device-tray "$helper/MacOS/1device-tray"
           # `bundle.macOS.files` copies file by file with `fs::copy`, which keeps the
           # mode — but a tray that is not executable would only be discovered by a
           # user whose icon never appears.
-          test -x "$helper/MacOS/universallink-tray"
+          test -x "$helper/MacOS/1device-tray"
 
       # `externalBin` is injected HERE (and not in tauri.conf.json) so that the
       # `cargo build`/clippy runs in ci.yml don't require the sidecar to be
@@ -235,23 +235,23 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          # Inside the dmg, not in `bundle/macos/UniversalLink.app`: with only the dmg
+          # Inside the dmg, not in `bundle/macos/1Device.app`: with only the dmg
           # requested, tauri deletes that intermediate bundle as its last act
-          # ("Cleaning …UniversalLink.app"). Checking the image that actually ships is
+          # ("Cleaning …1Device.app"). Checking the image that actually ships is
           # the better evidence in any case.
           dmg="$(ls target/release/bundle/dmg/*.dmg | head -1)"
-          mnt=/tmp/ul-verify-layout
+          mnt=/tmp/1device-verify-layout
           hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mnt" > /dev/null
-          app="$mnt/UniversalLink.app"
-          helper="$app/Contents/Frameworks/UniversalLinkTray.app"
+          app="$mnt/1Device.app"
+          helper="$app/Contents/Frameworks/1DeviceTray.app"
           # Collected rather than exited on, so the image is always detached.
           status=0
-          if [ ! -x "$helper/Contents/MacOS/universallink-tray" ]; then
+          if [ ! -x "$helper/Contents/MacOS/1device-tray" ]; then
             echo "::error::no executable tray in the helper bundle"
             ls -lR "$app/Contents" | head -60
             status=1
           fi
-          if [ -e "$app/Contents/MacOS/universallink-tray" ]; then
+          if [ -e "$app/Contents/MacOS/1device-tray" ]; then
             echo "::error::the tray is ALSO in Contents/MacOS, where it takes the application's Launch Services identity: clicking the app icon would open nothing"
             status=1
           fi
@@ -267,7 +267,7 @@ jobs:
       - name: Run artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: universallink-${{ matrix.triple }}
+          name: 1device-${{ matrix.triple }}
           path: ${{ matrix.bundle_glob }}
           if-no-files-found: error
 
@@ -282,14 +282,14 @@ jobs:
           files: ${{ matrix.bundle_glob }}
           fail_on_unmatched_files: true
           body: |
-            UniversalLink installers — **unsigned** (milestone 1). The OS will show a warning on first launch:
+            1Device installers — **unsigned** (milestone 1). The OS will show a warning on first launch:
 
             - **macOS**: "unverified developer" → System Settings → Privacy & Security → "Open anyway".
             - **Windows**: SmartScreen "Windows protected your PC" → "More info" → "Run anyway".
-            - **Linux** (AppImage): `chmod +x UniversalLink_*.AppImage`, then run it. If it fails to start with a `libfuse.so.2` error, install FUSE 2 (`sudo apt install libfuse2`, or your distro's equivalent). The tray icon additionally needs `libayatana-appindicator3` (`sudo apt install libayatana-appindicator3-1`) and a StatusNotifierItem host — on GNOME, the AppIndicator extension.
+            - **Linux** (AppImage): `chmod +x 1Device_*.AppImage`, then run it. If it fails to start with a `libfuse.so.2` error, install FUSE 2 (`sudo apt install libfuse2`, or your distro's equivalent). The tray icon additionally needs `libayatana-appindicator3` (`sudo apt install libayatana-appindicator3-1`) and a StatusNotifierItem host — on GNOME, the AppIndicator extension.
             - **Android** (`.apk`, **arm64 only** — a 32-bit-only phone will refuse it with `INSTALL_FAILED_NO_MATCHING_ABIS`): this one *is* signed, with the project's own key, because Android will not install or upgrade an app otherwise. That key is self-issued, so your phone still asks you to allow installs from whatever app you downloaded it with, and Play Protect may offer to scan it. Sideload only: it is not on the Play Store. Requires Android 7.0 or newer.
 
-            On first launch, the app installs the background service (per-user, no admin) and opens a setup screen: enter your UniversalLink server address and its OpenID Connect client (nothing is baked into the build). It then connects.
+            On first launch, the app installs the background service (per-user, no admin) and opens a setup screen: enter your 1Device server address and its OpenID Connect client (nothing is baked into the build). It then connects.
 
   # The Android client, in a job of its own rather than a fourth leg of the matrix
   # above: it shares not one step with it (no sidecars — the mobile app embeds the
@@ -317,7 +317,7 @@ jobs:
       # (36.0.0 says "Signer #1 certificate SHA-256 digest:", the image's says
       # "V3.0 Signer: certificate SHA-256 digest:" and knows a v3.2 scheme).
       BUILD_TOOLS_VERSION: "36.0.0"
-      # The ONE certificate allowed to sign a UniversalLink release, recorded from
+      # The ONE certificate allowed to sign a 1Device release, recorded from
       # the first run that used the key (RSA 4096, self-issued). A certificate is
       # public — it ships inside every copy of the APK — so this is not a secret;
       # it is a pin. It exists to catch what a signature check alone cannot: a
@@ -481,7 +481,7 @@ jobs:
             exit 1
           fi
 
-      # Named like the desktop bundles (UniversalLink_<version>_<arch>.<ext>) rather
+      # Named like the desktop bundles (1Device_<version>_<arch>.<ext>) rather
       # than shipped as Gradle's app-universal-release.apk, which says nothing to
       # someone looking at a downloads folder. A move, not a copy: what gets uploaded
       # is then byte-for-byte the file the step above verified, and the directory
@@ -491,14 +491,14 @@ jobs:
         run: |
           version="$(jq -r .version gui-mobile/tauri.conf.json)"
           dir=gui-mobile/gen/android/app/build/outputs/apk/universal/release
-          out="$dir/UniversalLink_${version}_arm64.apk"
+          out="$dir/1Device_${version}_arm64.apk"
           mv "$dir/app-universal-release.apk" "$out"
           echo "path=$out" >> "$GITHUB_OUTPUT"
 
       - name: Run artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: universallink-android-arm64
+          name: 1device-android-arm64
           path: ${{ steps.named.outputs.path }}
           if-no-files-found: error
 

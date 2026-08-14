@@ -170,7 +170,7 @@ pub trait PeerTransport: Send + Sync + std::fmt::Debug {
 /// ALPN of the data plane: a peer that does not speak it is refused by iroh
 /// (at the handshake). Source of truth for the daemon's iroh impl. Versioned
 /// like the rest — an incompatible change will bump it.
-pub const ALPN: &[u8] = b"ul/data/1";
+pub const ALPN: &[u8] = b"1device/data/1";
 
 /// Maximum size of a framed CONTROL frame (offer, acknowledgment, clip
 /// announce). Bounds the memory a peer can make us allocate at once. The file
@@ -1254,7 +1254,7 @@ impl PartFile {
         // A dotted (hidden), random name: never confused with a received file,
         // never colliding between two concurrent transfers. `create_new`
         // reserves the name and guarantees we overwrite nothing.
-        let path = dir.join(format!(".ul-{}.part", crate::state::random_hex(8)));
+        let path = dir.join(format!(".1device-{}.part", crate::state::random_hex(8)));
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)

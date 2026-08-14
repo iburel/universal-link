@@ -1,5 +1,5 @@
 [package]
-name = "universallink-test-support"
+name = "onedevice-test-support"
 version = "0.6.0"
 edition = "2024"
 license = "AGPL-3.0-only"
@@ -29,4 +29,4 @@ tokio-tungstenite = "0.30"
 # The in-memory transport (`memory_transport`) implements the Core library's
 # `PeerTransport` trait. Deliberate dev-only cycle (core[tests] → test-support → core[lib]):
 # cargo allows it, and the Core's lib-only cross-check compiles no dev-dep.
-universallink-core = { path = "../core" }
+onedevice-core = { path = "../core" }

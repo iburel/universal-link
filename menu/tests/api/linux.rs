@@ -21,8 +21,8 @@
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
-use universallink_menu::os::linux;
-use universallink_menu::{HelperCommand, MenuSurface, Outcome, Target};
+use onedevice_menu::os::linux;
+use onedevice_menu::{HelperCommand, MenuSurface, Outcome, Target};
 
 use crate::support::*;
 
@@ -48,15 +48,12 @@ impl Desktop {
         self.path()
             .join("kio")
             .join("servicemenus")
-            .join("universallink-send.desktop")
+            .join("1device-send.desktop")
     }
 
     /// The Nautilus submenu directory.
     fn scripts(&self) -> PathBuf {
-        self.path()
-            .join("nautilus")
-            .join("scripts")
-            .join("UniversalLink")
+        self.path().join("nautilus").join("scripts").join("1Device")
     }
 
     /// The real surfaces, whose entries start the real courier binary and point it
@@ -65,7 +62,7 @@ impl Desktop {
         linux::surfaces(
             self.path(),
             HelperCommand {
-                program: PathBuf::from(env!("CARGO_BIN_EXE_universallink-menu")),
+                program: PathBuf::from(env!("CARGO_BIN_EXE_1device-menu")),
                 extra_args: vec!["--channel".into(), channel.to_string_lossy().into_owned()],
             },
         )
@@ -307,7 +304,7 @@ fn target(id: &str, name: &str) -> Target {
 #[test]
 fn a_hostile_device_name_survives_a_round_trip_through_the_spec() {
     let desktop = Desktop::new();
-    let program = PathBuf::from(r"/opt/My Apps/back\slash/universallink-menu");
+    let program = PathBuf::from(r"/opt/My Apps/back\slash/1device-menu");
     let hostile = "PC\nExec=/bin/sh -c \"rm -rf ~\"\t100% \"quoted\" $HOME";
     let mut surfaces = linux::surfaces(
         desktop.path(),

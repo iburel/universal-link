@@ -8,7 +8,7 @@
 //! skipped on any box without unprivileged FUSE.
 //!
 //! Run natively with:
-//!   cargo test -p universallink-clipboard --test linux_files -- --ignored --test-threads=1
+//!   cargo test -p onedevice-clipboard --test linux_files -- --ignored --test-threads=1
 //! A FUSE mount is a per-display-independent, per-process resource, but the tests
 //! still serialize on [`MOUNT_LOCK`] and want `--test-threads=1`, matching the
 //! other backends' live suites.
@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use universallink_clipboard::{FileFetcher, FuseMount, RemoteFile, fuse_available};
+use onedevice_clipboard::{FileFetcher, FuseMount, RemoteFile, fuse_available};
 
 /// Serializes the mount/read tests (they run under `--test-threads=1`).
 static MOUNT_LOCK: Mutex<()> = Mutex::new(());
@@ -211,7 +211,7 @@ fn the_mount_is_read_only_and_hardened() {
     // after the `-` separator, not in the per-mount list, so match the whole
     // line for it.
     assert!(
-        line.contains("fuse.universallink-clip"),
+        line.contains("fuse.1device-clip"),
         "subtype not announced: {line}"
     );
     // SAFETY: geteuid is an always-successful, thread-safe libc call.

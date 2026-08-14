@@ -1,6 +1,6 @@
 # Security Policy
 
-UniversalLink links a user's own devices and transfers their files, so we take
+1Device links a user's own devices and transfers their files, so we take
 security reports seriously. Thank you for helping keep it safe.
 
 ## Reporting a vulnerability
@@ -25,7 +25,7 @@ prefer to remain anonymous.
 
 ## Scope
 
-UniversalLink's security model rests on a few load-bearing properties; reports
+1Device's security model rests on a few load-bearing properties; reports
 that undermine any of them are especially valuable:
 
 - **End-to-end encryption of the data plane.** The server relays control and
@@ -48,5 +48,5 @@ that undermine any of them are especially valuable:
 
 ## Supported versions
 
-UniversalLink is pre-1.0 and under active development. Only the latest release
+1Device is pre-1.0 and under active development. Only the latest release
 and `main` receive security fixes.
