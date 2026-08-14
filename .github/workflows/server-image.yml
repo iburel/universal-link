@@ -1,0 +1,173 @@
+# Builds and publishes the server's Docker image to GitHub Container Registry:
+# one multi-arch manifest (linux/amd64 + linux/arm64), each architecture built
+# on a NATIVE runner (arm64 runners are free for public repositories; emulating
+# a release Rust build under QEMU would take the better part of an hour) and
+# smoke-tested as a running server before anything is pushed.
+#
+# Triggers, mirroring release.yml: a `v*` tag publishes `<version>` and moves
+# `latest`; `workflow_dispatch` publishes `edge` from the chosen ref, which
+# tests the whole chain (registry push included) without laying down a tag.
+# The `promote` input additionally moves `latest` to that build: the bootstrap
+# path, for giving `latest` a first value from main before the next tagged
+# release ships.
+#
+# `--provenance=false` everywhere: buildx would otherwise attach a provenance
+# attestation, turning each pushed image into an OCI index with an extra
+# "unknown/unknown" entry. Some aging Docker engines and UIs choke on that,
+# and the audience of a published image is precisely the modest home server
+# (issue #90). Supply-chain attestations can come back the day they cost
+# nothing in compatibility.
+
+name: Server image
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      promote:
+        description: "Also move `latest` to this build (bootstrap outside a release)"
+        type: boolean
+        default: false
+
+# `packages: write` is what lets GITHUB_TOKEN push to ghcr. The first push
+# creates the package (private by default; making it public, so that
+# `docker pull` needs no login, is a one-time click in the package settings).
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/1device-server
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    # Cold release build of the server subtree, twice (smoke + push share the
+    # builder's cache, so the second one is free).
+    timeout-minutes: 45
+    strategy:
+      # One architecture failing must not cancel the other: the log of the
+      # survivor tells whether the failure is arch-specific.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      # Actions pinned to a SHA (the only immutable reference), as in ci.yml.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Log in to ghcr
+        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # The runner's default `docker` driver cannot export push-by-digest; a
+      # `docker-container` builder can, and it keeps its build cache across
+      # the two `buildx build` calls below.
+      - name: Create a buildx builder
+        run: docker buildx create --use
+
+      - name: Build the image
+        run: >-
+          docker buildx build --load -t smoke
+          -f docker/server/Dockerfile
+          --provenance=false
+          --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
+          --label "org.opencontainers.image.description=1Device control-plane server"
+          --label "org.opencontainers.image.licenses=AGPL-3.0-only"
+          --label "org.opencontainers.image.revision=${{ github.sha }}"
+          .
+
+      # A running server, not merely a built one: /health answers `ok`, the
+      # deployment descriptor serves the configuration back, and `docker stop`
+      # (SIGTERM) exits cleanly. That is the contract doc/server-deployment.md
+      # promises to a self-hoster.
+      - name: Smoke-test the image
+        run: |
+          docker run -d --name smoke -p 127.0.0.1:18080:8080 \
+            -e ONEDEVICE_OIDC_ISSUER=https://accounts.google.com \
+            -e ONEDEVICE_OIDC_CLIENT_ID=smoke-test-client-id \
+            smoke
+          for i in $(seq 1 30); do
+            curl -fsS -o /dev/null http://127.0.0.1:18080/health && break
+            if [ "$i" = 30 ]; then docker logs smoke; exit 1; fi
+            sleep 1
+          done
+          test "$(curl -fsS http://127.0.0.1:18080/health)" = ok
+          curl -fsS http://127.0.0.1:18080/.well-known/1device.json \
+            | jq -e '.oidc_client_id == "smoke-test-client-id"'
+          docker stop smoke
+          test "$(docker inspect --format '{{.State.ExitCode}}' smoke)" = 0
+
+      - name: Push by digest
+        run: |
+          docker buildx build \
+            -f docker/server/Dockerfile \
+            --provenance=false \
+            --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            --label "org.opencontainers.image.description=1Device control-plane server" \
+            --label "org.opencontainers.image.licenses=AGPL-3.0-only" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            --output "type=image,name=${IMAGE},push-by-digest=true,push=true" \
+            --metadata-file /tmp/metadata.json \
+            .
+          mkdir -p /tmp/digests
+          jq -r '."containerimage.digest"' /tmp/metadata.json > "/tmp/digests/${{ matrix.arch }}"
+          # Die here rather than hand the merge job an empty digest.
+          grep -q '^sha256:' "/tmp/digests/${{ matrix.arch }}"
+
+      - name: Hand the digest to the merge job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+
+  publish:
+    name: merge and tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: build
+    steps:
+      - name: Collect the digests
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: /tmp/digests
+
+      - name: Log in to ghcr
+        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # `imagetools create` assembles one manifest list from the two per-arch
+      # images already in the registry (referenced by digest, so nothing was
+      # ever tagged half-built), and stamps every requested tag on it.
+      - name: Create the multi-arch manifest
+        run: |
+          amd64="$(cat /tmp/digests/amd64)"
+          arm64="$(cat /tmp/digests/arm64)"
+          case "$GITHUB_REF" in
+            refs/tags/v*)
+              version="${GITHUB_REF_NAME#v}"
+              tags="-t $IMAGE:$version -t $IMAGE:latest"
+              primary="$version"
+              ;;
+            *)
+              tags="-t $IMAGE:edge"
+              primary="edge"
+              if [ "${{ inputs.promote }}" = "true" ]; then
+                tags="$tags -t $IMAGE:latest"
+              fi
+              ;;
+          esac
+          docker buildx imagetools create $tags "$IMAGE@$amd64" "$IMAGE@$arm64"
+          echo "PRIMARY_TAG=$primary" >> "$GITHUB_ENV"
+
+      - name: Verify the published manifest
+        run: |
+          docker buildx imagetools inspect "$IMAGE:$PRIMARY_TAG" | tee /tmp/manifest
+          grep -q 'linux/amd64' /tmp/manifest
+          grep -q 'linux/arm64' /tmp/manifest

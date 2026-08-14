@@ -6,10 +6,21 @@
 # certificate.
 #
 # Settings: a `.env` file NEXT TO this file (see .env.example).
-# To launch: from this directory, `docker compose up -d --build`.
+# To launch: from this directory, `docker compose up -d`. That pulls the
+# published server image: this directory plus a filled .env is a complete
+# deployment, no Rust toolchain, no build.
 
 services:
   server:
+    # Multi-arch (amd64 + arm64) image, built, smoke-tested and pushed by
+    # .github/workflows/server-image.yml at each release. Pin a version by
+    # replacing `latest` with one of the published tags.
+    image: ghcr.io/iburel/1device-server:latest
+    # With a `build:` section present, compose would otherwise build when the
+    # image is absent locally; `missing` makes `up -d` pull instead. Building
+    # from source stays one flag away: `docker compose up -d --build`
+    # (requires the cloned repository, not just this directory).
+    pull_policy: missing
     build:
       # Context = repository root (cargo needs the whole workspace); this
       # file lives in deploy/, hence the `..`.

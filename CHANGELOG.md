@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Self-hosting the server no longer requires building it.** Every release
+  now publishes the server's Docker image to GitHub Container Registry
+  (`ghcr.io/iburel/1device-server`, amd64 and arm64), each architecture
+  smoke-tested as a running server before publication. The `deploy/` compose
+  pulls that image by default: copy `.env.example` to `.env`, fill it in,
+  `docker compose up -d`, and no Rust toolchain ever touches your machine.
+  Building from source remains one flag away (`docker compose up -d --build`).
 - **Machines on the same network now find each other directly.** Each desktop
   announces itself over mDNS (as `1device`, UDP 5353) and resolves its
   siblings the same way — and being visible on the local network now *counts as
