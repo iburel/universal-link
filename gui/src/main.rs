@@ -62,7 +62,26 @@ fn main() {
         request_timeout: Duration::from_secs(30),
     };
 
-    onedevice_gui::shell(tauri::Builder::default(), config, endpoint.config_dir)
+    // A second launch hands off to the running instance — which surfaces its
+    // window — and exits, instead of opening a second window on the same Core.
+    // Registered on the incoming builder so it is the FIRST plugin: plugins
+    // initialize in registration order, and everything after this line is
+    // wasted work in a process about to defer. (The supervise block above does
+    // run twice; it is idempotent by design — the Core holds its own lock.)
+    // This is also what the tray's "Open" relies on when the window is already
+    // there: it just spawns this binary, and the handoff turns that into a
+    // focus.
+    let first_instance =
+        tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            use tauri::Manager;
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }));
+
+    onedevice_gui::shell(first_instance, config, endpoint.config_dir)
         .plugin(tauri_plugin_opener::init())
         .run(tauri::generate_context!())
         .expect("Tauri app startup");
