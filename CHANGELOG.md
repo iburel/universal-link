@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The identity step of self-hosting is documented end to end.** A new
+  [identity providers](doc/identity-providers.md) page carries the Google
+  console walkthrough with today's screen names and every trap called out
+  (Desktop-app client type, the secret shown only at creation, Testing
+  status, the six-month inactivity deletion), plus verified recipes for
+  issuers you host yourself: Keycloak, Authentik, Zitadel, Pocket ID,
+  Kanidm and Dex, each with the exact settings for the dynamic-port
+  loopback redirect and RS256 tokens this flow needs.
 - **Self-hosting the server no longer requires building it.** Every release
   now publishes the server's Docker image to GitHub Container Registry
   (`ghcr.io/iburel/1device-server`, amd64 and arm64), each architecture
