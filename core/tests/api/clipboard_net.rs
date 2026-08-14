@@ -847,24 +847,57 @@ impl RawPeer {
         }
     }
 
-    /// Accepts the next incoming stream (a `clip_session` the paster opens to
-    /// us) and drops it without serving — a source that vanishes mid-session
-    /// with no graceful `TX_STALE`, yielding `PEER_GONE` on the paster side.
-    async fn abandon_next_session(&self) {
-        if let Ok((_peer, mut stream)) = self.transport.accept().await {
-            // Read a little (the opening frame) so the paster's session is truly
-            // in flight, then drop the stream → the paster sees the reset.
-            let mut scratch = [0u8; 64];
-            let _ = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut scratch)).await;
+    /// Accepts incoming streams until one OPENS with a `wanted` frame, and hands
+    /// it back, that frame consumed. This peer's inbox is no longer the tests'
+    /// alone: since the continuum, the Core's sync task dials every attested
+    /// sibling it has a route to whenever the server teaches it something, so a
+    /// `dir_sync` stream can arrive here first. It is dropped on the floor — a
+    /// real Core would answer it, and a peer that goes quiet instead is exactly
+    /// what dirsync tolerates by design — rather than mistaken for the stream
+    /// the test is staging.
+    async fn next_stream_of(&self, wanted: &str) -> Option<Box<dyn universallink_core::IoStream>> {
+        loop {
+            let Ok((_peer, mut stream)) = self.transport.accept().await else {
+                return None;
+            };
+            // u32-BE length + JSON, the data plane's framing.
+            let mut len = [0u8; 4];
+            match tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut len)).await {
+                Ok(Ok(_)) => {}
+                _ => continue,
+            }
+            let len = u32::from_be_bytes(len) as usize;
+            if len > 1024 * 1024 {
+                continue;
+            }
+            let mut body = vec![0u8; len];
+            match tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut body)).await {
+                Ok(Ok(_)) => {}
+                _ => continue,
+            }
+            let Ok(frame) = serde_json::from_slice::<Value>(&body) else {
+                continue;
+            };
+            if frame.get("type").and_then(Value::as_str) == Some(wanted) {
+                return Some(stream);
+            }
         }
     }
 
-    /// Accepts the next incoming stream (the source's `clip_push`), drains it,
-    /// then drops it WITHOUT acking — what a Core too old to know `clip_push`
-    /// does with the frame. Draining first means the source's writes never
-    /// block, so the failure it reports is unambiguously "no ack".
+    /// Accepts the paster's `clip_session` and drops it without serving — a
+    /// source that vanishes mid-session with no graceful `TX_STALE`, yielding
+    /// `PEER_GONE` on the paster side. The opening frame is consumed first, so
+    /// the paster's session is truly in flight when the stream drops.
+    async fn abandon_next_session(&self) {
+        let _ = self.next_stream_of("clip_session").await;
+    }
+
+    /// Accepts the source's `clip_push`, drains it, then drops it WITHOUT
+    /// acking — what a Core too old to know `clip_push` does with the frame.
+    /// Draining first means the source's writes never block, so the failure it
+    /// reports is unambiguously "no ack".
     async fn abandon_next_push(&self) {
-        if let Ok((_peer, mut stream)) = self.transport.accept().await {
+        if let Some(mut stream) = self.next_stream_of("clip_push").await {
             let mut scratch = [0u8; 4096];
             loop {
                 match tokio::time::timeout(Duration::from_millis(500), stream.read(&mut scratch))

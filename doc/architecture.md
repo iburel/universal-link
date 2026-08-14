@@ -110,6 +110,72 @@ On each PC:
      Until it exists, the manual equivalent is to erase the trust root and the
      stored key on **every** device and start over from `account.setup` — a new
      recovery code, and every device attested again.
+   - **Revocation with no server**: where there is no directory to strike a
+     device from, the account key signs the withdrawal itself — a **tombstone**
+     over the `node_id`, under a domain of its own so it can never be confused
+     with an attestation. Every device verifies it against the key it derived
+     itself, so it needs no authority to carry it, and it **outlives what a
+     server says**: a deployment that was never told keeps listing the device,
+     and the peers keep refusing it. It is permanent by design (un-revoking
+     would need a total order the account cannot establish offline): a device
+     struck off comes back only as a new one, with a fresh `node_id`.
+   - **The struck device obeys, once it hears.** A tombstone naming *this*
+     device, verified under the account key, is not refused — it is the account's
+     own word, and the device leaves: trust root, account key, session, directory
+     and `device.key`, all erased, so its next startup is a first startup under
+     the fresh identity that is the only way back. Delivering it takes a
+     mechanism of its own, because enforcement blocks gossip: absorbing a
+     tombstone evicts the struck device from a sibling's directory, so every
+     informed sibling refuses the very streams that could have carried it. The
+     data plane therefore answers the struck-off device's dial with a one-entry
+     roster — its own tombstone, nothing read in return — and the same absorb
+     that reads rosters is the one that obeys. Best-effort by construction: a
+     device that never dials again never learns, and loses nothing by it, since
+     the account already refuses it everywhere.
+   - **A device signs what it says about itself**: its directory record carries
+     its own signature over `{node_id, name, platform, seq}`, so a description
+     can pass from device to device without the one relaying it being trusted
+     with it, and only its owner can raise the `seq` that makes a new
+     description supersede the one already known. What a device says in the
+     present tense — its relay, its liveness — is left unsigned, deliberately:
+     a signature over it would be a stale fact wearing a proof.
+   - **The continuum: one account, half on a server, half not.** The account is
+     the union the ACCOUNT KEY defines; a deployment lists the subset that
+     enrolled with it, and is the authority on that subset's names and routes —
+     nothing more. Where a server names a device, the device **countersigns**:
+     the name stays the server's word, the signature is nobody's but its own,
+     published to the server as blind as the attestation and rebroadcast in its
+     records. So the server's half proves itself like the serverless half, the
+     rosters carry both, and a serverless-only sibling is a full member of an
+     account the server never learns it belongs to. The server's snapshot is
+     merged, never swapped in — what the account can prove outlives every
+     reconnection and every logout — and a `devices.revoke` through the server
+     also mints the account's own tombstone wherever the key is at hand, because
+     a server-side strike stops at the server's reach. The two halves lag each
+     other by one sync round, not a quarter of an hour: server news nudges the
+     rosters.
+   - **The devices carry the directory between themselves.** Two devices that
+     already hold each other's record exchange rosters over the data plane (one
+     round trip, a frame type of its own on the existing ALPN): a device thereby
+     learns of a sibling it has never met, from a third one that has, and a
+     tombstone reaches the whole account. A relayer is a courier, never a
+     witness — every record must be signed by the device it describes AND
+     attested under the account key, so a compromised member cannot invent a
+     sibling, rename one, or bring a struck-off one back. What it can do is stay
+     silent, and silence costs nothing: an account is not made of what a peer
+     chooses to mention. What a courier could not witness (a route, a liveness)
+     is dropped on arrival, so a device learns of a sibling **known but not
+     reachable** until it hears it for itself.
+   - **The first introduction, with no server to make it.** That exchange
+     presupposes two devices that already hold each other's record, which the
+     recovery code typed into each machine does not give: each then knows only
+     itself. So a code displayed on one device and read on the other opens a
+     pairing over the local network — the code names the device to dial — and it
+     ends with each holding the other's signed record, the joiner's attested by
+     the sponsor on the spot. Both `node_id`s are authenticated by the transport,
+     so neither device can be posed as; what a photographed code buys is a race,
+     and the confirmation number is what catches it ("Pairing a device", "On the
+     local network").
 
 4. **Push between long-lived processes, pull for ephemeral artifacts.**
    Server → Core → managers: subscriptions/events, in-memory caches always warm.
@@ -163,7 +229,9 @@ provides:
   NodeId alone, so two machines that share a network connect directly — without
   the relay, including when a device never published one. Discovery only ever
   provides an *address*: an impostor announcing someone else's NodeId fails the
-  QUIC handshake, and the account attestation still gates every stream.
+  QUIC handshake, and the account attestation still gates every stream. Turning it
+  off also turns off pairing over the local network ("On the local network"), which
+  is the one route a device with no server has to reach another.
 
 ## The Client
 
@@ -425,6 +493,11 @@ Wire protocol: [server-api.md](server-api.md), "Pairing". Local API:
 [core-api.md](core-api.md), `pairing.*`. This section is the threat model those
 two point at.
 
+Two ways the code travels, and the rest of this section holds for both: through the
+**server**, which is a rendezvous and a relay of ciphertext, or — where there is no
+server at all — **dialled directly on the local network**, the code naming the
+device to dial ("On the local network", below).
+
 ### The channel
 
 The code carries three things: the session's id, a **128-bit secret**, and the
@@ -478,6 +551,82 @@ clicks without comparing is in the same place), it would add a step to every
 legitimate pairing, and it is the asymmetry Signal's device linking has too. It
 becomes worth revisiting if the passive check turns out to be one nobody reads.
 
+### On the local network
+
+An account with no server has no rendezvous, and needs none: the code carries the
+**`node_id` to dial** where the session id was, and the other device dials it on the
+data plane (`UL2:<psk>:<epk>:<node_id>`, one bidirectional stream, no new ALPN). The
+device that displays the code is the one that gets dialled — either of them can be
+the one displaying, so a machine with a camera and a machine without both have a
+gesture.
+
+A device that answers to a server may *scan* one of these codes and sponsor
+(the continuum, principle 3): the joiner then joins the **account** — key,
+roster, mutual records — and not the deployment, which simply never lists it.
+Showing a `UL1` code, through the server, remains that device's way of enrolling
+a newcomer on the deployment too; its `pairing.offer` still goes through the
+server whenever it has one.
+
+What changes in the threat model, and it changes for the better: **both `node_id`s
+are authenticated by the transport**. The dialer reached exactly the key the code
+names (iroh authenticates the remote end); the displaying side is handed the
+dialer's key by the transport rather than told it in a frame, and a device that
+declares a description belonging to another key is refused. So neither side can be
+*posed as*, where on the server path the joining device's name is its own to choose
+and only the number tells an impostor from a sibling. What is left for an attacker
+is the same race, answered by the same confirmation number.
+
+Three things the local path adds:
+
+- **The dialer proves it read the code off a screen** before the displaying side
+  spends anything: a MAC over both public halves and the `node_id`, keyed by the
+  code's 128-bit secret. Checked *before* the ephemeral secret is consumed — the
+  other order would let anything on the network burn a pairing window for the
+  device the human is actually holding.
+- **A window, and only a window.** The data plane refuses every device outside the
+  account's directory without reading a byte (C7). While a pairing is open on this
+  device — a deliberate human gesture, 180 seconds — a stranger is let as far as
+  its first frame, and that frame may only be the pairing offer; the window shuts
+  to newcomers the instant it takes a dialer. This is the only hole in
+  "the directory decides who is served", and it is the hole through which the
+  directory gets its first entry. What it costs, stated rather than glossed: for
+  the length of a window, someone on the network can make this device read (and
+  discard) frames it would otherwise not have read, and so occupy its handler
+  slots. It is not a new *class* of nuisance — anyone who can reach the endpoint
+  can already fill the QUIC acceptor's handshake slots, directory or no directory —
+  and it lasts as long as a human keeps a code on screen.
+- **The introduction is mutual.** With no server there is no directory to join:
+  each side ends up holding the other's *signed* record — the joiner's attested by
+  the sponsor on the spot — which is what lets the two devices carry the directory
+  between themselves afterwards (principle 3, "The devices carry the directory
+  between themselves").
+
+Who sponsors is whoever holds the account's private key. Neither holding it is
+refused; two *different* accounts are refused before the seed crosses (and the
+devices compare accounts as a MAC under the channel key, so the local network is
+not told which account either of them is in). Both holding the same key is not an
+error but the ordinary case of a serverless account whose recovery code was typed
+into each machine in turn: the device that displayed the code sponsors, the key that
+crosses is the one the other side already has, and what the two of them are really
+doing is swapping directories.
+
+And two refusals for a device the account struck off, one per direction. Its
+*dial* never reaches the window: the data plane answers it with its own tombstone
+instead (principle 3, "The struck device obeys") — the one good outcome left for
+that device is learning it is out. Its *code*, read on a healthy device, is
+refused before anything is dialled (`DEVICE_REVOKED`): a tombstone is permanent,
+so there is no pairing to attempt, and the refusal should say whose decision it
+was rather than surface later as a failed pairing.
+
+Deliberately LAN-only, and not relayed — decided, not omitted. The code's secret
+travels by a screen and a camera, so the window it opens should be as narrow as
+the room; a code that carried a relay hint would work from anywhere. The same
+decision bounds the serverless account as a whole: its records carry no relay,
+so two of its devices see each other where mDNS does, and nowhere else. If that
+reach is ever widened, the honest route is the directory itself (a device
+declaring its relay in its signed record) — never a public discovery that would
+announce every device's whereabouts to anyone holding its `node_id`.
+
 ### The fresh token, and what it proves
 
 `pairing.approve` demands an ID token minted no longer than
@@ -489,6 +638,12 @@ is still alive — so cutting the account's access there stops devices from bein
 taken in, which is the point — and it says nothing about anyone being at the
 keyboard. The human-presence gate is the confirmation screen; the token is the
 IdP-side kill switch.
+
+On the local path there is no such gate and none to be had: no IdP to be fresh
+with, and nothing to cut access at. What stands between a component and the account
+key there is the confirmation and the `session.manage` scope, exactly as with
+`devices.revoke` on a device with no server — an account that answers to nobody
+answers to the machine it is on.
 
 ### What it widens locally
 

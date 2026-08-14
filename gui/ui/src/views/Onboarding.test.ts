@@ -169,6 +169,59 @@ test("the portal offers a way out through sign-out", () => {
   expect(logout).toHaveBeenCalledOnce();
 });
 
+// With no server in this device's life, there is nothing to publish to: the
+// Core accepts setup/join as they are, so the server gate must not disarm the
+// very portal the no-server door opens onto.
+test("with no server at all, the actions are armed", () => {
+  store.session = { logged_in: false, server_connected: false, configured: false };
+
+  const view = render(Onboarding, { store });
+
+  expect(textOf(view)).not.toContain("Waiting for the server connection");
+  expect(byText(view, "button", "This is my first device")).toHaveProperty(
+    "disabled",
+    false,
+  );
+});
+
+// ...but a CONFIGURED server that is unreachable still disarms, session or not:
+// `configured` is what tells "no server at all" from "the server is down".
+test("a configured server that is down still disarms a signed-out portal", () => {
+  store.session = { logged_in: false, server_connected: false, configured: true };
+
+  const view = render(Onboarding, { store });
+
+  expect(byText(view, "button", "This is my first device")).toHaveProperty(
+    "disabled",
+    true,
+  );
+});
+
+// Entered through the setup screen's no-server door: no session to sign out
+// of, so the way out is the one the caller hands us — back through the door.
+test("behind the no-server door, the way out is Back, not Sign out", () => {
+  store.session = { logged_in: false, server_connected: false, configured: false };
+  const back = vi.fn();
+
+  const view = render(Onboarding, { store, back });
+
+  expect(textOf(view)).not.toContain("Sign out");
+  click(byText(view, "button", "Back"));
+  expect(back).toHaveBeenCalledOnce();
+});
+
+// A signed-in portal with no `back` prop keeps its sign-out; a signed-out one
+// with none (an unattested device behind a vanished door) offers neither —
+// better no exit than a dead button.
+test("without a back way, a signed-out portal offers no dead exit", () => {
+  store.session = { logged_in: false, server_connected: false, configured: false };
+
+  const view = render(Onboarding, { store });
+
+  expect(textOf(view)).not.toContain("Sign out");
+  expect(textOf(view)).not.toContain("Back");
+});
+
 test("the store's error banner is shown and closable", () => {
   store.notice = { kind: "error", text: "Invalid recovery code." };
 

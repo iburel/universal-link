@@ -687,6 +687,12 @@ impl DeviceKey {
     pub fn proof(&self, nonce: &str) -> String {
         hex::encode(self.key.sign(nonce.as_bytes()).to_bytes())
     }
+
+    /// Signature over arbitrary bytes, in hex — to stand in for a peer signing
+    /// its own directory record (`directory::record_message`).
+    pub fn sign(&self, msg: &[u8]) -> String {
+        hex::encode(self.key.sign(msg).to_bytes())
+    }
 }
 
 // ---------------------------------------------------------------------------

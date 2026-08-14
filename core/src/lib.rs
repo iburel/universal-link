@@ -14,7 +14,8 @@ mod conn;
 mod connector;
 mod datachannel;
 mod dataplane;
-mod directory;
+pub mod directory;
+mod dirsync;
 mod discover;
 mod framing;
 mod http;
@@ -32,11 +33,13 @@ use std::sync::{Arc, Mutex};
 
 pub use crate::connector::{Connecting, Connector, IoStream, PlainConnector, Target};
 pub use crate::dataplane::{
-    ALPN, Closing, FileHeader, HomeRelay, Incoming, Opening, OutgoingFile, PeerAddr, PeerTransport,
-    read_offer, receive_bodies, send_transfer,
+    ALPN, Closing, FileHeader, HomeRelay, Incoming, Listening, Opening, OutgoingFile, PeerAddr,
+    PeerTransport, read_offer, receive_bodies, send_transfer,
 };
 pub use crate::identity::load_or_generate_device_seed;
-pub use crate::pairing::PAYLOAD_TAG as PAIRING_CODE_TAG;
+pub use crate::pairing::{
+    LAN_PAYLOAD_TAG as PAIRING_LAN_CODE_TAG, PAYLOAD_TAG as PAIRING_CODE_TAG,
+};
 pub use crate::secrets::{FileSecretStore, SecretStore};
 use crate::state::{AppState, Registry, SessionState, SpawnGrant, Transfers, random_hex};
 
@@ -151,6 +154,9 @@ pub struct CoreHandle {
     /// LAN presence → `device.updated` broadcasts. Same lifecycle as the
     /// accept loop; already finished on a transport without LAN discovery.
     lan_presence_task: tokio::task::JoinHandle<()>,
+    /// Directory exchanges with the account's other devices (`dirsync`). Same
+    /// lifecycle: it holds an `Arc<AppState>` and is `abort()`ed at drop.
+    dirsync_task: tokio::task::JoinHandle<()>,
     /// Dropped at `drop` — hence before a restart reclaims the socket.
     _instance: transport::InstanceGuard,
 }
@@ -203,6 +209,7 @@ impl Drop for CoreHandle {
         self.accept_task.abort();
         self.dataplane_task.abort();
         self.lan_presence_task.abort();
+        self.dirsync_task.abort();
         // Closes the established IPC connections: a cleanly stopped Core does
         // not leave its components on a mute socket (in a separate process the
         // problem does not exist, in an in-process lib the tasks would leak).
@@ -293,13 +300,22 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
     });
 
     let session_info = session::read_session_file(&config.config_dir);
-    // The directory cache only vouches within a session: logged out, nothing
-    // is served no matter what the disk says. Stale or corrupt loads as
-    // nothing — the Core then starts fail-closed, as it did before the cache.
-    let cached_devices = match &session_info {
-        Some(_) => directory::load(&config.config_dir),
-        None => None,
+    // The stored directory vouches for a Core that belongs somewhere: a session,
+    // or the account's trust root — a device that joined the account without
+    // ever logging in has no server to snapshot from, so that file is not a
+    // cache of a directory, it IS the directory. Neither: nothing is served, no
+    // matter what the disk says. Stale or corrupt loads as nothing — fail-closed,
+    // exactly as before the file existed.
+    let stored_devices = match (&session_info, &account_root) {
+        (None, None) => None,
+        // Only a configured server could ever refresh it, and that is what
+        // makes expiry meaningful (see `directory`).
+        _ => directory::load(&config.config_dir, config.server.is_some()),
     };
+    // Whom the account has struck off (signed tombstones). Read unconditionally
+    // and never expired: a revocation is permanent, and it is not the session's
+    // to lose — the struck-off device keeps a valid attestation for good.
+    let revoked = directory::load_revoked(&config.config_dir);
     let state = Arc::new(AppState {
         registry: Mutex::new(Registry::new(file_token)),
         session: Mutex::new(SessionState::new(session_info.as_ref())),
@@ -318,13 +334,51 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
         transfers: Mutex::new(Transfers::new()),
         clipboard: Mutex::new(crate::clipboard::ClipboardState::new()),
         clipboard_reset: tokio::sync::Notify::new(),
+        dirsync_wake: tokio::sync::Notify::new(),
         reconnect_base_delay: config.reconnect_base_delay,
         shutdown_request: tokio::sync::Notify::new(),
     });
-    if let Some(devices) = cached_devices {
+    // Cloned out of the leaf lock before taking `session` (lock ordering).
+    let root = state
+        .account_root
+        .lock()
+        .expect("lock account_root")
+        .clone();
+    {
         // Seeded before any task exists — no reader can race it. The first
-        // successful session setup replaces it with the live snapshot.
-        state.session.lock().expect("lock session").devices = Some(devices);
+        // successful session setup replaces the records with the live snapshot;
+        // the tombstones, nothing replaces.
+        let mut s = state.session.lock().expect("lock session");
+        s.revoked = revoked;
+        if let Some(mut devices) = stored_devices {
+            // A struck-off device does not come back from the disk. This is what
+            // the store carries INSTEAD of a freshness bound where no server
+            // could ever refresh it (see `directory`).
+            if let Some(root) = &root {
+                devices.retain(|_, record| {
+                    record
+                        .get("node_id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none_or(|node_id| !s.barred(&root.ak_pub, node_id))
+                });
+            }
+            s.devices = Some(devices);
+        }
+        // A device in the account knows at least ITSELF — session or not, server
+        // or not. Without this a Core that joined the account and never logged in
+        // would answer `SERVER_UNREACHABLE` to a component asking who is around,
+        // while holding everything needed to say "me".
+        //
+        // Deliberately NOT persisted: writing the store here would refresh its
+        // `saved_at` at every startup and silently extend the staleness bound of
+        // records the server may have revoked meanwhile.
+        if let Some(root) = &root {
+            s.adopt_own(crate::state::OwnDevice {
+                identity: &state.identity,
+                name: &state.device_name,
+                attestation: &root.attestation,
+            });
+        }
     }
 
     if let Some(info) = session_info {
@@ -339,6 +393,10 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
     let dataplane_task = tokio::spawn(dataplane::serve(state.clone()));
     // LAN presence: relays mDNS visibility changes onto the `devices` topic.
     let lan_presence_task = tokio::spawn(dataplane::watch_lan_presence(state.clone()));
+    // Directory sync: tells the account's other devices whom we know, and takes
+    // in whom they know. Independent of the server session, for the same reason
+    // the accept loop is.
+    let dirsync_task = tokio::spawn(dirsync::run(state.clone()));
 
     Ok(CoreHandle {
         ipc_path: config.ipc_path,
@@ -346,6 +404,7 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
         accept_task,
         dataplane_task,
         lan_presence_task,
+        dirsync_task,
         _instance: instance,
     })
 }

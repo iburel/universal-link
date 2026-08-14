@@ -68,6 +68,20 @@ test("only the address is asked for", () => {
   ).toBeNull();
 });
 
+// The no-server door: offered on first run when the App hands us what taking it
+// means, and only there — the settings view configures a server, full stop.
+test("first run offers the no-server way in, the settings view does not", () => {
+  const withoutServer = vi.fn();
+
+  const first = render(ServerSetup, { store, firstRun: true, withoutServer });
+  click(byText(first, "button", "without a server"));
+  expect(withoutServer).toHaveBeenCalledOnce();
+
+  cleanup();
+  const settings = render(ServerSetup, { store });
+  expect(textOf(settings)).not.toContain("without a server");
+});
+
 test("an address is all it takes to continue", () => {
   const discover = vi.spyOn(store, "setUpFromAddress").mockResolvedValue("saved");
   const view = render(ServerSetup, { store, firstRun: true });

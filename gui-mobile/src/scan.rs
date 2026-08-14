@@ -52,13 +52,20 @@ const BACKSTOP: Duration = Duration::from_secs(300);
 /// first would be two windows fighting over one camera.
 static PENDING: Mutex<Option<oneshot::Sender<Value>>> = Mutex::new(None);
 
-/// What a code must start with to be one of ours — from the Core's own constant,
-/// so the format lives in exactly one place. The scanner is handed this and keeps
-/// looking until it sees it: a camera pointed at a screen may well have somebody
-/// else's QR code in view (a page, a sticker, a wifi code), and stopping on the
-/// first one it decodes would take the user to a dead end.
-fn tag() -> String {
-    format!("{}:", universallink_core::PAIRING_CODE_TAG)
+/// What a code must start with to be one of ours — the Core's own constants
+/// (`UL1` pairs through a server, `UL2` over the local network — either may be
+/// on the screen in front of the camera), so the format lives in exactly one
+/// place. Comma-separated: the list crosses to Kotlin in the one intent extra,
+/// and neither tag can carry a comma. The scanner is handed these and keeps
+/// looking until it sees one: a camera pointed at a screen may well have
+/// somebody else's QR code in view (a page, a sticker, a wifi code), and
+/// stopping on the first one it decodes would take the user to a dead end.
+fn tags() -> String {
+    format!(
+        "{}:,{}:",
+        universallink_core::PAIRING_CODE_TAG,
+        universallink_core::PAIRING_LAN_CODE_TAG
+    )
 }
 
 /// Whether this device can read a code at all: the mobile shell, and a camera.
@@ -89,7 +96,7 @@ pub async fn scan_code() -> Value {
         }
         *pending = Some(tx);
     }
-    if !bridge::start_scan(&tag()) {
+    if !bridge::start_scan(&tags()) {
         // No window to open the scanner from, or the JVM refused the call.
         clear();
         return json!({ "reason": "failed" });
@@ -143,7 +150,7 @@ pub extern "system" fn Java_org_universallink_mobile_ScanBridge_onScanResult(
 /// scanner the user eventually closes has no one to report to. Handing it to the
 /// NEXT scan instead would answer a fresh gesture with a stale result.
 fn report(json: &str) {
-    let outcome = normalize(json, &tag());
+    let outcome = normalize(json, &tags());
     let taken = PENDING.lock().expect("lock the pending scan").take();
     match taken {
         Some(tx) => {
@@ -159,18 +166,18 @@ fn report(json: &str) {
 /// never a guess. The payload comes from our own Kotlin, so anything else here is
 /// a bug on that side — and one that must not travel any further than this
 /// function, because the next stop for a code is `pairing.accept`.
-fn normalize(json: &str, tag: &str) -> Value {
+fn normalize(json: &str, tags: &str) -> Value {
     let failed = || json!({ "reason": "failed" });
     let Ok(reported) = serde_json::from_str::<Value>(json) else {
         tracing::error!(json, "a scan reported something that is not JSON");
         return failed();
     };
     if let Some(code) = reported["code"].as_str() {
-        if !code.starts_with(tag) {
-            // The scanner filters on this tag itself; a code that reaches here
-            // got past that filter, and `pairing.accept` is not the place to
-            // find that out.
-            tracing::error!("a scanned code did not carry the pairing tag");
+        if !tags.split(',').any(|tag| code.starts_with(tag)) {
+            // The scanner filters on these tags itself; a code that reaches
+            // here got past that filter, and `pairing.accept` is not the place
+            // to find that out.
+            tracing::error!("a scanned code did not carry a pairing tag");
             return failed();
         }
         return json!({ "code": code });
@@ -234,7 +241,7 @@ mod bridge {
 
     /// Opens the scanner. Any thread. `false` means it never started, so no
     /// result is coming.
-    pub fn start_scan(tag: &str) -> bool {
+    pub fn start_scan(tags: &str) -> bool {
         let Some((vm, class)) = SEAM.get() else {
             tracing::error!("no scanner seam yet");
             return false;
@@ -246,15 +253,15 @@ mod bridge {
                 return false;
             }
         };
-        let Ok(tag) = env.new_string(tag) else {
-            tracing::error!("could not pass the pairing tag to the JVM");
+        let Ok(tags) = env.new_string(tags) else {
+            tracing::error!("could not pass the pairing tags to the JVM");
             return false;
         };
         let started = env.call_static_method(
             class,
             "startScan",
             "(Ljava/lang/String;)Z",
-            &[jni::objects::JValue::Object(&tag)],
+            &[jni::objects::JValue::Object(&tags)],
         );
         match started.and_then(|value| value.z()) {
             Ok(started) => started,
@@ -276,8 +283,8 @@ mod bridge {
         false
     }
 
-    pub fn start_scan(tag: &str) -> bool {
-        let _ = tag;
+    pub fn start_scan(tags: &str) -> bool {
+        let _ = tags;
         false
     }
 }
@@ -286,31 +293,37 @@ mod bridge {
 mod tests {
     use super::*;
 
-    const TAG: &str = "UL1:";
-    const CODE: &str = "UL1:aaaa:bbbb:p_1";
+    const TAGS: &str = "UL1:,UL2:";
 
+    // Both kinds of pairing code pass: the one a server relays and the one that
+    // names a device on the local network. Which is which is the Core's
+    // business — the camera's job ends at "one of ours".
     #[test]
-    fn a_code_carrying_the_tag_is_passed_on_as_it_stands() {
-        assert_eq!(
-            normalize(&format!(r#"{{"code":"{CODE}"}}"#), TAG),
-            json!({ "code": CODE })
-        );
+    fn a_code_carrying_either_tag_is_passed_on_as_it_stands() {
+        for code in ["UL1:aaaa:bbbb:p_1", "UL2:aaaa:bbbb:node_1"] {
+            assert_eq!(
+                normalize(&json!({ "code": code }).to_string(), TAGS),
+                json!({ "code": code }),
+                "{code}"
+            );
+        }
     }
 
     // The one check that cannot be left to the Core: a foreign QR code read by
     // mistake must not be sent off as a pairing code.
     #[test]
-    fn a_code_without_the_tag_is_not_a_code() {
+    fn a_code_without_a_tag_is_not_a_code() {
         for foreign in [
             "https://example.test/",
             "WIFI:S:home;T:WPA;P:hunter2;;",
-            "UL2:aaaa:bbbb:p_1",
+            "UL3:aaaa:bbbb:p_1",
             "ul1:aaaa:bbbb:p_1",
+            "ul2:aaaa:bbbb:node_1",
             "",
         ] {
             let reported = json!({ "code": foreign }).to_string();
             assert_eq!(
-                normalize(&reported, TAG),
+                normalize(&reported, TAGS),
                 json!({ "reason": "failed" }),
                 "{foreign}"
             );
@@ -321,7 +334,7 @@ mod tests {
     fn each_reason_the_frontend_knows_survives_the_crossing() {
         for reason in ["cancelled", "denied", "no_camera", "failed"] {
             let reported = json!({ "reason": reason }).to_string();
-            assert_eq!(normalize(&reported, TAG), json!({ "reason": reason }));
+            assert_eq!(normalize(&reported, TAGS), json!({ "reason": reason }));
         }
     }
 
@@ -339,22 +352,28 @@ mod tests {
             "",
         ] {
             assert_eq!(
-                normalize(reported, TAG),
+                normalize(reported, TAGS),
                 json!({ "reason": "failed" }),
                 "{reported}"
             );
         }
     }
 
-    // The tag comes from the Core, and it is the tag of a CODE, not of a family
-    // of them: `UL10:` must not pass for `UL1:`.
+    // The tags come from the Core, and each is the tag of a CODE, not of a
+    // family of them: `UL10:` must not pass for `UL1:`, nor `UL20:` for `UL2:`.
     #[test]
-    fn the_tag_is_the_one_the_core_mints() {
-        assert_eq!(tag(), "UL1:");
-        assert_eq!(
-            normalize(r#"{"code":"UL10:aaaa:bbbb:p_1"}"#, &tag()),
-            json!({ "reason": "failed" })
-        );
+    fn the_tags_are_the_ones_the_core_mints() {
+        assert_eq!(tags(), "UL1:,UL2:");
+        for family in [
+            r#"{"code":"UL10:aaaa:bbbb:p_1"}"#,
+            r#"{"code":"UL20:aaaa:bbbb:node_1"}"#,
+        ] {
+            assert_eq!(
+                normalize(family, &tags()),
+                json!({ "reason": "failed" }),
+                "{family}"
+            );
+        }
     }
 
     // The waiting slot, whose whole job is that a button comes back to life. On a

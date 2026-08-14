@@ -41,6 +41,23 @@ pub fn load_or_generate_device_seed(config_dir: &Path) -> anyhow::Result<[u8; 32
     Ok(seed)
 }
 
+/// Erases `device.key`: the next startup mints a fresh identity. The one caller
+/// is a device leaving the account it was struck off from (`account_key::leave`)
+/// — a tombstone is permanent, so the `node_id` it names never returns, and the
+/// only way back is a new key, attested anew. This is what mints it. A failure
+/// is loud but not fatal: the old identity then survives the restart, and every
+/// door stays closed anyway (no trust root, and the peers hold the tombstone).
+pub(crate) fn remove(config_dir: &Path) {
+    let path = config_dir.join(KEY_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::error!(error = %e, "failed to erase device.key: the next startup keeps this identity");
+        }
+    }
+}
+
 impl DeviceIdentity {
     /// Re-reads the key from disk, or generates one at first startup.
     pub fn load_or_generate(config_dir: &Path) -> anyhow::Result<DeviceIdentity> {
@@ -58,5 +75,24 @@ impl DeviceIdentity {
     /// Proof of possession: signature of the nonce (UTF-8 bytes), in hex.
     pub fn proof(&self, nonce: &str) -> String {
         hex::encode(self.key.sign(nonce.as_bytes()).to_bytes())
+    }
+
+    /// Signature over a payload this project builds and domain-separates itself,
+    /// in hex — a directory record the device signs to stand behind its own
+    /// description (`directory::record_message`). Kept apart from [`proof`],
+    /// whose message is the server's nonce verbatim: a signature is only ever as
+    /// safe as the domain its message carries, and mixing the two would let one
+    /// be replayed as the other.
+    pub(crate) fn sign(&self, msg: &[u8]) -> String {
+        hex::encode(self.key.sign(msg).to_bytes())
+    }
+
+    /// A fixed identity for the unit tests: no file on disk, and a `node_id` an
+    /// assertion can name.
+    #[cfg(test)]
+    pub(crate) fn from_test_seed(seed: u8) -> DeviceIdentity {
+        DeviceIdentity {
+            key: SigningKey::from_bytes(&[seed; 32]),
+        }
     }
 }

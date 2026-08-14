@@ -346,6 +346,22 @@ export class CoreStore {
    */
   onboardingPending = $state(false);
 
+  /**
+   * No server in this device's life: nothing configured AND no session — the
+   * Core's own predicate (doc/core-api.md, "account.*"), under which it
+   * creates accounts locally, mints `UL2` pairing codes and revokes by the
+   * account key alone. Strict `=== false` on purpose: an old Core (no
+   * `configured` field) is not assumed serverless, and a `session.changed`
+   * delta (which carries no `configured` either) flips this to `false` until
+   * the resnapshot it triggers re-reads it — a transient lean toward the
+   * server gates, never away from them.
+   */
+  get serverless(): boolean {
+    return (
+      this.session?.configured === false && this.session.logged_in !== true
+    );
+  }
+
   /** Delay before retrying a missed resnapshot. Lowered by the tests. */
   retryDelayMs = 2000;
 
@@ -586,6 +602,24 @@ export class CoreStore {
         const state = params as SessionState | null;
         if (!state || typeof state.logged_in !== "boolean") return false;
         this.session = state;
+        return true;
+      }
+      // The MEMBERSHIP ended, not just a session — the Core has already obeyed
+      // the account's word and erased its own place in it. A `session.changed`
+      // rides along and looks exactly like a logout: this event is what tells
+      // the two apart, and this sentence is the only account of it the human
+      // gets. Sticky, because the resnapshot it asks for is precisely what
+      // would erase an ordinary notice.
+      case "account.left": {
+        const reason = (params as { reason?: string } | null)?.reason;
+        this.notice = {
+          kind: "error",
+          sticky: true,
+          text:
+            reason === "struck_off"
+              ? "This device was removed from your account by one of your other devices."
+              : `This device is no longer on your account (${reason ?? "unknown"}).`,
+        };
         return true;
       }
       case "device.added":

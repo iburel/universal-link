@@ -18,13 +18,18 @@ async fn enrolled_device_survives_a_restart() {
     let store = Arc::new(MemoryStore::default());
     let attestation = "ab".repeat(64);
 
-    // Server 1: a device enrolls, authenticates, publishes its C7 attestation.
+    // Server 1: a device enrolls, authenticates, publishes its C7 attestation —
+    // and its signed description (the continuum), which is bound to the durable
+    // name and must survive with it.
     let device = {
         let env = TestEnv::start_with_store(store.clone()).await;
         let mut device = online_device(&env, "alice", "pc-a", "linux").await;
         device
             .conn
-            .request("presence.update", json!({ "attestation": attestation }))
+            .request(
+                "presence.update",
+                json!({ "attestation": attestation, "seq": 42, "self_sig": "cd".repeat(64) }),
+            )
             .await
             .expect("presence.update");
         device
@@ -48,6 +53,11 @@ async fn enrolled_device_survives_a_restart() {
         record["attestation"], attestation,
         "attestation lost across restart → the peer would refuse the device"
     );
+    assert_eq!(
+        record["seq"], 42,
+        "signed description lost across restart → the record stops travelling"
+    );
+    assert_eq!(record["self_sig"], "cd".repeat(64));
 }
 
 #[tokio::test]

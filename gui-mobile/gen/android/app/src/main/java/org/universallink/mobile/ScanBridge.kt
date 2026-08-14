@@ -51,7 +51,12 @@ object ScanBridge {
 
     private const val TAG = "ULCore"
 
-    /** Passed to [ScanActivity]: the prefix a code must carry (see scan.rs). */
+    /**
+     * Passed to [ScanActivity]: the prefixes a code may carry, comma-separated
+     * (`UL1:` pairs through a server, `UL2:` over the local network — see
+     * scan.rs). One extra, not two: the list is the Rust side's to compose, and
+     * a third kind of code must not need a Kotlin change.
+     */
     const val EXTRA_TAG = "pairing_tag"
 
     /**
@@ -92,14 +97,14 @@ object ScanBridge {
      * never started and no result is coming: the window is gone (the user closed
      * the app while a command was in flight), or the JVM is shutting down.
      *
-     * `tag` is what a code must start with to be one of ours. It comes from the
-     * Core's own constant rather than being written down here, so the format has
-     * one home.
+     * `tags` is what a code may start with to be one of ours, comma-separated.
+     * It comes from the Core's own constants rather than being written down
+     * here, so the format has one home.
      */
     @JvmStatic
-    fun startScan(tag: String): Boolean {
+    fun startScan(tags: String): Boolean {
         val activity = host.get() ?: return false
-        val intent = Intent(activity, ScanActivity::class.java).putExtra(EXTRA_TAG, tag)
+        val intent = Intent(activity, ScanActivity::class.java).putExtra(EXTRA_TAG, tags)
         // Starting an activity is main-thread work, and Rust calls from a worker.
         return Handler(Looper.getMainLooper()).post {
             try {

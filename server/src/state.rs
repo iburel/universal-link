@@ -87,6 +87,15 @@ pub struct DeviceEntry {
     /// the peer that verifies it. Survives going offline (bound to `node_id`,
     /// stable), unlike `relay_url` (specific to the connection).
     pub attestation: Option<String>,
+    /// The device's signed description (the continuum): `seq` orders it,
+    /// `self_sig` is the device's own signature over `{node_id, name, platform,
+    /// seq}`. Opaque here exactly like the attestation — carried and rebroadcast,
+    /// never interpreted; it is what lets a PEER relay this record to devices
+    /// this server never met. Dropped on a rename (`devices.rename`): the
+    /// signature covered the old name, and the device republishes over its own
+    /// connection once it hears.
+    pub seq: Option<u64>,
+    pub self_sig: Option<String>,
     /// Current connection: one device = at most one connection.
     pub conn: Option<(ConnId, Sender<OutMsg>)>,
 }
@@ -101,6 +110,8 @@ impl DeviceEntry {
             "node_id": self.node_id,
             "relay_url": self.relay_url,
             "attestation": self.attestation,
+            "seq": self.seq,
+            "self_sig": self.self_sig,
             "online": self.conn.is_some(),
             "status": self.status,
             "last_seen": self.last_seen,
@@ -126,6 +137,8 @@ impl Registry {
                         platform: d.platform,
                         node_id: d.node_id,
                         attestation: d.attestation,
+                        seq: d.seq,
+                        self_sig: d.self_sig,
                         relay_url: None,
                         status: None,
                         last_seen: None,
@@ -154,6 +167,8 @@ impl Registry {
                     platform: d.platform.clone(),
                     node_id: d.node_id.clone(),
                     attestation: d.attestation.clone(),
+                    seq: d.seq,
+                    self_sig: d.self_sig.clone(),
                 })
                 .collect(),
             revoked: self.revoked.iter().cloned().collect(),

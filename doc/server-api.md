@@ -141,6 +141,8 @@ The central object, carried by `devices.list` and every notification:
   "node_id": "<iroh public key>",
   "relay_url": "https://relay.example/…",
   "attestation": "<hex signature, or null>",
+  "seq": 1753791245,
+  "self_sig": "<hex signature, or null>",
   "online": true,
   "status": null,
   "last_seen": "2026-07-09T15:04:05Z"
@@ -156,6 +158,14 @@ The central object, carried by `devices.list` and every notification:
 - `attestation`: an **opaque blob** for the server — see "Account attestation"
   below. Unlike `relay_url`, it SURVIVES going offline (it is bound to the
   `node_id`, which is stable).
+- `seq` + `self_sig`: the device's **signed description** — its own signature
+  over `{node_id, name, platform, seq}`, published alongside the attestation
+  (`presence.update`) and carried just as blind. It is what lets a *peer* relay
+  this record to devices this server never met (the serverless half of the
+  account — `doc/architecture.md`, the continuum). The pair comes and survives
+  together: one without the other is refused. A `devices.rename` that changes
+  the name **drops both** — the signature covered the old name — and the device
+  republishes over its own connection once it hears the rename.
 - `status`: an optional free field, reserved for extensibility (idle, busy…). v1
   defines no value for it.
 - `platform` is a **closed set**: `auth.enroll` refuses anything else with a
@@ -285,7 +295,7 @@ confirmation screen alone; the residual risk that follows is in
 | `devices.list {}` | session | Snapshot of the account's directory → `[ device, … ]` |
 | `devices.rename { device_id, name }` | session | Renames any device of the account (handy from the GUI of another PC) |
 | `devices.revoke { device_id, id_token }` | session + fresh OIDC | Strikes the device from the directory; its existing connection is closed (`DEVICE_REVOKED`) |
-| `presence.update { status?, relay_url?, attestation? }` | session | Updates its own record; broadcast to the others via `device.updated`. `attestation` = opaque account blob (C7), carried without being interpreted |
+| `presence.update { status?, relay_url?, attestation?, seq?, self_sig? }` | session | Updates its own record; broadcast to the others via `device.updated`. `attestation` = opaque account blob (C7), carried without being interpreted; `seq`/`self_sig` = the signed description, equally opaque, both-or-neither (the continuum) |
 
 `proof` = Ed25519 signature of the current nonce by the device's private key.
 

@@ -974,11 +974,16 @@ async fn a_stale_directory_cache_vouches_for_no_one() {
         let mut ca = spawn_component(&a, "warm-a", "tray", &["devices.read", "session.read"]).await;
         wait_server_connected(&mut ca, true).await;
         wait_attested(&mut ca, b.device_id()).await;
+        // The cut OBSERVED before the cache is touched below: the disconnect
+        // notification comes from the session task itself, so seeing it proves
+        // that task is in its retry loop — and no `device.*` straggler of its
+        // will rewrite the file under the test's edit.
+        server.cut();
+        wait_server_connected(&mut ca, false).await;
     }
 
     // Age A's cache past the TTL (the file format is the contract here: a
     // `saved_at` in seconds beside the records).
-    server.cut();
     let path = a.config_dir().join("directory.json");
     let mut cache: Value =
         serde_json::from_str(&std::fs::read_to_string(&path).expect("cache written"))
@@ -1056,15 +1061,20 @@ async fn lan_visibility_flows_into_devices_list_and_events() {
     assert_eq!(record["lan"], json!(true));
     assert_eq!(record["reachable"], json!(true));
 
-    // B leaves the LAN: the flip arrives as a device.updated, unprompted.
+    // B leaves the LAN: the flip arrives as a device.updated, unprompted. The
+    // loop skips to the flip itself — B's earlier server-side updates (its
+    // presence publications, its countersigned description) are legitimately in
+    // the backlog too, and any of them still says `lan: true`.
     switchboard.leave_lan(&b.key().node_id());
     let updated = loop {
         let (method, params) = watcher.notification().await;
-        if method == "device.updated" && params["device"]["device_id"] == json!(b.device_id()) {
+        if method == "device.updated"
+            && params["device"]["device_id"] == json!(b.device_id())
+            && params["device"]["lan"] == json!(false)
+        {
             break params;
         }
     };
-    assert_eq!(updated["device"]["lan"], json!(false));
     assert_eq!(
         updated["device"]["reachable"],
         json!(false),
@@ -1075,22 +1085,37 @@ async fn lan_visibility_flows_into_devices_list_and_events() {
     switchboard.join_lan(&b.key().node_id());
     let updated = loop {
         let (method, params) = watcher.notification().await;
-        if method == "device.updated" && params["device"]["device_id"] == json!(b.device_id()) {
+        if method == "device.updated"
+            && params["device"]["device_id"] == json!(b.device_id())
+            && params["device"]["lan"] == json!(true)
+        {
             break params;
         }
     };
-    assert_eq!(updated["device"]["lan"], json!(true));
     assert_eq!(updated["device"]["reachable"], json!(true));
 }
 
-/// Logging out forgets the cached directory along with the session: a Core no
-/// longer on the account serves and reaches no one at its next start.
+/// Logging out ends the session, not the membership (the continuum): the store
+/// keeps what the ACCOUNT can prove — this device's own countersigned record,
+/// and a serverless sibling's, both re-keyed by `node_id` — and sheds
+/// everything the server alone asserted. A Core that never joined an account
+/// still forgets the file whole: with no trust root, not one record in it
+/// could prove itself.
 #[tokio::test(flavor = "multi_thread")]
-async fn logout_forgets_the_cached_directory() {
+async fn logout_keeps_the_accounts_half_of_the_directory() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
     let code = universallink_core::account_key::generate_recovery_code();
-    let a = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
+    let sibling_key = DeviceKey::generate();
+    let sibling = peer_record(&sibling_key, "Nomad", std::env::consts::OS, &code, 1);
+    let a = TestCore::start_enrolled_lan_only_holding(
+        &server,
+        &switchboard,
+        &code,
+        DeviceKey::generate(),
+        &[sibling],
+    )
+    .await;
 
     let mut mgr = spawn_component(&a, "mgr", "custom", &["session.manage", "session.read"]).await;
     wait_server_connected(&mut mgr, true).await;
@@ -1103,7 +1128,34 @@ async fn logout_forgets_the_cached_directory() {
     mgr.request("session.logout", json!({}))
         .await
         .expect("logout");
-    assert!(!cache.exists(), "logout forgets whom the account trusted");
+    let store: Value = serde_json::from_str(
+        &std::fs::read_to_string(&cache).expect("the account's half survives the logout"),
+    )
+    .expect("a readable store");
+    let devices = store["devices"].as_object().expect("devices");
+    let own = devices
+        .get(&a.key().node_id())
+        .unwrap_or_else(|| panic!("our own record, under its node_id: {devices:?}"));
+    assert!(
+        universallink_core::directory::verify_record(own),
+        "and it is the countersigned description: {own}"
+    );
+    let kept = devices
+        .get(&sibling_key.node_id())
+        .unwrap_or_else(|| panic!("the sibling the account can prove: {devices:?}"));
+    assert!(universallink_core::directory::verify_record(kept));
+
+    // A Core that never joined an account: the logout forgets the file whole.
+    let b = TestCore::start_enrolled(&server).await;
+    let mut mgr_b = spawn_component(&b, "mgr", "custom", &["session.manage", "session.read"]).await;
+    wait_server_connected(&mut mgr_b, true).await;
+    let cache_b = b.config_dir().join("directory.json");
+    assert!(cache_b.exists());
+    mgr_b
+        .request("session.logout", json!({}))
+        .await
+        .expect("logout");
+    assert!(!cache_b.exists(), "nothing in it could prove itself");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1467,15 +1519,6 @@ fn received_files(core: &TestCore) -> Vec<PathBuf> {
         Ok(rd) => rd.filter_map(|e| e.ok().map(|e| e.path())).collect(),
         Err(_) => Vec::new(),
     }
-}
-
-/// A temporary file to send (the `TempDir` must stay alive for the duration of
-/// the send — hence returning the pair).
-fn scratch_file(contents: &[u8]) -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("f.bin");
-    std::fs::write(&path, contents).expect("write the temporary file");
-    (dir, path)
 }
 
 /// A temporary source TREE to send, returning `(guard, top)`:

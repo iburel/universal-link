@@ -45,9 +45,19 @@
 //! The attestation binds the `node_id` alone (a stable crypto identity), not
 //! the `device_id` (an ephemeral label re-minted by the server at each
 //! enrollment): it survives a re-login and says what matters — "this
-//! cryptographic device is one of ours". Revoking a specific device remains a
-//! server-side directory removal. The signed payload is versioned
+//! cryptographic device is one of ours". The signed payload is versioned
 //! (`ATTEST_DOMAIN`) to make a rotation possible later.
+//!
+//! **Taking it back.** An attestation cannot be withdrawn — a signature, once
+//! made, verifies forever, and the device holds a copy of it. Where there is a
+//! server, striking the device from its directory is what stops it (the peers
+//! only ever learn of devices the directory lists). Where there is none, the
+//! account key signs the withdrawal itself: a **revocation** ([`revoke`]) over
+//! the `node_id`, under a domain of its own so that neither signature can ever
+//! pass for the other. It is deliberately not dated and not countersignable —
+//! nothing later can contradict it, because a "cancel the revocation" statement
+//! would need a total order the account has no way to establish offline. A
+//! revoked device comes back only as a NEW device, with a fresh `node_id`.
 
 use std::path::Path;
 
@@ -68,6 +78,12 @@ const SEED_DOMAIN: &[u8] = b"universallink-account-key-v1";
 /// will sign under a bumped domain so an old attestation is never mistaken for
 /// a fresh one.
 const ATTEST_DOMAIN: &[u8] = b"ul-account-attest-v1:";
+
+/// Domain separation (and version) for a revocation. A domain of its own, not a
+/// flag inside the attestation's: an attestation must never read as a revocation
+/// — anyone holding a peer's record would then be able to strike it off — and a
+/// revocation must never read as an attestation.
+const REVOKE_DOMAIN: &[u8] = b"ul-account-revoke-v1:";
 
 /// Domain separation for the fingerprint (safety number) shown for out-of-band
 /// verification.
@@ -161,15 +177,43 @@ pub fn attest(ak: &SigningKey, node_id: &str) -> String {
 /// signature, invalid signature) answers `false`: *fail-closed*, no exception
 /// bubbles up to the authorization path.
 pub fn verify(ak_pub_hex: &str, node_id: &str, attestation_hex: &str) -> bool {
-    let Some(vk) = parse_public(ak_pub_hex) else {
+    verify_detached(ak_pub_hex, &attest_message(node_id), attestation_hex)
+}
+
+/// Strikes `node_id` off the account: the account key's signature over a
+/// statement no later one can contradict. This is what a device that never
+/// reaches a server has instead of a directory removal — it needs no authority to
+/// be checked, only the account's public key, which every device derived itself.
+///
+/// Permanent, by design. See the module header: un-revoking would need a total
+/// order the account cannot establish offline, so the way back for a struck-off
+/// device is a fresh `node_id`, attested anew.
+pub fn revoke(ak: &SigningKey, node_id: &str) -> String {
+    hex::encode(ak.sign(&revoke_message(node_id)).to_bytes())
+}
+
+/// Does `revocation_hex` prove, under `ak_pub_hex`, that the account struck
+/// `node_id` off? Fail-closed like [`verify`]: anything unreadable or unsigned
+/// answers `false` — we bar a device on a signature we checked, never on the
+/// mere presence of a file.
+pub fn verify_revocation(ak_pub_hex: &str, node_id: &str, revocation_hex: &str) -> bool {
+    verify_detached(ak_pub_hex, &revoke_message(node_id), revocation_hex)
+}
+
+/// Detached Ed25519 verification, fail-closed: an unreadable key, an unreadable
+/// signature or an invalid one all answer `false`, so no error ever bubbles up to
+/// an authorization path. The single place this project checks a signature it
+/// built itself, which is what makes `verify_strict` (small-order keys and
+/// signatures refused, like the server's proof-of-possession) the rule rather
+/// than a habit.
+pub(crate) fn verify_detached(public_hex: &str, msg: &[u8], sig_hex: &str) -> bool {
+    let Some(vk) = parse_public(public_hex) else {
         return false;
     };
-    let Some(sig) = parse_signature(attestation_hex) else {
+    let Some(sig) = parse_signature(sig_hex) else {
         return false;
     };
-    // `verify_strict`: rejects small-order keys/signatures (like the
-    // proof-of-possession on the server side).
-    vk.verify_strict(&attest_message(node_id), &sig).is_ok()
+    vk.verify_strict(msg, &sig).is_ok()
 }
 
 /// A human-readable fingerprint of AK_pub (safety number) — the anchor of
@@ -342,6 +386,181 @@ fn stow_and_verify(
     Ok(())
 }
 
+/// Leaves the account: this device has been struck off (a verified tombstone
+/// naming its `node_id` — [`crate::state::SessionState::absorb`] is what heard
+/// it), and everything that made it a member goes. The trust root (memory and
+/// file), the account key, the session and its refresh token, the directory and
+/// the tombstones, and `device.key` itself. The last one is what makes the way
+/// back honest: a revocation is permanent, so the `node_id` it names never
+/// returns — erasing the key is what mints the fresh identity a re-pairing
+/// needs, at the next startup. Until that restart the running Core keeps its
+/// old identity in memory, and every door fails closed on its own: no trust
+/// root means nothing is authorized, served, offered or synced.
+///
+/// The human's data is not the account's: nothing but the account material is
+/// touched. And obeying is not what excludes the device — every peer holding
+/// the tombstone already refuses it — it is the device's own hygiene: a machine
+/// the account struck off must not keep the account's private key, and must not
+/// keep believing.
+pub(crate) fn leave(state: &std::sync::Arc<crate::state::AppState>) {
+    // The trust root's slot is the claim: `take()` hands it to exactly one
+    // caller, so two streams delivering the same tombstone in the same breath
+    // leave ONCE — a second `account.left` would tell the human the same thing
+    // twice. A leaf lock, taken and released alone, like everywhere. (A guard
+    // against a race no test can schedule: between honest Cores the second
+    // delivery is already turned away upstream, `dirsync::absorb` finding no
+    // trust root to verify against — this claim survives a mutation campaign
+    // for that reason, and is kept for the interleaving nobody arranges.)
+    if state
+        .account_root
+        .lock()
+        .expect("lock account_root")
+        .take()
+        .is_none()
+    {
+        return;
+    }
+    // The keyring next, before the session lock (its calls can block; and on the
+    // desktop a delete is queued — accepted, like `remember`'s write). The
+    // refresh token goes too: a session is part of the membership, exactly as
+    // `session.logout` treats it.
+    state.secrets.delete(crate::secrets::ACCOUNT_SEED);
+    state.secrets.delete(crate::secrets::REFRESH_TOKEN);
+    let path = state.config_dir.join(KEY_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // Loud but not fatal: at the next startup the root attests a node_id
+        // whose key is gone, and `spawn`'s filter ignores it — fail-closed.
+        Err(e) => tracing::error!(error = %e, "failed to erase the trust root file"),
+    }
+    crate::identity::remove(&state.config_dir);
+
+    let abort = {
+        let mut s = state.session.lock().expect("lock session");
+        let gone: Vec<String> = s
+            .devices
+            .as_ref()
+            .map(|devices| devices.keys().cloned().collect())
+            .unwrap_or_default();
+        // `forget(None, None)`: unlike a logout, nothing survives — not this
+        // device's own record, and none of the account's half either (the leave
+        // ends the MEMBERSHIP, not just the session). The tombstones go with the
+        // rest: they were the account's signatures, and a device with no trust
+        // root can verify none of them anyway.
+        let (payload, abort) = s.forget(None, None);
+        s.revoked.clear();
+        // Under the same lock as the wipe: an exchange that read the trust root
+        // before we took it must find this the moment it gets here, or it would
+        // write the account it carried into the directory we just erased. (The
+        // CHECK is pinned by a unit test; this SET survives a mutation campaign,
+        // because the interleaving it guards is one no test can schedule — the
+        // absorb must be past its root read, and not yet at this lock, in the
+        // instant the leave holds it.)
+        s.left_the_account = true;
+        // Disk under the lock that mutated the state (state-then-disk), like
+        // every directory write.
+        crate::session::remove_session_file(&state.config_dir);
+        crate::directory::remove(&state.config_dir);
+        crate::directory::remove_revoked(&state.config_dir);
+        // Broadcast under the session lock (order: session then registry): the
+        // order of notifications is the order of states, and nothing may slip a
+        // stale directory event in after these.
+        let registry = state.registry.lock().expect("lock registry");
+        for device_id in gone {
+            registry.notify_topic(
+                "devices",
+                "device.removed",
+                &serde_json::json!({ "device_id": device_id }),
+            );
+        }
+        registry.notify_topic("session", "session.changed", &payload);
+        // The one event that says WHY, for the sentence the interface owes the
+        // human: this was the account's decision, not a logout.
+        registry.notify_topic(
+            "session",
+            "account.left",
+            &serde_json::json!({ "reason": "struck_off" }),
+        );
+        abort
+    };
+    if let Some(abort) = abort {
+        abort.abort();
+    }
+    // A pending OIDC flow belonged to the membership that just ended.
+    if let Some(slot) = state.login.lock().expect("lock login").take() {
+        slot.abort.abort();
+    }
+    // A pairing in flight cannot end well anymore, on either end: this device
+    // has no account to sponsor into and no standing to join with. `no_account`
+    // is the truth of the matter, said in the vocabulary the interface knows.
+    crate::pairing::fail_current(state, "no_account");
+    // The account's read grants do not outlive it (same as the logout).
+    state.clipboard.lock().expect("lock clipboard").clear_all();
+    state.clipboard_reset.notify_waiters();
+}
+
+/// A server has just accepted a revocation; where this device holds the account
+/// key, the ACCOUNT signs it too. A server-side strike stops at the server's
+/// reach — it mints no tombstone, so the account's serverless half would keep
+/// trusting the struck device until its store expired, or forever where nothing
+/// expires. This closes that gap whenever it can be closed: the tombstone joins
+/// `revoked.json` and the next sync round carries it (the continuum).
+///
+/// Best-effort, and honest about it: a device that holds the account WITHOUT its
+/// key cannot sign the account's word, and says so in a log rather than pretend
+/// (the server's strike stands on its own, exactly as before the continuum). And
+/// never against ourselves — a self-revocation through the server stays what it
+/// always was, `DEVICE_REVOKED` at the next exchange: signing a tombstone
+/// against one's own `node_id` is `CANNOT_REVOKE_SELF` everywhere else, and a
+/// server's yes does not change whose signature it would be.
+pub(crate) fn tombstone_after_server_revoke(state: &crate::state::AppState, node_id: &str) {
+    if node_id == state.identity.node_id() {
+        return;
+    }
+    // The keyring read before any state lock (it can block; leaf-lock rules).
+    let ak_pub = {
+        let root = state.account_root.lock().expect("lock account_root");
+        root.as_ref().map(|root| root.ak_pub.clone())
+    };
+    let Some(ak) = ak_pub
+        .as_deref()
+        .and_then(|ak_pub| recall(&*state.secrets, ak_pub))
+    else {
+        tracing::info!(
+            %node_id,
+            "revoked on the server only: no account key here, so no tombstone for the serverless half"
+        );
+        return;
+    };
+    let revocation = revoke(&ak, node_id);
+    {
+        let mut s = state.session.lock().expect("lock session");
+        let struck = s.strike_off(node_id, revocation);
+        // Disk under the lock that mutated the state (state-then-disk).
+        // `save_unrefreshed`: the tombstone is the account's word, not a
+        // re-check of the records against the server.
+        crate::directory::save_revoked(&state.config_dir, &s.revoked);
+        if let Some(devices) = s.devices.as_ref() {
+            crate::directory::save_unrefreshed(&state.config_dir, devices);
+        }
+        // Usually empty — the server's own `device.removed` evicted the record
+        // before its reply reached us — but a label the server never knew (a
+        // `node_id`-keyed twin) leaves here, and someone should hear it.
+        let registry = state.registry.lock().expect("lock registry");
+        for device_id in struck {
+            registry.notify_topic(
+                "devices",
+                "device.removed",
+                &serde_json::json!({ "device_id": device_id }),
+            );
+        }
+    }
+    // The account's other devices should hear the tombstone now, not at the
+    // next tick — the struck device least of all can be left to wait.
+    state.dirsync_wake.notify_one();
+}
+
 /// `OtherKey` if a root is already installed for a different account key.
 fn refuse_another_key(
     state: &crate::state::AppState,
@@ -356,6 +575,12 @@ fn refuse_another_key(
 
 fn attest_message(node_id: &str) -> Vec<u8> {
     let mut msg = ATTEST_DOMAIN.to_vec();
+    msg.extend_from_slice(node_id.as_bytes());
+    msg
+}
+
+fn revoke_message(node_id: &str) -> Vec<u8> {
+    let mut msg = REVOKE_DOMAIN.to_vec();
     msg.extend_from_slice(node_id.as_bytes());
     msg
 }
@@ -512,6 +737,15 @@ mod tests {
             "bed950f5621357e89d478daf60bbbf5fbd4730068aba44c041fd2c6435a752c0\
              bfb1df9596e721ad82344ccf2f42caf7a782024078cd02c88d073beca6fb4109",
         );
+        // A revocation outlives everything else here: it is permanent, it is
+        // persisted, and it travels between devices. A version of this project
+        // that stopped verifying the ones already handed out would silently take
+        // struck-off devices back into the account.
+        assert_eq!(
+            revoke(&ak, &a_node_id()),
+            "049b7522a29c94a02c690b6498cf65e7fa6c70ee0855752ccde8c9f5d82d4ffee\
+             6ec8e25c92d04c42b3204209c7e5c51d50bd7afcdbf56d71002557b43d10d0b",
+        );
     }
 
     /// The seed a device persists, likewise pinned: `SigningKey::to_bytes` is
@@ -630,6 +864,48 @@ mod tests {
         // elsewhere).
         let other_ak = account_key_from_code(&generate_recovery_code()).unwrap();
         assert!(!verify(&public_hex(&other_ak), &node_id, &att));
+    }
+
+    /// A revocation is checked like an attestation — and, above all, is NOT one.
+    /// The two signatures are made by the same key over the same `node_id`, and
+    /// only their domain tells them apart: without that separation, every peer's
+    /// record would carry the means to strike that peer off.
+    #[test]
+    fn a_revocation_is_not_an_attestation() {
+        let ak = account_key_from_code(&generate_recovery_code()).unwrap();
+        let ak_pub = public_hex(&ak);
+        let node_id = a_node_id();
+        let att = attest(&ak, &node_id);
+        let tombstone = revoke(&ak, &node_id);
+
+        assert!(verify_revocation(&ak_pub, &node_id, &tombstone));
+        assert_ne!(att, tombstone, "same key, same node: different statements");
+        assert!(
+            !verify_revocation(&ak_pub, &node_id, &att),
+            "an attestation must never read as a revocation"
+        );
+        assert!(
+            !verify(&ak_pub, &node_id, &tombstone),
+            "a revocation must never read as an attestation"
+        );
+
+        // And it says nothing about another device, nor under another account's
+        // key: no one strikes off a device of an account they are not in.
+        let other_node = hex::encode(
+            SigningKey::from_bytes(&[9u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        assert!(!verify_revocation(&ak_pub, &other_node, &tombstone));
+        let other_ak = account_key_from_code(&generate_recovery_code()).unwrap();
+        assert!(!verify_revocation(
+            &public_hex(&other_ak),
+            &node_id,
+            &tombstone
+        ));
+        // Fail-closed on garbage, like everything else on this path.
+        assert!(!verify_revocation("not-hex", &node_id, "not-hex"));
+        assert!(!verify_revocation(&ak_pub, &node_id, ""));
     }
 
     #[test]

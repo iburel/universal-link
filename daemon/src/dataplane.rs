@@ -45,7 +45,7 @@ use n0_future::{Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use universallink_core::{
-    ALPN, Closing, HomeRelay, Incoming, IoStream, Opening, PeerAddr, PeerTransport,
+    ALPN, Closing, HomeRelay, Incoming, IoStream, Listening, Opening, PeerAddr, PeerTransport,
 };
 
 /// Maximum wait for the endpoint to become reachable via a relay, after which
@@ -679,6 +679,18 @@ impl PeerTransport for LazyIrohTransport {
                 // session will retry on its next probe.
                 Err(_) => None,
             }
+        })
+    }
+
+    fn listen(&self) -> Listening<'_> {
+        // The bind, and nothing else: a Core that has to be REACHABLE by a device
+        // it does not know yet (a pairing window) needs the endpoint up, and does
+        // not need a relay to have been elected — waiting for one would cost ten
+        // seconds precisely where there is no internet, which is the case this is
+        // for. A failure is already logged by `ensure`; the caller has nothing to
+        // do about it either way.
+        Box::pin(async move {
+            let _ = self.ensure().await;
         })
     }
 

@@ -796,16 +796,20 @@ async fn what_pairing_refuses() {
     assert_eq!(err.app_code(), "PAIRING_STATE");
 }
 
-/// With no server configured there is no rendezvous to go to — the interface
-/// asks for the address before it offers to pair, exactly as a login does.
+/// A device that HAS a server pairs through it, and cannot pair at all while it
+/// cannot reach it: the rendezvous is the server's to be. (With no server at all
+/// there is nothing to be unreachable for, and the code is dialled on the local
+/// network instead — `lanpair.rs`.)
 #[tokio::test(flavor = "multi_thread")]
-async fn pairing_needs_a_server() {
-    let core = TestCore::start().await;
+async fn pairing_through_a_server_needs_that_server() {
+    let server = TestServer::start().await;
+    let core = TestCore::start_with_server(&server).await;
     let mut c = manager(&core).await;
+    server.cut();
     let err = c
         .request("pairing.offer", json!({}))
         .await
-        .expect_err("nothing configured");
+        .expect_err("the rendezvous is unreachable");
     assert_eq!(err.app_code(), "SERVER_UNREACHABLE");
 }
 

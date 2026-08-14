@@ -175,12 +175,26 @@ pub async fn run(state: Arc<AppState>, info: SessionInfo) {
 /// disk, and notify the subscribers. The state returns to that of a Core never
 /// logged in. No effect if a logout has already been through here.
 fn drop_session(state: &AppState) {
+    // Read out of the leaf locks before taking `session` (lock ordering). The
+    // trust root outlives the session (see below), so this device keeps knowing
+    // itself — the same rule as a logout — and so does everything the account
+    // can still prove under `ak_pub`.
+    let root = state
+        .account_root
+        .lock()
+        .expect("lock account_root")
+        .clone();
+    let own = root.as_ref().map(|root| crate::state::OwnDevice {
+        identity: &state.identity,
+        name: &state.device_name,
+        attestation: &root.attestation,
+    });
     {
         let mut s = state.session.lock().expect("lock session");
         if !s.logged_in {
             return;
         }
-        let (payload, _abort) = s.forget();
+        let (payload, _abort) = s.forget(own, root.as_ref().map(|root| root.ak_pub.as_str()));
         // The refresh token belonged to this session: a device the account has
         // struck off should no longer hold the means to obtain ID tokens.
         state.secrets.delete(crate::secrets::REFRESH_TOKEN);
@@ -195,9 +209,15 @@ fn drop_session(state: &AppState) {
         // the answer to that is an AK rotation, not a deletion an attacker has
         // already outrun.
         remove_session_file(&state.config_dir);
-        // The cached directory belonged to the session too: struck off, this
-        // device forgets whom the account trusted.
-        crate::directory::remove(&state.config_dir);
+        // What the SERVER asserted leaves with the session; what the ACCOUNT can
+        // still prove — the records `forget` kept — stays, because a server
+        // striking this device off its directory does not end a membership only
+        // the account key's tombstone can end (the continuum). `save_unrefreshed`:
+        // nothing here re-checked anything against an authority.
+        match s.devices.as_ref() {
+            Some(devices) => crate::directory::save_unrefreshed(&state.config_dir, devices),
+            None => crate::directory::remove(&state.config_dir),
+        }
         // The broadcast goes out under the session lock (order: session then
         // registry) — the order of notifications is the order of transitions.
         state.registry.lock().expect("lock registry").notify_topic(
@@ -331,12 +351,12 @@ async fn connect_and_serve(state: &Arc<AppState>, info: &SessionInfo) -> Outcome
     // republish it on EVERY (re)connection, before the snapshot — so our own
     // record comes back already carrying it, and peers receive it via the
     // `device.updated` the server broadcasts.
-    let attestation = state
+    let root = state
         .account_root
         .lock()
         .expect("lock account_root")
-        .as_ref()
-        .map(|root| root.attestation.clone());
+        .clone();
+    let attestation = root.as_ref().map(|root| root.attestation.clone());
     let setup = tokio::time::timeout(SETUP_TIMEOUT, async {
         let challenge = conn.request("auth.challenge", json!({})).await?;
         let nonce = challenge["nonce"].as_str().ok_or(SetupErr::Transport)?;
@@ -393,11 +413,38 @@ async fn connect_and_serve(state: &Arc<AppState>, info: &SessionInfo) -> Outcome
             return Outcome::Stop;
         }
         s.server_connected = true;
-        // The live snapshot replaces whatever the cache seeded, and goes to
-        // disk under the same lock (state-then-disk, like session.json): the
-        // file is never newer than the memory it mirrors.
-        crate::directory::save(&state.config_dir, &devices);
-        s.devices = Some(devices);
+        // A device the account struck off is not taken back on the server's
+        // word: the tombstone is signed by the account key (which the server
+        // does not hold), the snapshot is signed by nothing. A server that was
+        // never told about the revocation — or one that chose to forget it —
+        // therefore changes nothing here.
+        if let Some(root) = &root {
+            devices.retain(|_, record| {
+                record
+                    .get("node_id")
+                    .and_then(Value::as_str)
+                    .is_none_or(|node_id| !s.barred(&root.ak_pub, node_id))
+            });
+        }
+        // The live snapshot is the server's word about the server's HALF: merged,
+        // not swapped in — what the account can still prove about devices this
+        // server never met survives it (`merge_snapshot`, the continuum). Then
+        // our own record: the server names us, we countersign that name
+        // (`adopt_own`) so our description travels beyond the server's reach.
+        s.merge_snapshot(devices, root.as_ref().map(|root| root.ak_pub.as_str()));
+        if let Some(root) = &root {
+            s.adopt_own(crate::state::OwnDevice {
+                identity: &state.identity,
+                name: &state.device_name,
+                attestation: &root.attestation,
+            });
+        }
+        // Disk under the same lock (state-then-disk, like session.json): the
+        // file is never newer than the memory it mirrors. A refresh (`save`):
+        // this is the authority contact the freshness bound is about.
+        if let Some(devices) = s.devices.as_ref() {
+            crate::directory::save(&state.config_dir, devices);
+        }
         s.server_tx = Some(tx);
         let payload = s.status_record();
         // Broadcast under the session lock (order: session then registry):
@@ -409,10 +456,46 @@ async fn connect_and_serve(state: &Arc<AppState>, info: &SessionInfo) -> Outcome
             &payload,
         );
     }
+    // Our signed description, published where the attestation already lives
+    // (`presence.update`, opaque to the server): this is what makes our record —
+    // and every record this server serves of us — shareable, so a sibling of the
+    // account's serverless half can learn of us from ANY device of the server's
+    // half, not only from us in person. After the snapshot, deliberately: the
+    // countersignature covers the name the SERVER holds, which the snapshot is
+    // what told us. A server that refuses it costs a warning, not the session —
+    // the record travels first-hand over dirsync regardless.
+    if let Some((seq, self_sig)) = own_signed_description(state) {
+        let published = tokio::time::timeout(
+            SETUP_TIMEOUT,
+            conn.request(
+                "presence.update",
+                json!({ "seq": seq, "self_sig": self_sig }),
+            ),
+        )
+        .await;
+        match published {
+            Ok(Ok(_)) => {}
+            Ok(Err(SetupErr::Rpc(err))) => {
+                tracing::warn!(
+                    error = %err.message,
+                    "the server refused our signed description: peers of its half cannot relay us"
+                );
+            }
+            _ => {
+                return Outcome::Retry {
+                    was_connected: true,
+                };
+            }
+        }
+    }
     // Cache primed: replay what setup set aside.
     for (method, params) in std::mem::take(&mut conn.buffered) {
         apply_event(state, &method, &params);
     }
+    // The snapshot may have taught us devices the account's serverless half has
+    // never heard of: a round now, not at the next tick — the two halves of one
+    // account should not lag a quarter of an hour behind each other.
+    state.dirsync_wake.notify_one();
 
     // Cruising regime: relaying notifications, proxies, detecting the end of
     // the connection. `pending` retains the method: a rename's reply carries
@@ -541,6 +624,20 @@ async fn connect_and_serve(state: &Arc<AppState>, info: &SessionInfo) -> Outcome
     }
 }
 
+/// The `seq` and `self_sig` of our own record, if it stands verified — what
+/// `presence.update` publishes so the server's half can relay us. `None` for a
+/// record we have not countersigned (no trust root), which is also a record
+/// that could not travel anyway.
+fn own_signed_description(state: &AppState) -> Option<(Value, Value)> {
+    let s = state.session.lock().expect("lock session");
+    let record = s
+        .devices
+        .as_ref()?
+        .get(s.own_device_id.as_deref()?)
+        .filter(|record| crate::directory::verify_record(record))?;
+    Some((record["seq"].clone(), record["self_sig"].clone()))
+}
+
 /// A message from the server in the cruising regime: a notification to apply
 /// and relay, or a reply to a proxied request.
 fn handle_server_message(state: &Arc<AppState>, v: Value, pending: &mut PendingReplies) {
@@ -593,13 +690,44 @@ fn apply_event(state: &Arc<AppState>, method: &str, params: &Value) {
         crate::pairing::on_server_event(state, method, params);
         return;
     }
+    // Both read BEFORE the session lock (lock ordering: the transport and
+    // `account_root` each have a lock of their own).
+    let lan: std::collections::BTreeSet<String> = state.transport.lan_peers().into_iter().collect();
+    let ak_pub = state
+        .account_root
+        .lock()
+        .expect("lock account_root")
+        .as_ref()
+        .map(|root| root.ak_pub.clone());
+    let mut resign_ours = false;
+    let mut also_removed: Option<String> = None;
     let relayed = {
-        // Transport snapshot BEFORE the session lock (lock ordering).
-        let lan: std::collections::BTreeSet<String> =
-            state.transport.lan_peers().into_iter().collect();
         let mut s = state.session.lock().expect("lock session");
+        // The session may have ended under this event's feet (a logout, an
+        // abort that has not bitten yet): its events die with it. This used to
+        // be free — the directory left with the session — but the account's
+        // half now outlives it (`forget`), and a straggler must not write a
+        // dead session's word into it. (Survives a mutation campaign: the
+        // straggler is an event the session task was carrying at the instant an
+        // abort landed, and aborts bite at await points the scheduler owns — no
+        // test can hold one still. Caught live, once, by a no-retry gate run:
+        // the logout's freshly written store, torn under a reader.)
+        if !s.logged_in {
+            return;
+        }
         let own = s.own_device_id.clone();
         let server_connected = s.server_connected;
+        // The device this event is about, when it carries a record: one the
+        // account struck off does not come back, whatever the server still
+        // lists. Checked here rather than in the arms below, which hold a
+        // mutable borrow of the map.
+        let subject = params.pointer("/device/node_id").and_then(Value::as_str);
+        if let (Some(ak_pub), Some(node_id)) = (&ak_pub, subject)
+            && s.barred(ak_pub, node_id)
+        {
+            tracing::warn!(%node_id, "the server offers a struck-off device: ignored");
+            return;
+        }
         let Some(devices) = &mut s.devices else {
             return;
         };
@@ -611,8 +739,45 @@ fn apply_event(state: &Arc<AppState>, method: &str, params: &Value) {
                 let Some(id) = record.get("device_id").and_then(Value::as_str) else {
                     return;
                 };
-                devices.insert(id.to_string(), record.clone());
-                json!({ "device": enrich_device(record, own.as_deref(), server_connected, &lan) })
+                let mut incoming = record.clone();
+                let node_id = incoming
+                    .get("node_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                // A twin the account taught us before the server did (keyed by
+                // `node_id`): the server has just named that device, so its
+                // record moves under the server's label — one device, one entry —
+                // and its signed description is grafted onto the fresh record
+                // if it still proves itself (the merge's rules, event-sized).
+                let twin = node_id.as_deref().and_then(|node_id| {
+                    devices
+                        .iter()
+                        .find(|(key, held)| {
+                            *key != id
+                                && held.get("node_id").and_then(Value::as_str) == Some(node_id)
+                        })
+                        .map(|(key, _)| key.clone())
+                });
+                if let Some(twin) = twin {
+                    let held = devices.remove(&twin).expect("just found");
+                    crate::directory::graft_signature(&mut incoming, &held);
+                    also_removed = Some(twin);
+                } else if let Some(held) = devices.get(id) {
+                    crate::directory::graft_signature(&mut incoming, &held.clone());
+                }
+                // The server renamed US: the name is the server's word, the
+                // signature over it is nobody's but ours. Countersigned here and
+                // republished below, so the account's serverless half hears the
+                // new description instead of keeping the old one forever.
+                if ak_pub.is_some()
+                    && node_id.as_deref() == Some(state.identity.node_id().as_str())
+                    && !crate::directory::verify_record(&incoming)
+                    && crate::directory::countersign_own(&mut incoming, &state.identity)
+                {
+                    resign_ours = true;
+                }
+                devices.insert(id.to_string(), incoming.clone());
+                json!({ "device": enrich_device(&incoming, own.as_deref(), server_connected, &lan) })
             }
             "device.offline" => {
                 let Some(id) = params.get("device_id").and_then(Value::as_str) else {
@@ -649,11 +814,51 @@ fn apply_event(state: &Arc<AppState>, method: &str, params: &Value) {
         crate::directory::save(&state.config_dir, devices);
         relayed
     };
-    state
-        .registry
-        .lock()
-        .expect("lock registry")
-        .notify_topic("devices", method, &relayed);
+    {
+        let registry = state.registry.lock().expect("lock registry");
+        // The re-keyed twin's old label first: a subscriber that held the device
+        // under its `node_id` hears it leave before hearing it arrive under the
+        // server's label — never two entries for one device.
+        if let Some(device_id) = also_removed {
+            registry.notify_topic(
+                "devices",
+                "device.removed",
+                &json!({ "device_id": device_id }),
+            );
+        }
+        registry.notify_topic("devices", method, &relayed);
+    }
+    // What the server just taught us may be news to the account's serverless
+    // half, which no server will ever tell: a description that changed, a device
+    // that arrived. A round now — cheap when nothing changed (two rosters that
+    // agree exchange no state), and the alternative is a quarter-hour lag
+    // between the two halves of one account.
+    if matches!(method, "device.added" | "device.updated") {
+        state.dirsync_wake.notify_one();
+    }
+    if resign_ours {
+        // Fire-and-forget through the session task's own queue (this runs ON
+        // that task: awaiting the reply here would wait on ourselves). The
+        // receiver is dropped on purpose — a refusal costs a log line upstream,
+        // and the description travels first-hand over dirsync regardless.
+        if let Some((seq, self_sig)) = own_signed_description(state) {
+            let tx = {
+                let s = state.session.lock().expect("lock session");
+                s.server_tx.clone()
+            };
+            if let Some(tx) = tx {
+                let (reply_tx, _reply_rx) = oneshot::channel();
+                let _ = tx.try_send(ServerCmd {
+                    method: "presence.update",
+                    params: json!({ "seq": seq, "self_sig": self_sig }),
+                    reply: reply_tx,
+                });
+            }
+        }
+        // The account's serverless half should hear the new description now, not
+        // at the next tick.
+        state.dirsync_wake.notify_one();
+    }
 }
 
 /// Carries our freshly published `relay_url` onto our own cache record. The
@@ -662,6 +867,10 @@ fn apply_event(state: &Arc<AppState>, method: &str, params: &Value) {
 /// our relay.
 fn set_own_relay(state: &AppState, device_id: &str, url: &str) {
     let mut s = state.session.lock().expect("lock session");
+    // Same guard as `apply_event`: a session that ended took its facts with it.
+    if !s.logged_in {
+        return;
+    }
     if let Some(devices) = s.devices.as_mut() {
         if let Some(record) = devices.get_mut(device_id) {
             record["relay_url"] = json!(url);
@@ -670,16 +879,33 @@ fn set_own_relay(state: &AppState, device_id: &str, url: &str) {
     }
 }
 
-/// Publishes our attestation to the server then, on success, carries it onto OUR
-/// OWN cache record: the server excludes the publisher from its broadcast, and
-/// without this gesture our local directory would ignore itself until
-/// reconnection (same reason as `set_own_relay` for the relay).
+/// Makes this device's attestation (C7) known: published to the server when
+/// there is one, and carried onto OUR OWN directory record either way — the
+/// server excludes the publisher from its broadcast, so without that gesture our
+/// local directory would ignore itself until reconnection (same reason as
+/// `set_own_relay` for the relay).
 ///
-/// Called after joining the account mid-session — by a typed recovery code
+/// Called after joining the account — by a typed recovery code
 /// (`account.setup`/`join`) or by a pairing. On (re)connection there is nothing
 /// to do: setup publishes before taking the snapshot, so the snapshot already
 /// carries it.
+///
+/// **With no server configured there is nothing to publish to**, and nothing to
+/// wait for: the directory is local and our own record is the whole of it. (When
+/// a server IS configured, the caller's gate has already made sure it is
+/// connected — so the branch below is exactly the serverless case, not a
+/// disconnected one, whose local write would claim an attestation the account's
+/// other devices could not read.)
 pub(crate) async fn publish_attestation(state: &AppState, root: &crate::account_key::AccountRoot) {
+    let configured = state
+        .server_config
+        .lock()
+        .expect("lock server_config")
+        .is_some();
+    if !configured {
+        adopt_own_record(state, &root.attestation);
+        return;
+    }
     let published = proxy(
         state,
         "presence.update",
@@ -688,24 +914,22 @@ pub(crate) async fn publish_attestation(state: &AppState, root: &crate::account_
     .await
     .is_ok();
     if published {
-        set_own_attestation(state, &root.attestation);
+        adopt_own_record(state, &root.attestation);
     }
 }
 
-/// Carries our freshly published attestation (C7) onto our own cache record —
-/// same reason as `set_own_relay`: the server excludes the publisher from its
-/// broadcast. Called after an `account.setup`/`join` during a session (on
-/// (re)connection, the post-publication snapshot already carries the
-/// attestation).
-pub(crate) fn set_own_attestation(state: &AppState, attestation: &str) {
+/// Puts our own record in the directory, carrying `attestation` — created if this
+/// Core has none yet (no server ever named it), otherwise just updated. Same
+/// reason as `set_own_relay`: what we publish about ourselves does not come back
+/// to us.
+pub(crate) fn adopt_own_record(state: &AppState, attestation: &str) {
     let mut s = state.session.lock().expect("lock session");
-    let Some(device_id) = s.own_device_id.clone() else {
-        return;
-    };
-    if let Some(devices) = s.devices.as_mut() {
-        if let Some(record) = devices.get_mut(&device_id) {
-            record["attestation"] = json!(attestation);
-        }
+    s.adopt_own(crate::state::OwnDevice {
+        identity: &state.identity,
+        name: &state.device_name,
+        attestation,
+    });
+    if let Some(devices) = s.devices.as_ref() {
         crate::directory::save(&state.config_dir, devices);
     }
 }

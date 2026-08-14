@@ -53,9 +53,13 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use ed25519_dalek::SigningKey;
 use serde_json::{Value, json};
 use sha2::Sha256;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
 use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
 
+use crate::connector::IoStream;
+use crate::dataplane::{self, PeerAddr};
+use crate::directory::Roster;
 use crate::rpc::RpcErr;
 use crate::state::{AppState, ServerCmd};
 
@@ -126,6 +130,10 @@ static EPOCH: AtomicU64 = AtomicU64::new(0);
 /// How this pairing reaches the server.
 #[derive(Clone)]
 enum Wire {
+    /// It does not: there is no server in this device's life, and the other
+    /// device is dialled on the local network instead (see "Pairing on the local
+    /// network" below). Nothing here is ever asked of a server.
+    Lan,
     /// Over the session task's connection — the only one the server knows as a
     /// device of the account.
     Session,
@@ -187,6 +195,19 @@ impl Channel {
     /// Fail-closed: the caller fails the pairing rather than carrying on with a
     /// key an attacker could have dictated.
     fn establish(&mut self, theirs: &PublicKey, pairing_id: &str) -> Option<[u8; 32]> {
+        self.settle(theirs, CHANNEL_DOMAIN, pairing_id)
+    }
+
+    /// The same exchange for a pairing with no server in it: bound to the
+    /// DISPLAYING device's `node_id` rather than to a session id (there is no
+    /// server to mint one, and the `node_id` is the one field of the code the
+    /// transport itself authenticates), under a domain of its own so that neither
+    /// scheme's key can ever pass for the other's.
+    fn establish_lan(&mut self, theirs: &PublicKey, node_id: &str) -> Option<[u8; 32]> {
+        self.settle(theirs, LAN_CHANNEL_DOMAIN, node_id)
+    }
+
+    fn settle(&mut self, theirs: &PublicKey, domain: &[u8], binding: &str) -> Option<[u8; 32]> {
         let shared = self.secret.take()?.diffie_hellman(theirs);
         // A peer that sends a low-order point forces a shared secret that is
         // publicly known: everyone who watched would hold the channel key. The
@@ -199,7 +220,7 @@ impl Channel {
         } else {
             (theirs, &self.ours)
         };
-        let key = derive_key(&shared, &self.psk, offerer, claimer, pairing_id);
+        let key = derive_key(domain, &shared, &self.psk, offerer, claimer, binding);
         self.key = Some(key);
         Some(key)
     }
@@ -215,6 +236,13 @@ pub(crate) struct Pairing {
     wire: Wire,
     /// The expiry timer, cancelled by whatever settles the pairing first.
     expiry: Option<tokio::task::AbortHandle>,
+    /// LAN pairing only: how the human's yes reaches the task that holds the
+    /// stream. Its absence is how that task hears everything else — a
+    /// cancellation, an expiry, another pairing taking this slot all DROP this
+    /// sender, and the task then owes the other device a refusal rather than
+    /// silence. On the server path there is nothing to hand over: the
+    /// confirmation is a request of its own, and the server carries it.
+    confirm: Option<oneshot::Sender<()>>,
 }
 
 impl Pairing {
@@ -306,21 +334,24 @@ fn unb64(text: &str) -> Option<Vec<u8>> {
 /// The PSK goes in as the **salt** and the exchange as the keying material: the
 /// extraction is then a PRF keyed by the secret the server never saw, so
 /// recovering the key demands both halves. The `info` pins the transcript —
-/// both public keys in the order display-then-scan, and the session id — so a
-/// key derived for one pairing cannot be mistaken for another's, whatever the
-/// server hands out.
+/// both public keys in the order display-then-scan, and what identifies this one
+/// exchange — so a key derived for one pairing cannot be mistaken for another's,
+/// whatever the server hands out. `domain` is the scheme: a code relayed by a
+/// server and one dialled on the local network derive under labels of their own,
+/// so a channel of one can never be a channel of the other.
 fn derive_key(
+    domain: &[u8],
     shared: &SharedSecret,
     psk: &[u8; PSK_LEN],
     offerer: &PublicKey,
     claimer: &PublicKey,
-    pairing_id: &str,
+    binding: &str,
 ) -> [u8; 32] {
-    let mut info = Vec::with_capacity(CHANNEL_DOMAIN.len() + 64 + pairing_id.len());
-    info.extend_from_slice(CHANNEL_DOMAIN);
+    let mut info = Vec::with_capacity(domain.len() + 64 + binding.len());
+    info.extend_from_slice(domain);
     info.extend_from_slice(offerer.as_bytes());
     info.extend_from_slice(claimer.as_bytes());
-    info.extend_from_slice(pairing_id.as_bytes());
+    info.extend_from_slice(binding.as_bytes());
     let mut key = [0u8; 32];
     hkdf::Hkdf::<Sha256>::new(Some(psk), shared.as_bytes())
         .expand(&info, &mut key)
@@ -389,6 +420,12 @@ fn open(key: &[u8; 32], sealed: &str) -> Option<Vec<u8>> {
 /// covers the case a parameter would get wrong: a device that holds the key but
 /// was revoked needs to *join* again, not to sponsor.
 pub(crate) async fn offer(state: &Arc<AppState>) -> Result<Value, RpcErr> {
+    // No server in this device's life: there is no rendezvous to go to, and none
+    // is needed — the code says whom to dial and the other device dials it (see
+    // "Pairing on the local network" below).
+    if crate::state::serverless(state) {
+        return offer_lan(state).await;
+    }
     let role = local_role(state);
     let epoch = EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
     let channel = Channel::displaying();
@@ -431,6 +468,8 @@ pub(crate) async fn offer(state: &Arc<AppState>) -> Result<Value, RpcErr> {
             channel,
             wire,
             expiry: None,
+            // The server path confirms through a request of its own.
+            confirm: None,
         },
         expires_in,
     );
@@ -448,6 +487,12 @@ pub(crate) async fn offer(state: &Arc<AppState>) -> Result<Value, RpcErr> {
 /// what decides who is joining, and a payload that claimed otherwise would be
 /// claiming it about someone else's session.
 pub(crate) async fn accept(state: &Arc<AppState>, code: &str) -> Result<Value, RpcErr> {
+    // The code's own version tag decides which scheme this is — that is what a
+    // version tag is for, and it is why a LAN code is `UL2` and not a `UL1` with a
+    // field missing.
+    if let Some(payload) = LanPayload::parse(code) {
+        return accept_lan(state, payload).await;
+    }
     let payload = Payload::parse(code).ok_or_else(|| RpcErr::invalid_params("code"))?;
     let epoch = EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
     let mut channel = Channel::scanning(payload.psk);
@@ -508,6 +553,8 @@ pub(crate) async fn accept(state: &Arc<AppState>, code: &str) -> Result<Value, R
             channel,
             wire,
             expiry: None,
+            // The server path confirms through a request of its own.
+            confirm: None,
         },
         expires_in,
     );
@@ -532,9 +579,9 @@ pub(crate) async fn accept(state: &Arc<AppState>, code: &str) -> Result<Value, R
 /// `doc/architecture.md`, and the human-presence gate is this very confirmation.
 pub(crate) async fn confirm(state: &Arc<AppState>, pairing_id: &str) -> Result<Value, RpcErr> {
     let (key, wire) = {
-        let slot = state.pairing.lock().expect("lock pairing");
+        let mut slot = state.pairing.lock().expect("lock pairing");
         let p = slot
-            .as_ref()
+            .as_mut()
             .filter(|p| p.pairing_id == pairing_id)
             .ok_or_else(|| RpcErr::app("PAIRING_UNKNOWN"))?;
         if p.role != Role::Sponsor {
@@ -543,6 +590,20 @@ pub(crate) async fn confirm(state: &Arc<AppState>, pairing_id: &str) -> Result<V
         // No channel key means nobody has scanned yet: there is no one to seal
         // for, and the server would refuse the confirmation anyway.
         let key = p.channel.key.ok_or_else(|| RpcErr::app("PAIRING_STATE"))?;
+        if matches!(p.wire, Wire::Lan) {
+            // On the local network the bundle is sealed and sent by the task that
+            // holds the stream, not here: with no server to relay anything, the
+            // conversation is already open and this call is the yes it was waiting
+            // for. `PAIRING_STATE` if that task is gone — a pairing whose stream
+            // died has nothing left to confirm. And no `reauth_required` on this
+            // path ever: there is no OIDC to be fresh with.
+            return p
+                .confirm
+                .take()
+                .and_then(|confirm| confirm.send(()).ok())
+                .map(|()| json!({ "status": "done" }))
+                .ok_or_else(|| RpcErr::app("PAIRING_STATE"));
+        }
         (key, p.wire.clone())
     };
 
@@ -614,13 +675,19 @@ pub(crate) async fn cancel(state: &Arc<AppState>, pairing_id: &str) -> Result<Va
     };
     // The other side is told by the server rather than left waiting out the TTL.
     // Best-effort: the pairing is already gone from here.
-    let _ = request(
-        state,
-        &p.wire,
-        "pairing.cancel",
-        json!({ "pairing_id": pairing_id }),
-    )
-    .await;
+    //
+    // Nothing to tell a server that is not there: on the local network, dropping
+    // the pairing drops the confirmation channel, and that is what tells the task
+    // holding the stream to refuse for us (`lan_sponsor`).
+    if !matches!(p.wire, Wire::Lan) {
+        let _ = request(
+            state,
+            &p.wire,
+            "pairing.cancel",
+            json!({ "pairing_id": pairing_id }),
+        )
+        .await;
+    }
     p.abandon();
     Ok(json!({}))
 }
@@ -631,7 +698,27 @@ pub(crate) async fn cancel(state: &Arc<AppState>, pairing_id: &str) -> Result<Va
 
 /// A `pairing.*` notification arriving on a server connection — the session
 /// task's, or a pairing's own.
+///
+/// A server does not get to speak for a pairing it is not part of. Today that is
+/// unreachable — a LAN pairing exists only where there is no server at all
+/// (`crate::state::serverless`), so there is no connection for such a
+/// notification to arrive on — and it is written down anyway, because the two
+/// schemes share one slot and the failure it would cause (a server re-keying a
+/// channel keyed by a screen) is the kind nobody would think to look for.
 pub(crate) fn on_server_event(state: &Arc<AppState>, method: &str, params: &Value) {
+    if state
+        .pairing
+        .lock()
+        .expect("lock pairing")
+        .as_ref()
+        .is_some_and(|p| matches!(p.wire, Wire::Lan))
+    {
+        tracing::warn!(
+            method,
+            "a server spoke for a pairing on the local network: ignored"
+        );
+        return;
+    }
     match method {
         "pairing.claimed" => on_claimed(state, params),
         "pairing.completed" => on_completed(state, params),
@@ -725,17 +812,7 @@ async fn complete_as_joiner(state: Arc<AppState>, p: Pairing, bundle: String) {
         failed("state");
         return;
     };
-    let Some(plain) = open(&key, &bundle).and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-    else {
-        failed("bundle");
-        return;
-    };
-    let Some(ak) = plain["seed"]
-        .as_str()
-        .and_then(|s| hex::decode(s).ok())
-        .and_then(|b| <[u8; 32]>::try_from(b).ok())
-        .map(|seed| SigningKey::from_bytes(&seed))
-    else {
+    let Some((ak, account)) = open_bundle(&key, &bundle) else {
         failed("bundle");
         return;
     };
@@ -762,7 +839,7 @@ async fn complete_as_joiner(state: Arc<AppState>, p: Pairing, bundle: String) {
         // key, or one that has just been re-enrolled: the attestation is all that
         // is missing.
         crate::session::publish_attestation(&state, &root).await;
-    } else if let Err(reason) = enroll_on_grant(&state, &p, plain.get("account")).await {
+    } else if let Err(reason) = enroll_on_grant(&state, &p, account.as_ref()).await {
         tracing::warn!(error = %reason, "enrollment on the pairing failed");
         failed("enroll");
         return;
@@ -1008,8 +1085,10 @@ fn settle(state: &Arc<AppState>, pairing_id: &str, method: &str, mut params: Val
     notify(state, method, params);
 }
 
-/// Ends the current pairing, whatever it is, and says why.
-fn fail_current(state: &Arc<AppState>, reason: &str) {
+/// Ends the current pairing, whatever it is, and says why. `pub(crate)` for one
+/// outside caller: a device leaving the account (`account_key::leave`), whose
+/// pairing — either end of it — has just lost its standing.
+pub(crate) fn fail_current(state: &Arc<AppState>, reason: &str) {
     let Some(p) = state.pairing.lock().expect("lock pairing").take() else {
         return;
     };
@@ -1056,13 +1135,19 @@ fn holds_key(state: &AppState) -> bool {
 /// under. `ak_pub` is cloned out of its lock first: the keyring read can block,
 /// and `account_root` sits on the data plane's authorization path.
 fn account_key(state: &AppState) -> Option<SigningKey> {
-    let ak_pub = state
+    let ak_pub = account_pub(state)?;
+    crate::account_key::recall(&*state.secrets, &ak_pub)
+}
+
+/// The account's PUBLIC key, if this device is in an account at all — cloned out
+/// of the leaf lock, never held (see [`account_key`]).
+fn account_pub(state: &AppState) -> Option<String> {
+    state
         .account_root
         .lock()
         .expect("lock account_root")
         .as_ref()
-        .map(|r| r.ak_pub.clone())?;
-    crate::account_key::recall(&*state.secrets, &ak_pub)
+        .map(|r| r.ak_pub.clone())
 }
 
 /// Seals the account for the device that was confirmed: the key's seed, and the
@@ -1078,6 +1163,24 @@ fn seal_account(state: &AppState, key: &[u8; 32]) -> Option<String> {
         plain["account"] = account.clone();
     }
     seal(key, plain.to_string().as_bytes())
+}
+
+/// Opens a bundle and reads what a joiner is owed: the account key, and the
+/// account's identity as the sponsor knew it (a label for the interface — the
+/// account this device really lands in is settled by what the key derives).
+///
+/// `None` on anything at all: a bundle that does not open, does not parse, or
+/// carries no usable seed. One place, shared by both pairing schemes — what a
+/// bundle IS should not be a thing two paths each have their own idea of.
+fn open_bundle(key: &[u8; 32], sealed: &str) -> Option<(SigningKey, Option<Value>)> {
+    let plain: Value = serde_json::from_slice(&open(key, sealed)?).ok()?;
+    let ak = plain["seed"]
+        .as_str()
+        .and_then(|s| hex::decode(s).ok())
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .map(|seed| SigningKey::from_bytes(&seed))?;
+    let account = plain.get("account").filter(|a| !a.is_null()).cloned();
+    Some((ak, account))
 }
 
 /// What this device declares about itself when it is the one joining. The same
@@ -1099,6 +1202,10 @@ async fn request(
     params: Value,
 ) -> Result<Value, RpcErr> {
     match wire {
+        // A LAN pairing asks a server nothing, and every caller of this is a
+        // server path. Fail-closed rather than a panic: a mistake here has to cost
+        // a pairing, not the Core.
+        Wire::Lan => Err(RpcErr::app("PAIRING_STATE")),
         Wire::Session => crate::session::proxy(state, method, params).await,
         Wire::Direct { tx, .. } => {
             let unreachable = || RpcErr::app("SERVER_UNREACHABLE");
@@ -1114,6 +1221,1099 @@ async fn request(
                 Ok(Err(_)) | Err(_) => Err(unreachable()),
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pairing on the local network, with no server at all.
+// ---------------------------------------------------------------------------
+//
+// An account with no server has, until now, had exactly one way in: the recovery
+// code, typed into every machine. Which works, and leaves each machine knowing
+// only itself — the exchange that carries the directory between devices
+// (`dirsync`) needs each of them to already hold the other's record. This is the
+// first introduction, and it is what makes that exchange run at all.
+//
+// # The protocol (over `dataplane::ALPN`, one bidirectional stream)
+//
+// ```text
+// dialer   → displayer  { "type": "lan_pair",    epk, proof, record, holds_key, account? }
+// displayer → dialer    { "type": "lan_hello",   record, holds_key, account? }
+//                     | { "type": "lan_refused", reason }
+//   ... the roles are settled, both ends show the same number, a human confirms
+// sponsor  → joiner     { "type": "pair_grant",  bundle, records, revoked }
+//                     | { "type": "lan_refused", reason }
+// joiner   → sponsor    { "type": "pair_roster", records, revoked }
+// ```
+//
+// The device that DISPLAYS the code is the one that gets dialled — the code says
+// whom to dial, which is the field a server used to be. No new ALPN: the data
+// plane dispatches on the first frame's type, and `lan_pair` is the one frame it
+// serves to a device that is not in the directory yet (`dataplane::serve`), and
+// only while a window is open here.
+//
+// # What holds it up, with no server anywhere
+//
+// **Both `node_id`s are authenticated by the transport**, which is more than the
+// server path can say: the dialer reached exactly the key the code names (iroh
+// authenticates the remote end), and the displayer is handed the dialer's key by
+// the transport rather than told it in a frame. So neither side can be POSED as,
+// and a description that does not match the key that sent it is refused
+// (`standing_of`). What is left for an attacker is a race, and that is what the
+// confirmation number catches — the same asymmetry the server path lives with.
+//
+// **The dialer proves it read the code off a screen** before the displaying side
+// spends anything: a MAC over both public halves and the `node_id`, keyed by the
+// code's 128-bit secret (`dialer_proof`). Checked BEFORE the ephemeral secret is
+// consumed, deliberately — otherwise anything on the network could burn a pairing
+// window for the device the human is actually holding.
+//
+// **The account key still crosses sealed**, under a channel keyed by that same
+// optical secret, exactly as it does through a server. The transport is already
+// encrypted, so this is belt on braces; it is worth it because there is then ONE
+// rule about the seed rather than two, and the weaker one would be the one that
+// mattered.
+//
+// **Two devices do not tell the network which account they are in**: whether they
+// belong to the same one is compared as a MAC over the account's public key under
+// the channel key (`account_mark`), which only the two ends of this one exchange
+// can compute.
+//
+// # Who ends up sponsoring
+//
+// The device that holds the account's private key vouches; the other joins. When
+// BOTH hold it — two devices of one account that have never met, which is exactly
+// what an account looks like when the recovery code was typed into each machine —
+// the one that displayed the code sponsors, and the exchange is the same one: the
+// key that crosses is the key the other side already has, and `account_key::install`
+// takes it as the no-op it is. What the two of them are really doing then is
+// swapping rosters, which is the whole point.
+
+/// Version tag of the payload a code carries when there is no server to be the
+/// rendezvous. A version of its own rather than a `UL1` with a field standing for
+/// something else: the two schemes derive different keys, and a code that
+/// half-parses is worse than one that does not parse at all.
+pub const LAN_PAYLOAD_TAG: &str = "UL2";
+
+/// Domain separation for the channel key of a pairing with no server in it.
+const LAN_CHANNEL_DOMAIN: &[u8] = b"ul-lanpair-channel-v1";
+
+/// Domain separation for the dialer's proof that it read the code off a screen.
+const LAN_PROOF_DOMAIN: &[u8] = b"ul-lanpair-proof-v1";
+
+/// Domain separation for the mark that tells two devices whether they are in the
+/// same account without either of them naming it.
+const LAN_ACCOUNT_DOMAIN: &[u8] = b"ul-lanpair-account-v1";
+
+/// Frame types. `lan_pair` is the one a device outside the directory may send.
+const LAN_OFFER: &str = "lan_pair";
+const LAN_HELLO: &str = "lan_hello";
+const LAN_REFUSED: &str = "lan_refused";
+const LAN_GRANT: &str = "pair_grant";
+const LAN_ROSTER: &str = "pair_roster";
+
+/// How long a LAN code is good for. Long enough to carry a phone into the next
+/// room, short enough that a window nobody used does not stay open — and it is
+/// this window, and only it, that lets a stranger's frame be read at all.
+const LAN_TTL: Duration = Duration::from_secs(180);
+
+/// What we allow the transport to come up in before a code goes on screen. Past
+/// it the code is handed out anyway: the endpoint may well finish binding while
+/// the human is walking to the other machine, and the dialer has a budget of its
+/// own.
+const LAN_LISTEN_BUDGET: Duration = Duration::from_secs(10);
+
+/// Budget for reaching the device whose code was read. On a local network this is
+/// a handful of milliseconds; the budget is for the case where it is not there.
+const LAN_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Budget for a frame the other side sends with no human in between.
+const LAN_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What the last writer allows itself to see the stream close (the QUIC lifecycle
+/// the transfer protocol learned the hard way).
+const LAN_LINGER: Duration = Duration::from_secs(5);
+
+/// What a device with no server puts on screen: the optical secret, the public
+/// half of its channel, and the device to dial.
+struct LanPayload {
+    psk: [u8; PSK_LEN],
+    epk: PublicKey,
+    node_id: String,
+}
+
+impl LanPayload {
+    /// `UL2:<psk>:<public key>:<node_id>` — the shape of a `UL1` code with the
+    /// device to dial where the session id was, and the `node_id` LAST for the
+    /// same reason the id was: whatever is in it survives the split untouched.
+    fn encode(&self) -> String {
+        format!(
+            "{LAN_PAYLOAD_TAG}:{}:{}:{}",
+            b64(&self.psk),
+            b64(self.epk.as_bytes()),
+            self.node_id,
+        )
+    }
+
+    fn parse(text: &str) -> Option<LanPayload> {
+        let mut fields = text.trim().splitn(4, ':');
+        if fields.next()? != LAN_PAYLOAD_TAG {
+            return None;
+        }
+        let psk: [u8; PSK_LEN] = unb64(fields.next()?)?.try_into().ok()?;
+        let epk: [u8; 32] = unb64(fields.next()?)?.try_into().ok()?;
+        let node_id = fields.next()?;
+        // Checked here rather than left to the dial: a mistyped code must be
+        // refused as a code, not reported as a device that would not answer.
+        if node_id.len() != 64 || !node_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(LanPayload {
+            psk,
+            epk: PublicKey::from(epk),
+            node_id: node_id.to_string(),
+        })
+    }
+}
+
+/// The dialer's proof that it read the code off a screen: a MAC over the
+/// exchange's two public halves and the device being dialled, keyed by the
+/// optical secret.
+///
+/// Deliberately NOT derived from the channel key, which is the obvious way to
+/// write this and the wrong one: computing that key spends the displaying side's
+/// ephemeral secret, so anything on the network could then end a pairing window
+/// for the device the human is actually holding. Keyed by the PSK alone, the check
+/// costs one HKDF and turns a stranger away with the window intact. It is bound to
+/// both public keys, so it cannot be replayed into another window either.
+fn dialer_proof(
+    psk: &[u8; PSK_LEN],
+    offerer: &PublicKey,
+    claimer: &PublicKey,
+    node_id: &str,
+) -> String {
+    let mut info = Vec::with_capacity(LAN_PROOF_DOMAIN.len() + 64 + node_id.len());
+    info.extend_from_slice(LAN_PROOF_DOMAIN);
+    info.extend_from_slice(offerer.as_bytes());
+    info.extend_from_slice(claimer.as_bytes());
+    info.extend_from_slice(node_id.as_bytes());
+    let mut out = [0u8; 32];
+    hkdf::Hkdf::<Sha256>::new(None, psk)
+        .expand(&info, &mut out)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    hex::encode(out)
+}
+
+/// Which account this device is in, as a mark only the two ends of this exchange
+/// can read: another output of the channel KDF, over the account's public key.
+///
+/// The public key itself would do the job and would tell the local network which
+/// account this device belongs to — a thing it has no business learning from a
+/// pairing window left open on a screen.
+fn account_mark(key: &[u8; 32], ak_pub: &str) -> String {
+    let mut info = LAN_ACCOUNT_DOMAIN.to_vec();
+    info.extend_from_slice(ak_pub.as_bytes());
+    let mut out = [0u8; 32];
+    hkdf::Hkdf::<Sha256>::from_prk(key)
+        .expect("a 32-byte channel key is a valid HKDF-SHA256 PRK")
+        .expand(&info, &mut out)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    hex::encode(out)
+}
+
+/// Compares two derived secrets without leaking where they stop matching. One
+/// wrong answer ends the exchange, so the timing channel here is thin — but a MAC
+/// comparison that returns early is not a habit worth having.
+fn same_secret(ours: &str, theirs: &str) -> bool {
+    ours.len() == theirs.len()
+        && ours
+            .bytes()
+            .zip(theirs.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+}
+
+/// What one side brings to a LAN pairing: whether it can vouch for a device, which
+/// account it is in, and the description it stands behind.
+struct Standing {
+    /// Does this device hold the account's PRIVATE key — read back from the
+    /// keyring, never remembered from a write, exactly as `account.status` answers
+    /// it. This is what decides who sponsors.
+    holds_key: bool,
+    /// `Some` when the device is in an account, with or without its key — as a
+    /// mark, see [`account_mark`].
+    ///
+    /// Both sides send it, so neither has to take the other's word for it that they
+    /// belong to the same account. Between two honest Cores the DIALLED side would
+    /// have refused a mismatch first, and this is what keeps the answer from
+    /// depending on that.
+    account: Option<String>,
+    /// The device's own signed description, see [`lan_declaration`].
+    record: Value,
+}
+
+/// What this device declares about itself on the local network: its own SIGNED
+/// description (`directory::own_record`'s shape), not the three loose fields the
+/// server path sends.
+///
+/// Two reasons, and both are about what happens next. The other side has to be
+/// able to put this record in its directory once it has attested it, and a
+/// description nobody signed enters as hearsay and travels no further
+/// (`directory::shareable`). And the signature is checked against the `node_id`
+/// the TRANSPORT authenticated, so a device cannot declare itself to be another
+/// one.
+///
+/// A device in no account has no record to hold: it mints one, unattested — which
+/// is precisely what it is asking to change.
+fn lan_declaration(state: &AppState) -> Value {
+    let held = {
+        let s = state.session.lock().expect("lock session");
+        s.own_device_id
+            .as_deref()
+            .and_then(|id| s.devices.as_ref().and_then(|devices| devices.get(id)))
+            .filter(|record| crate::directory::verify_record(record))
+            .cloned()
+    };
+    held.unwrap_or_else(|| {
+        crate::directory::own_record(
+            &state.identity.node_id(),
+            crate::state::OwnDevice {
+                identity: &state.identity,
+                name: &state.device_name,
+                attestation: "",
+            },
+            None,
+        )
+    })
+}
+
+/// What this device brings, with the channel key it will be compared over.
+fn standing(state: &AppState, key: &[u8; 32]) -> Standing {
+    Standing {
+        // The keyring read, and it is the only answer worth anything here: on the
+        // desktop a write is queued, so only a read tells the truth about what
+        // this device can actually sign with.
+        holds_key: holds_key(state),
+        account: account_pub(state).map(|ak_pub| account_mark(key, &ak_pub)),
+        record: lan_declaration(state),
+    }
+}
+
+/// What the other side declared, as far as it can be checked without a human: a
+/// description signed by the very device the transport authenticated. `None`
+/// otherwise — a device does not get to describe another one, and a record nobody
+/// signed could never enter a directory anyway.
+fn standing_of(frame: &Value, node_id: &str) -> Option<Standing> {
+    let record = frame.get("record")?.clone();
+    if record.get("node_id").and_then(Value::as_str) != Some(node_id) {
+        return None;
+    }
+    if !crate::directory::verify_record(&record) {
+        return None;
+    }
+    Some(Standing {
+        // Absent reads as false: a device that does not say it can vouch cannot.
+        holds_key: frame
+            .get("holds_key")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        account: frame
+            .get("account")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        record,
+    })
+}
+
+/// The three fields the interface puts in front of the human, out of a declared
+/// record — the same shape the server path's `device` has.
+fn declared(record: &Value) -> Value {
+    json!({
+        "name": record.get("name").cloned().unwrap_or(Value::Null),
+        "platform": record.get("platform").cloned().unwrap_or(Value::Null),
+        "node_id": record.get("node_id").cloned().unwrap_or(Value::Null),
+    })
+}
+
+/// Which end of this pairing each device is on. Both sides run it over the same
+/// two standings and get mirror answers, `we_displayed` being the only thing that
+/// differs between them.
+fn lan_roles(ours: &Standing, theirs: &Standing, we_displayed: bool) -> Result<Role, &'static str> {
+    if !ours.holds_key && !theirs.holds_key {
+        // Neither can vouch. Two devices with no account do not make one by
+        // meeting, and a device that has the account WITHOUT its key cannot hand
+        // over what it does not hold — it is the one that needs a sponsor.
+        return Err("no_account");
+    }
+    if let (Some(ours), Some(theirs)) = (&ours.account, &theirs.account)
+        && ours != theirs
+    {
+        // Two accounts do not become one by pairing. Refused here rather than at
+        // the install, so the seed does not cross at all.
+        return Err("other_account");
+    }
+    Ok(match (ours.holds_key, theirs.holds_key) {
+        (true, false) => Role::Sponsor,
+        (false, true) => Role::Joiner,
+        // Both hold it: see the section header. The device that displayed the code
+        // answers — the human who scanned is the one asking.
+        _ => {
+            if we_displayed {
+                Role::Sponsor
+            } else {
+                Role::Joiner
+            }
+        }
+    })
+}
+
+/// The other device's refusal, in this API's vocabulary. `pairing.accept` answers
+/// synchronously, so a refusal that arrives during it is an error and not an event.
+fn refusal(reason: Option<&str>) -> RpcErr {
+    match reason {
+        // Nobody in this pair can vouch — the same wall `pairing.confirm` and
+        // `devices.revoke` hit, said the same way.
+        Some("no_account") => RpcErr::app("NO_ACCOUNT_KEY"),
+        // One of the two is already attested under another account key.
+        Some("other_account") => RpcErr::app("ACCOUNT_KEY_SET"),
+        _ => RpcErr::app("PAIRING_STATE"),
+    }
+}
+
+/// Is a LAN pairing window open, and still looking for its dialer? What the data
+/// plane asks before reading a frame from a device it cannot place
+/// (`dataplane::serve`): the one moment a stranger's stream is worth a look, and a
+/// moment a human opened deliberately. It closes again the instant a dialer is
+/// taken, so a window serves exactly one.
+pub(crate) fn lan_window_open(state: &AppState) -> bool {
+    state
+        .pairing
+        .lock()
+        .expect("lock pairing")
+        .as_ref()
+        .is_some_and(|p| matches!(p.wire, Wire::Lan) && p.channel.key.is_none())
+}
+
+/// `pairing.offer` with no server: a code another device can dial.
+async fn offer_lan(state: &Arc<AppState>) -> Result<Value, RpcErr> {
+    let epoch = EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
+    let channel = Channel::displaying();
+    // Minted here: with no server there is no session id to be handed one, and
+    // none is needed — the two sides never name the pairing to each other (the
+    // channel is bound to the `node_id` instead). It is a handle for this device's
+    // own interface, and that is all.
+    let pairing_id = format!("p_{}", crate::state::random_hex(8));
+    let code = LanPayload {
+        psk: channel.psk,
+        epk: channel.ours,
+        node_id: state.identity.node_id(),
+    }
+    .encode();
+    // What this device is ABLE to be. Which end it ends up on is settled when the
+    // other one dials (`lan_roles`) — with no server there is nobody to settle it
+    // in advance, and a device that turns out to hold the key too changes the
+    // answer.
+    let role = if holds_key(state) {
+        Role::Sponsor
+    } else {
+        Role::Joiner
+    };
+    // The one moment a device has to be reachable by a device it does not know:
+    // the daemon's transport binds nothing until it has someone to talk to.
+    if tokio::time::timeout(LAN_LISTEN_BUDGET, state.transport.listen())
+        .await
+        .is_err()
+    {
+        tracing::warn!("the data plane is slow to come up: this code may not be dialable yet");
+    }
+    install(
+        state,
+        Pairing {
+            epoch,
+            pairing_id: pairing_id.clone(),
+            role,
+            channel,
+            wire: Wire::Lan,
+            expiry: None,
+            // Created when a dialer arrives: until then there is nothing to
+            // confirm, and `pairing.confirm` says so.
+            confirm: None,
+        },
+        LAN_TTL.as_secs(),
+    );
+    Ok(json!({
+        "pairing_id": pairing_id,
+        "code": code,
+        "role": role.as_str(),
+        "expires_in": LAN_TTL.as_secs(),
+    }))
+}
+
+/// `pairing.accept` of a `UL2` code: dial the device that displayed it, prove we
+/// read its screen, and settle who is joining. Returns as soon as that much is
+/// done — what follows waits on a human, and waits in a task of its own.
+async fn accept_lan(state: &Arc<AppState>, payload: LanPayload) -> Result<Value, RpcErr> {
+    // A device that answers to a server used to refuse this (`PAIRING_VIA_SERVER`):
+    // handing the account key over would have put the other device in an account
+    // half of which the server had never heard. The continuum made the two halves
+    // one — records that sign themselves travel by dirsync whichever half minted
+    // them — so this device may scan a `UL2` code and sponsor over the local
+    // network. What the joiner joins is the ACCOUNT, not the deployment: it is not
+    // enrolled on the server, which simply never lists it. Enrolling it there too
+    // is what the `UL1` code this device would itself display is for.
+    //
+    // Our own code, read on the machine that is displaying it.
+    if payload.node_id == state.identity.node_id() {
+        return Err(RpcErr::invalid_params("code"));
+    }
+    // A code shown by a device the account has struck off. A tombstone is
+    // permanent — the `node_id` it names never returns, and a device that reset
+    // itself would show a fresh one — so there is no pairing here to attempt:
+    // this device would refuse everything the other declared at the absorb
+    // anyway, after the humans had confirmed a number for nothing. Said as what
+    // it is (the account's own decision) rather than left to end as a pairing
+    // failure. The mirror case needs no check of ours: a struck-off DIALER is
+    // answered its tombstone by the displayer's data plane before the offer is
+    // even read (`dataplane::serve`).
+    if crate::dataplane::struck_off(state, &payload.node_id).is_some() {
+        return Err(RpcErr::app("DEVICE_REVOKED"));
+    }
+    let epoch = EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
+    let mut channel = Channel::scanning(payload.psk);
+    // Derived before anything is dialled: the code carries everything needed, and
+    // a code whose public key is unusable must cost the other device nothing.
+    let Some(key) = channel.establish_lan(&payload.epk, &payload.node_id) else {
+        return Err(RpcErr::invalid_params("code"));
+    };
+    let number = verification(&key);
+    // Read before the stream exists and before any lock is taken: the keyring can
+    // block, and nothing here may wait on it while holding state.
+    let ours = standing(state, &key);
+
+    let peer = PeerAddr {
+        node_id: payload.node_id.clone(),
+        relay_url: None,
+    };
+    let offline = |what: &'static str| {
+        move |e: std::io::Error| {
+            tracing::debug!(error = %e, "{what}");
+            RpcErr::app("DEVICE_OFFLINE")
+        }
+    };
+    // No relay, deliberately: a code carries the secret a screen and a camera
+    // share, and the window it opens should be as narrow as the room. Which makes
+    // the local network the route, and mDNS the way this device is found.
+    let mut stream = within(
+        LAN_CONNECT_TIMEOUT,
+        state.transport.open(&peer),
+        "dialling the device",
+    )
+    .await
+    .map_err(offline("the device whose code was read did not answer"))?;
+
+    let mut hello = json!({
+        "type": LAN_OFFER,
+        "epk": b64(channel.ours.as_bytes()),
+        "proof": dialer_proof(&payload.psk, &payload.epk, &channel.ours, &payload.node_id),
+        "record": ours.record.clone(),
+        "holds_key": ours.holds_key,
+    });
+    if let Some(mark) = &ours.account {
+        hello["account"] = json!(mark);
+    }
+    within(
+        LAN_FRAME_TIMEOUT,
+        dataplane::write_control(&mut stream, &hello),
+        "our offer",
+    )
+    .await
+    .map_err(offline("our pairing offer did not reach the device"))?;
+
+    let answer = within(
+        LAN_FRAME_TIMEOUT,
+        dataplane::read_control(&mut stream),
+        "their answer",
+    )
+    .await
+    .map_err(offline("the device did not answer our pairing offer"))?;
+    match answer.get("type").and_then(Value::as_str) {
+        Some(LAN_HELLO) => {}
+        // It has a window open and we are not what it is waiting for.
+        Some(LAN_REFUSED) => {
+            return Err(refusal(answer.get("reason").and_then(Value::as_str)));
+        }
+        _ => return Err(RpcErr::app("PAIRING_STATE")),
+    }
+    let Some(theirs) = standing_of(&answer, &payload.node_id) else {
+        lan_refuse(&mut stream, "record").await;
+        return Err(RpcErr::app("PAIRING_STATE"));
+    };
+    let role = match lan_roles(&ours, &theirs, false) {
+        Ok(role) => role,
+        Err(reason) => {
+            // Both ends work it out for themselves, so the other one is refusing
+            // too — telling it is what keeps its human from watching a screen
+            // that has already given up.
+            lan_refuse(&mut stream, reason).await;
+            return Err(refusal(Some(reason)));
+        }
+    };
+
+    let pairing_id = format!("p_{}", crate::state::random_hex(8));
+    let (confirm_tx, confirm_rx) = oneshot::channel();
+    let sponsoring = role == Role::Sponsor;
+    install(
+        state,
+        Pairing {
+            epoch,
+            pairing_id: pairing_id.clone(),
+            role,
+            channel,
+            wire: Wire::Lan,
+            expiry: None,
+            confirm: sponsoring.then_some(confirm_tx),
+        },
+        LAN_TTL.as_secs(),
+    );
+    let device = declared(&theirs.record);
+    tokio::spawn(lan_tail(
+        state.clone(),
+        stream,
+        LanTail {
+            pairing_id: pairing_id.clone(),
+            role,
+            key,
+            theirs: theirs.record,
+            confirm: sponsoring.then_some(confirm_rx),
+        },
+    ));
+    let mut result = json!({
+        "pairing_id": pairing_id,
+        "role": role.as_str(),
+        "verification": number,
+    });
+    if sponsoring {
+        // What the human has to be shown before confirming — and only then: a
+        // joiner has nothing to decide.
+        result["device"] = device;
+    }
+    Ok(result)
+}
+
+/// What the dialled side settled, under the pairing lock and in one go.
+enum Armed {
+    /// The window took this dialer.
+    Taken {
+        pairing_id: String,
+        role: Role,
+        key: [u8; 32],
+        /// Our own half of the conversation, ready to send.
+        hello: Value,
+        confirm: Option<oneshot::Receiver<()>>,
+    },
+    /// No window this dialer can be the answer to. `ours` names our pairing when
+    /// it ends with this refusal — a stranger that cannot prove it saw the screen
+    /// must NOT be able to end a pairing, while a channel we cannot key does.
+    Refused {
+        reason: &'static str,
+        ours: Option<String>,
+    },
+}
+
+/// The dialled half, reached from the data plane's frame dispatch: a device asking
+/// to be introduced. The one frame served to a device outside the directory
+/// (`dataplane::serve_incoming`), and only while a window is open here.
+pub(crate) async fn recv_lan_pair(
+    state: Arc<AppState>,
+    peer: String,
+    first: Value,
+    mut stream: Box<dyn IoStream>,
+) {
+    // Unreadable: not one of our codes at all, and not a conversation. Nothing is
+    // answered — an answer would only tell whoever is probing that something here
+    // is listening.
+    let Some((their_epk, proof)) = channel_material(&first) else {
+        tracing::warn!(peer = %peer, "unreadable pairing offer on the local network: ignored");
+        return;
+    };
+    let Some(theirs) = standing_of(&first, &peer) else {
+        tracing::warn!(peer = %peer, "a pairing offer whose description is not that device's own: refused");
+        lan_refuse(&mut stream, "record").await;
+        return;
+    };
+    // Both read before the pairing lock (which is a leaf: the keyring can block,
+    // and `lan_declaration` takes the session).
+    let ours_holds_key = holds_key(&state);
+    let ours_ak_pub = account_pub(&state);
+    let ours_record = lan_declaration(&state);
+    let own_node_id = state.identity.node_id();
+
+    let armed = {
+        let mut slot = state.pairing.lock().expect("lock pairing");
+        arm(
+            slot.as_mut(),
+            &their_epk,
+            &proof,
+            &own_node_id,
+            &theirs,
+            Standing {
+                holds_key: ours_holds_key,
+                // Filled in below: the mark needs the channel key, which does not
+                // exist until the proof has been checked.
+                account: None,
+                record: ours_record,
+            },
+            ours_ak_pub,
+        )
+    };
+
+    let (pairing_id, role, key, hello, confirm) = match armed {
+        Armed::Taken {
+            pairing_id,
+            role,
+            key,
+            hello,
+            confirm,
+        } => (pairing_id, role, key, hello, confirm),
+        Armed::Refused { reason, ours } => {
+            tracing::debug!(peer = %peer, reason, "a pairing offer on the local network was refused");
+            lan_refuse(&mut stream, reason).await;
+            if let Some(pairing_id) = ours {
+                settle(
+                    &state,
+                    &pairing_id,
+                    "pairing.failed",
+                    json!({ "reason": reason }),
+                );
+            }
+            return;
+        }
+    };
+
+    if let Err(e) = within(
+        LAN_FRAME_TIMEOUT,
+        dataplane::write_control(&mut stream, &hello),
+        "our answer",
+    )
+    .await
+    {
+        tracing::debug!(peer = %peer, error = %e, "answering a pairing offer failed");
+        settle(
+            &state,
+            &pairing_id,
+            "pairing.failed",
+            json!({ "reason": "abandoned" }),
+        );
+        return;
+    }
+    // Both ends are told the number here and only here: this is the first moment
+    // either of them has a channel to derive it from, and the moment a human is
+    // asked to compare.
+    let mut announced = json!({ "pairing_id": pairing_id, "verification": verification(&key) });
+    if role == Role::Sponsor {
+        announced["device"] = declared(&theirs.record);
+    }
+    notify(&state, "pairing.claimed", announced);
+    lan_tail(
+        state.clone(),
+        stream,
+        LanTail {
+            pairing_id,
+            role,
+            key,
+            theirs: theirs.record,
+            confirm,
+        },
+    )
+    .await;
+}
+
+/// Settles the dialled side's half of the pairing: the window has to be open and
+/// unclaimed, the dialer has to prove it saw the screen, and only then is the
+/// ephemeral secret spent. Pure and under the lock — no await, no second lock.
+fn arm(
+    slot: Option<&mut Pairing>,
+    their_epk: &PublicKey,
+    proof: &str,
+    own_node_id: &str,
+    theirs: &Standing,
+    mut ours: Standing,
+    ours_ak_pub: Option<String>,
+) -> Armed {
+    // No window, or a window that belongs to a server pairing, or one that has
+    // already taken its dialer. None of them is OUR pairing failing: the dialer is
+    // simply not what is being waited for here.
+    //
+    // Both clauses are belt on braces, and worth having: the data plane already
+    // refuses a device it cannot place unless a LAN window is open AND unclaimed
+    // (`lan_window_open`), and a device it CAN place — a sibling — would be turned
+    // away by the proof. What is left for them to catch is a device that is both in
+    // the directory and read the code off the screen: without this, its second dial
+    // would find the ephemeral secret spent and end the pairing under way.
+    let busy = || Armed::Refused {
+        reason: "busy",
+        ours: None,
+    };
+    let Some(p) = slot else { return busy() };
+    if !matches!(p.wire, Wire::Lan) || p.channel.key.is_some() {
+        return busy();
+    }
+    // BEFORE the ephemeral secret is spent — see `dialer_proof`.
+    let expected = dialer_proof(&p.channel.psk, &p.channel.ours, their_epk, own_node_id);
+    if !same_secret(&expected, proof) {
+        return Armed::Refused {
+            reason: "proof",
+            ours: None,
+        };
+    }
+    let Some(key) = p.channel.establish_lan(their_epk, own_node_id) else {
+        // A public key that is unusable, or an exchange somebody could have
+        // dictated. The code is spent either way, so this one IS our pairing
+        // failing.
+        return Armed::Refused {
+            reason: "channel",
+            ours: Some(p.pairing_id.clone()),
+        };
+    };
+    ours.account = ours_ak_pub.map(|ak_pub| account_mark(&key, &ak_pub));
+    let role = match lan_roles(&ours, theirs, true) {
+        Ok(role) => role,
+        Err(reason) => {
+            return Armed::Refused {
+                reason,
+                ours: Some(p.pairing_id.clone()),
+            };
+        }
+    };
+    // The role this device is really on, which the offer could only guess at.
+    p.role = role;
+    let mut hello = json!({
+        "type": LAN_HELLO,
+        "record": ours.record,
+        "holds_key": ours.holds_key,
+    });
+    if let Some(mark) = &ours.account {
+        hello["account"] = json!(mark);
+    }
+    let confirm = (role == Role::Sponsor).then(|| {
+        let (tx, rx) = oneshot::channel();
+        p.confirm = Some(tx);
+        rx
+    });
+    Armed::Taken {
+        pairing_id: p.pairing_id.clone(),
+        role,
+        key,
+        hello,
+        confirm,
+    }
+}
+
+/// The dialer's channel material, out of its offer.
+fn channel_material(frame: &Value) -> Option<(PublicKey, String)> {
+    let epk: [u8; 32] = unb64(frame.get("epk")?.as_str()?)?.try_into().ok()?;
+    let proof = frame.get("proof")?.as_str()?.to_string();
+    Some((PublicKey::from(epk), proof))
+}
+
+/// Everything the rest of a LAN pairing needs. It owns the stream, because between
+/// the roles being settled and the account crossing there is a human.
+struct LanTail {
+    pairing_id: String,
+    role: Role,
+    key: [u8; 32],
+    /// What the other device declared about itself: the record a sponsor attests
+    /// and takes in once it has vouched for it.
+    theirs: Value,
+    /// The human's yes, for a sponsor. `None` for a joiner — it has nothing to
+    /// confirm.
+    confirm: Option<oneshot::Receiver<()>>,
+}
+
+async fn lan_tail(state: Arc<AppState>, mut stream: Box<dyn IoStream>, mut tail: LanTail) {
+    let confirm = tail.confirm.take();
+    match tail.role {
+        Role::Sponsor => lan_sponsor(&state, &mut stream, &tail, confirm).await,
+        Role::Joiner => lan_joiner(&state, &mut stream, &tail).await,
+    }
+    let _ = stream.shutdown().await;
+    let _ = tokio::time::timeout(LAN_LINGER, dataplane::drain(&mut stream)).await;
+}
+
+/// The giving side: wait for the human, hand over the account, take the device in.
+async fn lan_sponsor(
+    state: &Arc<AppState>,
+    stream: &mut Box<dyn IoStream>,
+    tail: &LanTail,
+    confirm: Option<oneshot::Receiver<()>>,
+) {
+    let Some(confirm) = confirm else {
+        tracing::error!("a sponsor with no confirmation to wait for: pairing abandoned");
+        return;
+    };
+    // No budget of our own: the pairing's expiry is what bounds this wait, and it
+    // bounds it by DROPPING the other end of this channel — which is also what a
+    // cancellation and a replacement do. So every way this can end without a yes
+    // arrives here as the same error, and the other device is told to stop waiting
+    // instead of being left to time out.
+    if confirm.await.is_err() {
+        lan_refuse(stream, "declined").await;
+        return;
+    }
+    let failed = |reason: &str| {
+        settle(
+            state,
+            &tail.pairing_id,
+            "pairing.failed",
+            json!({ "reason": reason }),
+        )
+    };
+    // Read at this instant and let go of again: a pairing waiting on a human holds
+    // no key material beyond the channel's.
+    let Some(bundle) = seal_account(state, &tail.key) else {
+        lan_refuse(stream, "no_account").await;
+        failed("no_account");
+        return;
+    };
+    // The account sealed under the channel the screen keyed, and in the same frame
+    // everything this device knows about the account: a device that learned only
+    // the key would be in the account and know nobody in it — including us, which
+    // would leave it with nobody to ask.
+    let mut grant = roster_frame(state, LAN_GRANT);
+    grant["bundle"] = json!(bundle);
+    if let Err(e) = within(
+        LAN_FRAME_TIMEOUT,
+        dataplane::write_control(stream, &grant),
+        "the grant",
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "handing the account over failed");
+        failed("abandoned");
+        return;
+    }
+    // Only now, the write having gone through: the device really does have the key,
+    // so it really is one of ours. Its own description, attested under our account
+    // key, enters the directory — through `absorb`, like every record that comes
+    // from another device, because that is where the rules live.
+    adopt_peer(state, &tail.theirs);
+    settle(state, &tail.pairing_id, "pairing.completed", json!({}));
+    // What it knows and we do not: a device coming back to an account it was
+    // already in brings its own directory with it. Best effort — the pairing is
+    // done either way, and the sync task would catch up on its own now that the two
+    // of us know each other.
+    match read_roster(stream, LAN_ROSTER).await {
+        Ok(roster) => crate::dirsync::absorb(state, &roster),
+        Err(e) => tracing::debug!(error = %e, "the joining device sent no roster back"),
+    }
+}
+
+/// The receiving side: wait for the grant, install the account, tell the sponsor
+/// what we know.
+async fn lan_joiner(state: &Arc<AppState>, stream: &mut Box<dyn IoStream>, tail: &LanTail) {
+    let failed = |reason: &str| {
+        settle(
+            state,
+            &tail.pairing_id,
+            "pairing.failed",
+            json!({ "reason": reason }),
+        )
+    };
+    // A human is deciding on the other machine. What bounds this is the pairing's
+    // own deadline, counted here as it is on the other side.
+    let frame = match within(LAN_TTL, dataplane::read_control(stream), "the grant").await {
+        Ok(frame) => frame,
+        Err(e) => {
+            tracing::debug!(error = %e, "no answer from the sponsoring device");
+            failed("abandoned");
+            return;
+        }
+    };
+    match frame.get("type").and_then(Value::as_str) {
+        Some(LAN_GRANT) => {}
+        Some(LAN_REFUSED) => {
+            failed(
+                frame
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("declined"),
+            );
+            return;
+        }
+        _ => {
+            failed("state");
+            return;
+        }
+    }
+    let opened = frame
+        .get("bundle")
+        .and_then(Value::as_str)
+        .and_then(|sealed| open_bundle(&tail.key, sealed));
+    // The account's identity, when the sponsor had one to name, is a label a
+    // session carries — and there is no session here. Ignored rather than stored:
+    // this device answers to no server, and a name for an account it cannot reach
+    // would be the one thing on screen that nothing ever corrects.
+    let Some((ak, _account)) = opened else {
+        failed("bundle");
+        return;
+    };
+    // The step that can refuse: a key other than the one this device is already
+    // attested under is another account's, whatever the human confirmed over
+    // there. (The same key is not a refusal — it is the way back in for a device
+    // that has the account without its key.)
+    let root = match crate::account_key::install(state, &ak) {
+        Ok(root) => root,
+        Err(crate::account_key::InstallError::OtherKey) => {
+            failed("other_account");
+            return;
+        }
+        Err(crate::account_key::InstallError::SaveFailed) => {
+            failed("install");
+            return;
+        }
+    };
+    // In the account: this device can now sign its own description AND attest it.
+    join_locally(state, &root);
+    // Whom the account knows, as the sponsor knows it — every record checked
+    // against the key we have just installed, never taken on the sponsor's word.
+    if let Some(roster) = Roster::parse(&frame) {
+        crate::dirsync::absorb(state, &roster);
+    }
+    // And whom we know. Sent after the install, because before it this device had
+    // nothing it could prove to anybody.
+    if let Err(e) = within(
+        LAN_FRAME_TIMEOUT,
+        dataplane::write_control(stream, &roster_frame(state, LAN_ROSTER)),
+        "our roster",
+    )
+    .await
+    {
+        tracing::debug!(error = %e, "our roster did not reach the sponsoring device");
+    }
+    settle(state, &tail.pairing_id, "pairing.completed", json!({}));
+}
+
+/// Takes the other device's own description into the directory, attested under our
+/// account key — the sponsor's half of the introduction, and what makes the two of
+/// them able to talk afterwards.
+///
+/// Through `absorb`, like every record that comes from another device: the
+/// description is signed by the device it describes (checked on arrival against
+/// the `node_id` the transport authenticated) and the attestation is the one minted
+/// here. So nothing is being believed — this is the account admitting a device,
+/// which is exactly what a human just confirmed.
+fn adopt_peer(state: &Arc<AppState>, record: &Value) {
+    let Some(ak) = account_key(state) else { return };
+    let Some(node_id) = record.get("node_id").and_then(Value::as_str) else {
+        return;
+    };
+    let mut record = record.clone();
+    record["attestation"] = json!(crate::account_key::attest(&ak, node_id));
+    crate::dirsync::absorb(
+        state,
+        &Roster {
+            records: vec![record],
+            ..Default::default()
+        },
+    );
+}
+
+/// Enters the account locally, the key installed: this device's own record — which
+/// it can now both sign and attest — on disk, and announced if it is new.
+///
+/// `save_unrefreshed` rather than `save`: nothing here was checked against a
+/// server, and the store's stamp is a bound against one (`directory`). With no
+/// server the stamp means nothing either way; what matters is that this path does
+/// not become a way to move it.
+fn join_locally(state: &Arc<AppState>, root: &crate::account_key::AccountRoot) {
+    // Transport snapshot before the session lock (lock ordering).
+    let lan: std::collections::BTreeSet<String> = state.transport.lan_peers().into_iter().collect();
+    let mut s = state.session.lock().expect("lock session");
+    let own_record = |s: &crate::state::SessionState| {
+        s.own_device_id
+            .as_deref()
+            .and_then(|id| s.devices.as_ref().and_then(|devices| devices.get(id)))
+            .cloned()
+    };
+    let had = own_record(&s).is_some();
+    s.adopt_own(crate::state::OwnDevice {
+        identity: &state.identity,
+        name: &state.device_name,
+        attestation: &root.attestation,
+    });
+    if let Some(devices) = s.devices.as_ref() {
+        crate::directory::save_unrefreshed(&state.config_dir, devices);
+    }
+    // A device that already held a record of its own has just got its account key
+    // back, which changes nothing anyone is watching the directory for.
+    if had {
+        return;
+    }
+    let own = s.own_device_id.clone();
+    let Some(record) = own_record(&s) else { return };
+    let device = crate::state::enrich_device(&record, own.as_deref(), s.server_connected, &lan);
+    // Under the session lock (order: session then registry), like every directory
+    // broadcast: a Core that was answering "I know nobody at all" now answers with
+    // itself, and that is worth one event.
+    state.registry.lock().expect("lock registry").notify_topic(
+        "devices",
+        "device.added",
+        &json!({ "device": device }),
+    );
+}
+
+/// This device's roster as a frame of `kind`. Empty when it has no trust root —
+/// which for a sponsor cannot happen, and for a joiner means it has not installed
+/// the key yet.
+fn roster_frame(state: &AppState, kind: &str) -> Value {
+    let roster = crate::dirsync::our_roster(state).unwrap_or_default();
+    let mut frame = roster.payload();
+    frame["type"] = json!(kind);
+    frame
+}
+
+/// Reads a roster frame, refusing anything that is not one of `kind`.
+async fn read_roster(stream: &mut Box<dyn IoStream>, kind: &str) -> std::io::Result<Roster> {
+    let frame = within(LAN_FRAME_TIMEOUT, dataplane::read_control(stream), kind).await?;
+    if frame.get("type").and_then(Value::as_str) != Some(kind) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("expected a {kind}"),
+        ));
+    }
+    Roster::parse(&frame)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "unreadable roster"))
+}
+
+/// Tells the other device why, best effort. A stream that closes without a word is
+/// a human watching a screen, waiting for something to happen.
+async fn lan_refuse(stream: &mut Box<dyn IoStream>, reason: &str) {
+    let frame = json!({ "type": LAN_REFUSED, "reason": reason });
+    if let Err(e) = within(
+        LAN_FRAME_TIMEOUT,
+        dataplane::write_control(stream, &frame),
+        "the refusal",
+    )
+    .await
+    {
+        tracing::debug!(error = %e, "the refusal did not reach the other device");
+    }
+    let _ = stream.shutdown().await;
+}
+
+/// Bounds a frame exchange: past `dur` the other device is not answering, and a
+/// task that holds a stream must never wait on one forever.
+async fn within<T>(
+    dur: Duration,
+    fut: impl Future<Output = std::io::Result<T>>,
+    what: &str,
+) -> std::io::Result<T> {
+    match tokio::time::timeout(dur, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("timed out: {what}"),
+        )),
     }
 }
 
@@ -1401,5 +2601,343 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(open(&key, &a).as_deref(), Some(&b"same"[..]));
         assert_eq!(open(&key, &b).as_deref(), Some(&b"same"[..]));
+    }
+
+    // -- Pairing on the local network ---------------------------------------
+
+    /// A plausible `node_id`: 64 hex characters, which is what the code carries
+    /// and what the transport authenticates.
+    fn a_node_id() -> String {
+        crate::identity::DeviceIdentity::from_test_seed(7).node_id()
+    }
+
+    fn a_lan_code() -> (Channel, LanPayload) {
+        let channel = Channel::displaying();
+        let payload = LanPayload {
+            psk: channel.psk,
+            epk: channel.ours,
+            node_id: a_node_id(),
+        };
+        (channel, payload)
+    }
+
+    #[test]
+    fn a_lan_code_round_trips() {
+        let (_, payload) = a_lan_code();
+        let text = payload.encode();
+        let parsed = LanPayload::parse(&text).expect("our own code parses");
+        assert_eq!(parsed.psk, payload.psk);
+        assert_eq!(parsed.epk.as_bytes(), payload.epk.as_bytes());
+        assert_eq!(parsed.node_id, payload.node_id);
+        // A pasted code brings its whitespace along.
+        assert!(LanPayload::parse(&format!("  {text}\n")).is_some());
+    }
+
+    /// The two schemes are told apart by their tag and nothing else, so each has
+    /// to refuse the other's code WHOLE rather than half-read it.
+    #[test]
+    fn the_two_code_schemes_do_not_read_each_other() {
+        let (channel, payload) = a_lan_code();
+        let server_code = Payload {
+            pairing_id: "p_0011223344556677".to_string(),
+            psk: channel.psk,
+            epk: channel.ours,
+        }
+        .encode();
+
+        assert!(LanPayload::parse(&server_code).is_none(), "{server_code}");
+        assert!(Payload::parse(&payload.encode()).is_none());
+    }
+
+    #[test]
+    fn what_is_not_a_lan_code_is_refused() {
+        let (_, payload) = a_lan_code();
+        let sound = payload.encode();
+        let fields: Vec<&str> = sound.split(':').collect();
+        for wrong in [
+            "".to_string(),
+            "hello".to_string(),
+            sound.replacen(LAN_PAYLOAD_TAG, "UL3", 1),
+            sound.replacen(LAN_PAYLOAD_TAG, "ul2", 1),
+            // A field short, and an empty device to dial.
+            format!("{}:{}:{}", fields[0], fields[1], fields[2]),
+            format!("{}:{}:{}:", fields[0], fields[1], fields[2]),
+            // Unreadable or wrongly sized halves.
+            format!("{}:not-base64!:{}:{}", fields[0], fields[2], fields[3]),
+            format!(
+                "{}:{}:{}:{}",
+                fields[0],
+                b64(&[7u8; 15]),
+                fields[2],
+                fields[3]
+            ),
+            format!(
+                "{}:{}:{}:{}",
+                fields[0],
+                fields[1],
+                b64(&[7u8; 31]),
+                fields[3]
+            ),
+            // A device to dial that cannot be one: too short, too long, not hex.
+            format!(
+                "{}:{}:{}:{}",
+                fields[0],
+                fields[1],
+                fields[2],
+                "ab".repeat(31)
+            ),
+            format!(
+                "{}:{}:{}:{}",
+                fields[0],
+                fields[1],
+                fields[2],
+                "ab".repeat(33)
+            ),
+            format!(
+                "{}:{}:{}:{}",
+                fields[0],
+                fields[1],
+                fields[2],
+                "z".repeat(64)
+            ),
+        ] {
+            assert!(
+                LanPayload::parse(&wrong).is_none(),
+                "accepted as a LAN pairing code: {wrong:?}"
+            );
+        }
+        assert!(LanPayload::parse(&sound).is_some(), "the sound one parses");
+    }
+
+    /// Both ends of a LAN pairing derive the same key, and it is NOT the key the
+    /// same material would derive through a server: the two schemes carry their own
+    /// domain, so a channel of one can never be a channel of the other.
+    #[test]
+    fn a_lan_channel_is_shared_and_its_own() {
+        let offerer = Channel::displaying();
+        let mut dialer = Channel::scanning(offerer.psk);
+        let mut displayer = Channel { ..offerer };
+        let theirs = dialer.ours;
+        let ours = displayer.ours;
+        let node_id = a_node_id();
+
+        let a = displayer
+            .establish_lan(&theirs, &node_id)
+            .expect("the displaying side's key");
+        let b = dialer
+            .establish_lan(&ours, &node_id)
+            .expect("the dialling side's key");
+        assert_eq!(a, b, "the two ends must agree, or nothing opens");
+
+        // The same exchange under the server scheme, with the node_id where the
+        // session id goes: a different key.
+        let mut again = Channel::scanning(offerer.psk);
+        let through_a_server = again.establish(&ours, &node_id).expect("key");
+        assert_ne!(b, through_a_server);
+        // And bound to the device it names.
+        let mut elsewhere = Channel::scanning(offerer.psk);
+        assert_ne!(
+            b,
+            elsewhere
+                .establish_lan(&ours, &"ab".repeat(32))
+                .expect("key")
+        );
+    }
+
+    /// The proof is what a device that read the code can produce and nothing else
+    /// can. Keyed by the optical secret ALONE, deliberately: the displaying side
+    /// checks it before spending its ephemeral secret (see `dialer_proof`).
+    #[test]
+    fn only_a_device_that_saw_the_screen_can_prove_it() {
+        let offerer = Channel::displaying();
+        let dialer = Channel::scanning(offerer.psk);
+        let node_id = a_node_id();
+        let proof = dialer_proof(&offerer.psk, &offerer.ours, &dialer.ours, &node_id);
+        // Both ends compute it from what they each hold.
+        assert_eq!(
+            proof,
+            dialer_proof(&offerer.psk, &offerer.ours, &dialer.ours, &node_id)
+        );
+        // Someone who watched the whole conversation holds both public keys and the
+        // node_id. Without the secret that travelled by the screen, that is not a
+        // proof.
+        assert_ne!(
+            proof,
+            dialer_proof(&[0u8; PSK_LEN], &offerer.ours, &dialer.ours, &node_id)
+        );
+        // And it is bound to this exchange: another window (another epk), or
+        // another device, is another proof — so it cannot be replayed.
+        let other = Channel::scanning(offerer.psk);
+        assert_ne!(
+            proof,
+            dialer_proof(&offerer.psk, &offerer.ours, &other.ours, &node_id)
+        );
+        assert_ne!(
+            proof,
+            dialer_proof(&offerer.psk, &other.ours, &dialer.ours, &node_id)
+        );
+        assert_ne!(
+            proof,
+            dialer_proof(&offerer.psk, &offerer.ours, &dialer.ours, &"ab".repeat(32))
+        );
+    }
+
+    /// Two devices find out whether they are in the same account without telling
+    /// the local network which account that is.
+    #[test]
+    fn an_account_mark_compares_without_naming() {
+        let key = [3u8; 32];
+        let ak_pub = "ab".repeat(32);
+        let other = "cd".repeat(32);
+
+        assert_eq!(account_mark(&key, &ak_pub), account_mark(&key, &ak_pub));
+        assert_ne!(account_mark(&key, &ak_pub), account_mark(&key, &other));
+        // Another channel, another mark: a device that did not take part cannot
+        // recognize an account by the mark it saw somewhere else.
+        assert_ne!(
+            account_mark(&key, &ak_pub),
+            account_mark(&[4u8; 32], &ak_pub)
+        );
+        assert!(
+            !account_mark(&key, &ak_pub).contains(&ak_pub),
+            "the mark must not carry the key it is about"
+        );
+    }
+
+    #[test]
+    fn a_derived_secret_is_compared_whole() {
+        assert!(same_secret("abcd", "abcd"));
+        assert!(!same_secret("abcd", "abce"));
+        assert!(!same_secret("abcd", "zbcd"));
+        assert!(!same_secret("abcd", "abcde"), "a prefix is not a match");
+        assert!(!same_secret("", "a"));
+        assert!(same_secret("", ""));
+    }
+
+    fn standing(holds_key: bool, account: Option<&str>) -> Standing {
+        Standing {
+            holds_key,
+            account: account.map(str::to_string),
+            record: json!({}),
+        }
+    }
+
+    /// Who ends up sponsoring, in every case there is. Both sides run this over the
+    /// same two standings, so the answers have to be mirror images — a table that
+    /// disagreed with itself would leave two joiners waiting for each other.
+    #[test]
+    fn the_two_ends_settle_on_mirror_roles() {
+        let ours = "same-account";
+        let theirs = "another-account";
+        let cases = [
+            // (we hold, our account, they hold, their account, what we are)
+            (true, Some(ours), false, None, Ok(Role::Sponsor)),
+            (false, None, true, Some(ours), Ok(Role::Joiner)),
+            // A device that has the account WITHOUT its key is the one that needs
+            // a sponsor, not one.
+            (true, Some(ours), false, Some(ours), Ok(Role::Sponsor)),
+            (false, Some(ours), true, Some(ours), Ok(Role::Joiner)),
+            // Nobody can vouch.
+            (false, None, false, None, Err("no_account")),
+            (false, Some(ours), false, Some(ours), Err("no_account")),
+            // Two accounts do not become one.
+            (true, Some(ours), true, Some(theirs), Err("other_account")),
+            (true, Some(ours), false, Some(theirs), Err("other_account")),
+            (false, Some(theirs), true, Some(ours), Err("other_account")),
+        ];
+        for (we_hold, our_account, they_hold, their_account, expected) in cases {
+            let us = standing(we_hold, our_account);
+            let them = standing(they_hold, their_account);
+            let described =
+                format!("{we_hold}/{our_account:?} against {they_hold}/{their_account:?}");
+            for we_displayed in [true, false] {
+                assert_eq!(
+                    lan_roles(&us, &them, we_displayed),
+                    expected,
+                    "{described} (displayed: {we_displayed})"
+                );
+            }
+            // The mirror: what the OTHER side works out has to be the other end of
+            // the same pairing.
+            let mirrored = lan_roles(&them, &us, false);
+            match expected {
+                Ok(Role::Sponsor) => assert_eq!(mirrored, Ok(Role::Joiner), "{described}"),
+                Ok(Role::Joiner) => assert_eq!(mirrored, Ok(Role::Sponsor), "{described}"),
+                Err(reason) => assert_eq!(mirrored, Err(reason), "{described}"),
+            }
+        }
+    }
+
+    /// Both holding the key is two devices of ONE account meeting: somebody has to
+    /// lead, and it is the device that displayed the code.
+    #[test]
+    fn when_both_hold_the_key_the_one_that_showed_the_code_answers() {
+        let both = || standing(true, Some("same-account"));
+        assert_eq!(lan_roles(&both(), &both(), true), Ok(Role::Sponsor));
+        assert_eq!(lan_roles(&both(), &both(), false), Ok(Role::Joiner));
+    }
+
+    /// A device does not get to describe another one: the declaration is checked
+    /// against the `node_id` the transport authenticated, and against the signature
+    /// of the key that `node_id` IS.
+    #[test]
+    fn a_declaration_stands_only_for_the_device_that_sent_it() {
+        let identity = crate::identity::DeviceIdentity::from_test_seed(7);
+        let node_id = identity.node_id();
+        let record = crate::directory::signed_record(&identity, "Office-PC", 5, "attestation");
+        let frame = |record: Value| json!({ "record": record, "holds_key": true });
+
+        let standing = standing_of(&frame(record.clone()), &node_id).expect("its own record");
+        assert!(standing.holds_key);
+        assert_eq!(standing.account, None, "absent until a channel exists");
+        assert_eq!(declared(&standing.record)["name"], json!("Office-PC"));
+        assert_eq!(declared(&standing.record)["node_id"], json!(node_id));
+
+        // Another device's record, whoever relayed it.
+        let elsewhere = crate::identity::DeviceIdentity::from_test_seed(9);
+        let borrowed = crate::directory::signed_record(&elsewhere, "Not-Mine", 5, "attestation");
+        assert!(standing_of(&frame(borrowed), &node_id).is_none());
+        // Its own node_id, and a description it never signed.
+        let mut rewritten = record.clone();
+        rewritten["name"] = json!("Renamed-In-Flight");
+        assert!(standing_of(&frame(rewritten), &node_id).is_none());
+        // A record a server minted: attested, unsigned — and unable to travel.
+        assert!(
+            standing_of(
+                &frame(
+                    json!({ "node_id": node_id, "name": "Named-By-A-Server", "platform": "linux" })
+                ),
+                &node_id,
+            )
+            .is_none()
+        );
+        assert!(standing_of(&frame(json!({})), &node_id).is_none());
+        assert!(standing_of(&json!({}), &node_id).is_none());
+        // A device that does not say it can vouch cannot.
+        assert!(
+            !standing_of(&json!({ "record": record }), &node_id)
+                .expect("a record is enough to be read")
+                .holds_key
+        );
+    }
+
+    /// The refusal a dialer is told, in the vocabulary its caller answers in.
+    #[test]
+    fn a_refusal_keeps_its_meaning_across_the_wire() {
+        assert_eq!(
+            refusal(Some("no_account")).app.as_deref(),
+            Some("NO_ACCOUNT_KEY")
+        );
+        assert_eq!(
+            refusal(Some("other_account")).app.as_deref(),
+            Some("ACCOUNT_KEY_SET")
+        );
+        for anything_else in [Some("proof"), Some("busy"), Some("record"), None] {
+            assert_eq!(
+                refusal(anything_else).app.as_deref(),
+                Some("PAIRING_STATE"),
+                "{anything_else:?}"
+            );
+        }
     }
 }

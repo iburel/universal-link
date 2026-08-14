@@ -332,13 +332,30 @@ impl Flow {
         refresh_token: Option<&str>,
     ) -> Result<String, String> {
         self.claim_and_stash(refresh_token)?;
+        // The target's crypto identity, read while its record is still here (the
+        // eviction the reply carries would erase it): what the tombstone names,
+        // if this device can mint one — same gesture as the browser-free path.
+        let target_node_id = {
+            let s = self.state.session.lock().expect("lock session");
+            s.devices
+                .as_ref()
+                .and_then(|devices| devices.get(device_id))
+                .and_then(|record| record.get("node_id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
         crate::session::proxy(
             &self.state,
             "devices.revoke",
             json!({ "device_id": device_id, "id_token": id_token }),
         )
         .await
-        .map(|_| "Revocation done. You can close this tab.".to_string())
+        .map(|_| {
+            if let Some(node_id) = &target_node_id {
+                crate::account_key::tombstone_after_server_revoke(&self.state, node_id);
+            }
+            "Revocation done. You can close this tab.".to_string()
+        })
         .map_err(|err| {
             format!(
                 "Revocation refused ({}).",
@@ -463,7 +480,10 @@ pub(crate) fn open_session(
         }
         s.logged_in = true;
         s.account = info.account.clone();
-        s.own_device_id = Some(info.device_id.clone());
+        // Not a plain assignment: this device may already have been in the
+        // account with no server, under a `device_id` it minted for itself. The
+        // server has just named it, so its own record follows (`rekey_own`).
+        s.rekey_own(info.device_id.clone());
         let payload = s.status_record();
         // Broadcast under the session lock (order: session then registry): the
         // order of notifications is the order of transitions.

@@ -95,6 +95,10 @@ pub type HomeRelay<'a> = Pin<Box<dyn Future<Output = Option<String>> + Send + 'a
 /// The transport's clean shutdown, once complete.
 pub type Closing<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
+/// The transport listening, once it is. Same shape as `Closing`: there is nothing
+/// to report, only a moment to wait for.
+pub type Listening<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
 /// The Core's data plane: open streams to peers, accept theirs, and know its
 /// own relay to publish. `Debug` is mandatory (like `Connector`/`SecretStore`):
 /// `Config` derives it, and an `Arc<dyn PeerTransport>` without it would not
@@ -135,6 +139,23 @@ pub trait PeerTransport: Send + Sync + std::fmt::Debug {
     /// watch.
     fn lan_changes(&self) -> tokio::sync::watch::Receiver<u64> {
         tokio::sync::watch::channel(0).1
+    }
+
+    /// Makes this device reachable NOW, binding the transport if it binds
+    /// lazily.
+    ///
+    /// Every other path here belongs to a Core that already knows a peer, and
+    /// the daemon's transport leans on that: it binds nothing until the first
+    /// `open`/`home_relay`, so a Core that never enrolled emits no traffic at
+    /// all — no relay probes, no portmapper. A LAN pairing window is the one
+    /// place that reasoning breaks: the device has to be dialable by a device it
+    /// does not know yet, and nothing else it does would bind the endpoint. So
+    /// the radio comes on when a human opens that window, and not before.
+    ///
+    /// Default: nothing to do — an endpoint already bound, or an in-memory
+    /// transport that was never anything else.
+    fn listen(&self) -> Listening<'_> {
+        Box::pin(std::future::ready(()))
     }
 
     /// Closes the transport cleanly — at process shutdown, not at the drop of
@@ -232,11 +253,33 @@ pub(crate) async fn serve(state: Arc<AppState>) {
                     // attestation under OUR account key, C7). An unknown — even
                     // with the right ALPN — gets nothing: no byte read, no file
                     // written.
-                    if !peer_in_directory(&state, &peer) {
-                        tracing::warn!(peer = %peer, "incoming stream from a peer outside the directory: refused");
-                        continue;
+                    let known = peer_in_directory(&state, &peer);
+                    if !known {
+                        // A device the ACCOUNT struck off is not a mere stranger:
+                        // it is answered its own tombstone — before the pairing
+                        // window is even consulted, because the one good outcome
+                        // left for that device is learning it is out (a tombstone
+                        // is permanent: it can never pair back in as itself). See
+                        // `answer_struck_off` for why the dial is the only place
+                        // this can happen.
+                        if let Some(revocation) = struck_off(&state, &peer) {
+                            handlers.spawn(answer_struck_off(peer, stream, revocation));
+                            continue;
+                        }
+                        // With ONE exception, and it is the exception the whole
+                        // account rests on: a device the human is pairing with has
+                        // no way to be in the directory yet — being put there is
+                        // what the pairing is for. So while a LAN pairing window is
+                        // open on this device, a stranger is let as far as its first
+                        // frame, and `serve_incoming` serves it nothing but the
+                        // pairing offer. Outside that window nothing changes: no
+                        // byte is read from a device we cannot place.
+                        if !crate::pairing::lan_window_open(&state) {
+                            tracing::warn!(peer = %peer, "incoming stream from a peer outside the directory: refused");
+                            continue;
+                        }
                     }
-                    handlers.spawn(serve_incoming(state.clone(), peer, stream));
+                    handlers.spawn(serve_incoming(state.clone(), peer, stream, known));
                 }
                 Err(e) => {
                     // Transport closed under our feet: the data plane is DEAD —
@@ -333,6 +376,60 @@ fn peer_in_directory(state: &AppState, node_id: &str) -> bool {
                 .and_then(Value::as_str)
                 .is_some_and(|att| crate::account_key::verify(&ak_pub, node_id, att))
     })
+}
+
+/// The account's signature striking `node_id` off, if this Core holds one that
+/// verifies. What tells a struck-off device apart from a mere stranger — and the
+/// ONLY thing the data plane will ever say to either. `pub(crate)` for the
+/// pairing too, which refuses to dial a code shown by a device the account has
+/// struck off.
+pub(crate) fn struck_off(state: &AppState, node_id: &str) -> Option<String> {
+    // Leaf lock released before taking `session` (lock ordering).
+    let ak_pub = {
+        let root = state.account_root.lock().expect("lock account_root");
+        root.as_ref()?.ak_pub.clone()
+    };
+    let s = state.session.lock().expect("lock session");
+    let revocation = s.revoked.get(node_id)?;
+    crate::account_key::verify_revocation(&ak_pub, node_id, revocation).then(|| revocation.clone())
+}
+
+/// Answers the dial of a device the account struck off: a `dir_roster` of one
+/// entry — its own tombstone — written without reading a byte, then the close.
+///
+/// This is what DELIVERS a revocation to the device it names, and the dial is
+/// the only place it can happen. It cannot arrive by gossip: absorbing the
+/// tombstone is what evicts the device from a sibling's directory, so every
+/// sibling that could carry it refuses that device's streams — and stops dialling
+/// it — from that moment on. Enforcing the revocation is exactly what blocks its
+/// delivery, and answering the refused dial is what breaks the circle.
+///
+/// It hands the peer nothing it does not already own: the tombstone names the
+/// very key the transport authenticated, is public account-signed data, and the
+/// frame is the same `dir_roster` the peer's own sync round asked for — the
+/// `absorb` that reads it is the one that obeys it (`account_key::leave`). A
+/// stream opened for anything else gets the same answer and fails its own
+/// protocol check, which costs the zombie one failed exchange until its next
+/// sync round learns the truth.
+async fn answer_struck_off(peer: String, mut stream: Box<dyn IoStream>, revocation: String) {
+    tracing::info!(peer = %peer, "a struck-off device dialled: answering its tombstone");
+    let mut revoked = serde_json::Map::new();
+    revoked.insert(peer.clone(), json!(revocation));
+    let frame = json!({ "type": "dir_roster", "records": [], "revoked": revoked });
+    if let Err(e) = bounded(
+        STALL_TIMEOUT,
+        write_control(&mut stream, &frame),
+        "tombstone",
+    )
+    .await
+    {
+        tracing::debug!(peer = %peer, error = %e, "the tombstone answer did not go out");
+        return;
+    }
+    // Held like every responder holds its reply: dropping now would abandon the
+    // frame in flight on the QUIC side.
+    let _ = stream.shutdown().await;
+    let _ = tokio::time::timeout(LINGER, drain(&mut stream)).await;
 }
 
 /// The `device_id` (server label) associated with a `node_id`, taken from the
@@ -828,9 +925,20 @@ async fn write_ack(stream: &mut Box<dyn IoStream>) -> std::io::Result<()> {
 
 /// Serves an incoming stream: reads the first control frame and dispatches on
 /// its `type`. `offer` is a file transfer (below); `clip_announce` /
-/// `clip_session` are the clipboard network plane (`clipnet`). The peer is
-/// already vouched for by `peer_in_directory` (C7) at the accept loop.
-async fn serve_incoming(state: Arc<AppState>, peer: String, mut stream: Box<dyn IoStream>) {
+/// `clip_session` are the clipboard network plane (`clipnet`); `dir_sync` is the
+/// directory's (`dirsync`); `lan_pair` is a device asking for its first
+/// introduction (`pairing`).
+///
+/// `known`: is this peer a device of the account (`peer_in_directory`, C7)? Only
+/// `lan_pair` is served to one that is not — everything else here presupposes a
+/// device the account vouches for, and a stranger reached this far only because a
+/// pairing window is open (see `serve`).
+async fn serve_incoming(
+    state: Arc<AppState>,
+    peer: String,
+    mut stream: Box<dyn IoStream>,
+    known: bool,
+) {
     let first = match bounded(STALL_TIMEOUT, read_control(&mut stream), "first frame").await {
         Ok(v) => v,
         Err(e) => {
@@ -839,10 +947,20 @@ async fn serve_incoming(state: Arc<AppState>, peer: String, mut stream: Box<dyn 
         }
     };
     match first.get("type").and_then(Value::as_str) {
+        // The one frame a device outside the directory may send — and the one
+        // that puts it in there.
+        Some("lan_pair") => crate::pairing::recv_lan_pair(state, peer, first, stream).await,
+        other if !known => {
+            tracing::warn!(
+                peer = %peer, kind = ?other,
+                "a device outside the directory spoke something other than a pairing offer: refused"
+            );
+        }
         Some("offer") => serve_transfer(state, peer, first, stream).await,
         Some("clip_announce") => crate::clipnet::recv_announce(state, peer, first, stream).await,
         Some("clip_push") => crate::clipnet::recv_push(state, peer, first, stream).await,
         Some("clip_session") => crate::clipnet::serve_session(state, first, stream).await,
+        Some("dir_sync") => crate::dirsync::recv_sync(state, peer, first, stream).await,
         other => {
             tracing::debug!(peer = %peer, kind = ?other, "unknown incoming frame type: abandoned");
         }
@@ -1229,13 +1347,16 @@ fn unique_child_name(dir: &Path, name: &str, is_dir: bool) -> String {
 // ---------------------------------------------------------------------------
 
 /// Writes a CONTROL frame: the serialized JSON, framed.
-async fn write_control(stream: &mut Box<dyn IoStream>, value: &Value) -> std::io::Result<()> {
+pub(crate) async fn write_control(
+    stream: &mut Box<dyn IoStream>,
+    value: &Value,
+) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(value)?;
     write_frame(stream, &bytes).await
 }
 
 /// Reads a CONTROL frame and parses it as JSON.
-async fn read_control(stream: &mut Box<dyn IoStream>) -> std::io::Result<Value> {
+pub(crate) async fn read_control(stream: &mut Box<dyn IoStream>) -> std::io::Result<Value> {
     let bytes = read_frame(stream).await?;
     serde_json::from_slice(&bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))

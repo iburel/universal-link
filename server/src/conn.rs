@@ -47,6 +47,9 @@ const RELAY_URL_MAX: usize = 2048;
 /// hex = 128 chars), stored and rebroadcast without ever being interpreted.
 /// Bounded loosely: the server does not decode it, it just rejects the absurd.
 const ATTESTATION_MAX: usize = 256;
+/// A device's signature over its own description (the continuum): opaque and
+/// bounded exactly like the attestation, for the same reason.
+const SELF_SIG_MAX: usize = 256;
 /// `node_id` = an Ed25519 public key in hex. Bounded here because the pairing
 /// path PINS one before any proof has been checked, so an absurd value would sit
 /// in a session; `auth.enroll`'s OIDC path verifies the proof first, which by
@@ -377,8 +380,11 @@ impl Conn {
             status: None,
             last_seen: None,
             // Published separately (`presence.update`) once the device has joined
-            // the account (C7): enrollment alone does not carry it.
+            // the account (C7): enrollment alone carries neither the attestation
+            // nor the signed description.
             attestation: None,
+            seq: None,
+            self_sig: None,
             conn: None,
         };
         let record = entry.record();
@@ -485,6 +491,14 @@ impl Conn {
             else {
                 return Err(RpcErr::app("DEVICE_UNKNOWN"));
             };
+            if entry.name != name {
+                // The signed description covered the old name: known stale, so it
+                // is dropped rather than rebroadcast as if it still proved
+                // something. The device republishes over its own connection once
+                // it hears the rename.
+                entry.seq = None;
+                entry.self_sig = None;
+            }
             entry.name = name;
             let record = entry.record();
             reg.broadcast(
@@ -558,13 +572,22 @@ impl Conn {
         // here — it's the PEER that verifies it under its account key. The server
         // only carries it, blind, like the rest of the directory.
         let attestation = rpc::optional_str_max(params, "attestation", ATTESTATION_MAX)?;
+        // The signed description (the continuum): opaque like the attestation,
+        // and meaningless in halves — a `seq` orders a signature and a signature
+        // covers a `seq`, so one without the other is refused rather than stored
+        // as something no peer could ever verify.
+        let seq = rpc::optional_u64(params, "seq")?;
+        let self_sig = rpc::optional_str_max(params, "self_sig", SELF_SIG_MAX)?;
+        if seq.is_some() != self_sig.is_some() {
+            return Err(RpcErr::invalid_params("seq/self_sig"));
+        }
         let device_id = self
             .device_id
             .clone()
             .expect("authenticated → device bound");
-        // Only the attestation is durable here (status/relay_url are ephemeral):
-        // we persist only if it changes.
-        let attestation_changed = attestation.is_some();
+        // Only the attestation and the signed description are durable here
+        // (status/relay_url are ephemeral): we persist only if one changes.
+        let durable_changed = attestation.is_some() || self_sig.is_some();
 
         {
             let mut reg = self.state.registry.lock().expect("lock registry");
@@ -587,6 +610,10 @@ impl Conn {
             if attestation.is_some() {
                 entry.attestation = attestation;
             }
+            if self_sig.is_some() {
+                entry.seq = seq;
+                entry.self_sig = self_sig;
+            }
             let record = entry.record();
             reg.broadcast(
                 &account,
@@ -595,7 +622,7 @@ impl Conn {
                 json!({ "device": record }),
             );
         }
-        if attestation_changed {
+        if durable_changed {
             self.state.persist();
         }
         Ok(json!({}))
@@ -845,6 +872,8 @@ mod tests {
                     status: Some("ready".into()),
                     last_seen: None,
                     attestation: None,
+                    seq: None,
+                    self_sig: None,
                     conn: Some((2, current_tx)),
                 },
             );

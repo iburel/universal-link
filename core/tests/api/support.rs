@@ -78,10 +78,11 @@
 //!   connection (the server broadcasts `device.offline`), deletes
 //!   `session.json` (or empties it if the deletion fails — an empty file counts
 //!   as "no session" at startup), does not reconnect.
-//! - `devices.list` IPC: serves the cache (last known snapshot), even when
-//!   disconnected — freshness is read from `session.changed`;
-//!   `SERVER_UNREACHABLE` if no snapshot since startup (or no session). Each
-//!   device record served over the IPC is enriched with `is_self`.
+//! - `devices.list` IPC: serves the stored directory (last known snapshot), even
+//!   when disconnected — freshness is read from `session.changed`;
+//!   `SERVER_UNREACHABLE` only for a Core that knows of no device AT ALL (see the
+//!   serverless block below). Each device record served over the IPC is enriched
+//!   with `is_self`.
 //! - `devices.rename` IPC: proxy to the server; the response (`{ device }`) is
 //!   relayed enriched; a server error is relayed as-is (JSON-RPC code +
 //!   `data.code`); `SERVER_UNREACHABLE` if disconnected. The Core synthesizes
@@ -183,6 +184,190 @@
 //!   outcome (`transfer.failed { error: "cancelled" }`) is emitted by the task,
 //!   ONCE, AFTER deregistration — a `files.cancel` replayed immediately after
 //!   seeing it therefore finds `TRANSFER_UNKNOWN`.
+//!
+//! An account with no server (serverless, building block 1 — `serverless.rs`):
+//! - Being IN the account (`account.status.attested`: the C7 trust root is
+//!   installed and attests THIS `node_id`) and being LOGGED IN (`session.json`)
+//!   are independent. Everything that decides trust and routes already rests on
+//!   the first alone; this block stops the second from being a prerequisite.
+//! - `account.setup`/`account.join` require a CONNECTED server only when one is
+//!   CONFIGURED. Nothing configured → nothing to publish an attestation to, and
+//!   the account is created locally. Configured but disconnected → still
+//!   `SERVER_UNREACHABLE` (the other devices would never read the attestation).
+//! - A device in the account holds its OWN directory record, minted from what it
+//!   knows first-hand (`node_id`, name, attestation): `device_id` = its `node_id`
+//!   when no server has named it, `online: true`, and `null` where only a server
+//!   can fill in (`relay_url`, `last_seen`, `status`). Hence `devices.list`
+//!   answering with no session at all, and `SERVER_UNREACHABLE` being left for a
+//!   Core that has never logged in AND never joined an account.
+//! - It survives a logout and a revocation: a session ends, a membership does
+//!   not (the trust root already stayed). The self-minted `device_id` takes over
+//!   from the server's label, which left with the session.
+//! - `directory.json` expires (7-day TTL, the revocation-staleness bound) only
+//!   where a configured server could refresh it. With none, that file is not a
+//!   cache of a directory — it IS the directory, and expiring it would erase the
+//!   account rather than fail closed. It is loaded at startup for a session OR a
+//!   trust root, and the boot-time self-record is NOT persisted (writing it would
+//!   refresh `saved_at` at every startup and silently extend the bound).
+//!
+//! A record that signs itself, and revocation without a server (serverless,
+//! building block 2 — `serverless.rs`, `revocation.rs`):
+//! - A record a device minted for itself carries `seq` (u64) and `self_sig`: its
+//!   own signature over `{node_id, name, platform, seq}`
+//!   (`directory::record_message`, verifiable by `directory::verify_record` — the
+//!   key is the `node_id` itself). What is deliberately NOT signed: `relay_url`,
+//!   `online`, `last_seen`, `status`, `device_id`. A record the SERVER minted
+//!   carries neither field, and that is not a defect — there the server owns the
+//!   name.
+//! - The signed description is stable: a restart keeps it verbatim, `seq`
+//!   included. `devices.rename` is the one thing that re-signs it, under a
+//!   strictly higher `seq`. A stored record that CLAIMS this device's signature
+//!   without carrying it is minted again (a peer would refuse it); one with no
+//!   signature at all is a server's, and is left alone.
+//! - `devices.rename` with NO server configured renames THIS device (any other
+//!   `device_id` → `SERVER_UNREACHABLE`, unchanged) and broadcasts
+//!   `device.updated` itself.
+//! - `devices.revoke` with NO server configured mints a TOMBSTONE: the account
+//!   key's signature over the target's `node_id` (`account_key::revoke`,
+//!   `revoked.json`). Permanent — nothing un-revokes a `node_id`. Requires the
+//!   account's private key (`NO_ACCOUNT_KEY` otherwise), refuses this very device
+//!   (`CANNOT_REVOKE_SELF`), and answers `DEVICE_UNKNOWN` for a device it does not
+//!   hold.
+//! - A tombstone bars a `node_id` at every door into the directory: the store at
+//!   startup, a server snapshot, a server `device.*` event. So it OUTLIVES what a
+//!   server says — a deployment that was never told keeps listing the device, and
+//!   the Core keeps refusing it. `revoked.json` survives a logout and a
+//!   revocation of this device, unlike `directory.json`.
+//!
+//! The devices carry the directory between themselves (serverless, building block
+//! 3 — `dirsync.rs`):
+//! - Frame type `dir_sync` on the data plane's existing ALPN, answered by
+//!   `dir_roster`: one round trip, both frames `{ records[], revoked{} }`, both
+//!   sides absorbing. The answer is the roster the responder held BEFORE
+//!   absorbing. A frame over 512 entries, or whose `revoked` is present and not an
+//!   object, is refused WHOLE.
+//! - Both ends must already hold each other's record for the stream to exist
+//!   (`peer_in_directory` on the way in, `account_peers` on the way out): the
+//!   first introduction is the pairing brick's, not this one's.
+//! - A record is taken in only if it is signed by the device it describes AND
+//!   attested under the account key; a tombstone only if the account key signed
+//!   it. The highest `seq` wins, and only among SIGNED descriptions — a record
+//!   held without a `seq` is a server's, and the server keeps the name.
+//! - An unknown device arrives keyed and labelled by its `node_id`, with
+//!   `relay_url`/`last_seen`/`status` null and `online: false`: known, not
+//!   reachable. A record describing THIS device is never taken in, whatever its
+//!   `seq`; a tombstone naming this device, once it verifies, is OBEYED — the
+//!   device leaves the account (building block 5 below).
+//! - The initiator OFFERS its roster as well as reading the answer, so learning
+//!   goes both ways in one round trip. A record it already holds is not echoed
+//!   back: the answer is the roster the responder held BEFORE absorbing.
+//! - With a server, a roster of TOMBSTONES ALONE always travels, which is what
+//!   makes a revocation minted with no server outlive a deployment that was never
+//!   told. (The records used to stay behind, unsigned; since the continuum —
+//!   block 6 below — the server's half countersigns and travels too.)
+//! - Rounds run on a LAN membership change, on a local `devices.rename` /
+//!   `devices.revoke`, and on a slow tick. An exchange that teaches nothing emits
+//!   no notification and does not rewrite `directory.json`; one that DOES teach
+//!   something writes the records without moving `saved_at` — the 7-day bound is a
+//!   bound against the server, and only the server resets it.
+//!
+//! A device's first introduction, on the local network (serverless, building block
+//! 4 — `lanpair.rs`):
+//! - With NO server in this device's life, `pairing.offer` mints a `UL2` code —
+//!   `UL2:<psk>:<epk>:<node_id>` — instead of answering `SERVER_UNREACHABLE`, and
+//!   `pairing.accept` of a `UL2` code dials that `node_id` on the data plane. The
+//!   `UL1` code (a server relays it) and the `UL2` code (the device is dialled) are
+//!   told apart by their tag; a `UL1` code with no server → `SERVER_UNREACHABLE`.
+//!   (The mirror refusal — `UL2` where a server answers, `PAIRING_VIA_SERVER` —
+//!   fell with the continuum, block 6 below: such a device now scans and
+//!   sponsors.)
+//! - Frames on the existing ALPN: `lan_pair` (dialer → displayer), answered by
+//!   `lan_hello` or `lan_refused { reason }`; then `pair_grant { bundle, records,
+//!   revoked }` from the sponsor and `pair_roster { records, revoked }` back.
+//!   `lan_pair` is the ONE frame the data plane serves to a device outside the
+//!   directory, and only while a window is open — the window closes to newcomers
+//!   the instant it takes a dialer, and outside one nothing is read at all.
+//! - The dialer proves it read the code off a screen (a MAC over both public
+//!   halves and the `node_id`, keyed by the code's secret) BEFORE the displaying
+//!   side spends its ephemeral secret: a device that cannot prove it must not be
+//!   able to burn the window for the device that can.
+//! - Each side declares its OWN signed record (`directory::own_record`'s shape),
+//!   and a record whose `node_id` is not the one the transport authenticated — or
+//!   which is not signed — is refused (`record`). The sponsor attests that record
+//!   and takes it in through the same `absorb` a roster goes through, so both
+//!   devices end up holding each other and `dirsync` runs from then on.
+//! - Who sponsors: whoever holds the account's private key. Neither →
+//!   `no_account`; two different accounts → `other_account` (refused BEFORE the
+//!   seed crosses); BOTH holding the same key → the device that DISPLAYED the code
+//!   sponsors, the key that crosses is the one the other already has, and what the
+//!   two of them are really doing is swapping rosters.
+//! - `pairing.claimed` / `pairing.confirm` / `pairing.completed` / `pairing.failed`
+//!   are the server path's, unchanged, and both ends show the same `verification`.
+//!   `pairing.confirm` never answers `reauth_required` here (no OIDC to be fresh
+//!   with), and a declined or cancelled window tells the other device rather than
+//!   leaving it to time out. `expires_in` is 180 s, counted locally on both sides.
+//!
+//! Being struck off, heard and obeyed (serverless, building block 5 — `leave.rs`):
+//! - A tombstone naming THIS device, once its signature verifies under the account
+//!   key, is OBEYED: the device leaves the account. Everything that made it a
+//!   member goes — the trust root (`account-key.json`, memory included), the
+//!   account key and the refresh token in the keyring, `session.json`,
+//!   `directory.json`, `revoked.json`, and `device.key` itself — so the next
+//!   startup is a first startup, under a FRESH identity: the struck `node_id` is
+//!   barred for good, and only a new key can be attested again. The human's files
+//!   are not the account's: nothing else is touched. One that does NOT verify
+//!   wipes nothing, like any tombstone the account never signed.
+//! - What the components hear, in that order: `device.removed` for every device
+//!   served, `session.changed`, then `account.left { reason: "struck_off" }`
+//!   (topic `session`) — the one event that says it was the account's decision,
+//!   not a logout. A pairing in flight — either end — fails with `no_account`;
+//!   clipboard grants die as they do at a logout. Nothing else of the roster that
+//!   carried the tombstone is absorbed.
+//! - Delivery is the answer to a dial, not gossip: absorbing a tombstone is what
+//!   evicts the struck device from a sibling's directory, so the siblings refuse
+//!   the very streams that could have carried it — and stop dialling it. Instead,
+//!   the data plane answers the struck-off device's dial (ANY dial, a pairing
+//!   window open or not, no byte of it read) with a one-entry `dir_roster`
+//!   holding its own tombstone — which its own sync round reads through the same
+//!   absorb that obeys it. A mere stranger still gets silence: the answer exists
+//!   only for a `node_id` the account's signature names.
+//! - `pairing.accept` of a code shown by a struck-off `node_id` → `DEVICE_REVOKED`
+//!   before anything is dialled: the account's own decision, said as such, not a
+//!   pairing failure discovered after two humans compared a number for nothing.
+//!
+//! One account, half on a server and half not (the continuum, building block 6 —
+//! `continuum.rs`):
+//! - The account is the union the ACCOUNT KEY defines; a deployment lists the
+//!   subset that enrolled with it. Where a server names a device, the device
+//!   COUNTERSIGNS the description — the name stays the server's word (a rename
+//!   still goes through `devices.rename`), the signature is its own, minted at a
+//!   `seq` strictly above anything it carried before. Published to the server
+//!   like the attestation (`presence.update { seq, self_sig }`, both-or-neither,
+//!   opaque, rebroadcast in the records, dropped server-side on a rename), so a
+//!   record of the server's half proves itself and is RELAYED like any other —
+//!   a serverless-only sibling learns of devices the server enrolled from any
+//!   device of either half, and the server never learns that sibling exists.
+//! - The server's snapshot is MERGED, never swapped in: a record the account can
+//!   prove (signed + attested) survives every reconnection even where the server
+//!   does not list it, re-keyed by its `node_id` with the present-tense fields
+//!   dropped; a held proof is grafted onto the fresh record of a device both
+//!   halves know, when it still covers the description (a device renamed while
+//!   away goes unsigned until it countersigns — but keeps the PROVEN `seq` as
+//!   the floor its next countersignature must clear). A logout and a server-side
+//!   revocation of THIS device keep that provable half on disk
+//!   (`save_unrefreshed`); a Core with no trust root keeps nothing, as before.
+//! - `devices.revoke` through the server also mints the account's own TOMBSTONE
+//!   whenever this device holds the account key (never against itself); a device
+//!   the server never named — its label IS its `node_id` — is struck by the
+//!   account key alone, the server not asked. Without the key, the server's
+//!   strike stands alone, as before the continuum.
+//! - News crosses the halves within a sync round, not a tick: what a server
+//!   teaches a Core (`device.added`/`device.updated`, a fresh snapshot, a
+//!   countersigned rename) nudges `dirsync` at once.
+//! - `pairing.accept` of a `UL2` code on a device that answers to a server
+//!   sponsors over the local network; the joiner joins the ACCOUNT, not the
+//!   deployment. `pairing.offer` on that device still goes through the server —
+//!   the `UL1` path is what also enrolls the newcomer on the deployment.
 
 #![allow(dead_code)]
 
@@ -417,7 +602,10 @@ impl TestServer {
 pub struct TestCore {
     pub handle: CoreHandle,
     dir: tempfile::TempDir,
-    /// Identity seeded by `start_enrolled` (the Core's device on the server).
+    /// Identity the harness seeded into the config directory, and the
+    /// `device_id` the Core goes by: the server's label when it was enrolled
+    /// (`start_enrolled`), its own `node_id` when the account owes nothing to a
+    /// server (`start_in_account`).
     enrolled: Option<(String, DeviceKey)>,
     /// Server+OIDC config passed to the Core (preserved by `restart`).
     server_cfg: Option<universallink_core::ServerConfig>,
@@ -432,8 +620,10 @@ pub struct TestCore {
     reload_slot: Arc<std::sync::Mutex<Result<Option<universallink_core::ServerConfig>, String>>>,
 }
 
-/// The server+OIDC config of a Core pointed at the test environment.
-fn server_cfg(server: &TestServer) -> universallink_core::ServerConfig {
+/// The server+OIDC config of a Core pointed at the test environment. Public for
+/// the tests that configure a Core AFTER it started, the way the GUI writes
+/// `config.json` and calls `session.reload`.
+pub fn server_cfg(server: &TestServer) -> universallink_core::ServerConfig {
     universallink_core::ServerConfig {
         url: server.core_url(),
         oidc_issuer: server.oidc.issuer(),
@@ -452,10 +642,211 @@ fn seed_account_from_code(dir: &Path, node_id: &str, code: &str) {
     universallink_core::account_key::save(dir, &root).expect("seed account-key.json");
 }
 
+/// A directory record for another device of the account, as that device would
+/// have produced it: the description signed by ITS key (`self_sig`), the
+/// membership attested under the account's (`code`). Keyed by its own `node_id` —
+/// the label a device with no server to name it goes by.
+pub fn peer_record(key: &DeviceKey, name: &str, platform: &str, code: &str, seq: u64) -> Value {
+    let ak = universallink_core::account_key::account_key_from_code(code).expect("valid test code");
+    let node_id = key.node_id();
+    json!({
+        "device_id": node_id,
+        "name": name,
+        "platform": platform,
+        "node_id": node_id,
+        "seq": seq,
+        "self_sig": key.sign(&universallink_core::directory::record_message(
+            &node_id, name, platform, seq,
+        )),
+        "relay_url": null,
+        "attestation": universallink_core::account_key::attest(&ak, &node_id),
+        "online": false,
+        "status": null,
+        "last_seen": null,
+    })
+}
+
+/// Writes the persisted directory (`directory.json`) holding `records`, dated
+/// `age_secs` ago — what a Core finds on disk at startup. `age_secs` is what
+/// makes a store stale for a Core that has a server to refresh it from.
+pub fn seed_directory(dir: &Path, records: &[Value], age_secs: u64) {
+    let devices: serde_json::Map<String, Value> = records
+        .iter()
+        .map(|record| {
+            let id = record["device_id"].as_str().expect("device_id").to_string();
+            (id, record.clone())
+        })
+        .collect();
+    let saved_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs()
+        - age_secs;
+    let store = json!({ "saved_at": saved_at, "devices": devices });
+    std::fs::write(dir.join("directory.json"), store.to_string()).expect("seed directory.json");
+}
+
+/// A device of the account, enrolled and ONLINE on the server, publishing a
+/// perfectly valid attestation under `code` and a relay: everything a legitimate
+/// sibling has, so a test that expects it to be refused can only be refusing it
+/// for the reason under test.
+///
+/// Its connection comes back with it: a device that disconnects goes offline, and
+/// the server forgets the relay it just published.
+pub async fn attested_sibling(
+    server: &TestServer,
+    code: &str,
+    name: &str,
+) -> (DeviceKey, String, TestConn) {
+    let key = DeviceKey::generate();
+    let mut conn = server.connect_direct().await;
+    let device_id = enroll_key(
+        &mut conn,
+        &server.oidc,
+        &key,
+        TEST_SUB,
+        name,
+        std::env::consts::OS,
+    )
+    .await;
+    authenticate(&mut conn, &key, &device_id).await;
+    let ak = universallink_core::account_key::account_key_from_code(code).expect("valid code");
+    conn.request(
+        "presence.update",
+        json!({
+            "attestation": universallink_core::account_key::attest(&ak, &key.node_id()),
+            "relay_url": format!("iroh+memory://{}", key.node_id()),
+        }),
+    )
+    .await
+    .expect("presence.update");
+    (key, device_id, conn)
+}
+
+/// Writes `revoked.json`: the account (`code`) strikes `node_id` off, for good.
+/// What `devices.revoke` mints with no server in the picture — seeded by hand
+/// where the test needs the tombstone to pre-date the Core.
+pub fn seed_revocation(dir: &Path, code: &str, node_id: &str) {
+    let ak = universallink_core::account_key::account_key_from_code(code).expect("valid test code");
+    let revoked = json!({
+        "revoked": { node_id: universallink_core::account_key::revoke(&ak, node_id) },
+    });
+    std::fs::write(dir.join("revoked.json"), revoked.to_string()).expect("seed revoked.json");
+}
+
 impl TestCore {
     pub async fn start() -> TestCore {
         let dir = tempfile::tempdir().expect("tempdir");
         Self::spawn_in(dir, None, None, None).await
+    }
+
+    /// A Core that has joined the account with NO server in the picture: nothing
+    /// configured, no session — just `device.key`, the trust root and the account
+    /// key in the keyring, which is everything `account.join` writes. The
+    /// serverless starting point, and the state a restart has to come back to. Its
+    /// `device_id` is its own `node_id`: no server ever named it.
+    pub async fn start_in_account(code: &str) -> TestCore {
+        Self::start_in_account_holding(code, &[]).await
+    }
+
+    /// Like `start_in_account`, but its persisted directory already holds
+    /// `records` — siblings this device knew of before it started. There is no
+    /// server to learn one from here, and the wire that will carry them between
+    /// two serverless devices is a later building block: until then, the store is
+    /// the only way a Core in this state knows anyone but itself.
+    pub async fn start_in_account_holding(code: &str, records: &[Value]) -> TestCore {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = DeviceKey::generate();
+        Self::seed_in_account(dir.path(), &key, code, records);
+        let device_id = key.node_id();
+        Self::spawn_in(dir, Some((device_id, key)), None, None).await
+    }
+
+    /// Like `start_in_account_holding`, but under a key the CALLER generated and
+    /// on a shared switchboard, ON the fake LAN with no relay — a serverless
+    /// machine whose only route is mDNS. The caller supplies the key because a
+    /// directory exchange presupposes each device already holding the other's
+    /// record: the records have to be built before either Core exists.
+    pub async fn start_in_account_on(
+        code: &str,
+        switchboard: &MemorySwitchboard,
+        key: DeviceKey,
+        records: &[Value],
+    ) -> TestCore {
+        let dir = tempfile::tempdir().expect("tempdir");
+        Self::seed_in_account(dir.path(), &key, code, records);
+        let node_id = key.node_id();
+        let transport: Arc<dyn universallink_core::PeerTransport> =
+            switchboard.endpoint(node_id.clone(), None);
+        switchboard.join_lan(&node_id);
+        Self::spawn_in(dir, Some((node_id.clone(), key)), None, Some(transport)).await
+    }
+
+    /// `start_in_account_on`, but in a config directory the CALLER prepared — for
+    /// state that must pre-date the Core, like a tombstone against a device it
+    /// never held a record for (`seed_revocation`). The seeding writes everything
+    /// membership means and touches nothing else, so whatever the test put there
+    /// first is what the Core wakes up to.
+    pub async fn start_in_account_in(
+        dir: tempfile::TempDir,
+        code: &str,
+        switchboard: &MemorySwitchboard,
+    ) -> TestCore {
+        let key = DeviceKey::generate();
+        Self::seed_in_account(dir.path(), &key, code, &[]);
+        let node_id = key.node_id();
+        let transport: Arc<dyn universallink_core::PeerTransport> =
+            switchboard.endpoint(node_id.clone(), None);
+        switchboard.join_lan(&node_id);
+        Self::spawn_in(dir, Some((node_id, key)), None, Some(transport)).await
+    }
+
+    /// A Core that has joined NOTHING — no account, no server — on a shared
+    /// switchboard and on the fake LAN. What a machine is the first time it is
+    /// switched on, and the state the receiving end of a pairing starts from. The
+    /// key is the caller's, so a test can name the device before it exists.
+    pub async fn start_fresh_on(switchboard: &MemorySwitchboard, key: DeviceKey) -> TestCore {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("device.key"), key.seed_hex()).expect("seed device.key");
+        let node_id = key.node_id();
+        let transport: Arc<dyn universallink_core::PeerTransport> =
+            switchboard.endpoint(node_id.clone(), None);
+        switchboard.join_lan(&node_id);
+        // No `enrolled`: this device has no `device_id` and no account, and the
+        // accessors that would invent one keep saying so. `node_id()` reads
+        // `device.key` back, so it answers all the same.
+        Self::spawn_in(dir, None, None, Some(transport)).await
+    }
+
+    /// The config directory of a device that has joined the account with no server:
+    /// `device.key`, the trust root, the account key in the keyring, and a store
+    /// holding its own signed record plus `records`.
+    fn seed_in_account(dir: &Path, key: &DeviceKey, code: &str, records: &[Value]) {
+        std::fs::write(dir.join("device.key"), key.seed_hex()).expect("seed device.key");
+        seed_account_from_code(dir, &key.node_id(), code);
+        // The account key itself, as `account.join` stows it: a device that holds
+        // it can vouch for another and strike one off.
+        let ak = universallink_core::account_key::account_key_from_code(code).expect("valid code");
+        universallink_core::account_key::remember(
+            &universallink_core::FileSecretStore::new(dir),
+            &ak,
+        )
+        .expect("stow the account key");
+        // The store as `account.join` leaves it: this device's own record, a
+        // description it has already signed once (`seq` 1). Seeded rather than
+        // left to the Core to mint at startup, because a minted `seq` is the
+        // current second — two starts in different seconds would then hold two
+        // different records for the same unchanged device, and a test that
+        // restarts could not compare them.
+        let mut store = vec![peer_record(
+            key,
+            CORE_DEVICE_NAME,
+            std::env::consts::OS,
+            code,
+            1,
+        )];
+        store.extend_from_slice(records);
+        seed_directory(dir, &store, 0);
     }
 
     /// Core configured (server + OIDC) but never logged in: the state a
@@ -476,6 +867,16 @@ impl TestCore {
     pub async fn start_enrolled(server: &TestServer) -> TestCore {
         let (dir, enrolled) = Self::seed_enrolled(server).await;
         Self::spawn_in(dir, Some(enrolled), Some(server_cfg(server)), None).await
+    }
+
+    /// An enrolled Core whose `config.json` is GONE: a session on disk — which
+    /// carries its own server URL — and nothing configured. What a deleted or
+    /// half-written config leaves behind, and a state where "nothing configured"
+    /// must NOT read as "no server": this device still answers to one, and so does
+    /// every other device of the account.
+    pub async fn start_enrolled_without_config(server: &TestServer) -> TestCore {
+        let (dir, enrolled) = Self::seed_enrolled(server).await;
+        Self::spawn_in(dir, Some(enrolled), None, None).await
     }
 
     /// Like `start_enrolled`, but the server is cut between the enrollment and
@@ -594,9 +995,51 @@ impl TestCore {
         .await
     }
 
+    /// Like `start_lan_only_on`, but under a key the CALLER generated, with the
+    /// account key stowed (this device can vouch and strike off), and with a
+    /// persisted directory already holding `records` — the enrolled half of a
+    /// continuum scenario, where each side must hold the other's record before
+    /// either Core exists (the same reason as `start_in_account_on`).
+    pub async fn start_enrolled_lan_only_holding(
+        server: &TestServer,
+        switchboard: &MemorySwitchboard,
+        code: &str,
+        key: DeviceKey,
+        records: &[Value],
+    ) -> TestCore {
+        let (dir, enrolled) = Self::seed_enrolled_as(server, key).await;
+        let node_id = enrolled.1.node_id();
+        seed_account_from_code(dir.path(), &node_id, code);
+        let ak = universallink_core::account_key::account_key_from_code(code).expect("valid code");
+        universallink_core::account_key::remember(
+            &universallink_core::FileSecretStore::new(dir.path()),
+            &ak,
+        )
+        .expect("stow the account key");
+        if !records.is_empty() {
+            seed_directory(dir.path(), records, 0);
+        }
+        let transport: Arc<dyn universallink_core::PeerTransport> =
+            switchboard.endpoint(node_id.clone(), None);
+        switchboard.join_lan(&node_id);
+        Self::spawn_in(
+            dir,
+            Some(enrolled),
+            Some(server_cfg(server)),
+            Some(transport),
+        )
+        .await
+    }
+
     async fn seed_enrolled(server: &TestServer) -> (tempfile::TempDir, (String, DeviceKey)) {
+        Self::seed_enrolled_as(server, DeviceKey::generate()).await
+    }
+
+    async fn seed_enrolled_as(
+        server: &TestServer,
+        key: DeviceKey,
+    ) -> (tempfile::TempDir, (String, DeviceKey)) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let key = DeviceKey::generate();
         let mut conn = server.connect_direct().await;
         let device_id = enroll_key(
             &mut conn,
@@ -692,14 +1135,24 @@ impl TestCore {
         *self.reload_slot.lock().expect("reload slot") = Err(reason.to_string());
     }
 
-    /// device_id of the Core in the directory (panics outside `start_enrolled`).
+    /// device_id of the Core in the directory (panics outside `start_enrolled` /
+    /// `start_in_account`).
     pub fn device_id(&self) -> &str {
         &self.enrolled.as_ref().expect("enrolled Core").0
     }
 
-    /// Key of the Core's device (panics outside `start_enrolled`).
+    /// Key of the Core's device (panics outside `start_enrolled` /
+    /// `start_in_account`).
     pub fn key(&self) -> &DeviceKey {
         &self.enrolled.as_ref().expect("enrolled Core").1
+    }
+
+    /// The Core's `node_id`, read back from `device.key`. For a Core the harness
+    /// seeded no identity into (`start`), that file — generated at startup — is
+    /// the only place it exists.
+    pub fn node_id(&self) -> String {
+        let seed = std::fs::read_to_string(self.dir.path().join("device.key")).expect("device.key");
+        DeviceKey::from_seed_hex(seed.trim()).node_id()
     }
 
     pub fn config_dir(&self) -> &Path {
@@ -1237,6 +1690,15 @@ fn parse_response(v: Value) -> Result<Value, RpcError> {
     }
 }
 
+/// A temporary file to send (the `TempDir` must stay alive for the duration of
+/// the send — hence returning the pair).
+pub fn scratch_file(contents: &[u8]) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("f.bin");
+    std::fs::write(&path, contents).expect("write the temporary file");
+    (dir, path)
+}
+
 // ---------------------------------------------------------------------------
 // Flows: ready-to-use components.
 // ---------------------------------------------------------------------------
@@ -1294,6 +1756,35 @@ pub async fn pending_component(
         .expect("hello without a token");
     assert_eq!(r["status"], "pending");
     c
+}
+
+/// Writes a control frame the way the data plane frames one: a u32 big-endian
+/// length, then the JSON. For the tests that stand in for a peer and speak the
+/// protocol by hand.
+pub async fn peer_write(stream: &mut Box<dyn universallink_core::IoStream>, frame: &Value) {
+    let bytes = serde_json::to_vec(frame).expect("serialize");
+    stream
+        .write_all(&(bytes.len() as u32).to_be_bytes())
+        .await
+        .expect("frame length");
+    stream.write_all(&bytes).await.expect("frame body");
+    stream.flush().await.expect("flush");
+}
+
+/// Reads a control frame — or `None` when the stream ended first, which is how
+/// the data plane refuses a device it will not talk to at all.
+pub async fn peer_read(stream: &mut Box<dyn universallink_core::IoStream>) -> Option<Value> {
+    let mut len = [0u8; 4];
+    timeout(RESPONSE_TIMEOUT, stream.read_exact(&mut len))
+        .await
+        .expect("an answer or a close")
+        .ok()?;
+    let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+    timeout(RESPONSE_TIMEOUT, stream.read_exact(&mut body))
+        .await
+        .expect("the body of an announced frame")
+        .ok()?;
+    Some(serde_json::from_slice(&body).expect("the frame is JSON"))
 }
 
 /// Retries `attempt` (50 ms step) until `true`, within the limit of

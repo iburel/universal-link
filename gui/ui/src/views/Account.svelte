@@ -27,6 +27,50 @@
 
   {#if !store.primed}
     <p class="muted">Connecting to Core…</p>
+  {:else if !store.session?.logged_in && store.account?.attested === true}
+    <!-- Signed out — or never signed in anywhere — but IN the account: a
+         session's end does not end a membership, and a serverless device never
+         had a session to begin with. "No account is connected" would be false
+         here, and the way forward differs: nothing is missing unless the KEY
+         is (below), and the server is an option, not the door. -->
+    <p>This device is on your account.</p>
+    <dl>
+      {#if store.account.fingerprint}
+        <dt>Fingerprint</dt>
+        <dd>
+          <code>{store.account.fingerprint}</code>
+          <span class="hint">compare this across your devices</span>
+        </dd>
+      {/if}
+      <dt>Server</dt>
+      <dd>{store.serverless ? "none" : "signed out"}</dd>
+    </dl>
+
+    {#if store.serverless}
+      <p class="muted">
+        Your devices meet on the local network. To use a server some day, set
+        one up in the Server tab, then sign in here.
+      </p>
+    {:else}
+      <p class="muted">
+        Sign-in opens in your browser; come back here once you have granted
+        access.
+      </p>
+      <button class="primary" {disabled} onclick={() => store.login()}>
+        Sign in
+      </button>
+    {/if}
+
+    {#if keyless}
+      <h2>This device has your account, but not its key</h2>
+      <p class="muted">
+        It can still exchange files with your other devices; it just cannot link a
+        new one. Give it the key and it will — the same two ways in as a brand-new
+        device.
+      </p>
+      <LinkDevice {store} mode="join" />
+      <RecoveryCode {store} label="Or enter your recovery code:" />
+    {/if}
   {:else if !store.session?.logged_in}
     <p>No account is connected on this device.</p>
     <p class="muted">
