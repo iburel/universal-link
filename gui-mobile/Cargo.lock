@@ -3736,6 +3736,7 @@ dependencies = [
  "keyring",
  "libc",
  "n0-future",
+ "netdev",
  "onedevice-core",
  "onedevice-paths",
  "rustls-platform-verifier",

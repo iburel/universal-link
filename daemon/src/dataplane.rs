@@ -247,28 +247,44 @@ fn lan_lookup(secret: &SecretKey, lan_discovery: bool) -> Option<MdnsAddressLook
     }
 }
 
-/// Whether multicast actually reaches the wire: a beacon sent to the mDNS
-/// group must come back to a member of that group on the same host. The probe
-/// uses the real group but an ephemeral port, so it never collides with mDNS
-/// itself. Public because it is also the tests' judge of whether an
-/// environment can host the real-socket LAN tests at all — GitHub's hosted
-/// macOS runners refuse the send outright (five identical timeouts in a row
-/// on every try, while real Macs pass).
+/// Whether multicast comes back at all: something looped, whatever route it
+/// took. Public because it is also the tests' judge of whether an environment
+/// can host the real-socket LAN tests at all: GitHub's hosted macOS runners
+/// refuse the send outright (five identical timeouts in a row on every try,
+/// while real Macs pass).
 pub async fn multicast_reaches_the_wire() -> bool {
+    !matches!(multicast_loopback().await, Beacon::Nothing)
+}
+
+/// What one probe attempt observed.
+enum Beacon {
+    /// The beacon looped back, stamped with this source address: the address
+    /// of the interface the kernel sent it out of. That choice is the whole
+    /// diagnosis, because a VPN that captured multicast routing stamps the
+    /// tunnel's address on a beacon the actual network never saw.
+    Heard(std::net::IpAddr),
+    /// Nothing came back within the timeout.
+    Nothing,
+}
+
+/// The raw probe: a beacon sent to the mDNS group must come back to a member
+/// of that group on the same host. It uses the real group but an ephemeral
+/// port, so it never collides with mDNS itself.
+async fn multicast_loopback() -> Beacon {
     use std::net::Ipv4Addr;
 
     let group = Ipv4Addr::new(224, 0, 0, 251);
     let Ok(rx) = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await else {
-        return false;
+        return Beacon::Nothing;
     };
     let Ok(local) = rx.local_addr() else {
-        return false;
+        return Beacon::Nothing;
     };
     if rx.join_multicast_v4(group, Ipv4Addr::UNSPECIFIED).is_err() {
-        return false;
+        return Beacon::Nothing;
     }
     let Ok(tx) = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await else {
-        return false;
+        return Beacon::Nothing;
     };
     let beacon = b"1device multicast probe";
     // Two beacons: the first can race the group join on a slow stack.
@@ -276,42 +292,84 @@ pub async fn multicast_reaches_the_wire() -> bool {
         let _ = tx.send_to(beacon, (group, local.port())).await;
         let mut buf = [0u8; 64];
         match tokio::time::timeout(Duration::from_secs(2), rx.recv_from(&mut buf)).await {
-            Ok(Ok((n, _))) if &buf[..n] == beacon => return true,
+            Ok(Ok((n, from))) if &buf[..n] == beacon => return Beacon::Heard(from.ip()),
             _ => {}
         }
     }
-    false
+    Beacon::Nothing
 }
 
-/// One plain line when LAN discovery is on but the wire is dark. Without it,
-/// the only trace is the discovery library's per-send warnings — hundreds of
-/// lines that name no cure. macOS is the expected culprit: it asks each fresh
-/// build for the "Local Network" permission and quietly refuses every
-/// multicast send (`No route to host`) until someone answers, so its line
-/// names the switch to flip. Three probes over twenty seconds ride out a
-/// Wi-Fi still associating at login and a permission prompt just answered.
+/// One plain line when LAN discovery is on but the wire is dark or captured.
+/// Without it, the only trace is the discovery library's per-send warnings:
+/// hundreds of lines that name no cure. Two distinct diagnoses share the
+/// probe:
+///
+/// - **dark**: nothing loops back at all. macOS is the expected culprit: it
+///   asks each fresh build for the "Local Network" permission and quietly
+///   refuses every multicast send (`No route to host`) until someone answers,
+///   so its line names the switch to flip.
+/// - **tunneled**: the beacon loops back, but stamped with a VPN tunnel's
+///   address. The kernel routed multicast into the tunnel (per-app VPNs on
+///   Android and desktop VPNs holding the default route both do this), looped
+///   a copy back locally, and the actual network never saw a byte: a deafness
+///   a naive probe files as a healthy wire. The line names the tunnel and the
+///   way out.
+///
+/// Three probes over twenty seconds ride out a Wi-Fi still associating at
+/// login and a permission prompt just answered.
 async fn warn_if_lan_dark() {
-    if any_attempt_succeeds(3, Duration::from_secs(10), multicast_reaches_the_wire).await {
-        return;
+    match worst_that_stands(3, Duration::from_secs(10), wire_verdict).await {
+        Wire::Healthy => {}
+        Wire::Tunneled(iface) => tracing::warn!("{}", lan_tunneled_notice(&iface)),
+        Wire::Dark => tracing::warn!("{}", lan_dark_notice(std::env::consts::OS)),
     }
-    tracing::warn!("{}", lan_dark_notice(std::env::consts::OS));
+}
+
+/// One probe attempt's verdict on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Wire {
+    /// The beacon looped back from a non-tunnel interface: multicast gets out.
+    Healthy,
+    /// The beacon looped back from this tunnel interface: a VPN swallows it.
+    Tunneled(String),
+    /// The beacon never looped back at all.
+    Dark,
+}
+
+/// One probe attempt, classified against the live interface table.
+async fn wire_verdict() -> Wire {
+    match multicast_loopback().await {
+        Beacon::Nothing => Wire::Dark,
+        Beacon::Heard(source) => match tunnel_owning_source(source, &interface_summaries()) {
+            Some(iface) => Wire::Tunneled(iface),
+            None => Wire::Healthy,
+        },
+    }
 }
 
 /// Runs `probe` up to `attempts` times, `pause` apart, stopping at the first
-/// success.
-async fn any_attempt_succeeds<F>(attempts: u32, pause: Duration, probe: impl Fn() -> F) -> bool
+/// healthy attempt. What stands at the end is the most *specific* bad news
+/// seen: a tunneled loop explains a dark wire (the VPN that swallowed one
+/// beacon swallowed the others), so it wins over plain darkness.
+async fn worst_that_stands<F>(attempts: u32, pause: Duration, probe: impl Fn() -> F) -> Wire
 where
-    F: std::future::Future<Output = bool>,
+    F: std::future::Future<Output = Wire>,
 {
+    let mut tunneled = None;
     for attempt in 0..attempts {
         if attempt > 0 {
             tokio::time::sleep(pause).await;
         }
-        if probe().await {
-            return true;
+        match probe().await {
+            Wire::Healthy => return Wire::Healthy,
+            Wire::Tunneled(iface) => tunneled = Some(iface),
+            Wire::Dark => {}
         }
     }
-    false
+    match tunneled {
+        Some(iface) => Wire::Tunneled(iface),
+        None => Wire::Dark,
+    }
 }
 
 /// The line for a dark wire, per platform. Takes the OS as a value so every
@@ -331,6 +389,118 @@ fn lan_dark_notice(os: &str) -> &'static str {
              unaffected."
         }
     }
+}
+
+/// The line for a captured wire: the beacon does loop back, but through a
+/// VPN. Names the tunnel so the user knows which app to open, and the
+/// remedies in the order they usually exist.
+fn lan_tunneled_notice(iface: &str) -> String {
+    format!(
+        "LAN discovery is on, but multicast is routed into a VPN tunnel \
+         ({iface}) instead of your network: this device neither sees nor is \
+         seen on its own network. Exclude 1Device from the VPN (WireGuard \
+         calls it \"Excluded applications\") or allow LAN traffic in the \
+         VPN's settings; server and relay are unaffected."
+    )
+}
+
+/// The slice of an interface the tunnel verdict needs, split from `netdev`'s
+/// full struct so the verdict stays a pure function the tests can feed.
+struct InterfaceSummary {
+    /// What the warning will name: the friendly name where the platform has
+    /// one (Windows kernel names are GUIDs), the kernel name elsewhere.
+    name: String,
+    /// Every IPv4 address the interface owns.
+    addrs: Vec<std::net::Ipv4Addr>,
+    /// Tunnel-shaped, per [`looks_like_tunnel`].
+    tunnel: bool,
+}
+
+/// The live interface table, reduced to what the verdict reads.
+fn interface_summaries() -> Vec<InterfaceSummary> {
+    netdev::get_interfaces()
+        .into_iter()
+        .map(|iface| InterfaceSummary {
+            tunnel: looks_like_tunnel(&iface),
+            addrs: iface.ipv4_addrs(),
+            name: match &iface.friendly_name {
+                Some(friendly) => friendly.clone(),
+                None => iface.name.clone(),
+            },
+        })
+        .collect()
+}
+
+/// Tunnel-shaped: the flag heuristic (up, point-to-point, no broadcast)
+/// covers tun/utun/wg out of the box, the OS-reported type covers Windows
+/// tunnel adapters, and the names catch what both miss (wintun registers as
+/// an ordinary virtual adapter).
+fn looks_like_tunnel(iface: &netdev::Interface) -> bool {
+    iface.is_tun()
+        || iface.if_type == netdev::interface::types::InterfaceType::Tunnel
+        || name_says_tunnel(
+            &iface.name,
+            iface.friendly_name.as_deref(),
+            iface.description.as_deref(),
+        )
+}
+
+/// Name-based recognition, the third net. Kernel names are terse and
+/// prefix-stable (`tun0`, `utun3`, `wg0`, `tailscale0`); friendly names and
+/// descriptions (Windows, mostly) are prose, matched on the vendors and the
+/// word itself. `eth0`, `en0`, `wlan0` and "Wi-Fi" match nothing here: a
+/// wrong accusation would be worse than the old silence.
+fn name_says_tunnel(name: &str, friendly: Option<&str>, description: Option<&str>) -> bool {
+    const NAME_PREFIXES: &[&str] = &[
+        "tun",
+        "tap",
+        "utun",
+        "wg",
+        "zt",
+        "ppp",
+        "ipsec",
+        "nordlynx",
+        "tailscale",
+    ];
+    const PROSE_KEYWORDS: &[&str] = &[
+        "vpn",
+        "tunnel",
+        "wintun",
+        "tap-windows",
+        "wireguard",
+        "tailscale",
+        "zerotier",
+        "openvpn",
+        "nordlynx",
+        "proton",
+    ];
+    let name = name.to_ascii_lowercase();
+    NAME_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+        || [friendly, description]
+            .into_iter()
+            .flatten()
+            .map(str::to_ascii_lowercase)
+            .any(|text| PROSE_KEYWORDS.iter().any(|word| text.contains(word)))
+}
+
+/// The tunnel owning the looped beacon's source address, if that is where it
+/// came from. `None` for a source no interface claims is deliberate: without
+/// an owner there is no diagnosis, and the benefit of the doubt keeps the
+/// old behavior (a heard beacon, a silent probe). The lan-dark hunt already
+/// convicted an innocent VPN once; this function is written to never repeat
+/// that.
+fn tunnel_owning_source(
+    source: std::net::IpAddr,
+    interfaces: &[InterfaceSummary],
+) -> Option<String> {
+    let std::net::IpAddr::V4(source) = source else {
+        return None;
+    };
+    interfaces
+        .iter()
+        .find(|iface| iface.addrs.contains(&source))
+        .filter(|iface| iface.tunnel)
+        .map(|iface| iface.name.clone())
 }
 
 /// Maintains the set of LAN-visible `node_id`s from the discovery events.
@@ -739,13 +909,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_probe_stops_at_the_first_success() {
+    async fn the_probe_stops_at_the_first_healthy_attempt() {
         let calls = AtomicU32::new(0);
-        let up_on_second = || {
+        let healthy_on_second = || {
             let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
-            async move { n == 2 }
+            async move { if n == 2 { Wire::Healthy } else { Wire::Dark } }
         };
-        assert!(any_attempt_succeeds(3, Duration::from_millis(1), up_on_second).await);
+        let verdict = worst_that_stands(3, Duration::from_millis(1), healthy_on_second).await;
+        assert_eq!(verdict, Wire::Healthy);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -754,9 +925,148 @@ mod tests {
         let calls = AtomicU32::new(0);
         let never = || {
             calls.fetch_add(1, Ordering::SeqCst);
-            async { false }
+            async { Wire::Dark }
         };
-        assert!(!any_attempt_succeeds(3, Duration::from_millis(1), never).await);
+        let verdict = worst_that_stands(3, Duration::from_millis(1), never).await;
+        assert_eq!(verdict, Wire::Dark);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_tunneled_loop_outlives_later_dark_attempts() {
+        // The VPN that swallowed the first beacon swallowed the next ones
+        // too: the specific diagnosis must not decay into the generic one.
+        let calls = AtomicU32::new(0);
+        let tunneled_then_dark = || {
+            let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                if n == 1 {
+                    Wire::Tunneled("wg0".into())
+                } else {
+                    Wire::Dark
+                }
+            }
+        };
+        let verdict = worst_that_stands(3, Duration::from_millis(1), tunneled_then_dark).await;
+        assert_eq!(verdict, Wire::Tunneled("wg0".into()));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_healthy_attempt_clears_an_earlier_tunneled_one() {
+        // A VPN disconnecting mid-probe: the wire is fine now, stay silent.
+        let calls = AtomicU32::new(0);
+        let tunneled_then_healthy = || {
+            let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                if n == 1 {
+                    Wire::Tunneled("wg0".into())
+                } else {
+                    Wire::Healthy
+                }
+            }
+        };
+        let verdict = worst_that_stands(3, Duration::from_millis(1), tunneled_then_healthy).await;
+        assert_eq!(verdict, Wire::Healthy);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    fn summary(name: &str, tunnel: bool, addrs: &[std::net::Ipv4Addr]) -> InterfaceSummary {
+        InterfaceSummary {
+            name: name.into(),
+            addrs: addrs.to_vec(),
+            tunnel,
+        }
+    }
+
+    #[test]
+    fn a_beacon_from_a_tunnel_address_names_the_tunnel() {
+        let interfaces = [
+            summary("eth0", false, &["192.168.1.34".parse().unwrap()]),
+            summary("wg0", true, &["10.8.0.2".parse().unwrap()]),
+        ];
+        let verdict = tunnel_owning_source("10.8.0.2".parse().unwrap(), &interfaces);
+        assert_eq!(verdict.as_deref(), Some("wg0"));
+    }
+
+    #[test]
+    fn a_beacon_from_the_lan_interface_accuses_nobody() {
+        let interfaces = [
+            summary("eth0", false, &["192.168.1.34".parse().unwrap()]),
+            summary("wg0", true, &["10.8.0.2".parse().unwrap()]),
+        ];
+        assert_eq!(
+            tunnel_owning_source("192.168.1.34".parse().unwrap(), &interfaces),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unclaimed_source_gets_the_benefit_of_the_doubt() {
+        let interfaces = [summary("wg0", true, &["10.8.0.2".parse().unwrap()])];
+        assert_eq!(
+            tunnel_owning_source("172.16.9.9".parse().unwrap(), &interfaces),
+            None
+        );
+        assert_eq!(
+            tunnel_owning_source("fe80::1".parse().unwrap(), &interfaces),
+            None
+        );
+    }
+
+    #[test]
+    fn kernel_tunnel_names_are_recognized() {
+        for name in [
+            "tun0",
+            "utun3",
+            "wg0",
+            "tailscale0",
+            "ppp0",
+            "nordlynx",
+            "zt7nnig34",
+        ] {
+            assert!(
+                name_says_tunnel(name, None, None),
+                "{name} should read as a tunnel"
+            );
+        }
+        for name in ["eth0", "en0", "wlan0", "enp3s0", "br-lan", "docker0"] {
+            assert!(
+                !name_says_tunnel(name, None, None),
+                "{name} must not read as a tunnel"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_prose_names_are_recognized() {
+        // On Windows the kernel name is a GUID; the giveaway is the friendly
+        // name or the adapter description.
+        let guid = "{7D3A2F41-9C58-4E06-B2D1-5A8C39E01B67}";
+        assert!(name_says_tunnel(guid, Some("WireGuard Tunnel"), None));
+        assert!(name_says_tunnel(
+            guid,
+            Some("Ethernet 2"),
+            Some("TAP-Windows Adapter V9")
+        ));
+        assert!(name_says_tunnel(guid, Some("ProtonVPN"), None));
+        assert!(!name_says_tunnel(
+            guid,
+            Some("Wi-Fi"),
+            Some("Intel(R) Wi-Fi 6 AX201")
+        ));
+        assert!(!name_says_tunnel(
+            guid,
+            Some("Ethernet"),
+            Some("Realtek PCIe GbE")
+        ));
+    }
+
+    #[test]
+    fn the_tunneled_notice_names_the_interface_and_the_way_out() {
+        let notice = lan_tunneled_notice("wg0");
+        assert!(notice.contains("wg0"));
+        assert!(notice.contains("Exclude 1Device from the VPN"));
+        assert!(notice.contains("server and relay are unaffected"));
     }
 }

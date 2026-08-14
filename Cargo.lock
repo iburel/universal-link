@@ -4377,6 +4377,7 @@ dependencies = [
  "keyring",
  "libc",
  "n0-future",
+ "netdev",
  "onedevice-core",
  "onedevice-daemon",
  "onedevice-ipc-client",

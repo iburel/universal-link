@@ -153,11 +153,16 @@ the app cannot opt out programmatically). Measured on a real device under
 WireGuard: the system's own mDNS still reaches the wire, the app's never does,
 in either direction.
 
-The Core's dark-wire probe cannot see this: its beacon loops back inside the
-kernel and reports a healthy wire, so no warning line appears. If devices on
-the same network do not see each other and one of them runs a VPN, this is
-the first thing to check. The cure is the VPN app's own per-app exemption
-(WireGuard calls it *Excluded applications*) — or turning the tunnel off.
+The Core's dark-wire probe reads the source address of its looped-back
+beacon: stamped with a tunnel interface's address, the beacon proves the
+kernel routed multicast into the VPN, and the warning line names that
+interface instead of reporting a healthy wire. The recognition is a
+heuristic (interface flags, OS-reported type, and well-known names), so a
+tunnel it cannot identify still slips through silently: if devices on the
+same network do not see each other and one of them runs a VPN, this remains
+the first thing to check even without the line. The cure is the VPN app's
+own per-app exemption (WireGuard calls it *Excluded applications*), a
+setting allowing LAN traffic outside the tunnel, or turning the tunnel off.
 
 ## Secrets
 
