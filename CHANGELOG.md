@@ -8,6 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A VPN that swallows the local network is now called by its name.** A
+  device-wide or per-app VPN can capture multicast routing: beacons loop
+  back inside the kernel while the actual network never sees a byte, which
+  the old probe filed as a healthy wire and stayed silent about. The probe
+  now reads the source address of its looped-back beacon; when a tunnel
+  interface owns it, the warning names that interface and the way out
+  (exclude 1Device from the VPN, or allow LAN traffic in its settings).
+  Devices that only ever met through the server while a VPN was up is the
+  symptom this line explains.
 - **The identity step of self-hosting is documented end to end.** A new
   [identity providers](doc/identity-providers.md) page carries the Google
   console walkthrough with today's screen names and every trap called out
