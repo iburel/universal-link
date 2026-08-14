@@ -13,9 +13,10 @@ for the source of truth and [`server-api.md`](server-api.md) for the protocol.
 
 > **State of this building block.** The artifacts below (Docker image, Caddy stack,
 > systemd unit) are not merely written: this is how the project's own deployment
-> runs, and the whole path has been validated against it — a real Google login,
-> enrollment, devices attesting one another, transfers in both directions. What is
-> still missing is an image **published to a registry**: you build it yourself.
+> runs, and the whole path has been validated against it: a real Google login,
+> enrollment, devices attesting one another, transfers in both directions. The
+> image is **published to a registry** (`ghcr.io/iburel/1device-server`, amd64 and
+> arm64), and the compose below pulls it: nothing gets compiled on your machine.
 
 ## What the server sees (threat model)
 
@@ -51,8 +52,10 @@ In other words: host it like a sensitive metadata directory, not like a data sto
   `your-server.example.com`).
 - **Ports 80 and 443** open and reachable from the Internet (Caddy needs them to
   obtain and then renew the Let's Encrypt certificate).
-- The means to build the image (the cloned repository) — see also the build
-  prerequisites in the [README](../README.md).
+- The [`deploy/`](../deploy/) directory of this repository. That is the whole
+  requirement: the image comes prebuilt from the registry, so there is no Rust
+  toolchain to install and nothing to compile. (Cloning the full repository is
+  fine too, and becomes necessary only for the build-from-source fallback.)
 
 ## Step 1 — Register a Google OIDC client
 
@@ -112,15 +115,20 @@ cd deploy
 cp .env.example .env
 # Edit .env: ONEDEVICE_DOMAIN, ONEDEVICE_OIDC_ISSUER,
 # ONEDEVICE_OIDC_CLIENT_ID (+ ONEDEVICE_OIDC_CLIENT_SECRET with Google).
-docker compose up -d --build
+docker compose up -d
 ```
 
 What this starts ([`deploy/docker-compose.yml`](../deploy/docker-compose.yml)):
 
-- **`server`** — the image built from [`docker/server/Dockerfile`](../docker/server/Dockerfile),
+- **`server`**: the published image `ghcr.io/iburel/1device-server:latest`
+  (multi-arch, amd64 + arm64, built from
+  [`docker/server/Dockerfile`](../docker/server/Dockerfile) and smoke-tested by
+  [`.github/workflows/server-image.yml`](../.github/workflows/server-image.yml)),
   directory persisted in the `directory` volume (`/data`), reachable only by Caddy
-  (no published port).
-- **`caddy`** — the official `caddy:2` image, ports 80/443, config
+  (no published port). To pin a release instead of `latest`, put its version in
+  the `image:` tag. To build from source instead, `docker compose up -d --build`
+  from a full clone of the repository: same Dockerfile, same result, just slower.
+- **`caddy`**: the official `caddy:2` image, ports 80/443, config
   [`deploy/Caddyfile`](../deploy/Caddyfile), certificates persisted in the
   `caddy_data` volume.
 
@@ -215,7 +223,6 @@ key rotation, but no more often than this),
 
 ## What is not (yet) there
 
-- **No published image** on a registry: you build it yourself.
 - **No graceful shutdown of axum**: `docker stop` / `SIGTERM` cuts the in-flight
   connections dead (the clients reconnect) — acceptable for a control plane.
 - **A single node**: the full-snapshot JSON persistence targets a single server.

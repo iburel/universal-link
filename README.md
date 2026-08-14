@@ -209,7 +209,7 @@ Caddy stack ready to use — follow
 ```sh
 cd deploy
 cp .env.example .env      # domain + OIDC issuer + client (+ secret if needed)
-docker compose up -d --build
+docker compose up -d      # pulls the published image, nothing to compile
 ```
 
 ### Piece 3 — `config.json` on each PC
