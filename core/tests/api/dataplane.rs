@@ -13,10 +13,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use onedevice_core::{IoStream, OutgoingFile, PeerAddr, PeerTransport, send_transfer};
+use onedevice_test_support::memory_transport::{MemorySwitchboard, MemoryTransport};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use universallink_core::{IoStream, OutgoingFile, PeerAddr, PeerTransport, send_transfer};
-use universallink_test_support::memory_transport::{MemorySwitchboard, MemoryTransport};
 
 use crate::support::*;
 
@@ -356,7 +356,7 @@ async fn a_second_folder_of_the_same_name_lands_beside_the_first() {
 async fn a_forged_folder_path_that_escapes_is_refused_and_writes_nothing() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let victim = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
     let (rogue_id, _conn, rogue) = attested_sink(&server, &switchboard, &code).await;
 
@@ -388,7 +388,7 @@ async fn a_forged_folder_path_that_escapes_is_refused_and_writes_nothing() {
 async fn a_forged_offer_with_a_duplicate_path_is_refused_and_writes_nothing() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let victim = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
     let (rogue_id, _conn, rogue) = attested_sink(&server, &switchboard, &code).await;
 
@@ -425,7 +425,7 @@ async fn a_flat_offer_with_two_same_basename_files_still_disambiguates() {
     // is scoped to directories and nested paths, never a plain top-level file.
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let victim = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
     let (rogue_id, _conn, rogue) = attested_sink(&server, &switchboard, &code).await;
 
@@ -533,8 +533,8 @@ async fn a_peer_with_a_mismatched_account_key_is_refused() {
 async fn an_injected_node_id_with_a_foreign_attestation_is_refused_inbound() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let victim_code = universallink_core::account_key::generate_recovery_code();
-    let foreign_code = universallink_core::account_key::generate_recovery_code();
+    let victim_code = onedevice_core::account_key::generate_recovery_code();
+    let foreign_code = onedevice_core::account_key::generate_recovery_code();
 
     // Victim: a legitimate Core with ITS OWN account key.
     let victim =
@@ -557,8 +557,8 @@ async fn an_injected_node_id_with_a_foreign_attestation_is_refused_inbound() {
     )
     .await;
     authenticate(&mut ic, &intruder_key, &intruder_id).await;
-    let foreign_ak = universallink_core::account_key::account_key_from_code(&foreign_code).unwrap();
-    let foreign_att = universallink_core::account_key::attest(&foreign_ak, &intruder_key.node_id());
+    let foreign_ak = onedevice_core::account_key::account_key_from_code(&foreign_code).unwrap();
+    let foreign_att = onedevice_core::account_key::attest(&foreign_ak, &intruder_key.node_id());
     let intruder_relay = format!("iroh+memory://{}", intruder_key.node_id());
     ic.request(
         "presence.update",
@@ -601,7 +601,7 @@ async fn an_injected_node_id_with_a_foreign_attestation_is_refused_inbound() {
 async fn a_core_without_an_account_key_reaches_and_serves_no_one() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     // A: attested. B: enrolled but NEVER joined — no account key.
     let a = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
     let b = TestCore::start_enrolled_on_with_code(&server, &switchboard, None).await;
@@ -644,7 +644,7 @@ async fn a_core_without_an_account_key_reaches_and_serves_no_one() {
 async fn a_crafted_traversal_name_is_refused_and_writes_nothing() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let victim = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
     // A peer OF THE ACCOUNT (attested under the SAME code) — thus accepted by
     // peer_in_directory — but that forges an offer with a malicious name. The
@@ -678,7 +678,7 @@ async fn a_crafted_traversal_name_is_refused_and_writes_nothing() {
 async fn a_body_shorter_than_announced_fails_and_writes_nothing() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let victim = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
     let (rogue_id, _conn, rogue) = attested_sink(&server, &switchboard, &code).await;
 
@@ -711,7 +711,7 @@ async fn a_body_shorter_than_announced_fails_and_writes_nothing() {
 async fn a_later_file_with_a_bad_name_aborts_the_whole_transfer() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let victim = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
     let (rogue_id, _conn, rogue) = attested_sink(&server, &switchboard, &code).await;
 
@@ -749,7 +749,7 @@ async fn a_later_file_with_a_bad_name_aborts_the_whole_transfer() {
 async fn cancelling_an_inbound_transfer_stops_it() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let victim = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
     let (rogue_id, _conn, rogue) = attested_sink(&server, &switchboard, &code).await;
 
@@ -797,7 +797,7 @@ async fn cancelling_an_inbound_transfer_stops_it() {
 async fn an_attested_peer_without_a_published_relay_is_offline() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let a = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
     // A device of the account, attested, but that has NOT published a relay.
     let (offline_id, _conn) = attested_without_relay(&server, &code).await;
@@ -833,7 +833,7 @@ async fn an_attested_peer_without_a_published_relay_is_offline() {
 async fn a_peer_without_a_relay_is_reachable_over_the_lan() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let a = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
     let b = TestCore::start_lan_only_on(&server, &switchboard, &code).await;
     // A's own mDNS is on too — resolving is half of the same switch.
@@ -904,7 +904,7 @@ async fn a_peer_without_a_relay_is_reachable_over_the_lan() {
 async fn a_cached_directory_carries_the_lan_over_a_dead_server() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let a = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
     let b = TestCore::start_lan_only_on(&server, &switchboard, &code).await;
     switchboard.join_lan(&a.key().node_id());
@@ -966,7 +966,7 @@ async fn a_cached_directory_carries_the_lan_over_a_dead_server() {
 async fn a_stale_directory_cache_vouches_for_no_one() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let a = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
     let b = TestCore::start_lan_only_on(&server, &switchboard, &code).await;
     switchboard.join_lan(&a.key().node_id());
@@ -1026,7 +1026,7 @@ async fn a_stale_directory_cache_vouches_for_no_one() {
 async fn lan_visibility_flows_into_devices_list_and_events() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let a = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
     let b = TestCore::start_lan_only_on(&server, &switchboard, &code).await;
     switchboard.join_lan(&a.key().node_id());
@@ -1105,7 +1105,7 @@ async fn lan_visibility_flows_into_devices_list_and_events() {
 async fn logout_keeps_the_accounts_half_of_the_directory() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let sibling_key = DeviceKey::generate();
     let sibling = peer_record(&sibling_key, "Nomad", std::env::consts::OS, &code, 1);
     let a = TestCore::start_enrolled_lan_only_holding(
@@ -1137,13 +1137,13 @@ async fn logout_keeps_the_accounts_half_of_the_directory() {
         .get(&a.key().node_id())
         .unwrap_or_else(|| panic!("our own record, under its node_id: {devices:?}"));
     assert!(
-        universallink_core::directory::verify_record(own),
+        onedevice_core::directory::verify_record(own),
         "and it is the countersigned description: {own}"
     );
     let kept = devices
         .get(&sibling_key.node_id())
         .unwrap_or_else(|| panic!("the sibling the account can prove: {devices:?}"));
-    assert!(universallink_core::directory::verify_record(kept));
+    assert!(onedevice_core::directory::verify_record(kept));
 
     // A Core that never joined an account: the logout forgets the file whole.
     let b = TestCore::start_enrolled(&server).await;
@@ -1275,7 +1275,7 @@ async fn a_restarted_core_still_transfers_to_its_peer() {
 async fn cancelling_an_outbound_transfer_stops_it() {
     let server = TestServer::start().await;
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let a = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
     // A peer of the account (attested under the SAME code) whose transport
     // accepts streams but NEVER reads them: the send blocks, in flight,
@@ -1555,8 +1555,8 @@ async fn attested_sink(
     )
     .await;
     authenticate(&mut conn, &key, &device_id).await;
-    let ak = universallink_core::account_key::account_key_from_code(code).expect("valid code");
-    let att = universallink_core::account_key::attest(&ak, &key.node_id());
+    let ak = onedevice_core::account_key::account_key_from_code(code).expect("valid code");
+    let att = onedevice_core::account_key::attest(&ak, &key.node_id());
     let relay = format!("iroh+memory://{}", key.node_id());
     conn.request(
         "presence.update",
@@ -1586,8 +1586,8 @@ async fn attested_without_relay(server: &TestServer, code: &str) -> (String, Tes
     )
     .await;
     authenticate(&mut conn, &key, &device_id).await;
-    let ak = universallink_core::account_key::account_key_from_code(code).expect("valid code");
-    let att = universallink_core::account_key::attest(&ak, &key.node_id());
+    let ak = onedevice_core::account_key::account_key_from_code(code).expect("valid code");
+    let att = onedevice_core::account_key::attest(&ak, &key.node_id());
     // Attestation ONLY — no relay_url.
     conn.request("presence.update", json!({ "attestation": att }))
         .await

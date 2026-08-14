@@ -25,9 +25,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use onedevice_ipc_client::{Client, Event, RequestError};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
-use universallink_ipc_client::{Client, Event, RequestError};
 
 use crate::channel::{self, Listener, Request, Response, Stream, error};
 use crate::clicks::Clicks;
@@ -95,7 +95,7 @@ pub async fn run(
     // listener drops, taking its socket and its exclusivity lock with it.
     drop(targets_tx);
     if tokio::time::timeout(CLEANUP_GRACE, applier).await.is_err() {
-        eprintln!("[universallink-menu] a surface did not clear in time: entries may remain");
+        eprintln!("[1device-menu] a surface did not clear in time: entries may remain");
     }
     couriers.abort();
     outcome
@@ -442,7 +442,7 @@ async fn serve(
                     couriers.spawn(handle(stream, clicks.clone(), targets.clone()));
                 }
                 Err(e) => {
-                    eprintln!("[universallink-menu] cannot accept a click: {e}");
+                    eprintln!("[1device-menu] cannot accept a click: {e}");
                     tokio::time::sleep(ACCEPT_ERROR_PAUSE).await;
                 }
             },

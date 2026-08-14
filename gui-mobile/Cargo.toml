@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
 
 # Tauri MOBILE shell of the GUI (spike): the SAME Svelte frontend and the SAME
-# `universallink-gui` bridge as the desktop app, but the Core is embedded
+# `onedevice-gui` bridge as the desktop app, but the Core is embedded
 # in-process (Android cannot spawn a separate daemon) and reached over an
 # in-process UDS. One UI, one transport (`invoke`), no new core API.
 #
@@ -26,7 +26,7 @@
 # advisory here would otherwise have been reported by nothing but GitHub's
 # security alerts.
 [package]
-name = "universallink-gui-mobile"
+name = "onedevice-gui-mobile"
 version = "0.0.0"
 edition = "2024"
 license = "AGPL-3.0-only"
@@ -74,11 +74,11 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
 webpki-roots = "1"
 
 # The desktop bridge, reused verbatim (commands + connection relay).
-universallink-gui = { path = "../gui" }
-universallink-ipc-client = { path = "../client" }
+onedevice-gui = { path = "../gui" }
+onedevice-ipc-client = { path = "../client" }
 # The embedded Core and its production iroh data-plane wiring.
-universallink-core = { path = "../core" }
-universallink-daemon = { path = "../daemon" }
+onedevice-core = { path = "../core" }
+onedevice-daemon = { path = "../daemon" }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

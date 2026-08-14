@@ -3,11 +3,11 @@
 
 //! Test harness: server started in-process + shared building blocks
 //! (fake OIDC, device keys, JSON-RPC WebSocket client — crate
-//! `universallink-test-support`).
+//! `onedevice-test-support`).
 //!
 //! Protocol decisions **frozen by this suite** (complementing doc/server-api.md):
 //! - Endpoints: WebSocket on `/ws`, health on `GET /health`, deployment
-//!   descriptor on `GET /.well-known/universallink.json`. TLS is terminated
+//!   descriptor on `GET /.well-known/1device.json`. TLS is terminated
 //!   upstream — the tests speak in the clear over localhost.
 //! - JSON-RPC 2.0: client→server requests with a numeric `id`; server→client
 //!   notifications without an `id`; application codes in `error.data.code`
@@ -36,11 +36,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-pub use universallink_test_support::*;
+pub use onedevice_test_support::*;
 
-use universallink_server::{
-    Config, DirectoryStore, OidcConfig, ServerHandle, spawn, spawn_with_store,
-};
+use onedevice_server::{Config, DirectoryStore, OidcConfig, ServerHandle, spawn, spawn_with_store};
 
 // ---------------------------------------------------------------------------
 // Test environment: fake OIDC + server.

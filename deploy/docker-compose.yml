@@ -17,14 +17,14 @@ services:
       dockerfile: docker/server/Dockerfile
     restart: unless-stopped
     environment:
-      UNIVERSALLINK_OIDC_ISSUER: ${UNIVERSALLINK_OIDC_ISSUER}
-      UNIVERSALLINK_OIDC_CLIENT_ID: ${UNIVERSALLINK_OIDC_CLIENT_ID}
+      ONEDEVICE_OIDC_ISSUER: ${ONEDEVICE_OIDC_ISSUER}
+      ONEDEVICE_OIDC_CLIENT_ID: ${ONEDEVICE_OIDC_CLIENT_ID}
       # `:-` so an existing .env that predates this setting stays valid without
       # a compose warning; empty = the deployment has no client secret.
-      UNIVERSALLINK_OIDC_CLIENT_SECRET: ${UNIVERSALLINK_OIDC_CLIENT_SECRET:-}
+      ONEDEVICE_OIDC_CLIENT_SECRET: ${ONEDEVICE_OIDC_CLIENT_SECRET:-}
       # Optional (defaults baked into the binary) — uncomment as needed:
-      # UNIVERSALLINK_MAX_REQUESTS_PER_MINUTE: "120"
-      # UNIVERSALLINK_LOG: "info"
+      # ONEDEVICE_MAX_REQUESTS_PER_MINUTE: "120"
+      # ONEDEVICE_LOG: "info"
     volumes:
       - directory:/data
     # No `ports:`: the server is only reachable by Caddy, on the compose
@@ -39,7 +39,7 @@ services:
       - "80:80"
       - "443:443"
     environment:
-      UNIVERSALLINK_DOMAIN: ${UNIVERSALLINK_DOMAIN}
+      ONEDEVICE_DOMAIN: ${ONEDEVICE_DOMAIN}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data      # certificates — BACK THESE UP, otherwise re-issuance

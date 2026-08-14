@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "UniversalLink",
+  "productName": "1Device",
   "version": "0.6.0",
-  "identifier": "org.universallink.mobile",
+  "identifier": "org.onedevice.mobile",
   "build": {
     "beforeBuildCommand": "npm --prefix gui/ui run build:mobile",
     "frontendDist": "../gui/ui/dist-mobile"
@@ -11,7 +11,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "UniversalLink"
+        "title": "1Device"
       }
     ],
     "security": {

@@ -107,7 +107,7 @@
   <h1>{firstRun ? "Set up your server" : "Server"}</h1>
   <p class="muted">
     {#if firstRun}
-      UniversalLink connects to a server you choose. Enter its address — it tells
+      1Device connects to a server you choose. Enter its address — it tells
       this device how to sign you in.
     {:else}
       The server this device connects to. Saving asks it again how to sign you in,
@@ -135,7 +135,7 @@
   {#if unpublished}
     <p class="banner warn" role="status">
       This server does not publish its settings — an older version, or not a
-      UniversalLink server. Enter them below; whoever runs it has them.
+      1Device server. Enter them below; whoever runs it has them.
     </p>
   {/if}
 
@@ -145,8 +145,8 @@
       bind:value={serverUrl}
       aria-label="Server address"
       placeholder={manual
-        ? "wss://universallink.example.com/ws"
-        : "universallink.example.com"}
+        ? "wss://1device.example.com/ws"
+        : "1device.example.com"}
       autocapitalize="off"
       autocorrect="off"
       spellcheck="false"
@@ -221,7 +221,7 @@
          local network — no server, no sign-in. A quiet link rather than a
          fork-in-the-road: the server is still the primary path. -->
     <button class="link" onclick={withoutServer}>
-      Or use UniversalLink without a server
+      Or use 1Device without a server
     </button>
   {/if}
 </section>

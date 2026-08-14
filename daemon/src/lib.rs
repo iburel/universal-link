@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
 
-//! The Core process: what the `universallink-core` lib cannot carry.
+//! The Core process: what the `1device-core` lib cannot carry.
 //!
 //! The lib is cross-checked from Linux to windows-msvc and aarch64-darwin,
 //! which forbids it any dependency whose `build.rs` compiles C — so rustls, so

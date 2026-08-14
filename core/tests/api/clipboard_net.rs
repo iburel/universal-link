@@ -21,10 +21,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
+use onedevice_core::{PeerAddr, PeerTransport};
+use onedevice_test_support::memory_transport::{MemorySwitchboard, MemoryTransport};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use universallink_core::{PeerAddr, PeerTransport};
-use universallink_test_support::memory_transport::{MemorySwitchboard, MemoryTransport};
 
 use crate::support::*;
 
@@ -78,7 +78,7 @@ async fn connected_lan_pair(
     server: &TestServer,
 ) -> (TestCore, TestComponent, TestCore, TestComponent) {
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let a = TestCore::start_enrolled_on_with_code(server, &switchboard, Some(&code)).await;
     let b = TestCore::start_lan_only_on(server, &switchboard, &code).await;
     switchboard.join_lan(&a.key().node_id());
@@ -799,7 +799,7 @@ async fn open_channel_token(c: &mut TestComponent, tx_id: &str) -> String {
 /// account that `b` already sees (its stream will pass `peer_in_directory`).
 async fn core_with_raw_peer(server: &TestServer) -> (TestCore, TestComponent, RawPeer) {
     let switchboard = MemorySwitchboard::new();
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let b = TestCore::start_enrolled_on_with_code(server, &switchboard, Some(&code)).await;
     let mut cb = backend(&b).await;
     subscribe(&mut cb).await;
@@ -830,8 +830,8 @@ impl RawPeer {
         )
         .await;
         authenticate(&mut conn, &key, &device_id).await;
-        let ak = universallink_core::account_key::account_key_from_code(code).expect("valid code");
-        let att = universallink_core::account_key::attest(&ak, &key.node_id());
+        let ak = onedevice_core::account_key::account_key_from_code(code).expect("valid code");
+        let att = onedevice_core::account_key::attest(&ak, &key.node_id());
         let relay = format!("iroh+memory://{}", key.node_id());
         conn.request(
             "presence.update",
@@ -855,7 +855,7 @@ impl RawPeer {
     /// real Core would answer it, and a peer that goes quiet instead is exactly
     /// what dirsync tolerates by design — rather than mistaken for the stream
     /// the test is staging.
-    async fn next_stream_of(&self, wanted: &str) -> Option<Box<dyn universallink_core::IoStream>> {
+    async fn next_stream_of(&self, wanted: &str) -> Option<Box<dyn onedevice_core::IoStream>> {
         loop {
             let Ok((_peer, mut stream)) = self.transport.accept().await else {
                 return None;

@@ -5,6 +5,6 @@
 # `reverse_proxy` relays the WebSocket (/ws) NATIVELY: nothing to configure for
 # the upgrade, unlike nginx. `/health` goes through the same block.
 
-{$UNIVERSALLINK_DOMAIN} {
+{$ONEDEVICE_DOMAIN} {
 	reverse_proxy server:8080
 }

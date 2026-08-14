@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
 
 //! Deployment discovery: what a device needs in order to log in, read from the
-//! server instead of typed in by hand — `GET /.well-known/universallink.json`
+//! server instead of typed in by hand — `GET /.well-known/1device.json`
 //! (doc/server-api.md, "Deployment descriptor").
 //!
 //! The IdP and the OIDC client are the same on every device of one server, so
@@ -22,7 +22,7 @@ use crate::connector::{Connector, parse_url};
 /// Where the descriptor lives, fixed by the server API — as is `/ws`. A
 /// deployment mounted under a path prefix is therefore not discoverable; the
 /// reverse-proxy recipes in `deploy/` all serve a whole domain.
-const DESCRIPTOR_PATH: &str = "/.well-known/universallink.json";
+const DESCRIPTOR_PATH: &str = "/.well-known/1device.json";
 
 /// The settings to write into `config.json`. Field for field what the setup
 /// screen used to ask for.
@@ -41,7 +41,7 @@ pub(crate) enum DiscoverError {
     /// Not an address we can do anything with.
     BadUrl,
     /// Answered, but publishes no descriptor: a server older than this endpoint,
-    /// or not a UniversalLink server at all.
+    /// or not a 1Device server at all.
     NoDescriptor,
     /// Could not be reached, or answered at the HTTP level in a way that leaves
     /// nothing to read.
@@ -147,13 +147,13 @@ mod tests {
 
     #[test]
     fn a_bare_host_is_read_over_tls() {
-        let (descriptor, server) = urls("universallink.example.com");
+        let (descriptor, server) = urls("1device.example.com");
 
         assert_eq!(
             descriptor,
-            "https://universallink.example.com/.well-known/universallink.json"
+            "https://1device.example.com/.well-known/1device.json"
         );
-        assert_eq!(server, "wss://universallink.example.com/ws");
+        assert_eq!(server, "wss://1device.example.com/ws");
     }
 
     #[test]
@@ -178,10 +178,7 @@ mod tests {
         // what someone setting up the next device will paste.
         let (descriptor, server) = urls("wss://host:8443/ws");
 
-        assert_eq!(
-            descriptor,
-            "https://host:8443/.well-known/universallink.json"
-        );
+        assert_eq!(descriptor, "https://host:8443/.well-known/1device.json");
         assert_eq!(server, "wss://host:8443/ws");
     }
 
@@ -195,7 +192,7 @@ mod tests {
         ] {
             let (descriptor, server) = urls(input);
             assert_eq!(
-                descriptor, "https://host/.well-known/universallink.json",
+                descriptor, "https://host/.well-known/1device.json",
                 "{input}"
             );
             assert_eq!(server, "wss://host/ws", "{input}");
@@ -206,10 +203,7 @@ mod tests {
     fn an_ipv6_literal_keeps_its_brackets() {
         let (descriptor, server) = urls("[::1]:8080");
 
-        assert_eq!(
-            descriptor,
-            "https://[::1]:8080/.well-known/universallink.json"
-        );
+        assert_eq!(descriptor, "https://[::1]:8080/.well-known/1device.json");
         assert_eq!(server, "wss://[::1]:8080/ws");
     }
 

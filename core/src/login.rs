@@ -683,7 +683,7 @@ async fn respond(conn: &mut TcpStream, status: u16, message: &str) {
     };
     let body = format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-         <title>UniversalLink</title></head><body><p>{}</p></body></html>",
+         <title>1Device</title></head><body><p>{}</p></body></html>",
         escape_html(message)
     );
     let response = format!(

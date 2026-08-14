@@ -6,7 +6,7 @@
 //!
 //! Source: `config.json` in the config directory, written by the GUI's setup
 //! screen — the daemon only ever READS it, never rewrites it. The
-//! `UNIVERSALLINK_*` environment variables override it, for development.
+//! `ONEDEVICE_*` environment variables override it, for development.
 //! NOTHING is baked into the binary: a fresh install carries no server, and the
 //! GUI walks the user through configuring one, then has the Core re-read this
 //! file live (see `session.reload`). Precedence: env > `config.json`.
@@ -21,7 +21,7 @@
 
 use std::path::{Path, PathBuf};
 
-use universallink_core::ServerConfig;
+use onedevice_core::ServerConfig;
 
 /// The file, as we read it — every field optional, so that the environment can
 /// complete a partial file. Validating completeness BEFORE the merge would
@@ -90,8 +90,8 @@ fn load_from(
             *field = Some(value);
         }
     };
-    over("UNIVERSALLINK_DEVICE_NAME", &mut fields.device_name);
-    over("UNIVERSALLINK_RECEIVE_DIR", &mut fields.receive_dir);
+    over("ONEDEVICE_DEVICE_NAME", &mut fields.device_name);
+    over("ONEDEVICE_RECEIVE_DIR", &mut fields.receive_dir);
     let device_name = fields
         .device_name
         .clone()
@@ -114,14 +114,14 @@ fn load_from(
         };
     }
 
-    over("UNIVERSALLINK_SERVER_URL", &mut fields.server_url);
-    over("UNIVERSALLINK_OIDC_ISSUER", &mut fields.oidc_issuer);
-    over("UNIVERSALLINK_OIDC_CLIENT_ID", &mut fields.oidc_client_id);
+    over("ONEDEVICE_SERVER_URL", &mut fields.server_url);
+    over("ONEDEVICE_OIDC_ISSUER", &mut fields.oidc_issuer);
+    over("ONEDEVICE_OIDC_CLIENT_ID", &mut fields.oidc_client_id);
     over(
-        "UNIVERSALLINK_OIDC_CLIENT_SECRET",
+        "ONEDEVICE_OIDC_CLIENT_SECRET",
         &mut fields.oidc_client_secret,
     );
-    over("UNIVERSALLINK_RELAY_URL", &mut fields.relay_url);
+    over("ONEDEVICE_RELAY_URL", &mut fields.relay_url);
 
     let server = match validate(&fields) {
         Ok(Some(server)) => Some(server),
@@ -148,7 +148,7 @@ fn load_from(
     // not a string the `over` helper can move. Garbage neither turns the radio
     // on nor off: the file's intent is clear, the variable's is not — reported,
     // then ignored.
-    let lan_discovery = match env("UNIVERSALLINK_LAN_DISCOVERY")
+    let lan_discovery = match env("ONEDEVICE_LAN_DISCOVERY")
         .map(|v| v.trim().to_ascii_lowercase())
         .filter(|v| !v.is_empty())
         .as_deref()
@@ -158,7 +158,7 @@ fn load_from(
         Some("false") | Some("0") => false,
         Some(other) => {
             problem.get_or_insert(format!(
-                "UNIVERSALLINK_LAN_DISCOVERY must be true or false, not {other:?}"
+                "ONEDEVICE_LAN_DISCOVERY must be true or false, not {other:?}"
             ));
             fields.lan_discovery.unwrap_or(true)
         }
@@ -174,7 +174,7 @@ fn load_from(
 }
 
 /// Where to drop received files. Priority: configured value (`config.json` or
-/// `UNIVERSALLINK_RECEIVE_DIR`) > `<Downloads>/UniversalLink` >
+/// `ONEDEVICE_RECEIVE_DIR`) > `<Downloads>/1Device` >
 /// `<config directory>/received` (last resort, always available). The
 /// directory itself is created on the first incoming transfer, by the Core.
 fn resolve_receive_dir(
@@ -186,7 +186,7 @@ fn resolve_receive_dir(
         return PathBuf::from(dir);
     }
     if let Some(downloads) = download_dir(env) {
-        return downloads.join("UniversalLink");
+        return downloads.join("1Device");
     }
     config_dir.join("received")
 }
@@ -391,7 +391,7 @@ mod tests {
         assert_eq!(server.oidc_client_secret.as_deref(), Some("GOCSPX-xyz"));
 
         // And the environment overrides it like the rest.
-        let server = load_with(&dir, &[("UNIVERSALLINK_OIDC_CLIENT_SECRET", "from-env")])
+        let server = load_with(&dir, &[("ONEDEVICE_OIDC_CLIENT_SECRET", "from-env")])
             .server
             .expect("server");
         assert_eq!(server.oidc_client_secret.as_deref(), Some("from-env"));
@@ -407,7 +407,7 @@ mod tests {
             &dir,
             r#"{ "server_url": "wss://relay.example/ws", "oidc_issuer": "https://idp.example" }"#,
         );
-        let config = load_with(&dir, &[("UNIVERSALLINK_OIDC_CLIENT_ID", "from-env")]);
+        let config = load_with(&dir, &[("ONEDEVICE_OIDC_CLIENT_ID", "from-env")]);
         assert_eq!(config.server.expect("server").oidc_client_id, "from-env");
         assert!(config.problem.is_none());
     }
@@ -416,7 +416,7 @@ mod tests {
     fn the_environment_overrides_the_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir, COMPLETE);
-        let config = load_with(&dir, &[("UNIVERSALLINK_SERVER_URL", "ws://127.0.0.1:9/ws")]);
+        let config = load_with(&dir, &[("ONEDEVICE_SERVER_URL", "ws://127.0.0.1:9/ws")]);
         assert_eq!(config.server.expect("server").url, "ws://127.0.0.1:9/ws");
     }
 
@@ -424,7 +424,7 @@ mod tests {
     fn an_empty_variable_does_not_erase_the_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir, COMPLETE);
-        let config = load_with(&dir, &[("UNIVERSALLINK_SERVER_URL", "  ")]);
+        let config = load_with(&dir, &[("ONEDEVICE_SERVER_URL", "  ")]);
         assert_eq!(
             config.server.expect("server").url,
             "wss://relay.example/ws",
@@ -517,10 +517,7 @@ mod tests {
         );
         assert!(config.problem.is_none());
         // And the environment overrides, as everywhere.
-        let config = load_with(
-            &dir,
-            &[("UNIVERSALLINK_RELAY_URL", "https://other.example")],
-        );
+        let config = load_with(&dir, &[("ONEDEVICE_RELAY_URL", "https://other.example")]);
         assert_eq!(
             config.relay_url.expect("relay").to_string(),
             "https://other.example/"
@@ -553,7 +550,7 @@ mod tests {
         let config = load_from(dir.path(), &env_of(&[("HOME", "/home/u")]), || "h".into());
         assert_eq!(
             config.receive_dir,
-            PathBuf::from("/home/u/Downloads/UniversalLink")
+            PathBuf::from("/home/u/Downloads/1Device")
         );
         // XDG_DOWNLOAD_DIR wins over ~/Downloads.
         let config = load_from(
@@ -561,7 +558,7 @@ mod tests {
             &env_of(&[("XDG_DOWNLOAD_DIR", "/data/dl"), ("HOME", "/home/u")]),
             || "h".into(),
         );
-        assert_eq!(config.receive_dir, PathBuf::from("/data/dl/UniversalLink"));
+        assert_eq!(config.receive_dir, PathBuf::from("/data/dl/1Device"));
     }
 
     #[test]
@@ -573,9 +570,9 @@ mod tests {
             PathBuf::from("/srv/received")
         );
         // The environment overrides, and an empty variable does not erase.
-        let config = load_with(&dir, &[("UNIVERSALLINK_RECEIVE_DIR", "/other/received")]);
+        let config = load_with(&dir, &[("ONEDEVICE_RECEIVE_DIR", "/other/received")]);
         assert_eq!(config.receive_dir, PathBuf::from("/other/received"));
-        let config = load_with(&dir, &[("UNIVERSALLINK_RECEIVE_DIR", "  ")]);
+        let config = load_with(&dir, &[("ONEDEVICE_RECEIVE_DIR", "  ")]);
         assert_eq!(config.receive_dir, PathBuf::from("/srv/received"));
     }
 
@@ -618,21 +615,21 @@ mod tests {
 
         // The environment overrides the file, in both directions and both
         // spellings.
-        assert!(load_with(&dir, &[("UNIVERSALLINK_LAN_DISCOVERY", "true")]).lan_discovery);
-        assert!(load_with(&dir, &[("UNIVERSALLINK_LAN_DISCOVERY", "1")]).lan_discovery);
+        assert!(load_with(&dir, &[("ONEDEVICE_LAN_DISCOVERY", "true")]).lan_discovery);
+        assert!(load_with(&dir, &[("ONEDEVICE_LAN_DISCOVERY", "1")]).lan_discovery);
         std::fs::remove_file(dir.path().join("config.json")).expect("remove config");
-        assert!(!load_with(&dir, &[("UNIVERSALLINK_LAN_DISCOVERY", "false")]).lan_discovery);
-        assert!(!load_with(&dir, &[("UNIVERSALLINK_LAN_DISCOVERY", "0")]).lan_discovery);
+        assert!(!load_with(&dir, &[("ONEDEVICE_LAN_DISCOVERY", "false")]).lan_discovery);
+        assert!(!load_with(&dir, &[("ONEDEVICE_LAN_DISCOVERY", "0")]).lan_discovery);
 
         // An empty variable does not erase, like everywhere.
         write(&dir, r#"{ "lan_discovery": false }"#);
-        assert!(!load_with(&dir, &[("UNIVERSALLINK_LAN_DISCOVERY", "  ")]).lan_discovery);
+        assert!(!load_with(&dir, &[("ONEDEVICE_LAN_DISCOVERY", "  ")]).lan_discovery);
 
         // Garbage: reported, and the file's clear intent is kept.
-        let config = load_with(&dir, &[("UNIVERSALLINK_LAN_DISCOVERY", "maybe")]);
+        let config = load_with(&dir, &[("ONEDEVICE_LAN_DISCOVERY", "maybe")]);
         assert!(!config.lan_discovery, "the file said false");
         let problem = config.problem.expect("garbage reported");
-        assert!(problem.contains("UNIVERSALLINK_LAN_DISCOVERY"), "{problem}");
+        assert!(problem.contains("ONEDEVICE_LAN_DISCOVERY"), "{problem}");
     }
 
     #[test]
@@ -641,7 +638,7 @@ mod tests {
         write(&dir, r#"{ "device_name": "Living room laptop" }"#);
         assert_eq!(load_with(&dir, &[]).device_name, "Living room laptop");
         assert_eq!(
-            load_with(&dir, &[("UNIVERSALLINK_DEVICE_NAME", "Other")]).device_name,
+            load_with(&dir, &[("ONEDEVICE_DEVICE_NAME", "Other")]).device_name,
             "Other"
         );
     }

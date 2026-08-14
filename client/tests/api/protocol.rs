@@ -4,8 +4,8 @@
 //! The client's protocol conformance, observed from a scripted Core:
 //! incoming requests, invalid frames.
 
+use onedevice_ipc_client::Event;
 use serde_json::json;
-use universallink_ipc_client::Event;
 
 use crate::connection::client_config_at;
 use crate::support::*;
@@ -13,7 +13,7 @@ use crate::support::*;
 #[tokio::test]
 async fn incoming_request_gets_method_not_found() {
     let mut scripted = ScriptedCore::start().await;
-    let (_client, mut events) = universallink_ipc_client::spawn(client_config_at(scripted.path()));
+    let (_client, mut events) = onedevice_ipc_client::spawn(client_config_at(scripted.path()));
     let mut conn = scripted.accept().await;
     conn.handle_hello(1).await;
     expect_connected(&mut events, &["session.read"]).await;
@@ -45,7 +45,7 @@ async fn served_method_surfaces_as_request_and_is_answered() {
     let mut scripted = ScriptedCore::start().await;
     let mut cfg = client_config_at(scripted.path());
     cfg.served_methods = vec!["clipboard.get_data".into()];
-    let (client, mut events) = universallink_ipc_client::spawn(cfg);
+    let (client, mut events) = onedevice_ipc_client::spawn(cfg);
     let mut conn = scripted.accept().await;
     conn.handle_hello(1).await;
     expect_connected(&mut events, &["session.read"]).await;
@@ -86,7 +86,7 @@ async fn respond_error_carries_the_application_code() {
     let mut scripted = ScriptedCore::start().await;
     let mut cfg = client_config_at(scripted.path());
     cfg.served_methods = vec!["clipboard.get_data".into()];
-    let (client, mut events) = universallink_ipc_client::spawn(cfg);
+    let (client, mut events) = onedevice_ipc_client::spawn(cfg);
     let mut conn = scripted.accept().await;
     conn.handle_hello(1).await;
     expect_connected(&mut events, &["session.read"]).await;
@@ -111,7 +111,7 @@ async fn respond_after_reconnect_is_disconnected() {
     let mut scripted = ScriptedCore::start().await;
     let mut cfg = client_config_at(scripted.path());
     cfg.served_methods = vec!["clipboard.get_data".into()];
-    let (client, mut events) = universallink_ipc_client::spawn(cfg);
+    let (client, mut events) = onedevice_ipc_client::spawn(cfg);
     let mut conn = scripted.accept().await;
     conn.handle_hello(1).await;
     expect_connected(&mut events, &["session.read"]).await;
@@ -132,7 +132,7 @@ async fn respond_after_reconnect_is_disconnected() {
 
     // The stale id must NOT be written onto the fresh connection.
     match client.respond(id, json!({})).await {
-        Err(universallink_ipc_client::RequestError::Disconnected) => {}
+        Err(onedevice_ipc_client::RequestError::Disconnected) => {}
         other => panic!("expected Disconnected, got {other:?}"),
     }
     conn2.assert_no_frame().await;
@@ -141,7 +141,7 @@ async fn respond_after_reconnect_is_disconnected() {
 #[tokio::test]
 async fn establishment_messages_are_buffered_and_served() {
     let mut scripted = ScriptedCore::start().await;
-    let (_client, mut events) = universallink_ipc_client::spawn(client_config_at(scripted.path()));
+    let (_client, mut events) = onedevice_ipc_client::spawn(client_config_at(scripted.path()));
     let mut conn = scripted.accept().await;
     let hello = conn.recv().await;
 
@@ -177,7 +177,7 @@ async fn establishment_messages_are_buffered_and_served() {
 #[tokio::test]
 async fn invalid_frame_causes_reconnect() {
     let mut scripted = ScriptedCore::start().await;
-    let (_client, mut events) = universallink_ipc_client::spawn(client_config_at(scripted.path()));
+    let (_client, mut events) = onedevice_ipc_client::spawn(client_config_at(scripted.path()));
     let mut conn = scripted.accept().await;
     conn.handle_hello(1).await;
     expect_connected(&mut events, &["session.read"]).await;

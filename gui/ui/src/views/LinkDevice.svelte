@@ -19,10 +19,10 @@
 
   // Only the SHOWING gesture is bound to the server, and only for a device with
   // a session: it pairs over that session, so showing a code while the server is
-  // lost is a dead end. READING a code is not — a `UL2` code names the device to
+  // lost is a dead end. READING a code is not — a `1D2` code names the device to
   // dial on the local network, which is exactly the situation a lost server
   // leaves the room in. And a device with no session opens a connection of its
-  // own on demand (or shows a `UL2` itself), so `server_connected` — false for
+  // own on demand (or shows a `1D2` itself), so `server_connected` — false for
   // it at all times — gates nothing there: it would disarm the very screen a
   // brand-new device needs.
   const stalled = $derived(
@@ -55,7 +55,7 @@
       <input
         bind:value={code}
         aria-label="Pairing code"
-        placeholder="UL1:… or UL2:…"
+        placeholder="1D1:… or 1D2:…"
         autocapitalize="off"
         autocorrect="off"
         spellcheck="false"

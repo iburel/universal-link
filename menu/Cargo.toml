@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
 
 [package]
-name = "universallink-menu"
+name = "onedevice-menu"
 version = "0.6.0"
 edition = "2024"
 license = "AGPL-3.0-only"
@@ -24,7 +24,7 @@ publish = false
 # AppKit is reached through a single `extern "C"` for NSUpdateDynamicServices.
 
 [[bin]]
-name = "universallink-menu"
+name = "1device-menu"
 path = "src/main.rs"
 
 [dependencies]
@@ -40,11 +40,11 @@ tokio = { version = "1", features = [
     "sync",
     "time",
 ] }
-universallink-ipc-client = { path = "../client" }
+onedevice-ipc-client = { path = "../client" }
 # Resolves the local channel's path the same way for the manager (which binds
-# it) and the helper (which the shell starts with no UNIVERSALLINK_* in its
+# it) and the helper (which the shell starts with no ONEDEVICE_* in its
 # environment, so it can only rediscover the path by convention).
-universallink-paths = { path = "../paths" }
+onedevice-paths = { path = "../paths" }
 
 # Peer verification (uid) on the local channel: the same level-1 check the
 # Core's IPC applies. Mirrors core/src/transport.rs.
@@ -84,13 +84,13 @@ tempfile = "3"
 # racing real sleeps against a loaded CI runner. Test-only, and it adds no package
 # to the lock — the feature is internal to tokio.
 tokio = { version = "1", features = ["full", "test-util"] }
-universallink-core = { path = "../core" }
+onedevice-core = { path = "../core" }
 # The integration suite runs the manager against a REAL Core connected to a
 # REAL server, so a harness device can be enrolled, brought online, and given a
 # valid account attestation — the only way to exercise target computation and a
 # click on genuine device records rather than hand-written JSON.
-universallink-server = { path = "../server" }
-universallink-test-support = { path = "../test-support" }
+onedevice-server = { path = "../server" }
+onedevice-test-support = { path = "../test-support" }
 
 # `CommandLineToArgvW`: the REAL parser every program the shell starts uses, as the
 # oracle for the command lines we write into a registry verb and into a shortcut —

@@ -1,5 +1,5 @@
 [package]
-name = "universallink-core"
+name = "onedevice-core"
 version = "0.6.0"
 edition = "2024"
 license = "AGPL-3.0-only"
@@ -67,5 +67,5 @@ windows-sys = { version = "0.61", features = [
 # integration-test crate can base64-encode materialized clipboard blobs.
 base64 = "0.22"
 tempfile = "3"
-universallink-server = { path = "../server" }
-universallink-test-support = { path = "../test-support" }
+onedevice-server = { path = "../server" }
+onedevice-test-support = { path = "../test-support" }

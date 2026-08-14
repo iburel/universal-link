@@ -165,7 +165,7 @@ function shareText(status: ShareBanner): Notice {
         case "not_signed_in":
           return {
             kind: "error",
-            text: "Sign in to UniversalLink first — nothing was shared.",
+            text: "Sign in to 1Device first — nothing was shared.",
           };
         case "offline":
           return {
@@ -349,7 +349,7 @@ export class CoreStore {
   /**
    * No server in this device's life: nothing configured AND no session — the
    * Core's own predicate (doc/core-api.md, "account.*"), under which it
-   * creates accounts locally, mints `UL2` pairing codes and revokes by the
+   * creates accounts locally, mints `1D2` pairing codes and revokes by the
    * account key alone. Strict `=== false` on purpose: an old Core (no
    * `configured` field) is not assumed serverless, and a `session.changed`
    * delta (which carries no `configured` either) flips this to `false` until
@@ -1105,7 +1105,7 @@ export class CoreStore {
         this.pairingSupported = false;
         this.notice = {
           kind: "error",
-          text: "Linking by code needs a newer UniversalLink on this device and on the server.",
+          text: "Linking by code needs a newer 1Device on this device and on the server.",
         };
       } else if (isInvalidParams(e)) {
         // The only parameter either call sends is the code, so this is the Core

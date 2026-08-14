@@ -1,12 +1,12 @@
-# Local `ul-build` build image: compiles and tests the gui crate (tauri)
+# Local `1device-build` build image: compiles and tests the gui crate (tauri)
 # under WSL, where the webkit2gtk -dev packages cannot be installed on the host
 # (no sudo). Reconstructed from the history of the image built by
 # hand on 2026-07-10 (rust:1.89-bookworm base at the time), now versioned.
 #
-# Build:          docker build -t ul-build docker/ul-build/
-# Verification:   docker run --rm ul-build rustc --version
-# Typical use:    docker run --rm -v "$PWD":/work -w /work ul-build \
-#                    cargo test -p universallink-gui --locked
+# Build:          docker build -t 1device-build docker/1device-build/
+# Verification:   docker run --rm 1device-build rustc --version
+# Typical use:    docker run --rm -v "$PWD":/work -w /work 1device-build \
+#                    cargo test -p onedevice-gui --locked
 #
 # The Rust version must stay aligned with the development toolchain and
 # with the CI one (.github/workflows/ci.yml, "Rust toolchain" step).

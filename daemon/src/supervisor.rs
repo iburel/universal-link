@@ -6,7 +6,7 @@
 //!
 //! # Contract of a supervised component
 //!
-//! 1. It finds the Core at the path passed in `UNIVERSALLINK_IPC_PATH`.
+//! 1. It finds the Core at the path passed in `ONEDEVICE_IPC_PATH`.
 //! 2. It reads its **spawn token** from the first line of its standard input.
 //!    Neither `argv` (readable by everyone in `/proc/pid/cmdline`) nor the
 //!    environment (inherited by all of its descendants).
@@ -27,9 +27,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use onedevice_core::CoreHandle;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
-use universallink_core::CoreHandle;
 
 use crate::child;
 
@@ -153,7 +153,7 @@ async fn run_once(
     let token = core.mint_spawn_token(&spec.role, &scopes);
 
     let envs = [(
-        "UNIVERSALLINK_IPC_PATH",
+        "ONEDEVICE_IPC_PATH",
         ipc_path.to_string_lossy().into_owned(),
     )];
     let mut handle = match child::spawn(&spec.program, &spec.args, &envs) {
@@ -221,20 +221,17 @@ pub fn official_components() -> Vec<ChildSpec> {
         not(any(target_os = "linux", target_os = "windows", target_os = "macos")),
         allow(unused_mut)
     )]
-    let mut official: Vec<(&str, &str, &[&str])> = vec![(
-        "universallink-tray",
-        "tray",
-        &["session.read", "system.shutdown"],
-    )];
+    let mut official: Vec<(&str, &str, &[&str])> =
+        vec![("1device-tray", "tray", &["session.read", "system.shutdown"])];
     #[cfg(target_os = "linux")]
     official.push((
-        "universallink-clipboard",
+        "1device-clipboard",
         "clipboard-backend",
         &["devices.read", "clipboard.read", "clipboard.write"],
     ));
     #[cfg(target_os = "windows")]
     official.push((
-        "universallink-clipboard",
+        "1device-clipboard",
         "clipboard-backend",
         &["devices.read", "clipboard.read", "clipboard.write"],
     ));
@@ -243,7 +240,7 @@ pub fn official_components() -> Vec<ChildSpec> {
     // (brick 7). The pull-at-paste platforms above do not need it.
     #[cfg(target_os = "macos")]
     official.push((
-        "universallink-clipboard",
+        "1device-clipboard",
         "clipboard-backend",
         &[
             "devices.read",
@@ -260,7 +257,7 @@ pub fn official_components() -> Vec<ChildSpec> {
     // the devices, and sends on a click.
     #[cfg(target_os = "linux")]
     official.push((
-        "universallink-menu",
+        "1device-menu",
         "menu-backend",
         &["session.read", "devices.read", "files.send"],
     ));
@@ -268,7 +265,7 @@ pub fn official_components() -> Vec<ChildSpec> {
     // and the "Send to" shortcuts.
     #[cfg(target_os = "windows")]
     official.push((
-        "universallink-menu",
+        "1device-menu",
         "menu-backend",
         &["session.read", "devices.read", "files.send"],
     ));
@@ -277,7 +274,7 @@ pub fn official_components() -> Vec<ChildSpec> {
     // Quick Actions row is a bonus the user enables, see `menu::os::macos`).
     #[cfg(target_os = "macos")]
     official.push((
-        "universallink-menu",
+        "1device-menu",
         "menu-backend",
         &["session.read", "devices.read", "files.send"],
     ));
@@ -320,13 +317,13 @@ fn component_program(dir: &Path, name: &str) -> Option<PathBuf> {
 /// in gets a nested bundle of its own; this is where it lands.
 ///
 /// Only the tray, and in practice only on macOS, where the reason is Launch
-/// Services: a process started from `UniversalLink.app/Contents/MacOS` *is* the
+/// Services: a process started from `1Device.app/Contents/MacOS` *is* the
 /// application, and takes the enclosing bundle's identifier. The tray owns a
 /// status item, so it checks in as a GUI application — and from the moment the
-/// Core spawned it, `org.universallink.gui` was already running. Every `open` of
+/// Core spawned it, `org.onedevice.gui` was already running. Every `open` of
 /// the app (the Dock, the Finder, the Launchpad, and the tray's own Open item)
 /// then activated the tray, which has no window, so clicking the icon did
-/// nothing whatsoever. Inside `Contents/Frameworks/UniversalLinkTray.app` the
+/// nothing whatsoever. Inside `Contents/Frameworks/1DeviceTray.app` the
 /// nearest enclosing bundle is its own: the layout Chromium and Electron helpers
 /// have always used. `tray/macos/Info.plist` is that bundle's identity and
 /// `release.yml` assembles it.
@@ -336,7 +333,7 @@ fn component_program(dir: &Path, name: &str) -> Option<PathBuf> {
 /// with one set of tests is worth more here than a `cfg`.
 fn helper_bundle_program(dir: &Path, name: &str) -> Option<PathBuf> {
     let bundle = match name {
-        "universallink-tray" => "UniversalLinkTray.app",
+        "1device-tray" => "1DeviceTray.app",
         _ => return None,
     };
     // `dir` is `Contents/MacOS`; the helper is its sibling under `Contents`. The
@@ -380,13 +377,10 @@ mod lookup_tests {
     fn a_component_beside_the_core_is_what_gets_launched() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let macos = bundle(tmp.path());
-        let sibling = macos.join(executable_name("universallink-tray"));
+        let sibling = macos.join(executable_name("1device-tray"));
         touch(&sibling);
 
-        assert_eq!(
-            component_program(&macos, "universallink-tray"),
-            Some(sibling)
-        );
+        assert_eq!(component_program(&macos, "1device-tray"), Some(sibling));
     }
 
     /// The macOS layout, and the reason this lookup exists: the tray in a bundle
@@ -396,16 +390,13 @@ mod lookup_tests {
     fn the_trays_helper_bundle_wins_over_a_copy_beside_the_core() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let macos = bundle(tmp.path());
-        touch(&macos.join(executable_name("universallink-tray")));
+        touch(&macos.join(executable_name("1device-tray")));
         let helper = tmp
             .path()
-            .join("Contents/Frameworks/UniversalLinkTray.app/Contents/MacOS/universallink-tray");
+            .join("Contents/Frameworks/1DeviceTray.app/Contents/MacOS/1device-tray");
         touch(&helper);
 
-        assert_eq!(
-            component_program(&macos, "universallink-tray"),
-            Some(helper)
-        );
+        assert_eq!(component_program(&macos, "1device-tray"), Some(helper));
     }
 
     /// Nothing else moves: the helper layout is the tray's alone, so a clipboard
@@ -414,17 +405,17 @@ mod lookup_tests {
     fn no_other_component_is_looked_for_in_a_helper_bundle() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let macos = bundle(tmp.path());
-        let decoy = tmp.path().join(
-            "Contents/Frameworks/UniversalLinkTray.app/Contents/MacOS/universallink-clipboard",
-        );
+        let decoy = tmp
+            .path()
+            .join("Contents/Frameworks/1DeviceTray.app/Contents/MacOS/1device-clipboard");
         touch(&decoy);
 
-        assert_eq!(component_program(&macos, "universallink-clipboard"), None);
+        assert_eq!(component_program(&macos, "1device-clipboard"), None);
 
-        let sibling = macos.join(executable_name("universallink-clipboard"));
+        let sibling = macos.join(executable_name("1device-clipboard"));
         touch(&sibling);
         assert_eq!(
-            component_program(&macos, "universallink-clipboard"),
+            component_program(&macos, "1device-clipboard"),
             Some(sibling)
         );
     }
@@ -434,7 +425,7 @@ mod lookup_tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let macos = bundle(tmp.path());
 
-        assert_eq!(component_program(&macos, "universallink-tray"), None);
+        assert_eq!(component_program(&macos, "1device-tray"), None);
     }
 
     /// A Core that is not inside a bundle at all (a `cargo run`, and every Linux
@@ -443,12 +434,9 @@ mod lookup_tests {
     #[test]
     fn a_core_outside_any_bundle_still_finds_its_components() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let sibling = tmp.path().join(executable_name("universallink-tray"));
+        let sibling = tmp.path().join(executable_name("1device-tray"));
         touch(&sibling);
 
-        assert_eq!(
-            component_program(tmp.path(), "universallink-tray"),
-            Some(sibling)
-        );
+        assert_eq!(component_program(tmp.path(), "1device-tray"), Some(sibling));
     }
 }

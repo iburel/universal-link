@@ -18,8 +18,8 @@
 //! account by having the recovery code typed into it, and every peer check stays
 //! fail-closed.
 
+use onedevice_core::{FileSecretStore, SecretStore};
 use serde_json::json;
-use universallink_core::{FileSecretStore, SecretStore};
 
 use crate::support::*;
 
@@ -115,7 +115,7 @@ async fn an_account_is_created_with_no_server_at_all() {
         "an ordering token for its description: {own}"
     );
     assert!(
-        universallink_core::directory::verify_record(&own),
+        onedevice_core::directory::verify_record(&own),
         "the device signs what it says about itself: {own}"
     );
 }
@@ -148,7 +148,7 @@ async fn the_description_a_device_signed_survives_a_restart() {
     assert_eq!(after["name"], json!("Atelier"), "not re-minted");
     assert_eq!(after["seq"], before["seq"]);
     assert_eq!(after["self_sig"], before["self_sig"]);
-    assert!(universallink_core::directory::verify_record(&after));
+    assert!(onedevice_core::directory::verify_record(&after));
     assert_eq!(after["online"], json!(true), "and it is running");
 }
 
@@ -157,7 +157,7 @@ async fn the_description_a_device_signed_survives_a_restart() {
 /// over the one it already holds — and a signature over that name.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_renames_itself_with_no_server() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let core = TestCore::start_in_account(&code).await;
     let mut c = manager(&core).await;
     c.request("events.subscribe", json!({ "topics": ["devices"] }))
@@ -181,7 +181,7 @@ async fn a_device_renames_itself_with_no_server() {
         "{renamed} must supersede {before}"
     );
     assert!(
-        universallink_core::directory::verify_record(&renamed),
+        onedevice_core::directory::verify_record(&renamed),
         "and be signed under the new name: {renamed}"
     );
     // Told to whoever subscribed, not just to the caller.
@@ -204,7 +204,7 @@ async fn a_device_renames_itself_with_no_server() {
 /// answer stays exactly what it was before this path existed.
 #[tokio::test(flavor = "multi_thread")]
 async fn renaming_another_device_still_needs_a_server() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let sibling = DeviceKey::generate();
     let core = TestCore::start_in_account_holding(
         &code,
@@ -236,7 +236,7 @@ async fn renaming_another_device_still_needs_a_server() {
 /// `account-key.json` alone — there is no `session.json` to hang it on.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_account_survives_a_restart_with_no_server() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let core = TestCore::start_in_account(&code).await;
     let mut c = manager(&core).await;
     let before = only_device(&mut c).await;
@@ -258,7 +258,7 @@ async fn the_account_survives_a_restart_with_no_server() {
 /// fail closed — it would erase the account's other devices for good.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_serverless_directory_does_not_expire() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let core = TestCore::start_in_account(&code).await;
 
     // A sibling of the same account — attested under the same key, and signing its
@@ -399,7 +399,7 @@ async fn a_session_without_a_configured_server_is_still_a_server() {
 /// being gone. The proof is to put the record back and start again.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_is_struck_off_for_good_with_no_server() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let lost = DeviceKey::generate();
     let lost_record = peer_record(&lost, "Lost-Phone", "android", &code, 1);
     let core = TestCore::start_in_account_holding(&code, std::slice::from_ref(&lost_record)).await;
@@ -439,7 +439,7 @@ async fn a_device_is_struck_off_for_good_with_no_server() {
 /// holds the account without its key must say so rather than pretend.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_that_cannot_sign_cannot_strike_anyone_off() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let lost = DeviceKey::generate();
     let core = TestCore::start_in_account_holding(
         &code,
@@ -472,7 +472,7 @@ async fn a_device_that_cannot_sign_cannot_strike_anyone_off() {
 /// plus erasing the trust root, not a signature against oneself.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_does_not_strike_itself_off() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let core = TestCore::start_in_account(&code).await;
     let mut c = manager(&core).await;
 

@@ -4,8 +4,8 @@
 //! Requests: multiplexing, JSON-RPC error relaying, fail-closed while
 //! offline, timeout, connection loss in flight.
 
+use onedevice_ipc_client::RequestError;
 use serde_json::json;
-use universallink_ipc_client::RequestError;
 
 use crate::connection::client_config_at;
 use crate::support::*;
@@ -84,7 +84,7 @@ async fn request_without_connection_fails_fast() {
 #[tokio::test]
 async fn inflight_request_fails_on_disconnect() {
     let mut scripted = ScriptedCore::start().await;
-    let (client, mut events) = universallink_ipc_client::spawn(client_config_at(scripted.path()));
+    let (client, mut events) = onedevice_ipc_client::spawn(client_config_at(scripted.path()));
     let mut conn = scripted.accept().await;
     conn.handle_hello(1).await;
     expect_connected(&mut events, &["session.read"]).await;
@@ -109,7 +109,7 @@ async fn slow_core_times_out() {
     let mut config = client_config_at(scripted.path());
     config.request_timeout = std::time::Duration::from_millis(200);
 
-    let (client, mut events) = universallink_ipc_client::spawn(config);
+    let (client, mut events) = onedevice_ipc_client::spawn(config);
     let mut conn = scripted.accept().await;
     conn.handle_hello(1).await;
     expect_connected(&mut events, &["session.read"]).await;
@@ -152,7 +152,7 @@ async fn request_times_out_even_when_the_manager_is_stuck() {
     let mut config = client_config_at(scripted.path());
     config.request_timeout = std::time::Duration::from_millis(300);
 
-    let (client, mut events) = universallink_ipc_client::spawn(config);
+    let (client, mut events) = onedevice_ipc_client::spawn(config);
     let mut conn = scripted.accept().await;
     conn.handle_hello(1).await;
     expect_connected(&mut events, &["session.read"]).await;

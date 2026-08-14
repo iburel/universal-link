@@ -13,7 +13,7 @@
 //! they are not part of the automated suite. They are run by hand on a real macOS
 //! session with:
 //!
-//!     cargo test -p universallink-menu --test macos -- --ignored --test-threads=1
+//!     cargo test -p onedevice-menu --test macos -- --ignored --test-threads=1
 //!
 //! Single-threaded, because they share one namespace: the user's own services.
 //!
@@ -33,9 +33,9 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use universallink_menu::channel::{self, Request, Response};
-use universallink_menu::os::macos::{Services, services_dir};
-use universallink_menu::{HelperCommand, MenuSurface, Target};
+use onedevice_menu::channel::{self, Request, Response};
+use onedevice_menu::os::macos::{Services, services_dir};
+use onedevice_menu::{HelperCommand, MenuSurface, Target};
 
 /// How long the system is given to notice a service appearing or disappearing. It
 /// notices an appearance on its own within a second or so; the surface asks for both
@@ -57,7 +57,7 @@ fn target() -> Target {
 }
 
 fn label() -> String {
-    format!("Send to {} (UniversalLink)", target().name)
+    format!("Send to {} (1Device)", target().name)
 }
 
 /// The real surface, and a guarantee that it is emptied again whatever the test does.
@@ -89,7 +89,7 @@ impl RealMenu {
             .filter(|p| {
                 p.file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("UniversalLink-") && n.ends_with(".workflow"))
+                    .is_some_and(|n| n.starts_with("1Device-") && n.ends_with(".workflow"))
             })
             .collect()
     }
@@ -118,7 +118,7 @@ impl Probe {
     /// next one.
     async fn start(tag: &str) -> Probe {
         // A path with a SPACE in it: the script single-quotes what it carries, and a
-        // real installation path (`/Applications/UniversalLink.app/…`) is one word
+        // real installation path (`/Applications/1Device.app/…`) is one word
         // only by luck.
         let path =
             std::env::temp_dir().join(format!("ul menu live {tag} {}.sock", std::process::id()));
@@ -169,7 +169,7 @@ impl Probe {
 /// pointed at the probe's channel.
 fn helper(channel: &Path) -> HelperCommand {
     HelperCommand {
-        program: PathBuf::from(env!("CARGO_BIN_EXE_universallink-menu")),
+        program: PathBuf::from(env!("CARGO_BIN_EXE_1device-menu")),
         extra_args: vec!["--channel".into(), channel.to_string_lossy().into_owned()],
     }
 }
@@ -230,12 +230,12 @@ async fn the_real_services_registry_follows_our_entries() {
     };
     menu.apply(std::slice::from_ref(&renamed));
     assert_eq!(menu.bundles().len(), 1, "the rename moved the bundle");
-    await_registration(&format!("Send to {} (UniversalLink)", renamed.name), true).await;
+    await_registration(&format!("Send to {} (1Device)", renamed.name), true).await;
     await_registration(&label(), false).await;
 
     menu.apply(&[]);
     assert_eq!(menu.bundles().len(), 0);
-    await_registration(&format!("Send to {} (UniversalLink)", renamed.name), false).await;
+    await_registration(&format!("Send to {} (1Device)", renamed.name), false).await;
 }
 
 /// The document, through the real workflow runtime: `automator` runs the bundle we
@@ -312,7 +312,7 @@ async fn a_lookup_by_the_label_we_wrote_resolves_the_service() {
         "the system did not resolve the label we wrote"
     );
     assert_eq!(
-        perform_service("Send to Nobody (UniversalLink)", &file),
+        perform_service("Send to Nobody (1Device)", &file),
         "false",
         "the system resolved a label nothing wrote"
     );

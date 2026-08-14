@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
 
 [package]
-name = "universallink-tray"
+name = "onedevice-tray"
 version = "0.6.0"
 edition = "2024"
 license = "AGPL-3.0-only"
@@ -21,7 +21,7 @@ publish = false
 # later building blocks.
 
 [[bin]]
-name = "universallink-tray"
+name = "1device-tray"
 path = "src/main.rs"
 
 [dependencies]
@@ -49,6 +49,6 @@ tokio = { version = "1", features = [
 # is dropped: it links `-lxdo` at build time only to power the predefined
 # Copy/Cut/Paste/SelectAll menu items, which we do not use.
 tray-icon = { version = "0.24.1", default-features = false, features = ["gtk"] }
-universallink-ipc-client = { path = "../client" }
+onedevice-ipc-client = { path = "../client" }
 # Resolves the config directory to read the GUI's recorded relaunch path.
-universallink-paths = { path = "../paths" }
+onedevice-paths = { path = "../paths" }

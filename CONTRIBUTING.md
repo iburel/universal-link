@@ -1,6 +1,6 @@
-# Contributing to UniversalLink
+# Contributing to 1Device
 
-Thanks for your interest in UniversalLink. This document explains how to
+Thanks for your interest in 1Device. This document explains how to
 build, test, and submit changes.
 
 ## Building and testing
@@ -51,7 +51,7 @@ Signed-off-by: Your Name <your.email@example.com>
 `git commit -s` adds it automatically. By signing off you agree to the
 Developer Certificate of Origin 1.1, reproduced below.
 
-> **Note on copyright and licensing.** UniversalLink is licensed under
+> **Note on copyright and licensing.** 1Device is licensed under
 > **AGPL-3.0-only**. The DCO certifies the *provenance* of a contribution; it
 > does **not** transfer copyright. Contributors retain copyright to their work
 > and license it to the project under AGPL-3.0-only. Relicensing the project as

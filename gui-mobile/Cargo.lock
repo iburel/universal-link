@@ -3702,6 +3702,101 @@ dependencies = [
 ]
 
 [[package]]
+name = "onedevice-core"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chacha20poly1305",
+ "ed25519-dalek",
+ "form_urlencoded",
+ "futures-util",
+ "hex",
+ "hkdf 0.13.0",
+ "libc",
+ "rand",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "windows-sys 0.61.2",
+ "x25519-dalek",
+]
+
+[[package]]
+name = "onedevice-daemon"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "gethostname",
+ "hex",
+ "iroh",
+ "iroh-mdns-address-lookup",
+ "keyring",
+ "libc",
+ "n0-future",
+ "onedevice-core",
+ "onedevice-paths",
+ "rustls-platform-verifier",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "onedevice-gui"
+version = "0.6.0"
+dependencies = [
+ "onedevice-ipc-client",
+ "onedevice-paths",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-opener",
+ "tokio",
+]
+
+[[package]]
+name = "onedevice-gui-mobile"
+version = "0.0.0"
+dependencies = [
+ "android_system_properties",
+ "anyhow",
+ "base64 0.22.1",
+ "onedevice-core",
+ "onedevice-daemon",
+ "onedevice-gui",
+ "onedevice-ipc-client",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-opener",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+ "webpki-roots",
+]
+
+[[package]]
+name = "onedevice-ipc-client"
+version = "0.6.0"
+dependencies = [
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "onedevice-paths"
+version = "0.6.0"
+
+[[package]]
 name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6126,101 +6221,6 @@ dependencies = [
  "crypto-common 0.2.2",
  "ctutils",
 ]
-
-[[package]]
-name = "universallink-core"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "chacha20poly1305",
- "ed25519-dalek",
- "form_urlencoded",
- "futures-util",
- "hex",
- "hkdf 0.13.0",
- "libc",
- "rand",
- "serde_json",
- "sha2 0.11.0",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "windows-sys 0.61.2",
- "x25519-dalek",
-]
-
-[[package]]
-name = "universallink-daemon"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "gethostname",
- "hex",
- "iroh",
- "iroh-mdns-address-lookup",
- "keyring",
- "libc",
- "n0-future",
- "rustls-platform-verifier",
- "serde_json",
- "tokio",
- "tokio-rustls",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "universallink-core",
- "universallink-paths",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "universallink-gui"
-version = "0.6.0"
-dependencies = [
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-opener",
- "tokio",
- "universallink-ipc-client",
- "universallink-paths",
-]
-
-[[package]]
-name = "universallink-gui-mobile"
-version = "0.0.0"
-dependencies = [
- "android_system_properties",
- "anyhow",
- "base64 0.22.1",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-opener",
- "tokio",
- "tokio-rustls",
- "tracing",
- "tracing-subscriber",
- "universallink-core",
- "universallink-daemon",
- "universallink-gui",
- "universallink-ipc-client",
- "webpki-roots",
-]
-
-[[package]]
-name = "universallink-ipc-client"
-version = "0.6.0"
-dependencies = [
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "universallink-paths"
-version = "0.6.0"
 
 [[package]]
 name = "untrusted"

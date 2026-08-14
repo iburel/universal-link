@@ -27,10 +27,10 @@ use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 use std::time::Duration;
 
-use universallink_core::{FileSecretStore, SecretStore};
+use onedevice_core::{FileSecretStore, SecretStore};
 
 /// Name of the service in the OS keyring.
-const SERVICE: &str = "universallink-core";
+const SERVICE: &str = "1device-core";
 /// An entry that does not exist: reading it tells whether the keyring answers.
 const PROBE: &str = "__probe__";
 /// Beyond this, the keyring is considered mute for this read.
@@ -128,7 +128,7 @@ impl BackgroundStore {
         let (tx, rx) = channel();
         let (done_tx, done) = sync_channel::<()>(0);
         std::thread::Builder::new()
-            .name("universallink-keyring".into())
+            .name("1device-keyring".into())
             .spawn(move || {
                 // Parked here: its drop, on the return of `serve`, signals `flush`.
                 let _done = done_tx;

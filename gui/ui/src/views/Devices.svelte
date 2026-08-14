@@ -21,7 +21,7 @@
   // Adding a device is offered where the devices are — but only by a device that
   // can actually vouch: it holds the account key AND is in the account. That is
   // the Core's own definition, session or none — a serverless sponsor shows a
-  // `UL2` code, a signed-in one pairs through its server. A device without the
+  // `1D2` code, a signed-in one pairs through its server. A device without the
   // key would be offered the gesture and then be told by the Core that it is the
   // one JOINING, which is not what "add a device" means. The Account screen
   // offers it that, in those words.

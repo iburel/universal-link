@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
 
-//! Tauri **mobile** shell: the SAME Svelte UI and the SAME `universallink-gui`
+//! Tauri **mobile** shell: the SAME Svelte UI and the SAME `1device-gui`
 //! bridge as the desktop app, but the Core is embedded in-process (Android
 //! cannot spawn a separate daemon) and reached over an in-process UDS. One UI,
 //! one transport (`invoke`), no new core API — the desktop's login, enrollment
@@ -24,14 +24,14 @@ use android_system_properties::AndroidSystemProperties;
 use anyhow::Context as _;
 use tauri::Manager;
 use tls::WebPkiConnector;
-use universallink_core::{Config, FileSecretStore, ServerConfig};
-use universallink_daemon::dataplane::LazyIrohTransport;
-use universallink_gui::{CoreState, GUI_OPTIONAL_TOPICS, GUI_SCOPES, GUI_TOPICS, bridge_loop};
-use universallink_ipc_client::{ClientConfig, TokenSource};
+use onedevice_core::{Config, FileSecretStore, ServerConfig};
+use onedevice_daemon::dataplane::LazyIrohTransport;
+use onedevice_gui::{CoreState, GUI_OPTIONAL_TOPICS, GUI_SCOPES, GUI_TOPICS, bridge_loop};
+use onedevice_ipc_client::{ClientConfig, TokenSource};
 
 /// The embedded Core, kept alive for the whole process (dropping the handle
 /// stops it). Tauri owns the async runtime, so we only hold the handle.
-static CORE: OnceLock<Mutex<universallink_core::CoreHandle>> = OnceLock::new();
+static CORE: OnceLock<Mutex<onedevice_core::CoreHandle>> = OnceLock::new();
 static LOGGING: OnceLock<()> = OnceLock::new();
 
 /// Mobile entry point (exported to the generated Android shell via JNI).
@@ -41,10 +41,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
-            universallink_gui::core_request,
-            universallink_gui::connection_status,
-            universallink_gui::set_server_config,
-            universallink_gui::get_server_config,
+            onedevice_gui::core_request,
+            onedevice_gui::connection_status,
+            onedevice_gui::set_server_config,
+            onedevice_gui::get_server_config,
             // Mobile-only: the snapshot of the last share sheet status, and the
             // release of a shared file's cache copy (the desktop shell has no
             // share surface at all).
@@ -178,7 +178,7 @@ async fn boot_core(data_dir: &Path) -> anyhow::Result<ClientConfig> {
     let reload_dir = data_dir.to_path_buf();
     let reload_server: Arc<dyn Fn() -> Result<Option<ServerConfig>, String> + Send + Sync> =
         Arc::new(move || {
-            let parsed = universallink_daemon::config::load(&reload_dir);
+            let parsed = onedevice_daemon::config::load(&reload_dir);
             match parsed.problem {
                 Some(problem) => Err(problem),
                 None => Ok(parsed.server),
@@ -188,7 +188,7 @@ async fn boot_core(data_dir: &Path) -> anyhow::Result<ClientConfig> {
     // Seed the server at boot from the same parse, so a returning (already
     // configured) user connects without waiting for the frontend's first
     // session.reload. A half-filled file is logged and left unconfigured.
-    let boot = universallink_daemon::config::load(data_dir);
+    let boot = onedevice_daemon::config::load(data_dir);
     if let Some(problem) = &boot.problem {
         tracing::warn!(problem = %problem, "config.json present but invalid; starting unconfigured");
     }
@@ -225,7 +225,7 @@ async fn boot_core(data_dir: &Path) -> anyhow::Result<ClientConfig> {
         reconnect_base_delay: Duration::from_millis(200),
     };
 
-    let core = universallink_core::spawn(config)
+    let core = onedevice_core::spawn(config)
         .await
         .map_err(|e| anyhow::anyhow!("core spawn: {e}"))?;
     tracing::info!(ipc = %ipc_path.display(), "embedded Core listening");
@@ -234,7 +234,7 @@ async fn boot_core(data_dir: &Path) -> anyhow::Result<ClientConfig> {
     Ok(ClientConfig {
         token: TokenSource::File(data_dir.join("ipc-token")),
         ipc_path,
-        name: "universallink-gui".into(),
+        name: "1device-gui".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         role: "gui".into(),
         scopes: GUI_SCOPES.iter().map(|s| s.to_string()).collect(),

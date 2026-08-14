@@ -158,7 +158,7 @@ test("multi-byte characters count as the bytes they are", () => {
 // session id). It has to land in a symbol a phone can read off a screen from a
 // hand's width away: 41 modules is 6 px each in a 250 px tile.
 test("a pairing code fits a symbol a camera can read", () => {
-  const code = `UL1:${"A".repeat(22)}:${"B".repeat(43)}:p_${"9".repeat(32)}`;
+  const code = `1D1:${"A".repeat(22)}:${"B".repeat(43)}:p_${"9".repeat(32)}`;
   expect(code.length).toBe(105);
   expect(qrMatrix(code).length).toBe(41); // version 6
 });

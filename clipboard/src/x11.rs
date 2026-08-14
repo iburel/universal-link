@@ -1663,7 +1663,7 @@ fn property_or_target(e: &x::SelectionRequestEvent) -> x::Atom {
 }
 
 fn warn(message: &str) {
-    eprintln!("[universallink-clipboard] {message}");
+    eprintln!("[1device-clipboard] {message}");
 }
 
 /// Connects to X, sets up the selection window/atoms/poll, and builds the pinned
@@ -1718,7 +1718,7 @@ pub fn create() -> Result<crate::os::Created, String> {
     for i in 0..SCRATCH_POOL {
         scratch.push(intern(
             &conn,
-            format!("UNIVERSALLINK_SELECTION_{i}").as_bytes(),
+            format!("ONEDEVICE_SELECTION_{i}").as_bytes(),
         )?);
     }
 

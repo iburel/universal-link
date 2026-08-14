@@ -16,9 +16,9 @@
 //! as through a server, and the refusals — a dialer that never saw the screen, two
 //! devices of two different accounts, two devices with no account at all.
 
+use onedevice_core::{FileSecretStore, PeerAddr, PeerTransport, SecretStore};
+use onedevice_test_support::memory_transport::MemorySwitchboard;
 use serde_json::{Value, json};
-use universallink_core::{FileSecretStore, PeerAddr, PeerTransport, SecretStore};
-use universallink_test_support::memory_transport::MemorySwitchboard;
 
 use crate::support::*;
 
@@ -107,7 +107,7 @@ async fn claimed_on(c: &mut TestComponent, pairing_id: &str) -> Value {
 /// each other — which is what makes the directory exchange run at all.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_new_device_joins_the_account_over_the_local_network() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
     let holder =
         TestCore::start_in_account_on(&code, &switchboard, DeviceKey::generate(), &[]).await;
@@ -125,7 +125,7 @@ async fn a_new_device_joins_the_account_over_the_local_network() {
         .to_string();
     let code_shown = offer["code"].as_str().expect("a code").to_string();
     assert!(
-        code_shown.starts_with("UL2:"),
+        code_shown.starts_with("1D2:"),
         "a code for a device to dial, not for a server to relay: {code_shown}"
     );
     assert!(
@@ -221,7 +221,7 @@ async fn a_new_device_joins_the_account_over_the_local_network() {
 /// happy to allow.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_does_not_pair_with_itself() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
     let core = TestCore::start_in_account_on(&code, &switchboard, DeviceKey::generate(), &[]).await;
     let mut c = watching(&core).await;
@@ -245,7 +245,7 @@ async fn a_device_does_not_pair_with_itself() {
 /// reversed; who confirms is not — the human is asked on the side that gives.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_new_device_can_be_the_one_showing_the_code() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
     let holder =
         TestCore::start_in_account_on(&code, &switchboard, DeviceKey::generate(), &[]).await;
@@ -295,7 +295,7 @@ async fn the_new_device_can_be_the_one_showing_the_code() {
 /// what they are really doing is swapping directories.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_devices_of_one_account_that_never_met_introduce_themselves() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
     // A device each has heard of and the other has not: BOTH have to cross, or the
     // introduction is only to each other and not to the account. One direction rides
@@ -352,7 +352,7 @@ async fn two_devices_of_one_account_that_never_met_introduce_themselves() {
 /// second door `account_key` names, next to the recovery code typed in again.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_that_lost_its_account_key_gets_it_back() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
     let holder =
         TestCore::start_in_account_on(&code, &switchboard, DeviceKey::generate(), &[]).await;
@@ -437,8 +437,8 @@ async fn two_devices_with_no_account_get_nowhere() {
 #[tokio::test(flavor = "multi_thread")]
 async fn two_accounts_are_not_merged_by_a_pairing() {
     let switchboard = MemorySwitchboard::new();
-    let ours = universallink_core::account_key::generate_recovery_code();
-    let theirs = universallink_core::account_key::generate_recovery_code();
+    let ours = onedevice_core::account_key::generate_recovery_code();
+    let theirs = onedevice_core::account_key::generate_recovery_code();
     let a = TestCore::start_in_account_on(&ours, &switchboard, DeviceKey::generate(), &[]).await;
     let b = TestCore::start_in_account_on(&theirs, &switchboard, DeviceKey::generate(), &[]).await;
     let mut ca = watching(&a).await;
@@ -464,7 +464,7 @@ async fn two_accounts_are_not_merged_by_a_pairing() {
 /// the device that asked did not slip into the directory on the way past.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pairing_the_human_declines_hands_nothing_over() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
     let holder =
         TestCore::start_in_account_on(&code, &switchboard, DeviceKey::generate(), &[]).await;
@@ -505,7 +505,7 @@ async fn a_pairing_the_human_declines_hands_nothing_over() {
 /// human on the other device still has the dialog the first one opened.
 #[tokio::test(flavor = "multi_thread")]
 async fn reading_the_same_code_twice_does_not_undo_the_first() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
     let holder =
         TestCore::start_in_account_on(&code, &switchboard, DeviceKey::generate(), &[]).await;
@@ -548,7 +548,7 @@ async fn reading_the_same_code_twice_does_not_undo_the_first() {
 /// exchange on screen. The second one still works, so retiring is not breaking.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_code_retires_the_first() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
     let holder =
         TestCore::start_in_account_on(&code, &switchboard, DeviceKey::generate(), &[]).await;
@@ -577,15 +577,15 @@ async fn a_second_code_retires_the_first() {
         .expect("the code that IS on screen");
 }
 
-/// A `UL1` code names a rendezvous on a server, and a device with no server in
+/// A `1D1` code names a rendezvous on a server, and a device with no server in
 /// its life has no way to go to it. (The mirror refusal this test used to pin —
-/// `UL2` on a device that answers to a server, `PAIRING_VIA_SERVER` — fell with
+/// `1D2` on a device that answers to a server, `PAIRING_VIA_SERVER` — fell with
 /// the continuum: such a device now sponsors over the local network, which
 /// `continuum.rs` proves end to end.)
 #[tokio::test(flavor = "multi_thread")]
 async fn a_server_code_is_refused_where_no_server_answers() {
     let server = TestServer::start().await;
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
     let serverless =
         TestCore::start_in_account_on(&code, &switchboard, DeviceKey::generate(), &[]).await;
@@ -599,7 +599,7 @@ async fn a_server_code_is_refused_where_no_server_answers() {
         .expect("pairing.offer through the server")["code"]
         .clone();
     assert!(
-        server_code.as_str().is_some_and(|c| c.starts_with("UL1:")),
+        server_code.as_str().is_some_and(|c| c.starts_with("1D1:")),
         "{server_code}"
     );
     let refused = sc
@@ -620,7 +620,7 @@ async fn a_server_code_is_refused_where_no_server_answers() {
 /// compromised member whose forged rosters must wipe nothing.
 pub(crate) struct Stranger {
     pub(crate) key: DeviceKey,
-    transport: std::sync::Arc<universallink_test_support::memory_transport::MemoryTransport>,
+    transport: std::sync::Arc<onedevice_test_support::memory_transport::MemoryTransport>,
 }
 
 impl Stranger {
@@ -663,7 +663,7 @@ impl Stranger {
         // fields are: a code of any other shape is not a code at all, and would
         // never get as far as being answered.
         format!(
-            "UL2:{}:{}:{}",
+            "1D2:{}:{}:{}",
             "c2NyZWVuLXNlY3JldC0xNg",
             STRANGER_EPK,
             self.key.node_id()
@@ -681,7 +681,7 @@ impl Stranger {
 
     /// `answer`, handing the stream back: for the tests that go on speaking (or
     /// deliberately stop) after the roles are settled.
-    async fn answer_keeping(&self, reply: Value) -> (Value, Box<dyn universallink_core::IoStream>) {
+    async fn answer_keeping(&self, reply: Value) -> (Value, Box<dyn onedevice_core::IoStream>) {
         let (_peer, mut stream) = tokio::time::timeout(RESPONSE_TIMEOUT, self.transport.accept())
             .await
             .expect("a Core to dial us")
@@ -703,7 +703,7 @@ const STRANGER_EPK: &str = "b3ZlciBteSBzaG91bGRlciwgbm90IHRoZSBzY3JlZW4";
 /// offer still gets nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_outside_the_directory_is_served_nothing_else() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
     let holder =
         TestCore::start_in_account_on(&code, &switchboard, DeviceKey::generate(), &[]).await;
@@ -756,7 +756,7 @@ async fn a_device_outside_the_directory_is_served_nothing_else() {
 /// window for the device the human is actually holding.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dialer_that_never_saw_the_code_cannot_burn_the_window() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
     let holder =
         TestCore::start_in_account_on(&code, &switchboard, DeviceKey::generate(), &[]).await;
@@ -818,7 +818,7 @@ async fn a_dialer_that_never_saw_the_code_cannot_burn_the_window() {
 /// enter a directory anyway.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_declaration_that_is_not_the_dialers_own_is_refused() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
     let holder =
         TestCore::start_in_account_on(&code, &switchboard, DeviceKey::generate(), &[]).await;
@@ -870,7 +870,7 @@ async fn a_declaration_that_is_not_the_dialers_own_is_refused() {
 /// a test noticing.
 #[tokio::test(flavor = "multi_thread")]
 async fn what_the_dialer_sends_is_everything_the_other_side_needs() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
     let holder =
         TestCore::start_in_account_on(&code, &switchboard, DeviceKey::generate(), &[]).await;
@@ -906,7 +906,7 @@ async fn what_the_dialer_sends_is_everything_the_other_side_needs() {
     assert_eq!(declared["node_id"], json!(holder.node_id()));
     assert_eq!(declared["name"], json!(CORE_DEVICE_NAME));
     assert!(
-        universallink_core::directory::verify_record(&declared),
+        onedevice_core::directory::verify_record(&declared),
         "a description it stands behind, or the other side could not take it in: {declared}"
     );
     // And the refusal it was answered with reaches its caller in this API's words.
@@ -922,7 +922,7 @@ async fn what_the_dialer_sends_is_everything_the_other_side_needs() {
 /// a device on the network from answering a dial by wearing a sibling's name.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dialled_device_that_declares_someone_elses_description_is_refused() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
     let holder =
         TestCore::start_in_account_on(&code, &switchboard, DeviceKey::generate(), &[]).await;
@@ -969,7 +969,7 @@ async fn a_dialled_device_that_declares_someone_elses_description_is_refused() {
 /// itself in an account with nobody in it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_that_takes_the_account_and_falls_silent_is_still_known() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
     let holder =
         TestCore::start_in_account_on(&code, &switchboard, DeviceKey::generate(), &[]).await;
@@ -1021,11 +1021,11 @@ async fn a_device_that_takes_the_account_and_falls_silent_is_still_known() {
     let learned = find_device(&list, &stranger.key.node_id());
     assert_eq!(learned["name"], json!("Stranger"));
     assert!(
-        universallink_core::directory::verify_record(learned),
+        onedevice_core::directory::verify_record(learned),
         "the description it signed, kept verbatim: {learned}"
     );
     assert!(
-        universallink_core::account_key::verify(
+        onedevice_core::account_key::verify(
             &ak_pub(&code),
             learned["node_id"].as_str().expect("node_id"),
             learned["attestation"].as_str().expect("attestation"),
@@ -1036,8 +1036,8 @@ async fn a_device_that_takes_the_account_and_falls_silent_is_still_known() {
 
 /// The account's public key, as every device of it derives it from the code.
 fn ak_pub(code: &str) -> String {
-    universallink_core::account_key::public_hex(
-        &universallink_core::account_key::account_key_from_code(code).expect("a valid test code"),
+    onedevice_core::account_key::public_hex(
+        &onedevice_core::account_key::account_key_from_code(code).expect("a valid test code"),
     )
 }
 
@@ -1047,7 +1047,7 @@ fn ak_pub(code: &str) -> String {
 /// depending on that.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dialled_device_claiming_another_account_is_refused_by_the_dialer() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
     let holder =
         TestCore::start_in_account_on(&code, &switchboard, DeviceKey::generate(), &[]).await;
@@ -1080,7 +1080,7 @@ async fn a_dialled_device_claiming_another_account_is_refused_by_the_dialer() {
 /// for the same two reasons.
 #[tokio::test(flavor = "multi_thread")]
 async fn there_is_nothing_to_confirm_until_a_device_has_dialled() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
     let holder =
         TestCore::start_in_account_on(&code, &switchboard, DeviceKey::generate(), &[]).await;

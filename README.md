@@ -1,4 +1,4 @@
-# UniversalLink
+# 1Device
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 
@@ -43,10 +43,10 @@ page, built by CI from the tag:
 
 | | Asset | |
 |---|---|---|
-| **Windows** | `UniversalLink_<v>_x64-setup.exe` | NSIS, per-user — no admin rights |
-| **macOS** | `UniversalLink_<v>_aarch64.dmg` | Apple Silicon |
-| **Linux** | `UniversalLink_<v>_amd64.AppImage` | `chmod +x`, then run |
-| **Android** | `UniversalLink_<v>_arm64.apk` | arm64 only, Android 7.0 or newer |
+| **Windows** | `1Device_<v>_x64-setup.exe` | NSIS, per-user — no admin rights |
+| **macOS** | `1Device_<v>_aarch64.dmg` | Apple Silicon |
+| **Linux** | `1Device_<v>_amd64.AppImage` | `chmod +x`, then run |
+| **Android** | `1Device_<v>_arm64.apk` | arm64 only, Android 7.0 or newer |
 
 **The desktop builds are not code-signed** (milestone 1), so the OS warns on
 first launch: on macOS, "unverified developer" → System Settings → Privacy &
@@ -172,30 +172,30 @@ of the app), which is why it lives in a config file rather than a keyring.
 
 ### Piece 2 — a running server
 
-The `universallink-server` binary (crate `server-daemon`) is configured through
+The `1device-server` binary (crate `server-daemon`) is configured through
 the environment and starts the control plane (WebSocket `/ws`, `GET /health`,
-and `GET /.well-known/universallink.json` — the deployment descriptor, from which
+and `GET /.well-known/1device.json` — the deployment descriptor, from which
 a client reads the OIDC settings below instead of having them typed in):
 
 ```sh
-# Add UNIVERSALLINK_OIDC_CLIENT_SECRET=… if your IdP demands one (Google does).
-UNIVERSALLINK_SERVER_BIND=0.0.0.0:8080 \
-UNIVERSALLINK_OIDC_ISSUER=https://accounts.google.com \
-UNIVERSALLINK_OIDC_CLIENT_ID=…apps.googleusercontent.com \
-cargo run --bin universallink-server --locked
+# Add ONEDEVICE_OIDC_CLIENT_SECRET=… if your IdP demands one (Google does).
+ONEDEVICE_SERVER_BIND=0.0.0.0:8080 \
+ONEDEVICE_OIDC_ISSUER=https://accounts.google.com \
+ONEDEVICE_OIDC_CLIENT_ID=…apps.googleusercontent.com \
+cargo run --bin 1device-server --locked
 ```
 
-Optional settings (with their defaults): `UNIVERSALLINK_OIDC_CLIENT_SECRET`
+Optional settings (with their defaults): `ONEDEVICE_OIDC_CLIENT_SECRET`
 (none; the server never uses it — it advertises it in the descriptor for the
 clients, and Google's installed-app clients need it at the token exchange),
-`UNIVERSALLINK_SERVER_STATE`
-(`universallink-directory.json` — the directory file, to point at a volume in a
-deployment), `UNIVERSALLINK_HEARTBEAT_SECS` (30),
-`UNIVERSALLINK_HEARTBEAT_MAX_MISSED` (2), `UNIVERSALLINK_NONCE_TTL_SECS` (60),
-`UNIVERSALLINK_FRESH_TOKEN_MAX_AGE_SECS` (300),
-`UNIVERSALLINK_JWKS_REFRESH_MIN_SECS` (60),
-`UNIVERSALLINK_MAX_REQUESTS_PER_MINUTE` (120; `0` = unlimited); log level via
-`UNIVERSALLINK_LOG`. On an incomplete or invalid config, the server **refuses to
+`ONEDEVICE_SERVER_STATE`
+(`1device-directory.json` — the directory file, to point at a volume in a
+deployment), `ONEDEVICE_HEARTBEAT_SECS` (30),
+`ONEDEVICE_HEARTBEAT_MAX_MISSED` (2), `ONEDEVICE_NONCE_TTL_SECS` (60),
+`ONEDEVICE_FRESH_TOKEN_MAX_AGE_SECS` (300),
+`ONEDEVICE_JWKS_REFRESH_MIN_SECS` (60),
+`ONEDEVICE_MAX_REQUESTS_PER_MINUTE` (120; `0` = unlimited); log level via
+`ONEDEVICE_LOG`. On an incomplete or invalid config, the server **refuses to
 start** and logs every error at once.
 
 The directory (device identities, account attestations, revocations) is
@@ -216,7 +216,7 @@ docker compose up -d --build
 
 The installed app's **first-run screen writes this file for you**, asking only for
 the address and reading the OIDC fields from the server (`GET
-/.well-known/universallink.json`) — this section is what it writes, and the path
+/.well-known/1device.json`) — this section is what it writes, and the path
 to take on a machine you drive from a terminal (development, a headless box). The
 Core reads it in its config directory (see
 [Where the files live](#where-the-files-live)) and never writes it itself.
@@ -244,17 +244,17 @@ Core reads it in its config directory (see
 - `relay_url`: optional — a self-hosted iroh relay; without it, the public n0
   relays are used.
 - `receive_dir`: optional — where received files land; without it,
-  `<Downloads>/UniversalLink`.
+  `<Downloads>/1Device`.
 - `lan_discovery`: optional, default `true` — announce this device and resolve
   its siblings over mDNS (UDP 5353) so machines on the same network reach each
   other directly. The broadcast carries the device's public key and addresses,
   nothing else, and trust is unaffected: an unknown machine is refused exactly
   as before. Set `false` on networks where even that is too chatty.
 
-Each of the variables `UNIVERSALLINK_SERVER_URL`, `UNIVERSALLINK_OIDC_ISSUER`,
-`UNIVERSALLINK_OIDC_CLIENT_ID`, `UNIVERSALLINK_OIDC_CLIENT_SECRET`,
-`UNIVERSALLINK_DEVICE_NAME`, `UNIVERSALLINK_RELAY_URL`,
-`UNIVERSALLINK_RECEIVE_DIR` overrides the file (for development); one that is
+Each of the variables `ONEDEVICE_SERVER_URL`, `ONEDEVICE_OIDC_ISSUER`,
+`ONEDEVICE_OIDC_CLIENT_ID`, `ONEDEVICE_OIDC_CLIENT_SECRET`,
+`ONEDEVICE_DEVICE_NAME`, `ONEDEVICE_RELAY_URL`,
+`ONEDEVICE_RECEIVE_DIR` overrides the file (for development); one that is
 defined but empty overrides nothing. **The Core always starts**, even with no config or a broken one:
 it logs the issue, and the interface says what is wrong.
 
@@ -265,16 +265,16 @@ from source, run them by hand:
 
 1. **Launch the Core**:
    ```sh
-   cargo run --bin universallink-core --locked
+   cargo run --bin 1device-core --locked
    ```
-   (or the built executable, `target/debug/universallink-core`). It writes an
+   (or the built executable, `target/debug/1device-core`). It writes an
    `ipc-token` in its config directory, regenerated at every startup: this is
    the root of trust the interface will read. It also spawns the background
    components it finds next to itself — tray, clipboard, context menu.
 
 2. **Launch the interface** (the real binary, not the browser mode):
    ```sh
-   cargo run -p universallink-gui --features webview --locked
+   cargo run -p onedevice-gui --features webview --locked
    ```
    It connects to the Core via the local socket and the `ipc-token`.
 
@@ -330,12 +330,12 @@ Identical to the toolchain pinned by CI
   ```
   Without `sudo` (WSL, locked-down machine), a build Docker image is provided:
   ```
-  docker build -t ul-build docker/ul-build/
-  docker run --rm -v "$PWD":/work -w /work ul-build cargo build -p universallink-gui --features webview --locked
+  docker build -t 1device-build docker/1device-build/
+  docker run --rm -v "$PWD":/work -w /work 1device-build cargo build -p onedevice-gui --features webview --locked
   ```
 
 The **Core** builds without the webview — only the GUI binary needs it. (Only
-the `universallink-core` *library*, the target of the multi-OS cross-check, is
+the `1device-core` *library*, the target of the multi-OS cross-check, is
 pure Rust with no C compiler; the Core binary itself links iroh and rustls just
 like the interface.)
 
@@ -360,7 +360,7 @@ cd ../..
 cargo build --workspace --lib --bins --locked
 
 # 3. The real interface binary (system webview)
-cargo build -p universallink-gui --features webview --locked
+cargo build -p onedevice-gui --features webview --locked
 ```
 
 `--locked` fails if `Cargo.lock` is stale instead of silently resolving other
@@ -417,9 +417,9 @@ Placed by the Core, per user (see [`doc/deployment.md`](doc/deployment.md)):
 
 | | Linux | macOS | Windows |
 |---|---|---|---|
-| IPC socket / pipe | `$XDG_RUNTIME_DIR/universallink/core.sock` | `~/Library/Application Support/UniversalLink/core.sock` | `\\.\pipe\universallink-core-<DOMAIN>-<USER>` |
-| config directory | `~/.config/universallink` | `~/Library/Application Support/UniversalLink` | `%APPDATA%\UniversalLink` |
-| logs | `~/.local/state/universallink/logs` | `~/Library/Logs/UniversalLink` | `%LOCALAPPDATA%\UniversalLink\logs` |
+| IPC socket / pipe | `$XDG_RUNTIME_DIR/1device/core.sock` | `~/Library/Application Support/1Device/core.sock` | `\\.\pipe\1device-core-<DOMAIN>-<USER>` |
+| config directory | `~/.config/1device` | `~/Library/Application Support/1Device` | `%APPDATA%\1Device` |
+| logs | `~/.local/state/1device/logs` | `~/Library/Logs/1Device` | `%LOCALAPPDATA%\1Device\logs` |
 
 The config directory holds `config.json` (written by the setup screen or by you),
 `ipc-token` (0600, regenerated at every startup), `device.key` (0600, the
@@ -438,7 +438,7 @@ OS keyring is reachable.
 On Android everything lives in the app's private storage, and goes with the app
 when it is uninstalled.
 
-Log level: `UNIVERSALLINK_LOG=debug` (not `RUST_LOG`).
+Log level: `ONEDEVICE_LOG=debug` (not `RUST_LOG`).
 
 ## Accepted limitations (v1)
 
@@ -480,7 +480,7 @@ Log level: `UNIVERSALLINK_LOG=debug` (not `RUST_LOG`).
 
 ## License
 
-UniversalLink is licensed under the **GNU Affero General Public License v3.0
+1Device is licensed under the **GNU Affero General Public License v3.0
 only** (AGPL-3.0-only). See [LICENSE](LICENSE) for the full text, and
 [CONTRIBUTING.md](CONTRIBUTING.md) for how to contribute (including the DCO
 sign-off).

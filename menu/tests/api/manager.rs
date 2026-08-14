@@ -3,8 +3,8 @@
 
 //! What the menu offers, and when it stops offering it.
 
-use universallink_ipc_client::{ClientConfig, TokenSource};
-use universallink_menu::Outcome;
+use onedevice_ipc_client::{ClientConfig, TokenSource};
+use onedevice_menu::Outcome;
 
 use crate::support::*;
 
@@ -17,10 +17,10 @@ async fn the_core_accepts_the_role_and_scopes_the_manager_asks_for() {
     let server = TestServer::start().await;
     let core = TestCore::start(&server).await;
 
-    let (_client, mut events) = universallink_ipc_client::spawn(ClientConfig {
+    let (_client, mut events) = onedevice_ipc_client::spawn(ClientConfig {
         ipc_path: core.ipc_path(),
         token: TokenSource::Spawn(core.mint(ROLE, SCOPES)),
-        name: "universallink-menu".into(),
+        name: "1device-menu".into(),
         version: "0".into(),
         role: ROLE.into(),
         scopes: SCOPES.iter().map(|s| (*s).to_string()).collect(),
@@ -191,7 +191,7 @@ async fn logging_out_empties_the_menu() {
     let peer = server.attested_peer(&code, "PC-B", "linux").await;
     manager.await_targets(&[&peer.device_id]).await;
 
-    let (gui, mut events) = universallink_ipc_client::spawn(ClientConfig {
+    let (gui, mut events) = onedevice_ipc_client::spawn(ClientConfig {
         ipc_path: core.ipc_path(),
         token: TokenSource::Spawn(core.mint("gui", &["session.read", "session.manage"])),
         name: "harness-gui".into(),

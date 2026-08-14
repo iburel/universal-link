@@ -33,7 +33,7 @@ async fn login_with_broken_oidc_is_unreachable() {
     // The issuer responds but without a discovery document: no authorization
     // URL possible.
     let server = TestServer::start().await;
-    let core = TestCore::start_with_config(universallink_core::ServerConfig {
+    let core = TestCore::start_with_config(onedevice_core::ServerConfig {
         url: server.core_url(),
         oidc_issuer: format!("{}/not-found", server.oidc.issuer()),
         oidc_client_id: TEST_CLIENT_ID.into(),
@@ -216,7 +216,7 @@ async fn broken_idp_reply_is_an_error_not_a_panic() {
         }
     });
 
-    let core = TestCore::start_with_config(universallink_core::ServerConfig {
+    let core = TestCore::start_with_config(onedevice_core::ServerConfig {
         url: format!("ws://{addr}/ws"),
         oidc_issuer: format!("http://{addr}"),
         oidc_client_id: TEST_CLIENT_ID.into(),

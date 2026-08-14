@@ -1,4 +1,4 @@
-package org.universallink.mobile
+package org.onedevice.mobile
 
 import android.app.Activity
 import android.app.Application
@@ -16,7 +16,7 @@ import android.util.Log
  *
  * The filter exists to save battery (each multicast frame on the network wakes
  * the Wi-Fi chip), so the lock is not simply held for the process's lifetime:
- * it follows the same rule as [UlForegroundService] — held while the app has a
+ * it follows the same rule as [OneDeviceForegroundService] — held while the app has a
  * window in front OR the Core reports work in flight, released the moment
  * neither is true. A cached background process thus goes deaf, which takes
  * nothing it could use: hearing a peer only ever serves a screen the user is
@@ -85,7 +85,7 @@ object LanMulticast {
                 if (!wanted) return
                 val wifi = context.applicationContext
                     .getSystemService(Context.WIFI_SERVICE) as WifiManager
-                wifi.createMulticastLock("universallink-lan").also {
+                wifi.createMulticastLock("1device-lan").also {
                     // Held or not, nothing in between: the two callers above
                     // both converge on `wanted` rather than pairing their own
                     // acquire/release.

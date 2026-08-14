@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [package]
-name = "universallink-clipboard"
+name = "onedevice-clipboard"
 version = "0.6.0"
 edition = "2024"
 license = "AGPL-3.0-only"
@@ -17,7 +17,7 @@ publish = false
 # land in later bricks (X11, Windows, macOS).
 
 [[bin]]
-name = "universallink-clipboard"
+name = "1device-clipboard"
 path = "src/main.rs"
 
 [dependencies]
@@ -29,7 +29,7 @@ tokio = { version = "1", features = [
     "io-util",
     "sync",
 ] }
-universallink-ipc-client = { path = "../client" }
+onedevice-ipc-client = { path = "../client" }
 
 # X11/XWayland clipboard backend (Linux only): the owner-driven deferred-render
 # selection loop. Same stack the private POC uses — `xcb` (an FFI binding to the
@@ -138,8 +138,8 @@ block2 = "0.6"
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
-universallink-core = { path = "../core" }
-universallink-test-support = { path = "../test-support" }
+onedevice-core = { path = "../core" }
+onedevice-test-support = { path = "../test-support" }
 
 # Live-X round-trip tests (tests/x11.rs) drive a SECOND X client (a requestor
 # and a selection owner) against the real backend under Xvfb. Linux-only, and

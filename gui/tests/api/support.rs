@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
 
 //! Harness: the Tauri shell on MockRuntime, wired to a REAL Core (the
-//! universallink-core lib) — same philosophy as the client crate's suite.
+//! 1device-core lib) — same philosophy as the client crate's suite.
 //! TestCore/RawComponent/TestServer are a deliberate and REDUCED copy of the
 //! client's harness (`client/tests/api/support.rs`, 2nd copy) — to be
 //! extracted into test-support if a third copy threatens (tray building block).
@@ -52,9 +52,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHal
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use universallink_core::CoreHandle;
-use universallink_ipc_client::{ClientConfig, TokenSource};
-pub use universallink_test_support::{FakeOidc, TEST_CLIENT_ID, TEST_EMAIL, browse};
+use onedevice_core::CoreHandle;
+use onedevice_ipc_client::{ClientConfig, TokenSource};
+pub use onedevice_test_support::{FakeOidc, TEST_CLIENT_ID, TEST_EMAIL, browse};
 
 pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Observation window to assert that no event arrives.
@@ -77,7 +77,7 @@ fn ipc_path_for(_dir: &Path) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     PathBuf::from(format!(
-        r"\\.\pipe\universallink-gui-test-{}-{}",
+        r"\\.\pipe\1device-gui-test-{}-{}",
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ))
@@ -92,7 +92,7 @@ pub struct TestCore {
     handle: Option<CoreHandle>,
     dir: tempfile::TempDir,
     ipc_path: PathBuf,
-    server_cfg: Option<universallink_core::ServerConfig>,
+    server_cfg: Option<onedevice_core::ServerConfig>,
 }
 
 impl TestCore {
@@ -105,7 +105,7 @@ impl TestCore {
         Self::spawn_in(Some(server.core_cfg())).await
     }
 
-    async fn spawn_in(server_cfg: Option<universallink_core::ServerConfig>) -> TestCore {
+    async fn spawn_in(server_cfg: Option<onedevice_core::ServerConfig>) -> TestCore {
         let dir = tempfile::tempdir().expect("tempdir");
         let ipc_path = ipc_path_for(dir.path());
         let mut core = TestCore {
@@ -126,7 +126,7 @@ impl TestCore {
     /// (Re)starts the Core on the same folder and the same IPC path.
     pub async fn restart(&mut self) {
         self.handle = None;
-        let config = universallink_core::Config {
+        let config = onedevice_core::Config {
             ipc_path: self.ipc_path.clone(),
             config_dir: self.dir.path().to_path_buf(),
             server: self.server_cfg.clone(),
@@ -135,11 +135,11 @@ impl TestCore {
                 Arc::new(move || Ok::<_, String>(s.clone()))
             },
             device_name: CORE_DEVICE_NAME.into(),
-            secret_store: Arc::new(universallink_core::FileSecretStore::new(self.dir.path())),
+            secret_store: Arc::new(onedevice_core::FileSecretStore::new(self.dir.path())),
             // The lib only speaks in the clear: it's the daemon that wires up TLS.
-            connector: Arc::new(universallink_core::PlainConnector),
+            connector: Arc::new(onedevice_core::PlainConnector),
             // These tests don't exercise the data plane: isolated in-memory transport.
-            transport: universallink_test_support::memory_transport::MemorySwitchboard::new()
+            transport: onedevice_test_support::memory_transport::MemorySwitchboard::new()
                 .endpoint("gui-test", None),
             receive_dir: self.dir.path().join("received"),
             reconnect_base_delay: Duration::from_millis(50),
@@ -148,7 +148,7 @@ impl TestCore {
         // the previous Core stops (asynchronous teardown). We keep trying.
         let deadline = tokio::time::Instant::now() + RESPONSE_TIMEOUT;
         let handle = loop {
-            match universallink_core::spawn(config.clone()).await {
+            match onedevice_core::spawn(config.clone()).await {
                 Ok(handle) => break handle,
                 Err(e) => {
                     assert!(tokio::time::Instant::now() < deadline, "Core startup: {e}");
@@ -181,15 +181,15 @@ pub fn gui_config(core: &TestCore) -> ClientConfig {
         name: "gui-test".into(),
         version: "0.0-test".into(),
         role: "gui".into(),
-        scopes: universallink_gui::GUI_SCOPES
+        scopes: onedevice_gui::GUI_SCOPES
             .iter()
             .map(|s| s.to_string())
             .collect(),
-        topics: universallink_gui::GUI_TOPICS
+        topics: onedevice_gui::GUI_TOPICS
             .iter()
             .map(|s| s.to_string())
             .collect(),
-        optional_topics: universallink_gui::GUI_OPTIONAL_TOPICS
+        optional_topics: onedevice_gui::GUI_OPTIONAL_TOPICS
             .iter()
             .map(|s| s.to_string())
             .collect(),
@@ -221,7 +221,7 @@ pub struct Shell {
 /// via an event, when the Core is already running.
 pub async fn shell_app(config: ClientConfig) -> Shell {
     let config_dir = tempfile::tempdir().expect("config tempdir");
-    let app = universallink_gui::shell(
+    let app = onedevice_gui::shell(
         tauri::test::mock_builder(),
         config,
         config_dir.path().to_path_buf(),
@@ -556,16 +556,16 @@ async fn recv_frame<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Optio
 
 pub struct TestServer {
     pub oidc: FakeOidc,
-    _server: universallink_server::ServerHandle,
+    _server: onedevice_server::ServerHandle,
     url: String,
 }
 
 impl TestServer {
     pub async fn start() -> TestServer {
         let oidc = FakeOidc::start().await;
-        let config = universallink_server::Config {
+        let config = onedevice_server::Config {
             bind_addr: "127.0.0.1:0".parse().expect("addr"),
-            oidc: universallink_server::OidcConfig {
+            oidc: onedevice_server::OidcConfig {
                 issuer_url: oidc.issuer(),
                 client_id: TEST_CLIENT_ID.into(),
                 client_secret: None,
@@ -578,7 +578,7 @@ impl TestServer {
             pairing_ttl: Duration::from_secs(120),
             max_requests_per_minute: None,
         };
-        let server = universallink_server::spawn(config)
+        let server = onedevice_server::spawn(config)
             .await
             .expect("server startup");
         let url = format!("ws://{}/ws", server.local_addr());
@@ -595,8 +595,8 @@ impl TestServer {
     }
 
     /// The config a Core pointed at this environment receives.
-    pub fn core_cfg(&self) -> universallink_core::ServerConfig {
-        universallink_core::ServerConfig {
+    pub fn core_cfg(&self) -> onedevice_core::ServerConfig {
+        onedevice_core::ServerConfig {
             url: self.url.clone(),
             oidc_issuer: self.oidc.issuer(),
             oidc_client_id: TEST_CLIENT_ID.into(),

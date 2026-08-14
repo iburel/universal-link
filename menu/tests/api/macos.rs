@@ -10,7 +10,7 @@
 //! here — it is read back out of the document with `plutil`, the plist parser macOS
 //! itself uses, and handed to `/bin/sh` the way the workflow engine hands it over:
 //! the selection as arguments, `$0` set to `-` (both measured on a real macOS, see
-//! `universallink_menu::os::macos`). Then the REAL courier binary runs.
+//! `onedevice_menu::os::macos`). Then the REAL courier binary runs.
 //!
 //! Neither test needs Finder, so both are part of the automated suite. What does need
 //! it — whether the entry is SHOWN in a real contextual menu — is in `tests/macos.rs`,
@@ -18,8 +18,8 @@
 
 use std::path::{Path, PathBuf};
 
-use universallink_menu::os::macos::Services;
-use universallink_menu::{HelperCommand, MenuSurface, Outcome};
+use onedevice_menu::os::macos::Services;
+use onedevice_menu::{HelperCommand, MenuSurface, Outcome};
 
 use crate::support::*;
 
@@ -44,7 +44,7 @@ impl Desktop {
     /// `channel`.
     fn surfaces(&self, channel: &Path) -> Vec<Box<dyn MenuSurface>> {
         let helper = HelperCommand {
-            program: PathBuf::from(env!("CARGO_BIN_EXE_universallink-menu")),
+            program: PathBuf::from(env!("CARGO_BIN_EXE_1device-menu")),
             extra_args: vec!["--channel".into(), channel.to_string_lossy().into_owned()],
         };
         vec![Box::new(Services::new(self.dir(), helper))]
@@ -79,7 +79,7 @@ impl Desktop {
                 );
                 label
                     .strip_prefix("Send to ")
-                    .and_then(|l| l.strip_suffix(" (UniversalLink)"))
+                    .and_then(|l| l.strip_suffix(" (1Device)"))
                     .unwrap_or_else(|| panic!("{label:?} is not one of our labels"))
                     .to_string()
             })

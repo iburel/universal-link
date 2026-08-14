@@ -11,7 +11,7 @@
 //! they are not part of the automated suite. They are run by hand on a real Windows
 //! session with:
 //!
-//!     cargo test -p universallink-menu --test windows -- --ignored --test-threads=1
+//!     cargo test -p onedevice-menu --test windows -- --ignored --test-threads=1
 //!
 //! Single-threaded, because they share one namespace: the user's own menus.
 //!
@@ -23,7 +23,7 @@
 //! these tests prove is that the shell reads our command line and runs it correctly;
 //! what `MultiSelectModel=Player` then does with five selected files is confirmed by
 //! a human selecting five files. The manager coalesces either way (see
-//! `universallink_menu::clicks`), so the only outcome that would matter is the shell
+//! `onedevice_menu::clicks`), so the only outcome that would matter is the shell
 //! handing over a PART of the selection — which is exactly what such a gesture
 //! shows.
 
@@ -34,10 +34,10 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use universallink_menu::channel::{self, Request, Response};
-use universallink_menu::os::windows::registry::Key;
-use universallink_menu::os::windows::{Cascade, SendTo, verb_command_line};
-use universallink_menu::{HelperCommand, MenuSurface, Target};
+use onedevice_menu::channel::{self, Request, Response};
+use onedevice_menu::os::windows::registry::Key;
+use onedevice_menu::os::windows::{Cascade, SendTo, verb_command_line};
+use onedevice_menu::{HelperCommand, MenuSurface, Target};
 
 /// The production root: this is the point of these tests.
 const CLASSES: &str = r"Software\Classes";
@@ -63,7 +63,7 @@ fn target() -> Target {
 /// click of a real install, silently.
 fn probe_channel() -> PathBuf {
     PathBuf::from(format!(
-        r"\\.\pipe\universallink-menu-live-100%-{}",
+        r"\\.\pipe\1device-menu-live-100%-{}",
         std::process::id()
     ))
 }
@@ -127,7 +127,7 @@ impl Probe {
 /// built, pointed at the probe's channel.
 fn helper(channel: &Path) -> HelperCommand {
     HelperCommand {
-        program: PathBuf::from(env!("CARGO_BIN_EXE_universallink-menu")),
+        program: PathBuf::from(env!("CARGO_BIN_EXE_1device-menu")),
         extra_args: vec!["--channel".into(), channel.to_string_lossy().into_owned()],
     }
 }
@@ -305,18 +305,18 @@ async fn the_real_shell_shows_the_cascade_and_forgets_it_when_it_goes() {
 #[tokio::test]
 #[ignore = "needs a real Windows session: it enumerates and writes the user's real shortcut menu"]
 async fn a_cascade_from_a_previous_version_is_swept_from_the_real_registry() {
-    const STALE: &str = "UniversalLinkSendPrevious";
-    const THEIRS: &str = "UniversalLinkNotOurs";
+    const STALE: &str = "1DeviceSendPrevious";
+    const THEIRS: &str = "1DeviceNotOurs";
 
     let shell = format!(r"{CLASSES}\*\shell");
     let parent = Key::create(&shell).expect("the shell key for files");
 
     let stale = Key::create(&format!(r"{shell}\{STALE}")).expect("create");
     stale
-        .set_string("UniversalLinkGenerated", "universallink-menu:generated")
+        .set_string("1DeviceGenerated", "1device-menu:generated")
         .expect("set the marker an older version would have written");
     stale
-        .set_string("MUIVerb", "Send with UniversalLink")
+        .set_string("MUIVerb", "Send with 1Device")
         .expect("set");
     let theirs = Key::create(&format!(r"{shell}\{THEIRS}")).expect("create");
     theirs.set_string("MUIVerb", "Someone else's").expect("set");
@@ -349,7 +349,7 @@ async fn a_cascade_from_a_previous_version_is_swept_from_the_real_registry() {
 #[tokio::test]
 #[ignore = "needs a real Windows session: it writes into the user's real Send to folder"]
 async fn a_send_to_entry_lands_in_the_real_folder_and_leaves_the_others_alone() {
-    let folder = universallink_menu::os::windows::send_to_folder().expect("the SendTo folder");
+    let folder = onedevice_menu::os::windows::send_to_folder().expect("the SendTo folder");
     let before: Vec<PathBuf> = std::fs::read_dir(&folder)
         .expect("read the SendTo folder")
         .filter_map(Result::ok)
@@ -363,7 +363,7 @@ async fn a_send_to_entry_lands_in_the_real_folder_and_leaves_the_others_alone() 
 
     let mut surface = SendTo::new(&folder, helper(&probe_channel()));
     surface.apply(&[target()]).expect("apply");
-    let entry = folder.join("PC-Live & Co (UniversalLink).lnk");
+    let entry = folder.join("PC-Live & Co (1Device).lnk");
     let created = entry.exists();
     surface.apply(&[]).expect("clear");
 

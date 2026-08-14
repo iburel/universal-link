@@ -96,7 +96,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libgtk-3-dev
 
-      # The X11 clipboard backend (universallink-clipboard) links libxcb + the
+      # The X11 clipboard backend (1device-clipboard) links libxcb + the
       # XFIXES extension through the `xcb` crate's FFI, so the -dev headers are
       # needed to BUILD/link it on Linux; its live-X integration tests need a
       # server, provided headless by Xvfb. DISPLAY is exported into the job env
@@ -134,7 +134,7 @@ jobs:
           npm test
           npm run build
 
-      # `universallink-core` must remain compilable for the three targets WITHOUT
+      # `onedevice-core` must remain compilable for the three targets WITHOUT
       # a C compiler: this is what forbids the library from bundling rustls or
       # keyring, and what justifies the existence of the `daemon` crate. Lib only:
       # its dev-dependencies (server → reqwest → ring) do not cross-compile,
@@ -143,8 +143,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           rustup target add x86_64-pc-windows-msvc aarch64-apple-darwin
-          cargo check -p universallink-core --locked --target x86_64-pc-windows-msvc
-          cargo check -p universallink-core --locked --target aarch64-apple-darwin
+          cargo check -p onedevice-core --locked --target x86_64-pc-windows-msvc
+          cargo check -p onedevice-core --locked --target aarch64-apple-darwin
 
       # Production build: lib and binaries ONLY, without dev-dependencies.
       # Essential, because `--all-targets` and `cargo test` unify the
@@ -193,10 +193,10 @@ jobs:
       # from --all-targets. Hence its two dedicated steps: linting main.rs,
       # then linking against the real webview engine.
       - name: Clippy GUI (webview)
-        run: cargo clippy -p universallink-gui --features webview --all-targets --locked -- -D warnings
+        run: cargo clippy -p onedevice-gui --features webview --all-targets --locked -- -D warnings
 
       - name: Build GUI (webview)
-        run: cargo build -p universallink-gui --features webview --locked
+        run: cargo build -p onedevice-gui --features webview --locked
 
   # The Android app. Nothing else in this file compiles it: `gui-mobile` is
   # EXCLUDED from the workspace (root Cargo.toml), so `--workspace` never reaches

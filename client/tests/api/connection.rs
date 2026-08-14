@@ -6,8 +6,8 @@
 
 use std::time::{Duration, Instant};
 
+use onedevice_ipc_client::{Event, RequestError, TokenSource};
 use serde_json::json;
-use universallink_ipc_client::{Event, RequestError, TokenSource};
 
 use crate::support::*;
 
@@ -32,7 +32,7 @@ async fn client_waits_for_core_and_rereads_token() {
 
     // Client started with the Core absent: no Connected, it waits in backoff.
     let (client, mut events) =
-        universallink_ipc_client::spawn(client_config(&core, "gui", &["session.read"], &[]));
+        onedevice_ipc_client::spawn(client_config(&core, "gui", &["session.read"], &[]));
     assert_no_event(&mut events).await;
 
     // The Core (re)starts: new token on disk. The client must connect
@@ -69,7 +69,7 @@ async fn spawn_token_connects() {
     let mut config = client_config(&core, "tray", &["session.read", "devices.read"], &[]);
     config.token = TokenSource::Spawn(token);
 
-    let (client, mut events) = universallink_ipc_client::spawn(config);
+    let (client, mut events) = onedevice_ipc_client::spawn(config);
     expect_connected(&mut events, &["session.read", "devices.read"]).await;
     client
         .request("session.status", json!({}))
@@ -83,7 +83,7 @@ async fn invalid_token_never_connects() {
     let mut config = client_config(&core, "tray", &["session.read"], &[]);
     config.token = TokenSource::Spawn("deadbeef".into());
 
-    let (client, mut events) = universallink_ipc_client::spawn(config);
+    let (client, mut events) = onedevice_ipc_client::spawn(config);
     // INVALID_TOKEN on every attempt: never Connected, the client loops.
     assert_no_event(&mut events).await;
     // And requests fail immediately, fail-closed.
@@ -100,7 +100,7 @@ async fn incompatible_api_version_is_terminal() {
     let mut config = client_config_at(scripted.path());
     config.topics = vec![];
 
-    let (client, mut events) = universallink_ipc_client::spawn(config);
+    let (client, mut events) = onedevice_ipc_client::spawn(config);
     let mut conn = scripted.accept().await;
     conn.handle_hello(2).await;
 
@@ -120,7 +120,7 @@ async fn incompatible_api_version_is_terminal() {
 #[tokio::test]
 async fn request_during_establishment_fails_fast() {
     let mut scripted = ScriptedCore::start().await;
-    let (client, mut events) = universallink_ipc_client::spawn(client_config_at(scripted.path()));
+    let (client, mut events) = onedevice_ipc_client::spawn(client_config_at(scripted.path()));
     let mut conn = scripted.accept().await;
     // hello received but left unanswered: establishment is in progress.
     let hello = conn.recv().await;
@@ -165,7 +165,7 @@ async fn request_during_establishment_fails_fast() {
 #[tokio::test]
 async fn hello_pending_is_a_cycle_failure() {
     let mut scripted = ScriptedCore::start().await;
-    let (_client, mut events) = universallink_ipc_client::spawn(client_config_at(scripted.path()));
+    let (_client, mut events) = onedevice_ipc_client::spawn(client_config_at(scripted.path()));
     let mut conn = scripted.accept().await;
     let hello = conn.recv().await;
     // Interactive third-party enrollment is not supported in v1: for an
@@ -182,7 +182,7 @@ async fn hello_pending_is_a_cycle_failure() {
 #[tokio::test]
 async fn backoff_doubles_and_resets() {
     let mut scripted = ScriptedCore::start().await;
-    let (_client, mut events) = universallink_ipc_client::spawn(client_config_at(scripted.path()));
+    let (_client, mut events) = onedevice_ipc_client::spawn(client_config_at(scripted.path()));
 
     // 4 rejected hellos: the attempts space out by doubling (base 25 ms).
     // `sleep` guarantees a minimum, never a maximum: we only assert lower
@@ -237,7 +237,7 @@ async fn the_topics_are_all_asked_for_in_one_call() {
     config.topics = vec!["session".into()];
     config.optional_topics = vec!["pairing".into()];
 
-    let (_client, mut events) = universallink_ipc_client::spawn(config);
+    let (_client, mut events) = onedevice_ipc_client::spawn(config);
     let mut conn = scripted.accept().await;
     conn.handle_hello(1).await;
 
@@ -262,7 +262,7 @@ async fn an_optional_topic_the_core_does_not_know_costs_only_that_topic() {
     config.topics = vec!["session".into()];
     config.optional_topics = vec!["pairing".into()];
 
-    let (_client, mut events) = universallink_ipc_client::spawn(config);
+    let (_client, mut events) = onedevice_ipc_client::spawn(config);
     let mut conn = scripted.accept().await;
     conn.handle_hello(1).await;
 
@@ -293,7 +293,7 @@ async fn a_required_topic_the_core_refuses_still_fails_the_cycle() {
     let mut config = client_config_at(scripted.path());
     config.topics = vec!["session".into()];
 
-    let (_client, mut events) = universallink_ipc_client::spawn(config);
+    let (_client, mut events) = onedevice_ipc_client::spawn(config);
     let mut conn = scripted.accept().await;
     conn.handle_hello(1).await;
 
@@ -312,8 +312,8 @@ async fn a_required_topic_the_core_refuses_still_fails_the_cycle() {
 }
 
 /// Config pointed at a scripted Core (static token, no file).
-pub fn client_config_at(path: std::path::PathBuf) -> universallink_ipc_client::ClientConfig {
-    universallink_ipc_client::ClientConfig {
+pub fn client_config_at(path: std::path::PathBuf) -> onedevice_ipc_client::ClientConfig {
+    onedevice_ipc_client::ClientConfig {
         ipc_path: path,
         token: TokenSource::Spawn("scripted-token".into()),
         name: "client-test".into(),

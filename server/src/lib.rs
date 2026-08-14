@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
 
-//! UniversalLink server — control plane: authentication (OIDC + device keys),
+//! 1Device server — control plane: authentication (OIDC + device keys),
 //! device directory, presence, iroh dial info, and the deployment descriptor a
 //! client reads to configure itself.
 //!
@@ -35,7 +35,7 @@ pub const API_VERSION: u64 = 1;
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Listen address (WebSocket on `/ws`, health on `GET /health`, deployment
-    /// descriptor on `GET /.well-known/universallink.json`).
+    /// descriptor on `GET /.well-known/1device.json`).
     /// TLS is terminated upstream (reverse proxy) — the server listens in the clear.
     pub bind_addr: SocketAddr,
     pub oidc: OidcConfig,

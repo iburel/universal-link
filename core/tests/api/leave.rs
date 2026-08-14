@@ -16,8 +16,8 @@
 //! the directory, the tombstones, and `device.key` itself — a revocation is
 //! permanent, so the only way back is the fresh identity the next startup mints.
 
+use onedevice_test_support::memory_transport::MemorySwitchboard;
 use serde_json::{Value, json};
-use universallink_test_support::memory_transport::MemorySwitchboard;
 
 use crate::lanpair::Stranger;
 use crate::support::*;
@@ -102,7 +102,7 @@ async fn struck_and_left(code: &str) -> (TestCore, TestComponent, String) {
 /// of the human's.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_account_striking_this_device_reaches_it_and_it_leaves() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
     let (a, c) = account_pair(&code, &switchboard).await;
     let mut ca = manager(&a).await;
@@ -171,7 +171,7 @@ async fn the_account_striking_this_device_reaches_it_and_it_leaves() {
 /// a fresh identity the old tombstone does not name — the only honest way back.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_next_startup_is_a_first_startup_under_a_fresh_identity() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let (c, _cc, struck_id) = struck_and_left(&code).await;
 
     let c = c.restart().await;
@@ -196,8 +196,8 @@ async fn the_next_startup_is_a_first_startup_under_a_fresh_identity() {
 /// verification as every tombstone.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tombstone_a_peer_merely_asserts_wipes_nothing() {
-    let code = universallink_core::account_key::generate_recovery_code();
-    let other_code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
+    let other_code = onedevice_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
     // A compromised MEMBER: its record is held, so its streams are served.
     let insider = Stranger::join(&switchboard);
@@ -214,10 +214,10 @@ async fn a_tombstone_a_peer_merely_asserts_wipes_nothing() {
     // Garbage where a signature should be, and a REAL signature under another
     // account's key: both name this very device, neither verifies under ours.
     let other_ak =
-        universallink_core::account_key::account_key_from_code(&other_code).expect("valid code");
+        onedevice_core::account_key::account_key_from_code(&other_code).expect("valid code");
     for forged in [
         json!("de".repeat(64)),
-        json!(universallink_core::account_key::revoke(
+        json!(onedevice_core::account_key::revoke(
             &other_ak,
             &core.node_id()
         )),
@@ -251,7 +251,7 @@ async fn a_tombstone_a_peer_merely_asserts_wipes_nothing() {
 /// only for a `node_id` the account's signature names.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_struck_off_dial_is_answered_its_tombstone_and_a_strangers_is_not() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
     let struck = Stranger::join(&switchboard);
     let stranger = Stranger::join(&switchboard);
@@ -269,11 +269,10 @@ async fn a_struck_off_dial_is_answered_its_tombstone_and_a_strangers_is_not() {
     assert_eq!(answer["records"], json!([]));
     let revoked = answer["revoked"].as_object().expect("a tombstone map");
     assert_eq!(revoked.len(), 1, "its own tombstone and nothing else");
-    let ak =
-        universallink_core::account_key::account_key_from_code(&code).expect("valid test code");
+    let ak = onedevice_core::account_key::account_key_from_code(&code).expect("valid test code");
     assert!(
-        universallink_core::account_key::verify_revocation(
-            &universallink_core::account_key::public_hex(&ak),
+        onedevice_core::account_key::verify_revocation(
+            &onedevice_core::account_key::public_hex(&ak),
             &struck.key.node_id(),
             revoked[&struck.key.node_id()]
                 .as_str()
@@ -298,7 +297,7 @@ async fn a_struck_off_dial_is_answered_its_tombstone_and_a_strangers_is_not() {
 /// human is actually waiting for.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_pairing_window_yields_to_the_tombstone() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
     let struck = Stranger::join(&switchboard);
     let dir = tempfile::tempdir().expect("tempdir");
@@ -336,7 +335,7 @@ async fn the_pairing_window_yields_to_the_tombstone() {
 /// number for nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_code_shown_by_a_struck_off_device_is_refused() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
     let struck = Stranger::join(&switchboard);
     let dir = tempfile::tempdir().expect("tempdir");
@@ -355,7 +354,7 @@ async fn a_code_shown_by_a_struck_off_device_is_refused() {
 /// device was, it has no account to sponsor into and no standing to join with.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pairing_in_flight_dies_with_the_account() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
     let insider = Stranger::join(&switchboard);
     let core = TestCore::start_in_account_on(
@@ -372,7 +371,7 @@ async fn a_pairing_in_flight_dies_with_the_account() {
 
     // The account's word arrives while the window is open — carried by a
     // sibling's roster this time, which is the other door absorb guards.
-    let ak = universallink_core::account_key::account_key_from_code(&code).expect("valid code");
+    let ak = onedevice_core::account_key::account_key_from_code(&code).expect("valid code");
     insider
         .say(
             &core,
@@ -380,7 +379,7 @@ async fn a_pairing_in_flight_dies_with_the_account() {
                 "type": "dir_sync",
                 "records": [],
                 "revoked": {
-                    core.node_id(): universallink_core::account_key::revoke(&ak, &core.node_id()),
+                    core.node_id(): onedevice_core::account_key::revoke(&ak, &core.node_id()),
                 },
             }),
         )
@@ -402,7 +401,7 @@ async fn a_pairing_in_flight_dies_with_the_account() {
 /// nobody, and the dial it names gets what any stranger gets — silence.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tombstone_the_file_merely_contains_does_not_speak() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
     let stranger = Stranger::join(&switchboard);
     let dir = tempfile::tempdir().expect("tempdir");
@@ -427,7 +426,7 @@ async fn a_tombstone_the_file_merely_contains_does_not_speak() {
 /// it is the account that ends rather than the session.
 #[tokio::test(flavor = "multi_thread")]
 async fn leaving_cuts_the_clipboards_open_grants() {
-    let code = universallink_core::account_key::generate_recovery_code();
+    let code = onedevice_core::account_key::generate_recovery_code();
     let switchboard = MemorySwitchboard::new();
     let insider = Stranger::join(&switchboard);
     let core = TestCore::start_in_account_on(
@@ -466,7 +465,7 @@ async fn leaving_cuts_the_clipboards_open_grants() {
     let mut ch = core.open_channel(&token).await;
     assert_eq!(ch.read("f0", 0, 6).await.unwrap(), b"secret");
 
-    let ak = universallink_core::account_key::account_key_from_code(&code).expect("valid code");
+    let ak = onedevice_core::account_key::account_key_from_code(&code).expect("valid code");
     insider
         .say(
             &core,
@@ -474,7 +473,7 @@ async fn leaving_cuts_the_clipboards_open_grants() {
                 "type": "dir_sync",
                 "records": [],
                 "revoked": {
-                    core.node_id(): universallink_core::account_key::revoke(&ak, &core.node_id()),
+                    core.node_id(): onedevice_core::account_key::revoke(&ak, &core.node_id()),
                 },
             }),
         )

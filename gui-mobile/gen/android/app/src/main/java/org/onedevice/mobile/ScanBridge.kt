@@ -1,4 +1,4 @@
-package org.universallink.mobile
+package org.onedevice.mobile
 
 import android.app.Activity
 import android.content.Intent
@@ -46,14 +46,14 @@ object ScanBridge {
         // The Tauri runtime's own `Rust` object already loads this library, but
         // only once its class is initialized. Loading it again is a no-op and
         // makes this seam independent of that ordering.
-        System.loadLibrary("universallink_gui_mobile")
+        System.loadLibrary("onedevice_gui_mobile")
     }
 
     private const val TAG = "ULCore"
 
     /**
      * Passed to [ScanActivity]: the prefixes a code may carry, comma-separated
-     * (`UL1:` pairs through a server, `UL2:` over the local network — see
+     * (`1D1:` pairs through a server, `1D2:` over the local network — see
      * scan.rs). One extra, not two: the list is the Rust side's to compose, and
      * a third kind of code must not need a Kotlin change.
      */

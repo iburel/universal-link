@@ -7,7 +7,7 @@
 //!
 //! 1. `spawn_core`: launch it now if it isn't already running. Unconditional
 //!    and safe — the Core holds a single-instance lock and exits with 0 if one
-//!    is already running (see the `universallink-core` binary), so a redundant
+//!    is already running (see the `1device-core` binary), so a redundant
 //!    spawn does nothing. The Core is detached: it survives the GUI closing,
 //!    which allows receiving a transfer with the window closed.
 //! 2. `register_autostart`: register it so it restarts at each session login
@@ -24,17 +24,17 @@ use std::path::{Path, PathBuf};
 
 /// Name of the Core binary bundled alongside the GUI (Tauri `externalBin`
 /// sidecar). Tauri strips the target-triple suffix at packaging time: at
-/// runtime it is simply `universallink-core[.exe]`.
+/// runtime it is simply `1device-core[.exe]`.
 pub const CORE_BIN: &str = if cfg!(windows) {
-    "universallink-core.exe"
+    "1device-core.exe"
 } else {
-    "universallink-core"
+    "1device-core"
 };
 
 /// Label of the macOS LaunchAgent (= plist label + file name). Reuses the
 /// bundle identifier. Windows/Linux name their entry differently.
 #[cfg(target_os = "macos")]
-const AUTOSTART_LABEL: &str = "org.universallink.core";
+const AUTOSTART_LABEL: &str = "org.onedevice.core";
 
 /// The bundled Core: alongside the GUI executable (the bundle places the
 /// `externalBin` in the same folder as the main binary). `None` if we can't
@@ -93,7 +93,7 @@ pub fn record_launch_target(dest: &Path) {
         return;
     };
     if let Err(e) = std::fs::write(dest, target.to_string_lossy().as_bytes()) {
-        eprintln!("[universallink] cannot record the GUI launch path: {e}");
+        eprintln!("[1device] cannot record the GUI launch path: {e}");
     }
 }
 
@@ -130,7 +130,7 @@ pub fn stabilize_core_path(bundled: &Path) -> PathBuf {
         Ok(stable) => stable,
         Err(e) => {
             eprintln!(
-                "[universallink] cannot stage a durable Core copy ({e}); \
+                "[1device] cannot stage a durable Core copy ({e}); \
                  autostart may not survive logout — using {}",
                 bundled.display()
             );
@@ -242,7 +242,7 @@ where
 pub fn spawn_core(core_path: &Path) {
     if !core_path.exists() {
         eprintln!(
-            "[universallink] Core not found alongside the GUI ({}): no spawn (dev build?)",
+            "[1device] Core not found alongside the GUI ({}): no spawn (dev build?)",
             core_path.display()
         );
         return;
@@ -263,15 +263,15 @@ pub fn spawn_core(core_path: &Path) {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     match cmd.spawn() {
-        Ok(_child) => eprintln!("[universallink] Core launched (or already running)"),
-        Err(e) => eprintln!("[universallink] cannot spawn the Core: {e}"),
+        Ok(_child) => eprintln!("[1device] Core launched (or already running)"),
+        Err(e) => eprintln!("[1device] cannot spawn the Core: {e}"),
     }
 }
 
 /// Registers the Core at session startup (idempotent, non-fatal).
 pub fn register_autostart(core_path: &Path) {
     if let Err(e) = register_autostart_inner(core_path) {
-        eprintln!("[universallink] cannot register autostart: {e}");
+        eprintln!("[1device] cannot register autostart: {e}");
     }
 }
 
@@ -316,7 +316,7 @@ fn autostart_desktop_entry(program: &Path) -> String {
     format!(
         "[Desktop Entry]\n\
          Type=Application\n\
-         Name=UniversalLink Core\n\
+         Name=1Device Core\n\
          Exec={program}\n\
          Terminal=false\n\
          X-GNOME-Autostart-enabled=true\n",
@@ -363,7 +363,7 @@ fn register_autostart_inner(core_path: &Path) -> std::io::Result<()> {
     let dir = base.join("autostart");
     std::fs::create_dir_all(&dir)?;
     std::fs::write(
-        dir.join("universallink-core.desktop"),
+        dir.join("1device-core.desktop"),
         autostart_desktop_entry(core_path),
     )
 }
@@ -388,10 +388,10 @@ fn data_home() -> std::io::Result<PathBuf> {
 /// Where the durable Core copy lives under a given data dir. Pure (tested).
 #[cfg(target_os = "linux")]
 fn staged_core_dest(data_home: &Path) -> PathBuf {
-    data_home.join("universallink").join(CORE_BIN)
+    data_home.join("1device").join(CORE_BIN)
 }
 
-/// Copies the Core into `<data_home>/universallink/` and returns its path.
+/// Copies the Core into `<data_home>/1device/` and returns its path.
 /// `data_home` is passed in (not read from the env) so the mechanics are
 /// testable deterministically.
 #[cfg(target_os = "linux")]
@@ -408,11 +408,7 @@ fn stage_core_copy(src: &Path, data_home: &Path) -> std::io::Result<PathBuf> {
 /// components are added; nothing cross-checks it against `official_components`, and
 /// a sidecar missing from it is simply never launched on a real Linux install.
 #[cfg(target_os = "linux")]
-const STAGED_SIDECARS: &[&str] = &[
-    "universallink-tray",
-    "universallink-clipboard",
-    "universallink-menu",
-];
+const STAGED_SIDECARS: &[&str] = &["1device-tray", "1device-clipboard", "1device-menu"];
 
 /// Copies each sidecar next to the durable Core (best-effort). A sidecar absent
 /// from this build is skipped; a copy failure is logged but not fatal — a Core
@@ -427,9 +423,9 @@ fn stage_sidecars(bundled_core: &Path, data_home: &Path) {
         if !src.exists() {
             continue; // not in this build
         }
-        let dest = data_home.join("universallink").join(bin);
+        let dest = data_home.join("1device").join(bin);
         if let Err(e) = stage_copy(&src, &dest) {
-            eprintln!("[universallink] cannot stage the {bin} copy ({e})");
+            eprintln!("[1device] cannot stage the {bin} copy ({e})");
         }
     }
 }
@@ -478,7 +474,7 @@ fn register_autostart_inner(core_path: &Path) -> std::io::Result<()> {
             "add",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
             "/v",
-            "UniversalLink",
+            "1Device",
             "/t",
             "REG_SZ",
             "/d",
@@ -502,8 +498,8 @@ mod tests {
 
     #[test]
     fn the_plist_names_the_program_and_survives_crashes_only() {
-        let plist = launch_agent_plist("org.universallink.core", Path::new("/Apps/UL.app/x/core"));
-        assert!(plist.contains("<string>org.universallink.core</string>"));
+        let plist = launch_agent_plist("org.onedevice.core", Path::new("/Apps/UL.app/x/core"));
+        assert!(plist.contains("<string>org.onedevice.core</string>"));
         assert!(plist.contains("<string>/Apps/UL.app/x/core</string>"));
         assert!(plist.contains("<key>RunAtLoad</key>"));
         // Conditional KeepAlive: we relaunch on crash, never on exit 0
@@ -533,23 +529,23 @@ mod tests {
 
     #[test]
     fn app_bundle_path_ascends_to_the_dot_app() {
-        let exe = Path::new("/Applications/UniversalLink.app/Contents/MacOS/UniversalLink");
+        let exe = Path::new("/Applications/1Device.app/Contents/MacOS/1Device");
         assert_eq!(
             app_bundle_path(exe),
-            Some(PathBuf::from("/Applications/UniversalLink.app"))
+            Some(PathBuf::from("/Applications/1Device.app"))
         );
         // Not inside a bundle (a bare executable): None, so the caller falls
         // back to the executable itself.
         assert_eq!(
-            app_bundle_path(Path::new("/usr/local/bin/universallink-gui")),
+            app_bundle_path(Path::new("/usr/local/bin/1device-gui")),
             None
         );
     }
 
     #[test]
     fn the_desktop_entry_points_at_the_program() {
-        let entry = autostart_desktop_entry(Path::new("/opt/ul/core"));
-        assert!(entry.contains("Exec=/opt/ul/core"));
+        let entry = autostart_desktop_entry(Path::new("/opt/1device/core"));
+        assert!(entry.contains("Exec=/opt/1device/core"));
         assert!(entry.contains("Terminal=false"));
         assert!(entry.starts_with("[Desktop Entry]"));
     }
@@ -557,9 +553,9 @@ mod tests {
     #[test]
     fn the_core_binary_name_matches_the_platform() {
         if cfg!(windows) {
-            assert_eq!(CORE_BIN, "universallink-core.exe");
+            assert_eq!(CORE_BIN, "1device-core.exe");
         } else {
-            assert_eq!(CORE_BIN, "universallink-core");
+            assert_eq!(CORE_BIN, "1device-core");
         }
     }
 
@@ -569,7 +565,7 @@ mod tests {
         let dest = staged_core_dest(Path::new("/home/u/.local/share"));
         assert_eq!(
             dest,
-            Path::new("/home/u/.local/share/universallink").join(CORE_BIN)
+            Path::new("/home/u/.local/share/1device").join(CORE_BIN)
         );
     }
 
@@ -595,7 +591,7 @@ mod tests {
         // No temp left behind.
         assert!(
             !data_home
-                .join("universallink")
+                .join("1device")
                 .join(format!("{CORE_BIN}.new"))
                 .exists()
         );
@@ -607,14 +603,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().expect("tempdir");
-        let src = tmp.path().join("universallink-tray");
+        let src = tmp.path().join("1device-tray");
         std::fs::write(&src, b"tray").expect("write src");
 
-        let dest = tmp
-            .path()
-            .join("data")
-            .join("universallink")
-            .join("universallink-tray");
+        let dest = tmp.path().join("data").join("1device").join("1device-tray");
         stage_copy(&src, &dest).expect("stage");
 
         assert_eq!(std::fs::read(&dest).expect("read"), b"tray");
@@ -641,7 +633,7 @@ mod tests {
 
         // Every declared sidecar lands next to the durable Core.
         for bin in STAGED_SIDECARS {
-            let dest = data_home.join("universallink").join(bin);
+            let dest = data_home.join("1device").join(bin);
             assert!(dest.exists(), "{bin} must be staged next to the Core");
             assert_eq!(std::fs::read(&dest).expect("read"), bin.as_bytes());
         }
@@ -650,11 +642,7 @@ mod tests {
         // is the failure that matters: a sidecar bundled in the AppImage but not
         // staged is never found next to the durable Core, so it silently never runs
         // — logged at INFO as "component absent" and nothing else.
-        for expected in [
-            "universallink-tray",
-            "universallink-clipboard",
-            "universallink-menu",
-        ] {
+        for expected in ["1device-tray", "1device-clipboard", "1device-menu"] {
             assert!(
                 STAGED_SIDECARS.contains(&expected),
                 "{expected} is launched by the supervisor but never staged"
@@ -671,22 +659,14 @@ mod tests {
         let core = mount.join(CORE_BIN);
         std::fs::write(&core, b"core").expect("core");
         // Only the tray is present; the clipboard is missing from this build.
-        std::fs::write(mount.join("universallink-tray"), b"tray").expect("tray");
+        std::fs::write(mount.join("1device-tray"), b"tray").expect("tray");
 
         let data_home = tmp.path().join("data");
         stage_sidecars(&core, &data_home); // must not panic on the absent one
 
+        assert!(data_home.join("1device").join("1device-tray").exists());
         assert!(
-            data_home
-                .join("universallink")
-                .join("universallink-tray")
-                .exists()
-        );
-        assert!(
-            !data_home
-                .join("universallink")
-                .join("universallink-clipboard")
-                .exists(),
+            !data_home.join("1device").join("1device-clipboard").exists(),
             "an absent sidecar is skipped, not fabricated"
         );
     }
@@ -718,8 +698,8 @@ mod tests {
     fn measured_appimage_env(appdir: &str) -> Vec<(String, String)> {
         [
             ("APPDIR", appdir.to_string()),
-            ("APPIMAGE", "/home/iwan/Applications/UniversalLink_0.5.0_amd64.AppImage".into()),
-            ("ARGV0", "/home/iwan/Applications/UniversalLink_0.5.0_amd64.AppImage".into()),
+            ("APPIMAGE", "/home/iwan/Applications/1Device_0.5.0_amd64.AppImage".into()),
+            ("ARGV0", "/home/iwan/Applications/1Device_0.5.0_amd64.AppImage".into()),
             ("OWD", "/home/iwan".into()),
             ("LD_LIBRARY_PATH", format!("{appdir}/usr/lib/:{appdir}/usr/lib/x86_64-linux-gnu/:{appdir}/lib64/:")),
             ("PATH", format!("{appdir}/usr/bin/:{appdir}/usr/sbin/:{appdir}/bin/:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin")),
@@ -840,7 +820,7 @@ mod tests {
     #[test]
     fn the_spawned_child_really_gets_the_scrubbed_environment() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let core = tmp.path().join("universallink-core");
+        let core = tmp.path().join("1device-core");
         let reported = tmp.path().join("child-env.txt");
         std::fs::write(&core, format!("#!/bin/sh\nenv > {}\n", reported.display()))
             .expect("write the stand-in Core");

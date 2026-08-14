@@ -3,7 +3,7 @@
 
 //! The Android **share sheet**, wired to the account's clipboard.
 //!
-//! Selecting text anywhere on the phone → Share → UniversalLink copies it to
+//! Selecting text anywhere on the phone → Share → 1Device copies it to
 //! every other device of the account, ready to paste. There is no OS clipboard
 //! to watch here (v1 shares on an explicit gesture, and Android grants no
 //! background clipboard read anyway), so this component is a *source only*: it
@@ -12,7 +12,7 @@
 //! Two seams meet in this file.
 //!
 //! **Kotlin → Rust.** The share intent lands in `MainActivity` (Kotlin), which
-//! hands the string to [`Java_org_universallink_mobile_ShareBridge_onShareText`].
+//! hands the string to [`Java_org_onedevice_mobile_ShareBridge_onShareText`].
 //! tao *also* parses `ACTION_SEND` `text/plain` into a `RunEvent::Opened`, which
 //! would need no JNI at all — but it wraps the text in a `data:` URL through the
 //! `url` crate, and anything that parses as a URL comes back normalized
@@ -54,7 +54,7 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
-use universallink_ipc_client::{Client, ClientConfig, Event, RequestError};
+use onedevice_ipc_client::{Client, ClientConfig, Event, RequestError};
 
 /// The frontend event carrying a share's progress — mirrored by `ShareStatus`
 /// in `gui/ui/src/lib/core.ts`. Mobile-only: the desktop shell never emits it.
@@ -140,13 +140,13 @@ fn submit_text(text: String) {
     let _ = queue().0.send(Share::Text(text));
 }
 
-/// `org.universallink.mobile.ShareBridge.onShareText` — see `ShareBridge.kt`.
+/// `org.onedevice.mobile.ShareBridge.onShareText` — see `ShareBridge.kt`.
 ///
 /// The JVM calls this on its own thread, possibly before the Tauri setup has
 /// run; nothing here touches app state, only the queue.
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_universallink_mobile_ShareBridge_onShareText(
+pub extern "system" fn Java_org_onedevice_mobile_ShareBridge_onShareText(
     mut env: tauri::tao::platform::android::prelude::JNIEnv<'_>,
     _class: tauri::tao::platform::android::prelude::JClass<'_>,
     text: tauri::tao::platform::android::prelude::JString<'_>,
@@ -164,7 +164,7 @@ pub extern "system" fn Java_org_universallink_mobile_ShareBridge_onShareText(
     }
 }
 
-/// `org.universallink.mobile.ShareBridge.onShareFiles` — see `ShareFiles.kt`.
+/// `org.onedevice.mobile.ShareBridge.onShareFiles` — see `ShareFiles.kt`.
 ///
 /// The payload is JSON rather than a flat argument list because a file share has
 /// three shapes (see [`file_share_status`]), and one seam that carries its own
@@ -176,7 +176,7 @@ pub extern "system" fn Java_org_universallink_mobile_ShareBridge_onShareText(
 /// [`register`] safe.
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_universallink_mobile_ShareBridge_onShareFiles(
+pub extern "system" fn Java_org_onedevice_mobile_ShareBridge_onShareFiles(
     mut env: tauri::tao::platform::android::prelude::JNIEnv<'_>,
     _class: tauri::tao::platform::android::prelude::JClass<'_>,
     json: tauri::tao::platform::android::prelude::JString<'_>,
@@ -381,7 +381,7 @@ pub fn spawn(app: AppHandle, gui: &ClientConfig) {
     let config = ClientConfig {
         ipc_path: gui.ipc_path.clone(),
         token: gui.token.clone(),
-        name: "universallink-share".into(),
+        name: "1device-share".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         // The exclusive role `clipboard.updated` demands (core: conn.rs
         // `require_clipboard_backend`), with the scope it checks — plus
@@ -404,7 +404,7 @@ pub fn spawn(app: AppHandle, gui: &ClientConfig) {
 }
 
 async fn run(app: AppHandle, config: ClientConfig, mut shares: Shares) {
-    let (client, events) = universallink_ipc_client::spawn(config);
+    let (client, events) = onedevice_ipc_client::spawn(config);
     // The delivery reports arrive as notifications on the same connection,
     // interleaved with its lifecycle events: split them off so a share can wait
     // for its own report without also owning the event stream.

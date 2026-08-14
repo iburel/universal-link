@@ -53,9 +53,9 @@ test("a pasted code is passed on, and Enter commits it", () => {
   const view = render(LinkDevice, { store, mode: "join" });
 
   click(byText(view, "button", "Enter a code…"));
-  typeInto(byLabel(view, "Pairing code"), "UL1:a:b:p_1");
+  typeInto(byLabel(view, "Pairing code"), "1D1:a:b:p_1");
   click(byText(view, "button", "Link"));
-  expect(enter).toHaveBeenCalledWith("UL1:a:b:p_1");
+  expect(enter).toHaveBeenCalledWith("1D1:a:b:p_1");
 
   press(byLabel(view, "Pairing code"), "Enter");
   expect(enter).toHaveBeenCalledTimes(2);
@@ -85,7 +85,7 @@ test("a Core that does not know pairing is not offered it", () => {
 
 // The two sides read "is the server there?" differently. A device with a session
 // SHOWS its code over that session, so a lost server disarms showing — and only
-// showing: reading a `UL2` code dials the device that displays it on the local
+// showing: reading a `1D2` code dials the device that displays it on the local
 // network, which is exactly the situation a lost server leaves the room in.
 test("a signed-in device with no server can still read a code, not show one", () => {
   store.session = { logged_in: true, server_connected: false };
@@ -97,9 +97,9 @@ test("a signed-in device with no server can still read a code, not show one", ()
   expect(textOf(view)).toContain("The server is unreachable");
 
   click(byText(view, "button", "Enter a code…"));
-  typeInto(byLabel(view, "Pairing code"), "UL2:a:b:node_1");
+  typeInto(byLabel(view, "Pairing code"), "1D2:a:b:node_1");
   click(byText(view, "button", "Link"));
-  expect(enter).toHaveBeenCalledWith("UL2:a:b:node_1");
+  expect(enter).toHaveBeenCalledWith("1D2:a:b:node_1");
 });
 
 // ...whereas a device with NO session opens a connection of its own on demand,

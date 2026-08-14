@@ -1,4 +1,4 @@
-# UniversalLink — Server public API
+# 1Device — Server public API
 
 > Specification of the API between the Core and the Server. Complements
 > [architecture.md](architecture.md). Status: implemented — the Core and the server
@@ -41,13 +41,13 @@ activity — only connections, heartbeats, and the directory.
   (racing with its own closure) is silently ignored, it does not overwrite the
   state published by the current connection.
 - Outside the WebSocket: `GET /health` (monitoring) and
-  `GET /.well-known/universallink.json` (the deployment descriptor, below). TLS
+  `GET /.well-known/1device.json` (the deployment descriptor, below). TLS
   mandatory everywhere — terminated by the server or by an upstream reverse proxy
   (the server can then listen in cleartext on its internal network).
 
 ## Deployment descriptor
 
-`GET /.well-known/universallink.json` — **unauthenticated**, necessarily: a
+`GET /.well-known/1device.json` — **unauthenticated**, necessarily: a
 client reads it before it is able to log in.
 
 ```json
@@ -115,7 +115,7 @@ into its `config.json`.
    `exp`), verifies the proof, creates the device under the account `(iss, sub)`.
    The JWKS is cached and re-fetched when a token carries an unknown key id, so
    an issuer key rotation is picked up without a restart (rate-limited by
-   `UNIVERSALLINK_JWKS_REFRESH_MIN_SECS`).
+   `ONEDEVICE_JWKS_REFRESH_MIN_SECS`).
 
 ### Nominal connection (at every startup)
 

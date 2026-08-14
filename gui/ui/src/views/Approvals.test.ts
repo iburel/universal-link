@@ -27,7 +27,7 @@ const REQUEST: PendingRequest = {
 
 const GUI: Component = {
   component_id: "c_gui",
-  name: "universallink-gui",
+  name: "1device-gui",
   role: "gui",
   scopes: ["components.approve"],
   connected: true,
@@ -118,7 +118,7 @@ test("only an enrolled component is revocable", () => {
   const revoke = vi.spyOn(store, "revokeComponent").mockResolvedValue();
 
   const view = render(Approvals, { store });
-  expect(() => byLabel(view, "Revoke universallink-gui")).toThrow();
+  expect(() => byLabel(view, "Revoke 1device-gui")).toThrow();
   expect(textOf(view)).toContain("local connection");
 
   click(byLabel(view, "Revoke clipnet"));

@@ -1,0 +1,46 @@
+# Deployment WITHOUT Docker: the bare binary behind YOUR reverse proxy (nginx,
+# Caddy, Traefik…). See doc/server-deployment.md, "Docker-free alternative".
+#
+# Installation:
+#   sudo useradd --system --no-create-home --home-dir /var/lib/1device onedevice
+#   cargo build --release --locked -p onedevice-server-daemon --bin 1device-server
+#   sudo install -m 0755 target/release/1device-server /usr/local/bin/
+#   sudo mkdir -p /etc/1device
+#   # server.env: see doc/server-deployment.md (loopback BIND + OIDC)
+#   sudo install -m 0640 server.env /etc/1device/server.env
+#   sudo cp deploy/1device-server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now 1device-server
+#
+# `systemctl stop` sends SIGTERM: the server exits cleanly (code 0), cf.
+# server-daemon/src/main.rs.
+
+[Unit]
+Description=1Device control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=onedevice
+Group=onedevice
+EnvironmentFile=/etc/1device/server.env
+# systemd creates /var/lib/1device (0700, with the right owner) via
+# StateDirectory and stores the directory there. Do NOT set
+# ONEDEVICE_SERVER_STATE in server.env: an EnvironmentFile ALWAYS
+# overrides Environment= (systemd rule, independent of line order).
+StateDirectory=1device
+Environment=ONEDEVICE_SERVER_STATE=/var/lib/1device/1device-directory.json
+ExecStart=/usr/local/bin/1device-server
+Restart=on-failure
+RestartSec=2
+
+# Hardening: the server only listens on a port and writes its directory.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/var/lib/1device
+
+[Install]
+WantedBy=multi-user.target

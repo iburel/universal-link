@@ -1671,7 +1671,7 @@ test.each([
   [
     { phase: "error", reason: "not_signed_in" } as const,
     "error",
-    "Sign in to UniversalLink first — nothing was shared.",
+    "Sign in to 1Device first — nothing was shared.",
   ],
   [
     { phase: "error", reason: "offline" } as const,
@@ -1993,7 +1993,7 @@ test("setUpFromAddress asks the server for its settings, then writes them", asyn
       "session.status": () => CONFIGURED,
       "session.reload": () => CONFIGURED,
       "session.discover": () => ({
-        server_url: "wss://universallink.example.com/ws",
+        server_url: "wss://1device.example.com/ws",
         oidc_issuer: "https://accounts.google.com",
         oidc_client_id: "abc.apps.googleusercontent.com",
         oidc_client_secret: "GOCSPX-secret",
@@ -2003,19 +2003,19 @@ test("setUpFromAddress asks the server for its settings, then writes them", asyn
   await store.start();
   await flush();
 
-  const outcome = await store.setUpFromAddress("universallink.example.com");
+  const outcome = await store.setUpFromAddress("1device.example.com");
 
   expect(outcome).toBe("saved");
   // The address goes as typed — deriving the URLs is the Core's job, in one
   // place, shared with the phone.
   expect(
     fake.calls.find((c) => c.method === "session.discover")?.params,
-  ).toEqual({ url: "universallink.example.com" });
+  ).toEqual({ url: "1device.example.com" });
   // What came back is what got written, secret included: the field that used to
   // be carried to every device by hand.
   expect(fake.configWrites).toEqual([
     {
-      server_url: "wss://universallink.example.com/ws",
+      server_url: "wss://1device.example.com/ws",
       oidc_issuer: "https://accounts.google.com",
       oidc_client_id: "abc.apps.googleusercontent.com",
       oidc_client_secret: "GOCSPX-secret",
@@ -2088,7 +2088,7 @@ test("setUpFromAddress surfaces an unreachable server as any other failure", asy
 
 const OFFER = {
   pairing_id: "p_1",
-  code: "UL1:secret:key:p_1",
+  code: "1D1:secret:key:p_1",
   role: "joiner",
   expires_in: 120,
 };
@@ -2118,7 +2118,7 @@ test("showing a code puts the Core's answer on screen, role included", async () 
     pairing_id: "p_1",
     role: "joiner",
     phase: "showing",
-    code: "UL1:secret:key:p_1",
+    code: "1D1:secret:key:p_1",
     expires_in: 120,
   });
 });
@@ -2138,7 +2138,7 @@ test("a code read on a device that can vouch goes straight to the confirmation",
     }),
   );
 
-  await store.enterPairingCode("  UL1:secret:key:p_2  ");
+  await store.enterPairingCode("  1D1:secret:key:p_2  ");
 
   expect(store.pairing).toMatchObject({
     pairing_id: "p_2",
@@ -2155,9 +2155,9 @@ test("the code is trimmed, and an empty one never reaches the Core", async () =>
   await store.enterPairingCode("   ");
   expect(fake.calls.map((c) => c.method)).not.toContain("pairing.accept");
 
-  await store.enterPairingCode(" UL1:x:y:p_1 \n");
+  await store.enterPairingCode(" 1D1:x:y:p_1 \n");
   expect(fake.calls.find((c) => c.method === "pairing.accept")?.params).toEqual({
-    code: "UL1:x:y:p_1",
+    code: "1D1:x:y:p_1",
   });
 });
 
@@ -2173,7 +2173,7 @@ test("a code someone else answered first says so", async () => {
     },
   });
 
-  await store.enterPairingCode("UL1:x:y:p_1");
+  await store.enterPairingCode("1D1:x:y:p_1");
 
   expect(store.pairing).toBeNull();
   expect(store.notice?.kind).toBe("error");
@@ -2181,7 +2181,7 @@ test("a code someone else answered first says so", async () => {
   expect(store.notice?.text).toMatch(/someone else/);
 });
 
-// A `UL2` code shown by a device the account struck off, refused before anything
+// A `1D2` code shown by a device the account struck off, refused before anything
 // is dialled: a tombstone is permanent, and the sentence must say that the way
 // out is a fresh device, not a retry.
 test("a code shown by a struck-off device says the strike is for good", async () => {
@@ -2192,7 +2192,7 @@ test("a code shown by a struck-off device says the strike is for good", async ()
     },
   });
 
-  await store.enterPairingCode("UL2:x:y:node_b");
+  await store.enterPairingCode("1D2:x:y:node_b");
 
   expect(store.pairing).toBeNull();
   expect(store.notice?.text).toBe(
@@ -2305,7 +2305,7 @@ test("a sponsor's completion names the device it added", async () => {
       }),
     }),
   );
-  await store.enterPairingCode("UL1:x:y:p_1");
+  await store.enterPairingCode("1D1:x:y:p_1");
 
   await emit("core:notification", {
     method: "pairing.completed",
@@ -2367,7 +2367,7 @@ test("a confirmation the server wants re-authorized goes through the browser", a
       }),
     }),
   );
-  await store.enterPairingCode("UL1:x:y:p_1");
+  await store.enterPairingCode("1D1:x:y:p_1");
 
   await store.confirmPairing();
 
@@ -2390,7 +2390,7 @@ test("a confirmation the keyring could settle opens no browser", async () => {
       }),
     }),
   );
-  await store.enterPairingCode("UL1:x:y:p_1");
+  await store.enterPairingCode("1D1:x:y:p_1");
 
   await store.confirmPairing();
 
@@ -2425,7 +2425,7 @@ test("a Core that does not know pairing takes the offer off the screen", async (
 
   expect(store.pairing).toBeNull();
   expect(store.pairingSupported).toBe(false);
-  expect(store.notice?.text).toContain("newer UniversalLink");
+  expect(store.notice?.text).toContain("newer 1Device");
 
   await emit("core:connection", CONNECTED);
   await vi.waitFor(() => expect(store.pairingSupported).toBe(true));
@@ -2454,7 +2454,7 @@ test("a code the Core cannot read is explained, not relayed", async () => {
     },
   });
 
-  await store.enterPairingCode("UL1:truncated");
+  await store.enterPairingCode("1D1:truncated");
 
   expect(store.pairing).toBeNull();
   expect(store.pairingSupported).toBe(true);
@@ -2482,14 +2482,14 @@ test("a shell with no scanner leaves the gesture off", async () => {
 test("a scanned code is joined with, like any other", async () => {
   const fake = await primed(pairingMethods(), {
     scanner: true,
-    scanned: () => ({ code: "UL1:scanned:key:p_1" }),
+    scanned: () => ({ code: "1D1:scanned:key:p_1" }),
   });
 
   await store.scanPairingCode();
 
   expect(fake.scans).toBe(1);
   expect(fake.calls.find((c) => c.method === "pairing.accept")?.params).toEqual({
-    code: "UL1:scanned:key:p_1",
+    code: "1D1:scanned:key:p_1",
   });
   expect(store.pairing).toMatchObject({ pairing_id: "p_1", phase: "waiting" });
   expect(store.notice).toBeNull();
@@ -2515,7 +2515,7 @@ test("the scan holds its own flag, not the one that guards the Core", async () =
   await store.scanPairingCode();
   expect(fake.scans).toBe(1);
 
-  scan.resolve({ code: "UL1:scanned:key:p_1" });
+  scan.resolve({ code: "1D1:scanned:key:p_1" });
   await done;
   expect(store.scanning).toBe(false);
   expect(fake.calls.map((c) => c.method)).toContain("pairing.accept");

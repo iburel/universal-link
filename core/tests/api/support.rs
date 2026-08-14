@@ -273,12 +273,12 @@
 //!
 //! A device's first introduction, on the local network (serverless, building block
 //! 4 — `lanpair.rs`):
-//! - With NO server in this device's life, `pairing.offer` mints a `UL2` code —
-//!   `UL2:<psk>:<epk>:<node_id>` — instead of answering `SERVER_UNREACHABLE`, and
-//!   `pairing.accept` of a `UL2` code dials that `node_id` on the data plane. The
-//!   `UL1` code (a server relays it) and the `UL2` code (the device is dialled) are
-//!   told apart by their tag; a `UL1` code with no server → `SERVER_UNREACHABLE`.
-//!   (The mirror refusal — `UL2` where a server answers, `PAIRING_VIA_SERVER` —
+//! - With NO server in this device's life, `pairing.offer` mints a `1D2` code —
+//!   `1D2:<psk>:<epk>:<node_id>` — instead of answering `SERVER_UNREACHABLE`, and
+//!   `pairing.accept` of a `1D2` code dials that `node_id` on the data plane. The
+//!   `1D1` code (a server relays it) and the `1D2` code (the device is dialled) are
+//!   told apart by their tag; a `1D1` code with no server → `SERVER_UNREACHABLE`.
+//!   (The mirror refusal — `1D2` where a server answers, `PAIRING_VIA_SERVER` —
 //!   fell with the continuum, block 6 below: such a device now scans and
 //!   sponsors.)
 //! - Frames on the existing ALPN: `lan_pair` (dialer → displayer), answered by
@@ -364,10 +364,10 @@
 //! - News crosses the halves within a sync round, not a tick: what a server
 //!   teaches a Core (`device.added`/`device.updated`, a fresh snapshot, a
 //!   countersigned rename) nudges `dirsync` at once.
-//! - `pairing.accept` of a `UL2` code on a device that answers to a server
+//! - `pairing.accept` of a `1D2` code on a device that answers to a server
 //!   sponsors over the local network; the joiner joins the ACCOUNT, not the
 //!   deployment. `pairing.offer` on that device still goes through the server —
-//!   the `UL1` path is what also enrolls the newcomer on the deployment.
+//!   the `1D1` path is what also enrolls the newcomer on the deployment.
 
 #![allow(dead_code)]
 
@@ -381,14 +381,14 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio::time::timeout;
 
-use universallink_core::{Config, CoreHandle};
+use onedevice_core::{Config, CoreHandle};
 // Harness server building blocks: fake OIDC (+ browser flow), device keys,
 // WS JSON-RPC client, mini HTTP browser. `TEST_SUB`/`TEST_EMAIL`: the test
 // account — all the harness's devices and the Core live there; it is also the
 // user that the fake's browser flow authenticates.
 // (Selective: `RpcError` and the timeouts also exist on the IPC side, below.)
-use universallink_test_support::memory_transport::MemorySwitchboard;
-pub use universallink_test_support::{
+use onedevice_test_support::memory_transport::MemorySwitchboard;
+pub use onedevice_test_support::{
     Device, DeviceKey, FakeOidc, TEST_CLIENT_ID, TEST_EMAIL, TEST_SUB, TestConn, assert_rfc3339,
     authenticate, browse, enroll_device_at, enroll_key, find_device, http_get, url_params,
 };
@@ -455,14 +455,14 @@ fn ipc_path_for(_dir: &Path) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     PathBuf::from(format!(
-        r"\\.\pipe\universallink-test-{}-{}",
+        r"\\.\pipe\1device-test-{}-{}",
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ))
 }
 
 // ---------------------------------------------------------------------------
-// Test environment: the real server (universallink-server lib), behind a
+// Test environment: the real server (1device-server lib), behind a
 // severable TCP proxy. Cutting the `ServerHandle` would not kill the already
 // accepted connections (axum spawns them): the proxy, for its part, lets us
 // simulate an unreachable server — connections in progress cut, new ones
@@ -471,7 +471,7 @@ fn ipc_path_for(_dir: &Path) -> PathBuf {
 
 pub struct TestServer {
     pub oidc: FakeOidc,
-    _server: universallink_server::ServerHandle,
+    _server: onedevice_server::ServerHandle,
     /// Direct URL, for the harness's devices (insensitive to `cut`).
     direct_url: String,
     /// URL via the proxy — the one the harness writes into session.json.
@@ -494,11 +494,11 @@ impl TestServer {
 
     /// Starts with an adjusted server config — a deployment that publishes an
     /// OIDC client secret, for instance.
-    pub async fn start_with(tweak: impl FnOnce(&mut universallink_server::Config)) -> TestServer {
+    pub async fn start_with(tweak: impl FnOnce(&mut onedevice_server::Config)) -> TestServer {
         let oidc = FakeOidc::start().await;
-        let mut config = universallink_server::Config {
+        let mut config = onedevice_server::Config {
             bind_addr: "127.0.0.1:0".parse().expect("addr"),
-            oidc: universallink_server::OidcConfig {
+            oidc: onedevice_server::OidcConfig {
                 issuer_url: oidc.issuer(),
                 client_id: TEST_CLIENT_ID.into(),
                 client_secret: None,
@@ -512,7 +512,7 @@ impl TestServer {
             max_requests_per_minute: None,
         };
         tweak(&mut config);
-        let server = universallink_server::spawn(config)
+        let server = onedevice_server::spawn(config)
             .await
             .expect("server startup");
         let real_addr = server.local_addr();
@@ -608,23 +608,23 @@ pub struct TestCore {
     /// server (`start_in_account`).
     enrolled: Option<(String, DeviceKey)>,
     /// Server+OIDC config passed to the Core (preserved by `restart`).
-    server_cfg: Option<universallink_core::ServerConfig>,
+    server_cfg: Option<onedevice_core::ServerConfig>,
     /// Data-plane transport injected at spawn — preserved by `restart`: a
     /// restarted Core keeps its memory switchboard, hence its peers (otherwise a
     /// "reconnection then re-ping" scenario would be inexpressible here).
-    transport: Arc<dyn universallink_core::PeerTransport>,
+    transport: Arc<dyn onedevice_core::PeerTransport>,
     /// The config `session.reload` re-reads: a shared slot standing in for
     /// `config.json`, so a test can reconfigure the Core the way the GUI does
     /// (see `stage_config` / `stage_invalid_config`). `Err` models a
     /// malformed/half-filled file.
-    reload_slot: Arc<std::sync::Mutex<Result<Option<universallink_core::ServerConfig>, String>>>,
+    reload_slot: Arc<std::sync::Mutex<Result<Option<onedevice_core::ServerConfig>, String>>>,
 }
 
 /// The server+OIDC config of a Core pointed at the test environment. Public for
 /// the tests that configure a Core AFTER it started, the way the GUI writes
 /// `config.json` and calls `session.reload`.
-pub fn server_cfg(server: &TestServer) -> universallink_core::ServerConfig {
-    universallink_core::ServerConfig {
+pub fn server_cfg(server: &TestServer) -> onedevice_core::ServerConfig {
+    onedevice_core::ServerConfig {
         url: server.core_url(),
         oidc_issuer: server.oidc.issuer(),
         oidc_client_id: TEST_CLIENT_ID.into(),
@@ -637,9 +637,9 @@ pub fn server_cfg(server: &TestServer) -> universallink_core::ServerConfig {
 /// exactly what `account.join` would do. Without it, the data plane is
 /// fail-closed: no peer is authorized or reachable.
 fn seed_account_from_code(dir: &Path, node_id: &str, code: &str) {
-    let ak = universallink_core::account_key::account_key_from_code(code).expect("valid test code");
-    let root = universallink_core::account_key::root_for(&ak, node_id);
-    universallink_core::account_key::save(dir, &root).expect("seed account-key.json");
+    let ak = onedevice_core::account_key::account_key_from_code(code).expect("valid test code");
+    let root = onedevice_core::account_key::root_for(&ak, node_id);
+    onedevice_core::account_key::save(dir, &root).expect("seed account-key.json");
 }
 
 /// A directory record for another device of the account, as that device would
@@ -647,7 +647,7 @@ fn seed_account_from_code(dir: &Path, node_id: &str, code: &str) {
 /// membership attested under the account's (`code`). Keyed by its own `node_id` —
 /// the label a device with no server to name it goes by.
 pub fn peer_record(key: &DeviceKey, name: &str, platform: &str, code: &str, seq: u64) -> Value {
-    let ak = universallink_core::account_key::account_key_from_code(code).expect("valid test code");
+    let ak = onedevice_core::account_key::account_key_from_code(code).expect("valid test code");
     let node_id = key.node_id();
     json!({
         "device_id": node_id,
@@ -655,11 +655,11 @@ pub fn peer_record(key: &DeviceKey, name: &str, platform: &str, code: &str, seq:
         "platform": platform,
         "node_id": node_id,
         "seq": seq,
-        "self_sig": key.sign(&universallink_core::directory::record_message(
+        "self_sig": key.sign(&onedevice_core::directory::record_message(
             &node_id, name, platform, seq,
         )),
         "relay_url": null,
-        "attestation": universallink_core::account_key::attest(&ak, &node_id),
+        "attestation": onedevice_core::account_key::attest(&ak, &node_id),
         "online": false,
         "status": null,
         "last_seen": null,
@@ -710,11 +710,11 @@ pub async fn attested_sibling(
     )
     .await;
     authenticate(&mut conn, &key, &device_id).await;
-    let ak = universallink_core::account_key::account_key_from_code(code).expect("valid code");
+    let ak = onedevice_core::account_key::account_key_from_code(code).expect("valid code");
     conn.request(
         "presence.update",
         json!({
-            "attestation": universallink_core::account_key::attest(&ak, &key.node_id()),
+            "attestation": onedevice_core::account_key::attest(&ak, &key.node_id()),
             "relay_url": format!("iroh+memory://{}", key.node_id()),
         }),
     )
@@ -727,9 +727,9 @@ pub async fn attested_sibling(
 /// What `devices.revoke` mints with no server in the picture — seeded by hand
 /// where the test needs the tombstone to pre-date the Core.
 pub fn seed_revocation(dir: &Path, code: &str, node_id: &str) {
-    let ak = universallink_core::account_key::account_key_from_code(code).expect("valid test code");
+    let ak = onedevice_core::account_key::account_key_from_code(code).expect("valid test code");
     let revoked = json!({
-        "revoked": { node_id: universallink_core::account_key::revoke(&ak, node_id) },
+        "revoked": { node_id: onedevice_core::account_key::revoke(&ak, node_id) },
     });
     std::fs::write(dir.join("revoked.json"), revoked.to_string()).expect("seed revoked.json");
 }
@@ -776,7 +776,7 @@ impl TestCore {
         let dir = tempfile::tempdir().expect("tempdir");
         Self::seed_in_account(dir.path(), &key, code, records);
         let node_id = key.node_id();
-        let transport: Arc<dyn universallink_core::PeerTransport> =
+        let transport: Arc<dyn onedevice_core::PeerTransport> =
             switchboard.endpoint(node_id.clone(), None);
         switchboard.join_lan(&node_id);
         Self::spawn_in(dir, Some((node_id.clone(), key)), None, Some(transport)).await
@@ -795,7 +795,7 @@ impl TestCore {
         let key = DeviceKey::generate();
         Self::seed_in_account(dir.path(), &key, code, &[]);
         let node_id = key.node_id();
-        let transport: Arc<dyn universallink_core::PeerTransport> =
+        let transport: Arc<dyn onedevice_core::PeerTransport> =
             switchboard.endpoint(node_id.clone(), None);
         switchboard.join_lan(&node_id);
         Self::spawn_in(dir, Some((node_id, key)), None, Some(transport)).await
@@ -809,7 +809,7 @@ impl TestCore {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("device.key"), key.seed_hex()).expect("seed device.key");
         let node_id = key.node_id();
-        let transport: Arc<dyn universallink_core::PeerTransport> =
+        let transport: Arc<dyn onedevice_core::PeerTransport> =
             switchboard.endpoint(node_id.clone(), None);
         switchboard.join_lan(&node_id);
         // No `enrolled`: this device has no `device_id` and no account, and the
@@ -826,12 +826,9 @@ impl TestCore {
         seed_account_from_code(dir, &key.node_id(), code);
         // The account key itself, as `account.join` stows it: a device that holds
         // it can vouch for another and strike one off.
-        let ak = universallink_core::account_key::account_key_from_code(code).expect("valid code");
-        universallink_core::account_key::remember(
-            &universallink_core::FileSecretStore::new(dir),
-            &ak,
-        )
-        .expect("stow the account key");
+        let ak = onedevice_core::account_key::account_key_from_code(code).expect("valid code");
+        onedevice_core::account_key::remember(&onedevice_core::FileSecretStore::new(dir), &ak)
+            .expect("stow the account key");
         // The store as `account.join` leaves it: this device's own record, a
         // description it has already signed once (`seq` 1). Seeded rather than
         // left to the Core to mint at startup, because a minted `seq` is the
@@ -856,7 +853,7 @@ impl TestCore {
     }
 
     /// Core configured with an arbitrary server config (dead IdP...).
-    pub async fn start_with_config(cfg: universallink_core::ServerConfig) -> TestCore {
+    pub async fn start_with_config(cfg: onedevice_core::ServerConfig) -> TestCore {
         let dir = tempfile::tempdir().expect("tempdir");
         Self::spawn_in(dir, None, Some(cfg), None).await
     }
@@ -915,7 +912,7 @@ impl TestCore {
     /// (fail-closed).
     pub async fn start_pair(server: &TestServer) -> (TestCore, TestCore) {
         let switchboard = MemorySwitchboard::new();
-        let code = universallink_core::account_key::generate_recovery_code();
+        let code = onedevice_core::account_key::generate_recovery_code();
         let a = Self::start_enrolled_on_with_code(server, &switchboard, Some(&code)).await;
         let b = Self::start_enrolled_on_with_code(server, &switchboard, Some(&code)).await;
         (a, b)
@@ -927,8 +924,8 @@ impl TestCore {
     /// membership no longer suffices.
     pub async fn start_mismatched_pair(server: &TestServer) -> (TestCore, TestCore) {
         let switchboard = MemorySwitchboard::new();
-        let code_a = universallink_core::account_key::generate_recovery_code();
-        let code_b = universallink_core::account_key::generate_recovery_code();
+        let code_a = onedevice_core::account_key::generate_recovery_code();
+        let code_b = onedevice_core::account_key::generate_recovery_code();
         let a = Self::start_enrolled_on_with_code(server, &switchboard, Some(&code_a)).await;
         let b = Self::start_enrolled_on_with_code(server, &switchboard, Some(&code_b)).await;
         (a, b)
@@ -941,7 +938,7 @@ impl TestCore {
         server: &TestServer,
         switchboard: &MemorySwitchboard,
     ) -> TestCore {
-        let code = universallink_core::account_key::generate_recovery_code();
+        let code = onedevice_core::account_key::generate_recovery_code();
         Self::start_enrolled_on_with_code(server, switchboard, Some(&code)).await
     }
 
@@ -960,7 +957,7 @@ impl TestCore {
             seed_account_from_code(dir.path(), &node_id, code);
         }
         let relay = Some(format!("iroh+memory://{node_id}"));
-        let transport: Arc<dyn universallink_core::PeerTransport> =
+        let transport: Arc<dyn onedevice_core::PeerTransport> =
             switchboard.endpoint(node_id, relay);
         Self::spawn_in(
             dir,
@@ -983,7 +980,7 @@ impl TestCore {
         let (dir, enrolled) = Self::seed_enrolled(server).await;
         let node_id = enrolled.1.node_id();
         seed_account_from_code(dir.path(), &node_id, code);
-        let transport: Arc<dyn universallink_core::PeerTransport> =
+        let transport: Arc<dyn onedevice_core::PeerTransport> =
             switchboard.endpoint(node_id.clone(), None);
         switchboard.join_lan(&node_id);
         Self::spawn_in(
@@ -1010,16 +1007,16 @@ impl TestCore {
         let (dir, enrolled) = Self::seed_enrolled_as(server, key).await;
         let node_id = enrolled.1.node_id();
         seed_account_from_code(dir.path(), &node_id, code);
-        let ak = universallink_core::account_key::account_key_from_code(code).expect("valid code");
-        universallink_core::account_key::remember(
-            &universallink_core::FileSecretStore::new(dir.path()),
+        let ak = onedevice_core::account_key::account_key_from_code(code).expect("valid code");
+        onedevice_core::account_key::remember(
+            &onedevice_core::FileSecretStore::new(dir.path()),
             &ak,
         )
         .expect("stow the account key");
         if !records.is_empty() {
             seed_directory(dir.path(), records, 0);
         }
-        let transport: Arc<dyn universallink_core::PeerTransport> =
+        let transport: Arc<dyn onedevice_core::PeerTransport> =
             switchboard.endpoint(node_id.clone(), None);
         switchboard.join_lan(&node_id);
         Self::spawn_in(
@@ -1066,8 +1063,8 @@ impl TestCore {
     async fn spawn_in(
         dir: tempfile::TempDir,
         enrolled: Option<(String, DeviceKey)>,
-        server_cfg: Option<universallink_core::ServerConfig>,
-        transport: Option<Arc<dyn universallink_core::PeerTransport>>,
+        server_cfg: Option<onedevice_core::ServerConfig>,
+        transport: Option<Arc<dyn onedevice_core::PeerTransport>>,
     ) -> TestCore {
         // Without a supplied transport, an isolated transport (its own memory
         // switchboard): the tests that do not exercise the data plane have no
@@ -1078,7 +1075,7 @@ impl TestCore {
                 .as_ref()
                 .map(|(_, k)| k.node_id())
                 .unwrap_or_else(|| "standalone".into());
-            let lone: Arc<dyn universallink_core::PeerTransport> =
+            let lone: Arc<dyn onedevice_core::PeerTransport> =
                 MemorySwitchboard::new().endpoint(node_id, None);
             lone
         });
@@ -1099,10 +1096,10 @@ impl TestCore {
             device_name: CORE_DEVICE_NAME.into(),
             // The file fallback — it is also what the harness inspects
             // (`secret`).
-            secret_store: Arc::new(universallink_core::FileSecretStore::new(dir.path())),
+            secret_store: Arc::new(onedevice_core::FileSecretStore::new(dir.path())),
             // The lib only speaks in the clear: it is the daemon that wires up
             // TLS.
-            connector: Arc::new(universallink_core::PlainConnector),
+            connector: Arc::new(onedevice_core::PlainConnector),
             transport: transport.clone(),
             // Receive directory inspectable by the transfer tests.
             receive_dir: dir.path().join("received"),
@@ -1110,9 +1107,7 @@ impl TestCore {
             // ms.
             reconnect_base_delay: Duration::from_millis(50),
         };
-        let handle = universallink_core::spawn(config)
-            .await
-            .expect("Core startup");
+        let handle = onedevice_core::spawn(config).await.expect("Core startup");
         TestCore {
             handle,
             dir,
@@ -1125,7 +1120,7 @@ impl TestCore {
 
     /// Rewrites the config that `session.reload` will pick up — the harness
     /// equivalent of the GUI writing a fresh `config.json`.
-    pub fn stage_config(&self, cfg: Option<universallink_core::ServerConfig>) {
+    pub fn stage_config(&self, cfg: Option<onedevice_core::ServerConfig>) {
         *self.reload_slot.lock().expect("reload slot") = Ok(cfg);
     }
 
@@ -1201,7 +1196,7 @@ impl TestCore {
     /// A second Core on the SAME listening point and the same directory: what a
     /// user who launches the daemon twice does. Returns the error — it is not
     /// supposed to start.
-    pub async fn start_rival(&self) -> universallink_core::SpawnError {
+    pub async fn start_rival(&self) -> onedevice_core::SpawnError {
         let config = Config {
             ipc_path: self.handle.ipc_path().to_path_buf(),
             config_dir: self.dir.path().to_path_buf(),
@@ -1211,13 +1206,13 @@ impl TestCore {
                 Arc::new(move || Ok::<_, String>(s.clone()))
             },
             device_name: CORE_DEVICE_NAME.into(),
-            secret_store: Arc::new(universallink_core::FileSecretStore::new(self.dir.path())),
-            connector: Arc::new(universallink_core::PlainConnector),
+            secret_store: Arc::new(onedevice_core::FileSecretStore::new(self.dir.path())),
+            connector: Arc::new(onedevice_core::PlainConnector),
             transport: MemorySwitchboard::new().endpoint("rival", None),
             receive_dir: self.dir.path().join("received"),
             reconnect_base_delay: Duration::from_millis(50),
         };
-        universallink_core::spawn(config)
+        onedevice_core::spawn(config)
             .await
             .err()
             .expect("a second Core must not start")
@@ -1761,7 +1756,7 @@ pub async fn pending_component(
 /// Writes a control frame the way the data plane frames one: a u32 big-endian
 /// length, then the JSON. For the tests that stand in for a peer and speak the
 /// protocol by hand.
-pub async fn peer_write(stream: &mut Box<dyn universallink_core::IoStream>, frame: &Value) {
+pub async fn peer_write(stream: &mut Box<dyn onedevice_core::IoStream>, frame: &Value) {
     let bytes = serde_json::to_vec(frame).expect("serialize");
     stream
         .write_all(&(bytes.len() as u32).to_be_bytes())
@@ -1773,7 +1768,7 @@ pub async fn peer_write(stream: &mut Box<dyn universallink_core::IoStream>, fram
 
 /// Reads a control frame — or `None` when the stream ended first, which is how
 /// the data plane refuses a device it will not talk to at all.
-pub async fn peer_read(stream: &mut Box<dyn universallink_core::IoStream>) -> Option<Value> {
+pub async fn peer_read(stream: &mut Box<dyn onedevice_core::IoStream>) -> Option<Value> {
     let mut len = [0u8; 4];
     timeout(RESPONSE_TIMEOUT, stream.read_exact(&mut len))
         .await

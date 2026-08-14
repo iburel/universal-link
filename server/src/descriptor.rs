@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
 
-//! Deployment descriptor: `GET /.well-known/universallink.json`.
+//! Deployment descriptor: `GET /.well-known/1device.json`.
 //!
 //! What a brand-new client needs in order to log in belongs to the
 //! **deployment**, not to the user: the IdP and the OIDC client are the same for
@@ -28,7 +28,7 @@ use crate::state::AppState;
 /// question is "what is deployed here" (RFC 8615). The name is not registered
 /// with IANA; the risk that answers to is a collision on a shared domain, and a
 /// deployment's domain serves this control plane alone.
-pub const PATH: &str = "/.well-known/universallink.json";
+pub const PATH: &str = "/.well-known/1device.json";
 
 /// The descriptor as served.
 ///

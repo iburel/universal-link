@@ -72,22 +72,22 @@ const CODE_ENTROPY: usize = 16;
 /// Domain separation for the code → AK seed derivation. Versioned: a change to
 /// the derivation scheme will bump the suffix, with no collision against the
 /// old one.
-const SEED_DOMAIN: &[u8] = b"universallink-account-key-v1";
+const SEED_DOMAIN: &[u8] = b"1device-account-key-v1";
 
 /// Domain separation (and version) for the attestation. A later AK rotation
 /// will sign under a bumped domain so an old attestation is never mistaken for
 /// a fresh one.
-const ATTEST_DOMAIN: &[u8] = b"ul-account-attest-v1:";
+const ATTEST_DOMAIN: &[u8] = b"1device-account-attest-v1:";
 
 /// Domain separation (and version) for a revocation. A domain of its own, not a
 /// flag inside the attestation's: an attestation must never read as a revocation
 /// — anyone holding a peer's record would then be able to strike it off — and a
 /// revocation must never read as an attestation.
-const REVOKE_DOMAIN: &[u8] = b"ul-account-revoke-v1:";
+const REVOKE_DOMAIN: &[u8] = b"1device-account-revoke-v1:";
 
 /// Domain separation for the fingerprint (safety number) shown for out-of-band
 /// verification.
-const FP_DOMAIN: &[u8] = b"ul-account-fingerprint-v1";
+const FP_DOMAIN: &[u8] = b"1device-account-fingerprint-v1";
 
 /// File for the persisted trust root: `ak_pub` (the account's public key) + our
 /// own attestation. Not a secret (unlike `device.key`) — an attacker who reads
@@ -719,9 +719,11 @@ mod tests {
     /// round-trip tests below cannot notice such a change, because both ends of
     /// the round trip move together — which is exactly what happened when
     /// `ed25519-dalek` went from `3.0.0-rc.0` to `3.0.0` and the whole suite
-    /// stayed green. These values were computed under the RC and must survive
-    /// every future bump; if one of them ever fails, the answer is not to update
-    /// the constant.
+    /// stayed green. These values must survive every future bump; if one of
+    /// them ever fails, the answer is not to update the constant. They were
+    /// re-pinned exactly once, deliberately: the rename to 1Device changed the
+    /// domain-separation strings, an identity break in which nothing pre-rename
+    /// survives, these vectors included.
     #[test]
     fn the_derivation_matches_its_published_vectors() {
         let code = encode_code(&[0x42u8; CODE_ENTROPY]);
@@ -730,12 +732,12 @@ mod tests {
         let ak = account_key_from_code(&code).expect("valid code");
         assert_eq!(
             public_hex(&ak),
-            "048907521bf4e62f9c8291e067adfef7e37be87cbd3f6c89944b91cb2f589101",
+            "7345bccf9cb31482522957fc861088070ae604535df7b2c666f77d630fc917b3",
         );
         assert_eq!(
             attest(&ak, &a_node_id()),
-            "bed950f5621357e89d478daf60bbbf5fbd4730068aba44c041fd2c6435a752c0\
-             bfb1df9596e721ad82344ccf2f42caf7a782024078cd02c88d073beca6fb4109",
+            "bd38c1c1aa7c5af80b321eaaec44e4c29a476645752a6ff6e30c5e7d751719a5\
+             3315e3dcf3e4832543c71be0ca24e17db177c418b87c354bd8e672fd97d2fc0e",
         );
         // A revocation outlives everything else here: it is permanent, it is
         // persisted, and it travels between devices. A version of this project
@@ -743,8 +745,8 @@ mod tests {
         // struck-off devices back into the account.
         assert_eq!(
             revoke(&ak, &a_node_id()),
-            "049b7522a29c94a02c690b6498cf65e7fa6c70ee0855752ccde8c9f5d82d4ffee\
-             6ec8e25c92d04c42b3204209c7e5c51d50bd7afcdbf56d71002557b43d10d0b",
+            "58d373a9ed990cc51fb85945b9e0a50553aa95425f5343ca01d2bd905b9cc05d\
+             f6c4807da20d4c3cf05da6bbf14a4ba146e890baefa27e8e018650e5ba78a50f",
         );
     }
 

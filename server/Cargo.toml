@@ -1,5 +1,5 @@
 [package]
-name = "universallink-server"
+name = "onedevice-server"
 version = "0.6.0"
 edition = "2024"
 license = "AGPL-3.0-only"
@@ -29,4 +29,4 @@ tracing = "0.1"
 
 [dev-dependencies]
 tokio-tungstenite = "0.30"
-universallink-test-support = { path = "../test-support" }
+onedevice-test-support = { path = "../test-support" }

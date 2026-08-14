@@ -88,11 +88,11 @@ test("an address is all it takes to continue", () => {
   expect(saveButton(view).disabled).toBe(true);
 
   // A bare host is enough — the Core derives the rest of it.
-  typeInto(byLabel(view, "Server address"), "  universallink.example.com  ");
+  typeInto(byLabel(view, "Server address"), "  1device.example.com  ");
   expect(saveButton(view).disabled).toBe(false);
   click(saveButton(view));
 
-  expect(discover).toHaveBeenCalledWith("universallink.example.com");
+  expect(discover).toHaveBeenCalledWith("1device.example.com");
 });
 
 test("a server that publishes nothing reveals the fields, and explains", async () => {

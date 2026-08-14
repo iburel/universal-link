@@ -10,7 +10,7 @@
 //!   takes effect on the next right click: nothing to notify, no cache to flush.
 //! - **Send to** ([`SendTo`]) — one `.lnk` per target in the user's `SendTo`
 //!   folder. A flat surface, so the entries carry the product's name themselves
-//!   (`PC A (UniversalLink)`, decision 3 of the plan) rather than sitting in a
+//!   (`PC A (1Device)`, decision 3 of the plan) rather than sitting in a
 //!   submenu.
 //!
 //! Both are per-user (`HKEY_CURRENT_USER`, `%APPDATA%`): nothing here needs
@@ -74,7 +74,7 @@ use crate::surface::{HelperCommand, MenuSurface};
 /// user owns (a registry key, the `SendTo` folder) and delete what is no longer
 /// wanted, and mistaking something else for a stale entry of ours would destroy
 /// someone's work.
-pub(crate) const MARKER: &str = "universallink-menu:generated";
+pub(crate) const MARKER: &str = "1device-menu:generated";
 
 /// Where per-user class registrations live. `HKEY_CLASSES_ROOT` is the merged view
 /// of this and the machine-wide one, with this taking precedence — so a verb
@@ -83,10 +83,10 @@ const CLASSES: &str = r"Software\Classes";
 
 /// The verb name our cascade takes under each class's `shell` key. Also the name
 /// the pruning looks for, so it must stay stable across versions.
-const VERB: &str = "UniversalLink";
+const VERB: &str = "1Device";
 
 /// The suffix that names us in a flat surface, appended to the device label.
-const SUFFIX: &str = " (UniversalLink)";
+const SUFFIX: &str = " (1Device)";
 
 /// Every Windows surface. The two cascades are independent registrations of the
 /// same list — one for files, one for folders — and "Send to" is a third: a broken
@@ -101,7 +101,7 @@ pub fn surfaces(helper: HelperCommand) -> Vec<Box<dyn MenuSurface>> {
     // surface — the cascade still works, so this is reported and not fatal.
     match sendto::folder() {
         Ok(dir) => surfaces.push(Box::new(SendTo::new(&dir, helper))),
-        Err(e) => eprintln!("[universallink-menu] no Send to folder ({e}): that entry is skipped"),
+        Err(e) => eprintln!("[1device-menu] no Send to folder ({e}): that entry is skipped"),
     }
     surfaces
 }
@@ -498,7 +498,7 @@ pub(crate) mod tests {
 
     impl TestRoot {
         pub(crate) fn new(tag: &str) -> TestRoot {
-            let parent = r"Software\UniversalLink-menu-tests".to_string();
+            let parent = r"Software\1Device-menu-tests".to_string();
             // One process per test under nextest, several threads under plain
             // `cargo test`: the tag keeps them apart either way.
             let name = format!("{tag}-{}", std::process::id());
@@ -526,7 +526,7 @@ pub(crate) mod tests {
 
     pub(crate) fn helper() -> HelperCommand {
         HelperCommand {
-            program: PathBuf::from(r"C:\Program Files\UL\universallink-menu.exe"),
+            program: PathBuf::from(r"C:\Program Files\UL\1device-menu.exe"),
             extra_args: vec![],
         }
     }
@@ -632,7 +632,7 @@ pub(crate) mod tests {
     #[test]
     fn every_argument_survives_a_round_trip_through_the_real_parser() {
         for arg in [
-            r"C:\Program Files\UL\universallink-menu.exe",
+            r"C:\Program Files\UL\1device-menu.exe",
             r"C:\dir\",
             r"C:\a b\c\\",
             r#"say "hi""#,
@@ -678,12 +678,12 @@ pub(crate) mod tests {
         let line = command_prefix(&helper(), &target("d_1", "PC"));
         assert_eq!(
             line,
-            r#""C:\Program Files\UL\universallink-menu.exe" --send d_1 --"#
+            r#""C:\Program Files\UL\1device-menu.exe" --send d_1 --"#
         );
         assert_eq!(
             parse_command_line(&line),
             [
-                r"C:\Program Files\UL\universallink-menu.exe",
+                r"C:\Program Files\UL\1device-menu.exe",
                 "--send",
                 "d_1",
                 "--"
@@ -697,10 +697,7 @@ pub(crate) mod tests {
     fn an_injected_channel_survives_the_command_line() {
         let helper = HelperCommand {
             program: PathBuf::from(r"C:\ul\menu.exe"),
-            extra_args: vec![
-                "--channel".into(),
-                r"\\.\pipe\universallink-menu-test".into(),
-            ],
+            extra_args: vec!["--channel".into(), r"\\.\pipe\1device-menu-test".into()],
         };
         let line = command_prefix(&helper, &target("d_1", "PC"));
         assert_eq!(
@@ -708,7 +705,7 @@ pub(crate) mod tests {
             [
                 r"C:\ul\menu.exe",
                 "--channel",
-                r"\\.\pipe\universallink-menu-test",
+                r"\\.\pipe\1device-menu-test",
                 "--send",
                 "d_1",
                 "--"

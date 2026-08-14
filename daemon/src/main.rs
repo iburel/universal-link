@@ -3,15 +3,15 @@
 
 //! The Core binary. All it does is wire things together: production paths,
 //! config, keyring, TLS, log, supervisor, signals. All the logic lives in the
-//! daemon lib and in `universallink-core`.
+//! daemon lib and in `1device-core`.
 
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use universallink_daemon::supervisor::{Policy, Supervisor};
-use universallink_daemon::{config, dataplane, logging, secrets, supervisor, tls};
+use onedevice_daemon::supervisor::{Policy, Supervisor};
+use onedevice_daemon::{config, dataplane, logging, secrets, supervisor, tls};
 
 /// What we allow ourselves to stop the children and close the IPC. Windows
 /// grants only about five seconds after a CTRL_CLOSE_EVENT; beyond that it
@@ -50,7 +50,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> anyhow::Result<Outcome> {
-    let endpoint = universallink_paths::production_endpoint()
+    let endpoint = onedevice_paths::production_endpoint()
         .context("incomplete environment (XDG_RUNTIME_DIR / HOME / APPDATA)")?;
     std::fs::create_dir_all(&endpoint.config_dir).with_context(|| {
         format!(
@@ -91,7 +91,7 @@ async fn run() -> anyhow::Result<Outcome> {
     // unconfigured. The daemon owns this parsing; the Core only calls back in.
     let reload_dir = endpoint.config_dir.clone();
     let reload_server: Arc<
-        dyn Fn() -> Result<Option<universallink_core::ServerConfig>, String> + Send + Sync,
+        dyn Fn() -> Result<Option<onedevice_core::ServerConfig>, String> + Send + Sync,
     > = Arc::new(move || {
         let parsed = config::load(&reload_dir);
         match parsed.problem {
@@ -100,7 +100,7 @@ async fn run() -> anyhow::Result<Outcome> {
         }
     });
 
-    let core = universallink_core::spawn(universallink_core::Config {
+    let core = onedevice_core::spawn(onedevice_core::Config {
         ipc_path: endpoint.ipc_path.clone(),
         config_dir: endpoint.config_dir.clone(),
         server: settings.server,
@@ -115,11 +115,11 @@ async fn run() -> anyhow::Result<Outcome> {
     .await;
     let core = match core {
         Ok(core) => core,
-        Err(universallink_core::SpawnError::AlreadyRunning) => {
+        Err(onedevice_core::SpawnError::AlreadyRunning) => {
             secrets.flush();
             return Ok(Outcome::AlreadyRunning);
         }
-        Err(universallink_core::SpawnError::Failed(e)) => {
+        Err(onedevice_core::SpawnError::Failed(e)) => {
             secrets.flush();
             return Err(e.context("starting the Core"));
         }
@@ -163,7 +163,7 @@ async fn run() -> anyhow::Result<Outcome> {
     // The iroh endpoint closes AFTER the Core (nobody opens streams anymore):
     // the peers are notified instead of waiting for a timeout. Bounded
     // internally.
-    universallink_core::PeerTransport::close(transport.as_ref()).await;
+    onedevice_core::PeerTransport::close(transport.as_ref()).await;
     secrets.flush();
     Ok(Outcome::Stopped)
 }

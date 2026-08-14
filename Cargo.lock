@@ -4316,6 +4316,201 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "onedevice-clipboard"
+version = "0.6.0"
+dependencies = [
+ "block2",
+ "fuser",
+ "image",
+ "libc",
+ "mio",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "onedevice-core",
+ "onedevice-ipc-client",
+ "onedevice-test-support",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
+ "windows-sys 0.61.2",
+ "xcb",
+]
+
+[[package]]
+name = "onedevice-core"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chacha20poly1305",
+ "ed25519-dalek 3.0.0",
+ "form_urlencoded",
+ "futures-util",
+ "hex",
+ "hkdf 0.13.0",
+ "libc",
+ "onedevice-server",
+ "onedevice-test-support",
+ "rand 0.10.2",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "tracing",
+ "windows-sys 0.61.2",
+ "x25519-dalek",
+]
+
+[[package]]
+name = "onedevice-daemon"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "gethostname",
+ "hex",
+ "iroh",
+ "iroh-mdns-address-lookup",
+ "keyring",
+ "libc",
+ "n0-future",
+ "onedevice-core",
+ "onedevice-daemon",
+ "onedevice-ipc-client",
+ "onedevice-paths",
+ "onedevice-test-support",
+ "rustls-platform-verifier",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "onedevice-gui"
+version = "0.6.0"
+dependencies = [
+ "onedevice-core",
+ "onedevice-ipc-client",
+ "onedevice-paths",
+ "onedevice-server",
+ "onedevice-test-support",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-opener",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "onedevice-ipc-client"
+version = "0.6.0"
+dependencies = [
+ "onedevice-core",
+ "onedevice-server",
+ "onedevice-test-support",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "onedevice-menu"
+version = "0.6.0"
+dependencies = [
+ "libc",
+ "onedevice-core",
+ "onedevice-ipc-client",
+ "onedevice-paths",
+ "onedevice-server",
+ "onedevice-test-support",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "windows 0.62.2",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "onedevice-paths"
+version = "0.6.0"
+
+[[package]]
+name = "onedevice-server"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "ed25519-dalek 3.0.0",
+ "futures-util",
+ "hex",
+ "humantime",
+ "jsonwebtoken",
+ "onedevice-test-support",
+ "rand 0.10.2",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "tracing",
+]
+
+[[package]]
+name = "onedevice-server-daemon"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "onedevice-server",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "onedevice-test-support"
+version = "0.6.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "ed25519-dalek 3.0.0",
+ "form_urlencoded",
+ "futures-util",
+ "hex",
+ "jsonwebtoken",
+ "onedevice-core",
+ "rand 0.10.2",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+]
+
+[[package]]
+name = "onedevice-tray"
+version = "0.6.0"
+dependencies = [
+ "onedevice-ipc-client",
+ "onedevice-paths",
+ "png 0.18.1",
+ "serde_json",
+ "tao",
+ "tokio",
+ "tray-icon",
+]
+
+[[package]]
 name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7268,201 +7463,6 @@ checksum = "f4987bdc12753382e0bec4a65c50738ffaabc998b9cdd1f952fb5f39b0048a96"
 dependencies = [
  "crypto-common 0.2.2",
  "ctutils",
-]
-
-[[package]]
-name = "universallink-clipboard"
-version = "0.6.0"
-dependencies = [
- "block2",
- "fuser",
- "image",
- "libc",
- "mio",
- "objc2",
- "objc2-app-kit",
- "objc2-foundation",
- "serde_json",
- "tempfile",
- "tokio",
- "universallink-core",
- "universallink-ipc-client",
- "universallink-test-support",
- "windows 0.62.2",
- "windows-core 0.62.2",
- "windows-sys 0.61.2",
- "xcb",
-]
-
-[[package]]
-name = "universallink-core"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "chacha20poly1305",
- "ed25519-dalek 3.0.0",
- "form_urlencoded",
- "futures-util",
- "hex",
- "hkdf 0.13.0",
- "libc",
- "rand 0.10.2",
- "serde_json",
- "sha2 0.11.0",
- "tempfile",
- "tokio",
- "tokio-tungstenite 0.30.0",
- "tracing",
- "universallink-server",
- "universallink-test-support",
- "windows-sys 0.61.2",
- "x25519-dalek",
-]
-
-[[package]]
-name = "universallink-daemon"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "gethostname",
- "hex",
- "iroh",
- "iroh-mdns-address-lookup",
- "keyring",
- "libc",
- "n0-future",
- "rustls-platform-verifier",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-rustls",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "universallink-core",
- "universallink-daemon",
- "universallink-ipc-client",
- "universallink-paths",
- "universallink-test-support",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "universallink-gui"
-version = "0.6.0"
-dependencies = [
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-opener",
- "tempfile",
- "tokio",
- "universallink-core",
- "universallink-ipc-client",
- "universallink-paths",
- "universallink-server",
- "universallink-test-support",
-]
-
-[[package]]
-name = "universallink-ipc-client"
-version = "0.6.0"
-dependencies = [
- "serde_json",
- "tempfile",
- "tokio",
- "universallink-core",
- "universallink-server",
- "universallink-test-support",
-]
-
-[[package]]
-name = "universallink-menu"
-version = "0.6.0"
-dependencies = [
- "libc",
- "serde_json",
- "tempfile",
- "tokio",
- "universallink-core",
- "universallink-ipc-client",
- "universallink-paths",
- "universallink-server",
- "universallink-test-support",
- "windows 0.62.2",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "universallink-paths"
-version = "0.6.0"
-
-[[package]]
-name = "universallink-server"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "axum",
- "ed25519-dalek 3.0.0",
- "futures-util",
- "hex",
- "humantime",
- "jsonwebtoken",
- "rand 0.10.2",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite 0.30.0",
- "tracing",
- "universallink-test-support",
-]
-
-[[package]]
-name = "universallink-server-daemon"
-version = "0.6.0"
-dependencies = [
- "anyhow",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "universallink-server",
-]
-
-[[package]]
-name = "universallink-test-support"
-version = "0.6.0"
-dependencies = [
- "axum",
- "base64 0.22.1",
- "ed25519-dalek 3.0.0",
- "form_urlencoded",
- "futures-util",
- "hex",
- "jsonwebtoken",
- "rand 0.10.2",
- "serde_json",
- "sha2 0.11.0",
- "tokio",
- "tokio-tungstenite 0.30.0",
- "universallink-core",
-]
-
-[[package]]
-name = "universallink-tray"
-version = "0.6.0"
-dependencies = [
- "png 0.18.1",
- "serde_json",
- "tao",
- "tokio",
- "tray-icon",
- "universallink-ipc-client",
- "universallink-paths",
 ]
 
 [[package]]

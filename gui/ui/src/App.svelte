@@ -89,11 +89,11 @@
     <h1>Incompatible version</h1>
     <p>
       This Core speaks version {store.connection.api_version} of the local API;
-      this interface speaks version 1. Please update UniversalLink.
+      this interface speaks version 1. Please update 1Device.
     </p>
     <!-- This screen asks the user to update, and no navigation reaches it: the
          version has to be here too, it is the first thing anyone will ask for. -->
-    <p class="version">UniversalLink {appVersion}</p>
+    <p class="version">1Device {appVersion}</p>
   </div>
 {:else if needsServerSetup}
   <ServerSetup {store} firstRun withoutServer={() => (localAccount = true)} />
@@ -173,7 +173,7 @@
     <!-- Last in the reading order, at the foot of the sidebar on screen: it is
          chrome, not content. Outside the <nav> for the same reason as the
          connection line above. -->
-    <p class="version">UniversalLink {appVersion}</p>
+    <p class="version">1Device {appVersion}</p>
   </div>
 {/if}
 

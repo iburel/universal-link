@@ -3,7 +3,7 @@
 
 //! Test harness for the clipboard orchestrator. Two Cores, same philosophy as
 //! the client crate's suite:
-//! - a REAL `universallink-core` in a temp directory drives the source side end
+//! - a REAL `1device-core` in a temp directory drives the source side end
 //!   to end (announce, supersession, the provider-channel serve of an inline
 //!   paste) — a second client (role `custom`, `clipboard.read`) plays the
 //!   pasting device and discovers the `tx_id` via `clipboard.current`;
@@ -26,9 +26,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHal
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use universallink_clipboard::{BackendEvent, ClipboardBackend, RemoteClip, run};
-use universallink_core::CoreHandle;
-use universallink_ipc_client::{Client, ClientConfig, Event, TokenSource};
+use onedevice_clipboard::{BackendEvent, ClipboardBackend, RemoteClip, run};
+use onedevice_core::CoreHandle;
+use onedevice_ipc_client::{Client, ClientConfig, Event, TokenSource};
 
 pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SILENCE_WINDOW: Duration = Duration::from_millis(300);
@@ -50,7 +50,7 @@ fn ipc_path_for(_dir: &Path) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     PathBuf::from(format!(
-        r"\\.\pipe\universallink-clipboard-test-{}-{}",
+        r"\\.\pipe\1device-clipboard-test-{}-{}",
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ))
@@ -70,22 +70,20 @@ impl TestCore {
     pub async fn start() -> TestCore {
         let dir = tempfile::tempdir().expect("tempdir");
         let ipc_path = ipc_path_for(dir.path());
-        let config = universallink_core::Config {
+        let config = onedevice_core::Config {
             ipc_path: ipc_path.clone(),
             config_dir: dir.path().to_path_buf(),
             server: None,
             reload_server: Arc::new(|| Ok::<_, String>(None)),
             device_name: CORE_DEVICE_NAME.into(),
-            secret_store: Arc::new(universallink_core::FileSecretStore::new(dir.path())),
-            connector: Arc::new(universallink_core::PlainConnector),
-            transport: universallink_test_support::memory_transport::MemorySwitchboard::new()
+            secret_store: Arc::new(onedevice_core::FileSecretStore::new(dir.path())),
+            connector: Arc::new(onedevice_core::PlainConnector),
+            transport: onedevice_test_support::memory_transport::MemorySwitchboard::new()
                 .endpoint("clipboard-test", None),
             receive_dir: dir.path().join("received"),
             reconnect_base_delay: Duration::from_millis(50),
         };
-        let handle = universallink_core::spawn(config)
-            .await
-            .expect("Core startup");
+        let handle = onedevice_core::spawn(config).await.expect("Core startup");
         TestCore {
             handle: Some(handle),
             dir,
@@ -117,7 +115,7 @@ pub fn spawn_client(
     scopes: &[&str],
     served: &[&str],
 ) -> (Client, mpsc::Receiver<Event>) {
-    universallink_ipc_client::spawn(ClientConfig {
+    onedevice_ipc_client::spawn(ClientConfig {
         ipc_path: ipc_path.to_path_buf(),
         token: TokenSource::Spawn(token),
         name: "clipboard-test".into(),
@@ -268,7 +266,7 @@ impl Consumer {
                 .as_str()
                 .expect("channel_token")
                 .to_string()),
-            Err(universallink_ipc_client::RequestError::Rpc(e)) => {
+            Err(onedevice_ipc_client::RequestError::Rpc(e)) => {
                 Err(e.data_code.unwrap_or_else(|| e.message.clone()))
             }
             Err(e) => panic!("transactions.open transport error: {e}"),
@@ -492,7 +490,7 @@ impl ScriptedCore {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let path = PathBuf::from(format!(
-            r"\\.\pipe\universallink-clipboard-scripted-{}-{}",
+            r"\\.\pipe\1device-clipboard-scripted-{}-{}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));

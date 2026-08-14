@@ -13,7 +13,7 @@
 //!   `kbuildsycoca5` dance. Older desktops simply see no entry, which is the
 //!   fail-closed side to be on.
 //! - **Nautilus scripts** ([`Scripts`]) — one executable script per target in
-//!   `$XDG_DATA_HOME/nautilus/scripts/UniversalLink/`. Nautilus turns a
+//!   `$XDG_DATA_HOME/nautilus/scripts/1Device/`. Nautilus turns a
 //!   subdirectory into a submenu and takes each file's NAME as the label
 //!   (`update_directory_in_scripts_menu`), which is the whole reason that surface
 //!   has to sanitize and deduplicate: a label is a file name there, and two PCs
@@ -72,12 +72,12 @@ use crate::surface::{HelperCommand, MenuSurface};
 /// Load-bearing: [`Scripts`] enumerates a directory and deletes what is no longer
 /// wanted, and mistaking a file someone else put there for a stale entry of ours
 /// would destroy their work.
-pub(crate) const MARKER: &str = "universallink-menu:generated";
+pub(crate) const MARKER: &str = "1device-menu:generated";
 
 /// Name of the temporary file the atomic writes go through. Hidden on purpose:
 /// Nautilus skips dotfiles, so a crash between the write and the rename cannot
 /// leave a bogus entry in a menu.
-const TMP_NAME: &str = ".universallink-menu.tmp";
+const TMP_NAME: &str = ".1device-menu.tmp";
 
 /// Both Linux surfaces, rooted at `data_home`. They render the same list and are
 /// independent: a broken KDE install does not cost the Nautilus entries.

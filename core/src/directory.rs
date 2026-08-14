@@ -77,7 +77,7 @@ const REVOKED_FILE: &str = "revoked.json";
 /// Domain separation (and version) for a device's signature over its own
 /// description. Distinct from the account key's domains: this one is a DEVICE
 /// saying what it is, not the ACCOUNT saying who belongs.
-const RECORD_DOMAIN: &[u8] = b"ul-dir-record-v1:";
+const RECORD_DOMAIN: &[u8] = b"1device-dir-record-v1:";
 
 /// Persists the map — called under the session lock at every mutation (the
 /// same state-then-disk discipline as `session.json` at login), so the file
@@ -802,7 +802,7 @@ mod tests {
     fn the_signed_message_matches_its_published_framing() {
         assert_eq!(
             hex::encode(record_message("ab12", "Ada", "linux", 7)),
-            "756c2d6469722d7265636f72642d76313a\
+            "316465766963652d6469722d7265636f72642d76313a\
              0000000000000007\
              000000000000000461623132000000000000000341646100000000000000056c696e7578",
         );

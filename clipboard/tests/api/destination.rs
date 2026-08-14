@@ -8,9 +8,9 @@
 //! Core in the client crate's `channel` suite — here we exercise the
 //! orchestrator's promise / paste / pull orchestration on top of it.
 
+use onedevice_clipboard::{BackendEvent, run};
 use serde_json::json;
 use tokio::sync::mpsc;
-use universallink_clipboard::{BackendEvent, run};
 
 use crate::support::*;
 

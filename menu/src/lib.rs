@@ -5,7 +5,7 @@
 //! per-OS surfaces plug into.
 //!
 //! A supervised component must (see `daemon/src/supervisor.rs`, "Contract of a
-//! supervised component"): find the Core at `UNIVERSALLINK_IPC_PATH`, read its
+//! supervised component"): find the Core at `ONEDEVICE_IPC_PATH`, read its
 //! spawn token from the first line of standard input, keep that standard input
 //! open (its EOF means "stop"), and exit if it loses its IPC connection — the
 //! spawn token is single-use, so a reconnection would fail; exiting lets the
@@ -13,7 +13,7 @@
 //!
 //! # Three seams meet in [`run`]
 //!
-//! - the **Core**, over [`universallink_ipc_client`]: it mirrors the directory
+//! - the **Core**, over [`onedevice_ipc_client`]: it mirrors the directory
 //!   (`devices.list` + the `devices` topic), follows the session (`session.status`
 //!   + the `session` topic), and sends on a click (`files.send`).
 //! - the **OS**, over [`MenuSurface`]: downcalls only. Rendering a target list is

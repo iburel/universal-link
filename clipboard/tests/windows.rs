@@ -11,7 +11,7 @@
 //! so they are NOT part of the automated suite — they are validated MANUALLY on
 //! a real Windows desktop with:
 //!
-//!     cargo test -p universallink-clipboard --test windows -- --ignored --test-threads=1
+//!     cargo test -p onedevice-clipboard --test windows -- --ignored --test-threads=1
 //!
 //! `OpenClipboard` is process-global, so the tests serialize on
 //! [`CLIPBOARD_LOCK`] and must run single-threaded.
@@ -22,12 +22,12 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tokio::sync::Mutex;
-use tokio::sync::mpsc;
-use universallink_clipboard::os;
-use universallink_clipboard::{
+use onedevice_clipboard::os;
+use onedevice_clipboard::{
     BackendEvent, ClipboardBackend, FileFetcher, Format, LocalClip, RemoteClip, RemoteFile,
 };
+use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
@@ -510,7 +510,7 @@ async fn a_foreign_files_copy_is_detected_and_announced() {
     let _guard = CLIPBOARD_LOCK.lock().await;
     let (handle, mut events, loop_thread) = skip_if_unsupported!(spawn_backend!());
 
-    let paths = ["C:\\Temp\\ul-a.txt", "C:\\Temp\\ul-dir\\b.bin"];
+    let paths = ["C:\\Temp\\1device-a.txt", "C:\\Temp\\1device-dir\\b.bin"];
     set_clipboard_hdrop(&paths);
 
     let (_generation, clip) = recv_copied_clip(&mut events).await.expect("Copied upcall");

@@ -25,7 +25,7 @@ Check them *before* starting — their symptoms are misleading:
 
 1. **`oidc_client_id` and `oidc_issuer` must be identical on both sides.** The
    value in each client's `config.json` **must** be exactly the one passed to the
-   server (`UNIVERSALLINK_OIDC_CLIENT_ID` / `UNIVERSALLINK_OIDC_ISSUER` in
+   server (`ONEDEVICE_OIDC_CLIENT_ID` / `ONEDEVICE_OIDC_ISSUER` in
    `deploy/.env`). The server checks the token's `aud` and `iss` at enrollment
    ([`server/src/oidc.rs`](../server/src/oidc.rs)). A mismatch is only visible
    **after** going through the browser, in the form of an opaque `OIDC_INVALID`.
@@ -58,7 +58,7 @@ Windows.)*
   firewall makes enrollment fail with `OIDC_INVALID` with no distinct signal.
 - The **server clock** must be synchronized (NTP): tokens are refused beyond a
   freshness window (`iat`, 300 s by default,
-  `UNIVERSALLINK_FRESH_TOKEN_MAX_AGE_SECS`), with no margin.
+  `ONEDEVICE_FRESH_TOKEN_MAX_AGE_SECS`), with no margin.
 
 **On each client machine** (the Mac and the Windows PC):
 
@@ -107,7 +107,7 @@ cd gui/ui && npm ci && npm run build && cd ../..
 cargo build --workspace --lib --bins --locked
 
 # c) the actual GUI binary (system webview)
-cargo build -p universallink-gui --features webview --locked
+cargo build -p onedevice-gui --features webview --locked
 ```
 
 Step (a) **must** precede (c): the GUI binary embeds `gui/ui/dist` at compile time.
@@ -124,8 +124,8 @@ Location of the config folder:
 
 | OS | Config folder |
 |---|---|
-| macOS | `~/Library/Application Support/UniversalLink/` |
-| Windows | `%APPDATA%\UniversalLink\` |
+| macOS | `~/Library/Application Support/1Device/` |
+| Windows | `%APPDATA%\1Device\` |
 
 Contents of `config.json` (`server_url`, `oidc_issuer` and `oidc_client_id` are
 **mandatory together**):
@@ -148,7 +148,7 @@ Contents of `config.json` (`server_url`, `oidc_issuer` and `oidc_client_id` are
 - `device_name` is optional (default: the hostname) — it is a display label, not an
   identity.
 - Also optional: `relay_url` (self-hosted iroh relay; otherwise the n0 public
-  relays) and `receive_dir` (otherwise `<Downloads>/UniversalLink`).
+  relays) and `receive_dir` (otherwise `<Downloads>/1Device`).
 
 An incomplete trio, a scheme typo (`https://…/ws` instead of `wss://`), or broken
 JSON: the Core **still starts** but *not configured*, and any login will answer
@@ -160,18 +160,18 @@ JSON: the Core **still starts** but *not configured*, and any login will answer
 macOS (Terminal):
 
 ```sh
-UNIVERSALLINK_LOG=debug cargo run --bin universallink-core --locked
+ONEDEVICE_LOG=debug cargo run --bin 1device-core --locked
 ```
 
 Windows (PowerShell):
 
 ```powershell
-$env:UNIVERSALLINK_LOG = "debug"; cargo run --bin universallink-core --locked
+$env:ONEDEVICE_LOG = "debug"; cargo run --bin 1device-core --locked
 ```
 
 **Expected**: the lines `keyring chosen` then `Core listening` with the IPC path.
 **No** `Core not configured` if `config.json` is complete. The process stays in the
-foreground until `Ctrl-C`. (`UNIVERSALLINK_LOG` — **not** `RUST_LOG`.)
+foreground until `Ctrl-C`. (`ONEDEVICE_LOG` — **not** `RUST_LOG`.)
 
 If you relaunch while a Core is already running for this user: it logs "a Core is
 already running" and exits cleanly (single-instance lock).
@@ -179,7 +179,7 @@ already running" and exits cleanly (single-instance lock).
 ### 1.4 Launch the GUI (another terminal; it does not start the Core)
 
 ```sh
-cargo run -p universallink-gui --features webview --locked
+cargo run -p onedevice-gui --features webview --locked
 ```
 
 **Expected**: a window opens and the state switches to "connected". The GUI joins
@@ -261,8 +261,8 @@ must be **online**). There is **no picker**: dropping outside an eligible card (
 space, an offline device, or your own PC) does nothing.
 
 **Expected**: A shows `transfer.started` then `transfer.finished`; the file lands in
-B's `receive_dir` (by default `<Downloads>/UniversalLink` —
-`~/Downloads/UniversalLink` on Mac, `%USERPROFILE%\Downloads\UniversalLink` on
+B's `receive_dir` (by default `<Downloads>/1Device` —
+`~/Downloads/1Device` on Mac, `%USERPROFILE%\Downloads\1Device` on
 Windows). A folder can be dropped too, and arrives as a folder.
 
 ### 3.2 B → A
@@ -277,11 +277,11 @@ On the receiving machine, list the receive folder:
 
 ```sh
 # macOS
-ls -l ~/Downloads/UniversalLink
+ls -l ~/Downloads/1Device
 ```
 ```powershell
 # Windows
-dir $env:USERPROFILE\Downloads\UniversalLink
+dir $env:USERPROFILE\Downloads\1Device
 ```
 
 The files must be present, at the right size. A leftover `.part` file = interrupted
@@ -318,12 +318,12 @@ network → failure). Lead: host your own relay and set it as `relay_url` in bot
 
 ### Where to look
 
-Core logs (relaunch it with `UNIVERSALLINK_LOG=debug`):
+Core logs (relaunch it with `ONEDEVICE_LOG=debug`):
 
 | OS | Logs |
 |---|---|
-| macOS | `~/Library/Logs/UniversalLink` |
-| Windows | `%LOCALAPPDATA%\UniversalLink\logs` |
+| macOS | `~/Library/Logs/1Device` |
+| Windows | `%LOCALAPPDATA%\1Device\logs` |
 
 State files, in the config folder (§1.2):
 

@@ -43,7 +43,7 @@ use super::{MARKER, label_of, sweep, write_if_changed};
 use crate::surface::{HelperCommand, MenuSurface, Target};
 
 /// Our own submenu under Nautilus's "Scripts".
-const DIR_NAME: &str = "UniversalLink";
+const DIR_NAME: &str = "1Device";
 /// Nautilus only offers a script it can launch, which means the executable bit.
 const MODE: u32 = 0o755;
 /// The longest file name any Linux filesystem in practice accepts, in BYTES.
@@ -233,7 +233,7 @@ mod tests {
 
     fn helper() -> HelperCommand {
         HelperCommand {
-            program: PathBuf::from("/opt/universallink/universallink-menu"),
+            program: PathBuf::from("/opt/1device/1device-menu"),
             extra_args: vec![],
         }
     }
@@ -332,9 +332,7 @@ mod tests {
         let two = script(&helper(), &target("d_1", "Renamed"));
         assert_eq!(one, two);
         assert!(
-            one.contains(
-                "exec '/opt/universallink/universallink-menu' '--send' 'd_1' '--' \"$@\"\n"
-            ),
+            one.contains("exec '/opt/1device/1device-menu' '--send' 'd_1' '--' \"$@\"\n"),
             "{one}"
         );
         assert!(one.starts_with("#!/bin/sh\n"));
@@ -431,10 +429,7 @@ mod tests {
         let mut surface = Scripts::new(dir.path(), helper());
         assert_eq!(
             surface.dir(),
-            dir.path()
-                .join("nautilus")
-                .join("scripts")
-                .join("UniversalLink")
+            dir.path().join("nautilus").join("scripts").join("1Device")
         );
 
         surface
@@ -537,7 +532,7 @@ mod tests {
         let scripts = surface.dir().parent().expect("scripts/").to_path_buf();
         std::fs::create_dir_all(&scripts).expect("mkdir");
 
-        let stale = scripts.join("Send to Ghost (UniversalLink)");
+        let stale = scripts.join("Send to Ghost (1Device)");
         std::fs::write(&stale, format!("#!/bin/sh\n# {MARKER}\nexec /nowhere\n")).expect("write");
         let theirs = scripts.join("their own script");
         std::fs::write(&theirs, "#!/bin/sh\necho mine\n").expect("write");

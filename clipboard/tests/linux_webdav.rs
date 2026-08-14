@@ -14,7 +14,7 @@ use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
 
-use universallink_clipboard::{FileFetcher, RemoteFile, WebDavServer};
+use onedevice_clipboard::{FileFetcher, RemoteFile, WebDavServer};
 
 /// Deterministic byte at absolute offset `k` (same formula as `tests/linux_files.rs`).
 fn byte_at(k: u64) -> u8 {

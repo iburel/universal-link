@@ -17,7 +17,7 @@ use std::io;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use universallink_daemon::logging::RepeatFilter;
+use onedevice_daemon::logging::RepeatFilter;
 
 const TAG: &str = "ULCore";
 

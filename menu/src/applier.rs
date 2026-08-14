@@ -103,13 +103,13 @@ async fn apply(
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     eprintln!(
-                        "[universallink-menu] {} could not be updated: {e}",
+                        "[1device-menu] {} could not be updated: {e}",
                         surface.name()
                     );
                     failed = true;
                 }
                 Err(_) => {
-                    eprintln!("[universallink-menu] {} panicked", surface.name());
+                    eprintln!("[1device-menu] {} panicked", surface.name());
                     failed = true;
                 }
             }

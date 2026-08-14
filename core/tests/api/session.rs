@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
 
 //! Server session: device identity, status, connection/reconnection to the
-//! real server (universallink-server lib, in-process), logout, revocation
+//! real server (1device-server lib, in-process), logout, revocation
 //! (doc/core-api.md "session.*", doc/server-api.md "Lifecycle").
 //! The OIDC login is the next building block: the harness seeds the identity.
 
@@ -259,7 +259,7 @@ async fn reload_configures_an_unconfigured_core() {
     );
 
     // The GUI has just written config.json: reload picks it up, no restart.
-    core.stage_config(Some(universallink_core::ServerConfig {
+    core.stage_config(Some(onedevice_core::ServerConfig {
         url: "wss://relay.example/ws".into(),
         oidc_issuer: "https://idp.example".into(),
         oidc_client_id: "public-id".into(),
@@ -452,7 +452,7 @@ async fn discover_requires_session_manage() {
     assert_eq!(err.app_code(), "SCOPE_DENIED");
 }
 
-/// An HTTP server that is not a UniversalLink server — the case of an address
+/// An HTTP server that is not a 1Device server — the case of an address
 /// typed from memory. Distinguished from an unreachable one, because the answer
 /// for the user is different: fill the fields in yourself.
 #[tokio::test]

@@ -92,7 +92,7 @@ mod tests {
     #[test]
     fn helper_args_carry_the_id_and_end_with_a_separator() {
         let helper = HelperCommand {
-            program: PathBuf::from("/opt/universallink-menu"),
+            program: PathBuf::from("/opt/1device-menu"),
             extra_args: vec![],
         };
         assert_eq!(helper.args_for(&target("d_1")), ["--send", "d_1", "--"]);
@@ -103,7 +103,7 @@ mod tests {
         // A live test points the generated artifacts at its own channel; the
         // override has to precede the mode so parsing stays positional-free.
         let helper = HelperCommand {
-            program: PathBuf::from("/opt/universallink-menu"),
+            program: PathBuf::from("/opt/1device-menu"),
             extra_args: vec!["--channel".into(), "/tmp/t.sock".into()],
         };
         assert_eq!(

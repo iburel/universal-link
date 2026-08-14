@@ -1,4 +1,4 @@
-# UniversalLink — Overall architecture (Phase 1)
+# 1Device — Overall architecture (Phase 1)
 
 > Summary document from the initial design phase, kept in step with what has been
 > built since: where it says **built**, the code is in the tree and under test.
@@ -262,13 +262,13 @@ Central daemon, launched automatically at session login.
 The Core finds them next to itself, and launches whichever ones the build shipped
 (a missing one is a line in the log, not a failure). **The tray on macOS is the one
 exception**: it ships in a nested application bundle of its own,
-`UniversalLink.app/Contents/Frameworks/UniversalLinkTray.app`, and the supervisor
+`1Device.app/Contents/Frameworks/1DeviceTray.app`, and the supervisor
 looks for it there first.
 
 That is not tidiness, it is the only way the app opens. To Launch Services, a
 process started from `Contents/MacOS` *is* the application: it takes the enclosing
 bundle's identifier. The tray owns a status item, so it checks in as a GUI
-application — and from the moment the Core spawned it, `org.universallink.gui` was
+application — and from the moment the Core spawned it, `org.onedevice.gui` was
 already running. Every `open` of the app then merely activated the tray, which has
 no window, so the Dock icon, the Finder, the Launchpad and the tray's own *Open*
 item all did nothing at all, silently and without an error anywhere. With an
@@ -317,8 +317,8 @@ Security).
 ### Transport
 
 - **macOS / Linux**: Unix domain socket in a private user folder
-  (`$XDG_RUNTIME_DIR/universallink/core.sock` on Linux).
-- **Windows**: named pipe `\\.\pipe\universallink-core-<USERDOMAIN>-<USERNAME>`
+  (`$XDG_RUNTIME_DIR/1device/core.sock` on Linux).
+- **Windows**: named pipe `\\.\pipe\1device-core-<USERDOMAIN>-<USERNAME>`
   with a DACL restricted to the current user's SID. The name carries the domain as
   well as the user: a local `john` and a domain `CORP\john` are two different
   users with the same `USERNAME`.
@@ -455,7 +455,7 @@ Two rules the implementation adds to the contract below:
    and targets exist. Fail-closed if the manager does not respond. No permanent
    entry.
 2. When the menu opens, the user sees the **current list of targets** (target UX:
-   `UniversalLink → PC A / PC B / …` submenu).
+   `1Device → PC A / PC B / …` submenu).
 3. On click, the backend reports **`(target, paths[])`** to the manager, which
    calls `files.send` on the Core. Fire-and-forget: progress lives elsewhere
    (tray/GUI).
@@ -555,7 +555,7 @@ becomes worth revisiting if the passive check turns out to be one nobody reads.
 
 An account with no server has no rendezvous, and needs none: the code carries the
 **`node_id` to dial** where the session id was, and the other device dials it on the
-data plane (`UL2:<psk>:<epk>:<node_id>`, one bidirectional stream, no new ALPN). The
+data plane (`1D2:<psk>:<epk>:<node_id>`, one bidirectional stream, no new ALPN). The
 device that displays the code is the one that gets dialled — either of them can be
 the one displaying, so a machine with a camera and a machine without both have a
 gesture.
@@ -563,7 +563,7 @@ gesture.
 A device that answers to a server may *scan* one of these codes and sponsor
 (the continuum, principle 3): the joiner then joins the **account** — key,
 roster, mutual records — and not the deployment, which simply never lists it.
-Showing a `UL1` code, through the server, remains that device's way of enrolling
+Showing a `1D1` code, through the server, remains that device's way of enrolling
 a newcomer on the deployment too; its `pairing.offer` still goes through the
 server whenever it has one.
 
@@ -630,7 +630,7 @@ announce every device's whereabouts to anyone holding its `node_id`.
 ### The fresh token, and what it proves
 
 `pairing.approve` demands an ID token minted no longer than
-`UNIVERSALLINK_FRESH_TOKEN_MAX_AGE_SECS` ago, exactly as `devices.revoke` does.
+`ONEDEVICE_FRESH_TOKEN_MAX_AGE_SECS` ago, exactly as `devices.revoke` does.
 What that gate proves is narrower than it looks: the Core mints the token from the
 refresh token in its keyring, browserless and with no human involved
 (`core/src/login.rs::fresh_id_token`). It proves the sponsor's session at the IdP

@@ -67,17 +67,17 @@ serial-os-clipboard = { max-threads = 1 }
 # flake rate to ~0 so retries almost never fire.
 [[profile.ci.overrides]]
 platform = 'cfg(any(target_os = "macos", target_os = "windows"))'
-filter = 'package(universallink-core) & kind(test) & test(/clipboard|dataplane/)'
+filter = 'package(onedevice-core) & kind(test) & test(/clipboard|dataplane/)'
 test-group = 'serial-ipc'
 
 [[profile.ci.overrides]]
 platform = 'cfg(any(target_os = "macos", target_os = "windows"))'
-filter = 'package(universallink-ipc-client) & kind(test) & test(/channel::/)'
+filter = 'package(onedevice-ipc-client) & kind(test) & test(/channel::/)'
 test-group = 'serial-ipc'
 
 [[profile.ci.overrides]]
 platform = 'cfg(any(target_os = "macos", target_os = "windows"))'
-filter = 'package(universallink-clipboard) & kind(test) & test(/source::/)'
+filter = 'package(onedevice-clipboard) & kind(test) & test(/source::/)'
 test-group = 'serial-ipc'
 
 # --- serial-os-clipboard: shared per-session OS resources -------------------

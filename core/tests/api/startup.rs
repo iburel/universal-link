@@ -13,7 +13,7 @@ async fn a_second_core_refuses_the_endpoint_of_a_living_one() {
 
     let err = core.start_rival().await;
     assert!(
-        matches!(err, universallink_core::SpawnError::AlreadyRunning),
+        matches!(err, onedevice_core::SpawnError::AlreadyRunning),
         "a second Core must recognize itself as one too many, not fail at random: {err}"
     );
 

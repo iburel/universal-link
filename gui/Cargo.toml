@@ -1,5 +1,5 @@
 [package]
-name = "universallink-gui"
+name = "onedevice-gui"
 version = "0.6.0"
 edition = "2024"
 license = "AGPL-3.0-only"
@@ -18,7 +18,7 @@ default = []
 webview = ["tauri/common-controls-v6"]
 
 [[bin]]
-name = "universallink-gui"
+name = "1device-gui"
 path = "src/main.rs"
 required-features = ["webview"]
 
@@ -35,9 +35,9 @@ tauri = { version = "2", default-features = false, features = [
 ] }
 tauri-plugin-opener = "2"
 tokio = { version = "1", features = ["macros", "rt", "sync"] }
-universallink-ipc-client = { path = "../client" }
+onedevice-ipc-client = { path = "../client" }
 # Deployment contract (socket, config directory) shared with the daemon.
-universallink-paths = { path = "../paths" }
+onedevice-paths = { path = "../paths" }
 
 [build-dependencies]
 tauri-build = "2"
@@ -48,6 +48,6 @@ tauri-build = "2"
 tauri = { version = "2", default-features = false, features = ["test"] }
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
-universallink-core = { path = "../core" }
-universallink-server = { path = "../server" }
-universallink-test-support = { path = "../test-support" }
+onedevice-core = { path = "../core" }
+onedevice-server = { path = "../server" }
+onedevice-test-support = { path = "../test-support" }

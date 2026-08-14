@@ -6,8 +6,8 @@
 
 use std::path::PathBuf;
 
+use onedevice_menu::channel::{Response, error};
 use serde_json::json;
-use universallink_menu::channel::{Response, error};
 
 use crate::support::*;
 
@@ -153,7 +153,7 @@ async fn a_refusal_from_the_core_is_relayed_verbatim() {
     let manager = Manager::start(&core).await;
 
     // Attested, but under a key that is not this account's.
-    let foreign_code = universallink_core::account_key::generate_recovery_code();
+    let foreign_code = onedevice_core::account_key::generate_recovery_code();
     let rogue = server
         .attested_peer(&foreign_code, "PC-Rogue", "linux")
         .await;
@@ -320,8 +320,8 @@ async fn a_second_manager_cannot_take_the_channel() {
     let core = TestCore::start(&server).await;
     let manager = Manager::start(&core).await;
 
-    match universallink_menu::channel::bind(manager.channel_path()) {
-        Err(universallink_menu::channel::BindError::AlreadyRunning) => {}
+    match onedevice_menu::channel::bind(manager.channel_path()) {
+        Err(onedevice_menu::channel::BindError::AlreadyRunning) => {}
         Ok(_) => panic!("two managers must not hold the same channel"),
         Err(e) => panic!("expected AlreadyRunning, got {e}"),
     }
