@@ -72,37 +72,37 @@ point:
 > attempted. A "Desktop app" client is the one that accepts a dynamic loopback
 > port.
 
-In the [Google Cloud console](https://console.cloud.google.com/):
+The full console walkthrough, with the current screen names and every trap
+called out (secret shown only once, Testing status, the six-month inactivity
+deletion), is in **[identity-providers.md](identity-providers.md#google-screen-by-screen)**.
+The short version:
 
-1. **Create or select a project.**
-2. **OAuth consent screen**:
-   - user type: **External**;
-   - fill in the app name and the support email;
-   - **scopes**: `openid` and `email` are enough (the server only reads the `sub`;
-     the Core displays the email). Nothing more;
-   - **users**: as long as the app stays in **"Testing"** status, add each
-     authorized Google account as a *test user*. ⚠️ In Testing mode, Google **expires
-     refresh tokens after 7 days**: you will have to re-connect every week. To avoid
-     this, **publish** the app ("In production" status).
-3. **Credentials → Create credentials → OAuth client ID**:
-   - application type: **Desktop app**;
-   - give it a name.
-4. Retrieve the **`client_id`** (`…apps.googleusercontent.com`) and the
-   **`client_secret`** Google shows you: both go into **this server's**
-   configuration (step 2), which hands them to the clients through its deployment
-   descriptor — that is what spares you configuring each machine and phone by
-   hand. An IdP that wants no secret simply gets none. For an installed
-   application the secret is not confidential — it ships inside every copy of the
-   app, and PKCE is what actually protects the exchange; the reasoning is spelled
-   out in [server-api.md](server-api.md#deployment-descriptor).
+1. In the console's **Google Auth Platform** section, run the **"Get
+   started"** wizard (app name, **External** audience, contact email).
+2. On the **Clients** page, create a client of type **Desktop app** and
+   copy the **`client_id`** and **`client_secret`** immediately (the secret
+   is shown only at creation).
+3. On the **Audience** page, add your Google accounts as **test users**, or
+   publish the app to skip the list (no verification review is needed for
+   the `openid`/`email` scopes this flow uses).
+
+Both values go into **this server's** configuration (step 2), which hands them
+to the clients through its deployment descriptor: that is what spares you
+configuring each machine and phone by hand. An IdP that wants no secret simply
+gets none. For an installed application the secret is not confidential, since it
+ships inside every copy of the app, and PKCE is what actually protects the
+exchange; the reasoning is spelled out in
+[server-api.md](server-api.md#deployment-descriptor).
 
 The **loopback** (`http://127.0.0.1:<port>/callback`) is handled automatically for
 "Desktop app" clients: the port is dynamic, you have no redirect URL to register.
 
-*(Another OIDC IdP — Auth0, Keycloak, Entra… — is fine if it exposes a client
-doing PKCE on a loopback redirect (with or without a secret) and the discovery
-endpoint
-`/.well-known/openid-configuration`. Then fill in its issuer instead.)*
+*(Another OIDC IdP is fine if it meets the
+[contract](identity-providers.md#the-contract): PKCE on a loopback redirect
+with a runtime port, discovery, RS256 tokens, secret optional. Verified
+recipes for **Keycloak, Authentik, Zitadel, Pocket ID, Kanidm and Dex** are in
+[identity-providers.md](identity-providers.md#your-own-issuer); then fill in
+that issuer instead.)*
 
 ## Step 2 — Deploy with Docker Compose + Caddy (recommended)
 

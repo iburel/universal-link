@@ -116,6 +116,7 @@ The design details (and what is deliberately deferred) live in
 [`doc/`](doc/): [architecture](doc/architecture.md),
 [Core API](doc/core-api.md), [server API](doc/server-api.md),
 [server deployment](doc/server-deployment.md),
+[identity providers](doc/identity-providers.md),
 [first link](doc/first-link.md),
 [Core deployment](doc/deployment.md). Release by release:
 [CHANGELOG.md](CHANGELOG.md).
@@ -445,9 +446,10 @@ Log level: `ONEDEVICE_LOG=debug` (not `RUST_LOG`).
 - **Unsigned desktop builds** (milestone 1): a first-launch OS warning, and no
   Windows 11 main-menu integration or Finder extension, both of which require a
   signed artifact registered at install time.
-- **The server is yours to host**: Docker image + Caddy auto-TLS are provided
-  (cf. [deployment](doc/server-deployment.md)), but the **image is not
-  published** to any registry.
+- **The server is yours to host**: nobody runs it for you. The published
+  Docker image and the Caddy auto-TLS stack reduce hosting to a compose file
+  and four variables (cf. [deployment](doc/server-deployment.md)), but a
+  machine and a domain remain yours to bring.
 - **Outbound drag-and-drop** is absent (only inbound works).
 - **The phone shares, it does not receive**, and aggressive power management can
   still end the app — on the test device, swiping it out of Recents kills the
@@ -471,6 +473,10 @@ Log level: `ONEDEVICE_LOG=debug` (not `RUST_LOG`).
 - [`doc/core-api.md`](doc/core-api.md) — the Core's local IPC API (the project's
   extension point).
 - [`doc/server-api.md`](doc/server-api.md) — the server API.
+- [`doc/identity-providers.md`](doc/identity-providers.md): the OIDC
+  identity provider. The Google walkthrough, recipes for self-hosted issuers
+  (Keycloak, Authentik, Zitadel, Pocket ID, Kanidm, Dex), and the contract
+  any other must meet.
 - [`doc/server-deployment.md`](doc/server-deployment.md) — hosting the server
   (Docker, Caddy, Google OIDC client).
 - [`doc/first-link.md`](doc/first-link.md) — bringing up a link end to end (two
