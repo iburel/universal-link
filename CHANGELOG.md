@@ -123,6 +123,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Launching the app twice now brings back the window you already have.**
+  The Core always held a single-instance lock, but the app itself did not: a
+  second launch (from the launcher, or the tray's "Open" while the window was
+  already there) opened a second window on the same Core. The second launch
+  now hands off to the running app, which surfaces and focuses its window,
+  and exits. Desktop only; the phone's shell never had the problem.
 - **Android: a repeating log line no longer buries the log.** Android's log is
   a small ring buffer shared with the whole system, and an app that repeats
   itself pushes out everything worth reading — a phone left in a pocket, whose

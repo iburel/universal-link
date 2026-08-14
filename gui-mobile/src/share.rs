@@ -51,10 +51,10 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
 use base64::Engine as _;
+use onedevice_ipc_client::{Client, ClientConfig, Event, RequestError};
 use serde_json::{Value, json};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
-use onedevice_ipc_client::{Client, ClientConfig, Event, RequestError};
 
 /// The frontend event carrying a share's progress — mirrored by `ShareStatus`
 /// in `gui/ui/src/lib/core.ts`. Mobile-only: the desktop shell never emits it.

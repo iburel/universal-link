@@ -39,6 +39,12 @@ onedevice-ipc-client = { path = "../client" }
 # Deployment contract (socket, config directory) shared with the daemon.
 onedevice-paths = { path = "../paths" }
 
+# Desktop only, twice over: the plugin exists for the three desktops, and the
+# mobile shell (which reuses this crate's LIBRARY) must not even compile it —
+# only the binary uses it, and the binary is desktop-only already.
+[target."cfg(not(target_os = \"android\"))".dependencies]
+tauri-plugin-single-instance = "2"
+
 [build-dependencies]
 tauri-build = "2"
 

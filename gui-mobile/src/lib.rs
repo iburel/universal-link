@@ -22,12 +22,12 @@ use std::time::Duration;
 
 use android_system_properties::AndroidSystemProperties;
 use anyhow::Context as _;
-use tauri::Manager;
-use tls::WebPkiConnector;
 use onedevice_core::{Config, FileSecretStore, ServerConfig};
 use onedevice_daemon::dataplane::LazyIrohTransport;
 use onedevice_gui::{CoreState, GUI_OPTIONAL_TOPICS, GUI_SCOPES, GUI_TOPICS, bridge_loop};
 use onedevice_ipc_client::{ClientConfig, TokenSource};
+use tauri::Manager;
+use tls::WebPkiConnector;
 
 /// The embedded Core, kept alive for the whole process (dropping the handle
 /// stops it). Tauri owns the async runtime, so we only hold the handle.

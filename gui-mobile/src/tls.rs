@@ -20,9 +20,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use onedevice_core::{Connecting, Connector, IoStream, Target};
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
-use onedevice_core::{Connecting, Connector, IoStream, Target};
 
 /// Bounded retries around the TCP connect (DNS + handshake-less socket open).
 /// Android's native resolver is prone to transient `getaddrinfo` failures
