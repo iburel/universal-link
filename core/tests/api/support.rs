@@ -1799,15 +1799,31 @@ pub async fn pending_component(
 
 /// Writes a control frame the way the data plane frames one: a u32 big-endian
 /// length, then the JSON. For the tests that stand in for a peer and speak the
-/// protocol by hand.
+/// protocol by hand, in a conversation the Core has already accepted: a write
+/// that fails here is a harness bug. A peer probing whether it will be talked
+/// to at all wants [`peer_try_write`] instead.
 pub async fn peer_write(stream: &mut Box<dyn onedevice_core::IoStream>, frame: &Value) {
+    assert!(
+        peer_try_write(stream, frame).await,
+        "the Core closed a stream mid-conversation"
+    );
+}
+
+/// [`peer_write`], answering whether the bytes went out instead of panicking.
+/// The Core refuses a device it will not talk to by DROPPING the stream
+/// without reading a byte, and that drop can land before these bytes do: on
+/// such a path a failed write is the refusal arriving early, not a broken
+/// harness, and it must read as the same answer as a silent close.
+pub async fn peer_try_write(stream: &mut Box<dyn onedevice_core::IoStream>, frame: &Value) -> bool {
     let bytes = serde_json::to_vec(frame).expect("serialize");
-    stream
-        .write_all(&(bytes.len() as u32).to_be_bytes())
-        .await
-        .expect("frame length");
-    stream.write_all(&bytes).await.expect("frame body");
-    stream.flush().await.expect("flush");
+    let sent = async {
+        stream
+            .write_all(&(bytes.len() as u32).to_be_bytes())
+            .await?;
+        stream.write_all(&bytes).await?;
+        stream.flush().await
+    };
+    sent.await.is_ok()
 }
 
 /// Reads a control frame — or `None` when the stream ended first, which is how
