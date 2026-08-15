@@ -38,6 +38,18 @@ updates:
         update-types:
           - minor
           - patch
+    ignore:
+      # tao is capped to the minor that tauri-runtime-wry pins (0.35 today):
+      # the tray names tao directly, the gui reaches the same crate through
+      # tauri, and a lone bump of the tray's copy does not move tao, it
+      # duplicates it in the lock. Cargo treats a 0.x minor as breaking, so
+      # dependabot files these as majors (0.36 arrived as its own PR, #70,
+      # rather than inside the group above): ignoring majors is exactly "stay
+      # on the tauri-compatible minor". Lift when a published tauri-runtime-wry
+      # depends on the next tao minor.
+      - dependency-name: "tao"
+        update-types:
+          - version-update:semver-major
 
   # The mobile shell is EXCLUDED from the workspace (see gui-mobile/Cargo.toml),
   # so it carries its OWN Cargo.lock, which the `/` entry above never reads. That
