@@ -150,7 +150,7 @@ changes at every login**, and **whether RS256 needs a nudge**.
 | Zitadel | Application type **Native** | register `http://127.0.0.1/callback`, the port is ignored on loopback | default |
 | Pocket ID | OIDC client, "Public Client" checked | callback URL `http://127.0.0.1:*/callback` | default on fresh installs |
 | Kanidm | `create-public` client | `enable-localhost-redirects` | **no: enable per client** |
-| Dex | `staticClients` entry, `public: true` | automatic, but **only with no `redirectURIs` listed** | default |
+| Dex | `staticClients` entry, `public: true` | automatic on **v2.42.0+**, and **only with no `redirectURIs` listed** | default |
 
 ### Keycloak
 
@@ -274,6 +274,12 @@ staticClients:
   on **any port and any path**. Listing even one explicit redirect URI
   switches that client back to exact matching and breaks the dynamic port,
   so resist the urge to "document" the URI in the config.
+- **Run v2.42.0 or newer.** The IP loopback forms arrived in v2.42.0
+  (dexidp/dex#3778, "also allow localhost equivalent IP addresses"); before
+  that, only the literal `localhost` host was special-cased, and the
+  client's `127.0.0.1` callback is rejected with `Unregistered
+  redirect_uri` (verified against v2.41, which rejects, and v2.44, which
+  accepts).
 - PKCE is supported since v2.26.0 (2020); there is no per-client switch to
   require it, the flow simply uses it.
 - A public static client may also carry a `secret`; if the deployment sets
