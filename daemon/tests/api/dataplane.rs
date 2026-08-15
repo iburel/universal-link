@@ -17,7 +17,9 @@ use iroh::{RelayUrl, SecretKey};
 use onedevice_core::{
     OutgoingFile, PeerAddr, PeerTransport, read_offer, receive_bodies, send_transfer,
 };
-use onedevice_daemon::dataplane::{IrohTransport, LazyIrohTransport, multicast_reaches_the_wire};
+use onedevice_daemon::dataplane::{
+    IrohTransport, LazyIrohTransport, RelayChoice, multicast_reaches_the_wire,
+};
 use tokio::time::timeout;
 
 fn node_id(seed: &[u8; 32]) -> String {
@@ -97,11 +99,11 @@ async fn the_core_transfer_protocol_survives_real_quic() {
     b.close().await;
 }
 
-/// Two endpoints with NO relay at all (empty map): mDNS is the only possible
-/// route, so a successful transfer proves the LAN discovery end to end —
-/// announcement on one side, resolution on the other, direct connection by
-/// `node_id` alone. This is what a `PeerAddr` without `relay_url` will become
-/// once the Core stops requiring a published relay (next block).
+/// Two endpoints in OFF mode (`RelayMode::Disabled`, the production default,
+/// #104): mDNS is the only possible route, so a successful transfer proves
+/// the LAN discovery end to end (announcement on one side, resolution on the
+/// other, direct connection by `node_id` alone) and with it the off
+/// default's promise that the LAN needs no relay.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_endpoints_reach_each_other_over_the_lan_without_any_relay() {
     if !multicast_reaches_the_wire().await {
@@ -110,10 +112,10 @@ async fn two_endpoints_reach_each_other_over_the_lan_without_any_relay() {
     }
     let seed_a = [3u8; 32];
     let seed_b = [4u8; 32];
-    let a = IrohTransport::bind_test(seed_a, iroh::RelayMap::empty(), true)
+    let a = IrohTransport::bind_test_off(seed_a, true)
         .await
         .expect("endpoint A");
-    let b = IrohTransport::bind_test(seed_b, iroh::RelayMap::empty(), true)
+    let b = IrohTransport::bind_test_off(seed_b, true)
         .await
         .expect("endpoint B");
 
@@ -177,10 +179,10 @@ async fn the_lan_set_reflects_what_mdns_hears() {
     }
     let seed_a = [5u8; 32];
     let seed_b = [6u8; 32];
-    let a = IrohTransport::bind_test(seed_a, iroh::RelayMap::empty(), true)
+    let a = IrohTransport::bind_test_off(seed_a, true)
         .await
         .expect("endpoint A");
-    let b = IrohTransport::bind_test(seed_b, iroh::RelayMap::empty(), true)
+    let b = IrohTransport::bind_test_off(seed_b, true)
         .await
         .expect("endpoint B");
 
@@ -220,7 +222,7 @@ async fn an_endpoint_publishes_its_relay() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lazy_transport_stays_silent_until_first_use() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let transport = LazyIrohTransport::new(dir.path().to_path_buf(), None, false);
+    let transport = LazyIrohTransport::new(dir.path().to_path_buf(), RelayChoice::Off, false);
 
     // `accept` is not a use: the Core's `serve` loop calls it right from
     // startup, and a never-enrolled Core must neither read/create `device.key`
@@ -247,10 +249,10 @@ async fn a_lazy_transport_stays_silent_until_first_use() {
 async fn a_direct_address_hint_dials_with_no_relay_and_no_discovery() {
     let seed_a = [8u8; 32];
     let seed_b = [9u8; 32];
-    let a = IrohTransport::bind_test(seed_a, iroh::RelayMap::empty(), false)
+    let a = IrohTransport::bind_test_off(seed_a, false)
         .await
         .expect("endpoint A");
-    let b = IrohTransport::bind_test(seed_b, iroh::RelayMap::empty(), false)
+    let b = IrohTransport::bind_test_off(seed_b, false)
         .await
         .expect("endpoint B");
 
@@ -320,28 +322,27 @@ async fn a_direct_address_hint_dials_with_no_relay_and_no_discovery() {
     b.close().await;
 }
 
-/// What `own_reach` claims as a relay is the CONFIGURED one, and only that
-/// (#89: relay use is explicit, never a silent default). And an UNBOUND lazy
-/// transport claims nothing at all, config included: no claim is not an empty
-/// claim: answering "empty" would have the reach watcher wipe the hints a
-/// record signed last session, at every boot, before anything binds.
+/// What `own_reach` claims as a relay is one somebody CHOSE, and only that
+/// (#89, amended by #104). And an UNBOUND lazy transport claims nothing at
+/// all, config included: no claim is not an empty claim: answering "empty"
+/// would have the reach watcher wipe the hints a record signed last session,
+/// at every boot, before anything binds.
 #[tokio::test(flavor = "multi_thread")]
-async fn own_reach_claims_the_configured_relay_and_only_that() {
+async fn own_reach_claims_the_chosen_relay_and_only_that() {
     // Unbound: NO claim, and asking must not bind.
     let dir = tempfile::tempdir().expect("tempdir");
     let url: RelayUrl = "https://relay.self-hosted.example"
         .parse()
         .expect("relay url");
-    let lazy = LazyIrohTransport::new(dir.path().to_path_buf(), Some(url), false);
+    let lazy = LazyIrohTransport::new(dir.path().to_path_buf(), RelayChoice::Url(url), false);
     assert_eq!(lazy.own_reach(), None, "unbound is silent");
     assert!(
         !dir.path().join("device.key").exists(),
         "asking must not bind"
     );
 
-    // Not configured: no relay claimed, a bound endpoint included, however
-    // real the relays it might elect by default for the server path.
-    let bare = IrohTransport::bind_test([10u8; 32], iroh::RelayMap::empty(), false)
+    // Off (the default): no relay claimed, a bound endpoint included.
+    let bare = IrohTransport::bind_test_off([10u8; 32], false)
         .await
         .expect("endpoint");
     assert_eq!(bare.own_reach().expect("bound claims").relay_hint, None);
@@ -361,4 +362,50 @@ async fn own_reach_claims_the_configured_relay_and_only_that() {
         .expect("relay url");
     assert_eq!(claimed, relay_url);
     configured.close().await;
+}
+
+/// The off default answers the session's relay probe NOW: `home_relay` must
+/// not sit out its ten-second budget on an `online()` that can never resolve
+/// without a relay (#104): that stall would tax every login of exactly the
+/// deployments the default is for.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_off_default_publishes_no_relay_and_does_not_stall() {
+    let a = IrohTransport::bind_test_off([12u8; 32], false)
+        .await
+        .expect("endpoint");
+    let home = timeout(Duration::from_secs(3), a.home_relay())
+        .await
+        .expect("home_relay must answer immediately in off mode");
+    assert_eq!(home, None, "no relay to publish");
+    a.close().await;
+}
+
+/// The n0 opt-in signs the ELECTED home relay (#104): with the election run
+/// against a local relay map, `own_reach` ends up claiming the elected URL:
+/// the amended invariant ("never a relay nobody chose") lets an explicit
+/// opt-in stand for the relay it elects, re-signed by the same watcher that
+/// re-signs addresses.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_n0_opt_in_signs_the_elected_home_relay() {
+    let (relay_map, relay_url, _guard) = run_relay_server().await.expect("local relay");
+    let a = IrohTransport::bind_test_elected([13u8; 32], relay_map, false)
+        .await
+        .expect("endpoint");
+
+    // The election takes a moment: follow the transport's own wake signal,
+    // exactly as the Core's reach watcher does.
+    let mut changes = a.reach_changes();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let hint = a.own_reach().expect("bound claims").relay_hint;
+        if let Some(hint) = hint {
+            let hint: RelayUrl = hint.parse().expect("relay url");
+            assert_eq!(hint, relay_url, "the elected home relay is the claim");
+            break;
+        }
+        let woke = tokio::time::timeout_at(deadline, changes.changed()).await;
+        assert!(woke.is_ok(), "no home relay elected within the deadline");
+        woke.expect("deadline").expect("watcher alive");
+    }
+    a.close().await;
 }

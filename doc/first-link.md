@@ -147,8 +147,9 @@ Contents of `config.json` (`server_url`, `oidc_issuer` and `oidc_client_id` are
   secret in the usual sense — it ships with any installed app.
 - `device_name` is optional (default: the hostname) — it is a display label, not an
   identity.
-- Also optional: `relay_url` (self-hosted iroh relay; otherwise the n0 public
-  relays) and `receive_dir` (otherwise `<Downloads>/1Device`).
+- Also optional: `relay` (off by default; a self-hosted iroh relay's URL, or
+  `"n0"` to opt into the public relays) and `receive_dir` (otherwise
+  `<Downloads>/1Device`).
 
 An incomplete trio, a scheme typo (`https://…/ws` instead of `wss://`), or broken
 JSON: the Core **still starts** but *not configured*, and any login will answer
@@ -308,13 +309,17 @@ Sources: [`core/src/login.rs`](../core/src/login.rs),
 
 This is the most likely friction point, and the reason is worth knowing: the iroh
 data plane is in a **minimal** preset — **automatic discovery is disabled** (no
-LAN/DNS), so the two peers **meet via the relay**. The relay then remains the
-fallback channel; NAT traversal (hole-punching) stays active and a **direct route**
-can form after the rendezvous. Without a configured `relay_url`, it is the **n0**
-public relays. Practical consequence: to establish the initial connection, **both
-machines must have a UDP egress to a common relay** (corporate firewall, restricted
-network → failure). Lead: host your own relay and set it as `relay_url` in both
-`config.json`. See [`daemon/src/dataplane.rs`](../daemon/src/dataplane.rs).
+DNS; mDNS covers the local network only), and the relay is **off by default**, so
+off the LAN two peers only meet through a route somebody set up: a VPN between
+them, their signed address hints, or a relay opted into with the `relay` setting
+(a URL, or `"n0"` for the public relays). With a relay, the peers **meet through
+it** (rendezvous); NAT traversal (hole-punching) stays active and a **direct
+route** can form after the rendezvous, the relay remaining the fallback channel.
+Practical consequence: to establish the initial connection through a relay,
+**both machines must have a UDP egress to a common relay** (corporate firewall,
+restricted network → failure). Lead: host your own relay and set it as `relay`
+in both `config.json`. See
+[`daemon/src/dataplane.rs`](../daemon/src/dataplane.rs).
 
 ### Where to look
 

@@ -22,14 +22,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Pairing a NEW device stays a same-room gesture, deliberately. Recipes in
   [beyond the LAN](doc/beyond-the-lan.md).
 - **A serverless account can rendezvous through a relay you host.** The
-  existing `relay_url` setting now serves the serverless half too: a device
-  that is explicitly pointed at a self-hosted
+  `relay` setting serves the serverless half too: a device that is explicitly
+  pointed at a self-hosted
   [`iroh-relay`](https://github.com/n0-computer/iroh) signs that relay into
   its record, and its siblings dial it through the relay across any NAT.
-  Explicit, never a default: a fleet that configured no relay signs none, and
-  no device of yours is ever dialed through a relay you did not set. In the
+  Explicit, never a default: a fleet whose relay is off signs none, and
+  no device of yours is ever dialed through a relay nobody chose. In the
   app, a device dialable only through its signed hints shows as "reachable":
   nobody vouches it is up, the dial is what answers.
+- **The relay is now off by default, and using one is a choice.** An
+  unconfigured device used to ride n0's public relays silently: the bound
+  endpoint kept a housekeeping connection to the nearest one even idle. The
+  `relay` setting (formerly `relay_url`) is now three-valued: `"off"` (the
+  default: no relay connection at all, and no ten-second wait for one at
+  login), `"n0"` (the public relays, opted into explicitly; the elected home
+  relay is then signed into the record like a configured one), or a relay
+  URL as before. What off costs, honestly: two devices behind two distinct
+  NATs, off the LAN, with no VPN between them, need a relay to meet. A
+  fleet that ran unconfigured keeps the LAN, VPN routes and signed address
+  hints, and regains a relay by choosing one; a `config.json` still carrying
+  `relay_url` (or the `ONEDEVICE_RELAY_URL` variable) is refused with the
+  cure in the message rather than silently downgraded. The "device is
+  offline" message now names the remedies.
 - **A VPN that swallows the local network is now called by its name.** A
   device-wide or per-app VPN can capture multicast routing: beacons loop
   back inside the kernel while the actual network never sees a byte, which
@@ -146,9 +160,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **Android now honors the configured relay.** The phone parsed `relay_url`
-  from its `config.json` like every desktop and then ignored it, so a fleet
-  pointed at a self-hosted relay silently excluded its phone. The parsed
+- **Android now honors the configured relay.** The phone parsed the relay
+  setting from its `config.json` like every desktop and then ignored it, so a
+  fleet pointed at a self-hosted relay silently excluded its phone. The parsed
   value now reaches the transport, on the same path as everywhere else.
 - **Launching the app twice now brings back the window you already have.**
   The Core always held a single-instance lock, but the app itself did not: a

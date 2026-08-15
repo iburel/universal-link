@@ -1077,7 +1077,7 @@ test("a send to an offline device is explained", async () => {
 
   expect(store.notice).toEqual({
     kind: "error",
-    text: "This device is offline.",
+    text: "No route to this device right now. The same network, a VPN between your devices, a relay, or a server would give it one.",
   });
 });
 
@@ -1953,7 +1953,10 @@ test("a refused send releases the copy right away and says why", async () => {
   await store.sendShare("d_win");
 
   expect(fake.discards).toEqual(["s_1"]);
-  expect(store.notice).toEqual({ kind: "error", text: "This device is offline." });
+  expect(store.notice).toEqual({
+    kind: "error",
+    text: "No route to this device right now. The same network, a VPN between your devices, a relay, or a server would give it one.",
+  });
 });
 
 test("cancelling the share releases the copy and sends nothing", async () => {

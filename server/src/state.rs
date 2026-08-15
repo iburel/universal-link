@@ -97,7 +97,7 @@ pub struct DeviceEntry {
     pub seq: Option<u64>,
     pub self_sig: Option<String>,
     /// The reach half of that description: where the device says it can be
-    /// dialed (socket addresses, an explicitly configured relay). Same opaque
+    /// dialed (socket addresses, a chosen relay). Same opaque
     /// treatment; replaced together with `seq`/`self_sig`, since one signature
     /// covers them all. Kept through a rename: the addresses did not move with
     /// the name, and peers only ever trust them through the signature anyway.

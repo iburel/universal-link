@@ -806,7 +806,7 @@ impl TestCore {
 
     /// `start_in_account_on`, with a relay registered on the endpoint: a
     /// serverless machine whose owner pointed it at a self-hosted relay
-    /// (`relay_url` in its config). What the device DECLARES about its own
+    /// (`relay` in its config). What the device DECLARES about its own
     /// reach, and therefore signs, is the test's business: `declare_reach` on
     /// the switchboard.
     pub async fn start_in_account_reaching(

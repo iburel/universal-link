@@ -9,7 +9,9 @@ rung); the design lives in [architecture.md](architecture.md), principle 3.
 The ladder, each rung strictly optional:
 
 1. **Nothing.** Your devices meet on the local network. Zero setup, zero
-   infrastructure, and the account ends at the walls.
+   infrastructure, and the account ends at the walls. This is also the
+   network's ground state: the relay is **off by default** (#104), so an
+   unconfigured device contacts no relay anybody did not choose.
 2. **Your own network** (WireGuard, Tailscale, public IPv6). Your devices reach
    each other anywhere that network routes. You run what you already ran;
    1Device adds nothing to host.
@@ -23,9 +25,10 @@ The ladder, each rung strictly optional:
 
 Every device signs, in its own directory record, where it can be dialed: the
 socket addresses its endpoint stands behind (`addrs`: LAN, VPN and public IPv6
-addresses alike) and the relay it was explicitly configured with
-(`relay_hint`). The records travel between your devices in the directory
-exchange they already run, and at dial time the hints are handed to the
+addresses alike) and the relay somebody chose for it (`relay_hint`: the
+configured URL, or the home relay an explicit `"n0"` opt-in elected). The
+records travel between your devices in the directory exchange they already
+run, and at dial time the hints are handed to the
 transport as candidates, tried alongside whatever mDNS resolves. When a
 device's addresses move (it joined a network, a VPN came up), it re-signs its
 record on the spot and tells the account.
@@ -93,21 +96,22 @@ is stateless: no accounts, no storage, one domain, one TLS certificate.
 
 1. Run `iroh-relay` on a machine with a public address, behind your TLS
    (a container or the plain binary; its own docs cover flags and ports).
-2. On EVERY device of the account, set `relay_url` in `config.json` (or the
-   `ONEDEVICE_RELAY_URL` environment variable) to `https://your-relay.example`,
+2. On EVERY device of the account, set `relay` in `config.json` (or the
+   `ONEDEVICE_RELAY` environment variable) to `https://your-relay.example`,
    and restart the Core. The phone reads the same `config.json` field.
 3. Each device now signs that relay into its record (`relay_hint`), and its
    siblings dial it through the relay from anywhere.
 
 Two properties are deliberate and worth knowing:
 
-- **Relaying your devices' bytes is explicit, never a default.** A device that
-  configured no relay signs none into its record, and no sibling of yours is
-  ever dialed through a relay you did not set. One nuance stated honestly:
-  once its endpoint is up, the transport itself (iroh) still keeps its stock
-  housekeeping connection to the nearest default relay (n0) for its own
-  reachability; none of your account's data rides it, and configuring your
-  own relay replaces it entirely.
+- **Relaying your devices' bytes is explicit, never a default.** The relay
+  setting is off unless somebody set it, and a device whose relay is off
+  contacts none at all: no relay connection, no housekeeping traffic, and it
+  signs no relay into its record, so no sibling of yours is ever dialed
+  through a relay you did not choose. The n0 public relays still exist as one
+  of the choices (`"n0"`), and that opt-in signs the home relay it elects,
+  exactly as a configured URL signs itself: everything in `relay_hint` is a
+  relay somebody chose.
 - **What a relay operator sees.** Never content (everything is end-to-end
   encrypted), but a relay in use sees node ids, client IPs, timings and
   volumes. That operator is you, which is the point of this rung.

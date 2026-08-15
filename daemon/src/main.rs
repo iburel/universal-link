@@ -81,7 +81,7 @@ async fn run() -> anyhow::Result<Outcome> {
     // and retried).
     let transport = Arc::new(dataplane::LazyIrohTransport::new(
         endpoint.config_dir.clone(),
-        settings.relay_url,
+        settings.relay,
         settings.lan_discovery,
     ));
 

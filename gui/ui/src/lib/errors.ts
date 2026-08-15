@@ -22,7 +22,10 @@ const APP_MESSAGES: Record<string, string> = {
   ACCOUNT_KEY_SET: "An account is already set up on this device.",
   ACCOUNT_KEY_SAVE_FAILED: "Could not save the account key.",
   DEVICE_UNKNOWN: "This device no longer exists.",
-  DEVICE_OFFLINE: "This device is offline.",
+  // With the relay off by default (#104), "offline" is usually "no route":
+  // the phrase names the remedies instead of leaving the user to spin.
+  DEVICE_OFFLINE:
+    "No route to this device right now. The same network, a VPN between your devices, a relay, or a server would give it one.",
   INVALID_TOKEN: "Invalid or revoked token.",
   SCOPE_DENIED: "The Core refused this operation (missing permission).",
   ROLE_CONFLICT: "This role is already held by another component.",

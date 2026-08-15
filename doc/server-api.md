@@ -170,7 +170,8 @@ The central object, carried by `devices.list` and every notification:
   and the device republishes over its own connection once it hears the rename.
 - `addrs` + `relay_hint`: the **reach half** of that same description: where
   the device says it can be dialed (socket addresses as text, at most 16 of at
-  most 64 bytes each) and the relay it was explicitly configured with. Opaque
+  most 64 bytes each) and the relay somebody chose for it (a configured URL,
+  or the home relay an explicit n0 opt-in elected). Opaque
   like the rest; every `presence.update` replaces them together with
   `seq`/`self_sig` (one signature covers the whole description), and they are
   refused without `self_sig`. Durable like the attestation: unlike
