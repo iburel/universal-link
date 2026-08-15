@@ -95,6 +95,12 @@ its public key.
 their relay ([`iroh-relay`]) — without it, the n0 public relays. A sovereign
 deployment's data plane then depends on no third-party infrastructure. Checked at
 startup like the rest: a typo is a `problem`, not a silently mute data plane.
+For a **serverless** account the same setting is the third rung of the
+self-hosting ladder: the device signs the configured relay into its directory
+record (`relay_hint`), and its already-paired siblings dial it through that
+relay from anywhere. Never silently: a device that configured no relay signs
+none, and none of your devices is dialed through one. The whole off-LAN story, VPN recipes included, is
+[beyond-the-lan.md](beyond-the-lan.md).
 
 [`iroh-relay`]: https://github.com/n0-computer/iroh
 

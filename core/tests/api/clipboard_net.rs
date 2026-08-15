@@ -919,6 +919,7 @@ impl RawPeer {
         let peer = PeerAddr {
             node_id: target.key().node_id(),
             relay_url: Some(format!("iroh+memory://{}", target.key().node_id())),
+            addrs: Vec::new(),
         };
         let mut stream = self
             .transport

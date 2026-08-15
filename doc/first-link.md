@@ -298,7 +298,7 @@ transfer (deleted automatically on failure).
 | `redirect_uri_mismatch` (browser) | The Google client is **not** of type "Desktop app" (**pitfall #2**). |
 | `access_denied` (browser) | Consent screen in "Testing" and the account not added as a test user. |
 | `DEVICE_UNKNOWN` | C7 attestation absent/invalid (one side has not done *setup*/*join*), or no directory snapshot yet. |
-| `DEVICE_OFFLINE` | Peer known but **with no relay**: its iroh has not joined a relay, or the server has not registered its `relay_url`. |
+| `DEVICE_OFFLINE` | Peer known but **with no route**: no relay (its iroh has not joined one, or the server has not registered its `relay_url`), not heard on the LAN, and its record carries no signed reach hints ([beyond-the-lan.md](beyond-the-lan.md)). |
 
 Sources: [`core/src/login.rs`](../core/src/login.rs),
 [`server/src/oidc.rs`](../server/src/oidc.rs),

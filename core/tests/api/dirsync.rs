@@ -352,6 +352,7 @@ impl RawPeer {
         let peer = PeerAddr {
             node_id: target.node_id(),
             relay_url: None,
+            addrs: Vec::new(),
         };
         let mut stream = self
             .transport
@@ -493,6 +494,59 @@ async fn a_roster_it_cannot_prove_teaches_the_receiver_nothing() {
         json!("Phone"),
         "the description we held is the one that device signed"
     );
+}
+
+/// A relayer cannot plant a route. The hints are covered by the device's own
+/// signature precisely so that whoever carries a record cannot rewrite where
+/// it points: a planted address would send every future dial (and its
+/// authenticated handshake) to a machine of the relayer's choosing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relayer_cannot_plant_a_route_on_a_record_it_carries() {
+    let code = onedevice_core::account_key::generate_recovery_code();
+    let third = DeviceKey::generate();
+    let held = peer_record_reaching(
+        &third,
+        "Phone",
+        "android",
+        &code,
+        4,
+        &onedevice_core::Reach {
+            addrs: vec!["10.8.0.2:41641".to_string()],
+            relay_hint: None,
+        },
+    );
+    let (core, raw) = core_with_raw_peer(&code, &[held]).await;
+    let mut c = manager(&core).await;
+
+    // The genuine fresher description, with its addresses rewritten in
+    // transit, and a second copy whose relay hint was planted instead.
+    let mut rerouted = peer_record_reaching(
+        &third,
+        "Phone",
+        "android",
+        &code,
+        9,
+        &onedevice_core::Reach {
+            addrs: vec!["10.8.0.2:41641".to_string()],
+            relay_hint: None,
+        },
+    );
+    rerouted["addrs"] = json!(["203.0.113.66:41641"]);
+    let mut rerelayed = rerouted.clone();
+    rerelayed["addrs"] = json!(["10.8.0.2:41641"]);
+    rerelayed["relay_hint"] = json!("https://liar.example");
+    let answer = raw
+        .offer(
+            &core,
+            json!({ "records": [rerouted, rerelayed], "revoked": {} }),
+        )
+        .await;
+
+    assert_eq!(answer["type"], json!("dir_roster"));
+    let kept = record_of(&mut c, &third.node_id()).await;
+    assert_eq!(kept["seq"], json!(4), "the tampered supersede never landed");
+    assert_eq!(kept["addrs"], json!(["10.8.0.2:41641"]));
+    assert_eq!(kept["relay_hint"], json!(null));
 }
 
 /// An exchange that teaches nothing costs nothing: not a notification, not a disk

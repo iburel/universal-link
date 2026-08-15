@@ -333,10 +333,13 @@ Core with three fields:
 - `lan` — this machine currently hears the device on the local network (mDNS).
   First-hand presence: alive with or without the server.
 - `reachable` — the Core's ONE presence verdict: what a send could reach right
-  now. True on the LAN, or — only while the server link that feeds the `online`
-  flags is up — for an online device with a published relay. **Consumers gate
-  on this**, never on `online` alone: it is derived once, Core-side, so nobody
-  re-assembles presence from parts that go stale at different times.
+  now, or is worth trying. True on the LAN; or, only while the server link that
+  feeds the `online` flags is up, for an online device with a published relay;
+  or for a device whose signed record carries reach hints (`addrs`,
+  `relay_hint`): no one vouches that it is up, but its own word gives the dial a
+  route, and the dial is what answers. **Consumers gate on this**, never on
+  `online` alone: it is derived once, Core-side, so nobody re-assembles presence
+  from parts that go stale at different times.
 
 | Method | Description |
 |---|---|
@@ -363,14 +366,23 @@ itself carries `device_id` = its own `node_id` (no server has named it),
 `online: true` (its own liveness needs nobody) and `null` in the fields only a
 server fills: `relay_url`, `last_seen`, `status`.
 
-**A record a device minted for itself signs itself.** It carries two more fields:
-`seq` (u64) and `self_sig` — the device's own signature, under the key its
-`node_id` IS, over `{node_id, name, platform, seq}`. So a description can travel
-from device to device without the one relaying it being trusted with it, and `seq`
-— which only its owner can raise — is what makes one description supersede
-another. Deliberately NOT signed: `relay_url`, `online`, `last_seen`, `status`,
-`device_id`. Those are said in the present tense, and a signature over them would
-be a stale fact wearing a proof.
+**A record a device minted for itself signs itself.** It carries four more
+fields: `seq` (u64); `self_sig`, the device's own signature, under the key its
+`node_id` IS, over `{node_id, name, platform, seq, addrs, relay_hint}`; and the
+two reach hints that signature covers: `addrs` (a list of socket addresses, as
+text, where the device says it can be dialed; at most 16 entries of at most 64
+bytes each) and `relay_hint` (the relay it was EXPLICITLY configured with, or
+null; never an elected default). So a description can travel from device to
+device without the one relaying it being trusted with it, and `seq`, which only
+its owner can raise, is what makes one description supersede another.
+Deliberately NOT signed: `relay_url`, `online`, `last_seen`, `status`,
+`device_id`. Those are said in the present tense, and a signature over them
+would be a stale fact wearing a proof. The hints are the deliberate exception:
+they claim no liveness, only "these are MY hints, as of this description": a
+stale one costs a failed dial attempt, never a wrong peer (the node key
+authenticates whoever answers), and an unsigned one would be a route any
+relayer could plant. The device re-signs its record, under a fresh `seq`,
+whenever its transport observes its addresses moved.
 
 **Where a server names the device, the device countersigns** (the continuum). The
 server keeps the name — `devices.rename` may come from another device — and the
@@ -453,11 +465,13 @@ safe:
 - The **highest `seq` wins**, and only among signed descriptions. A record this
   Core holds *without* a `seq` was minted by a server, and there the server keeps
   the name.
-- A device this Core has never heard of arrives **known but not reachable**: keyed
-  and labelled by its `node_id` (the one label a relayer cannot rewrite), with
-  `relay_url`, `last_seen` and `status` null and `online: false`. Those are
-  present-tense facts about a device the relayer is not — the transport hearing it
-  on the LAN, or a server that owns them, is what fills them in.
+- A device this Core has never heard of arrives keyed and labelled by its
+  `node_id` (the one label a relayer cannot rewrite), with `relay_url`,
+  `last_seen` and `status` null and `online: false`. Those are present-tense
+  facts about a device the relayer is not; the transport hearing it on the
+  LAN, or a server that owns them, is what fills them in. What the described
+  device SIGNED arrives whole, its reach hints included: the device may be
+  **known and worth dialing** on its own word alone, off any LAN.
 - A record describing **this** device is never taken in, whatever its `seq`: what a
   peer holds about us is at best what we told it.
 - An exchange that teaches nothing costs nothing — no notification, no disk write.
@@ -514,8 +528,9 @@ own.
 `device_id` is resolved by the directory, **C7 attestation verified before any
 opening**: a target that is absent or attested under a foreign key →
 `DEVICE_UNKNOWN` (fail-closed, indistinguishable so as to disclose nothing); known
-but with no route to it — no published relay, and not currently visible on the
-local network (mDNS) → `DEVICE_OFFLINE`. Once the `transfer_id` has been
+but with no route to it (no published relay, no signed reach hints in its
+record, and not currently visible on the local network over mDNS) →
+`DEVICE_OFFLINE`. Once the `transfer_id` has been
 returned, failures (connection, disk, a target that has shrunk) go through
 `transfer.failed`.
 

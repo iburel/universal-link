@@ -8,6 +8,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A serverless account now works beyond the local network.** Every device
+  signs, in its own directory record, where it can be dialed: the addresses
+  its endpoint stands behind (LAN, VPN and public IPv6 alike), re-signed on
+  the spot when they move. Its already-paired siblings learn them through the
+  directory exchanges they already run and try them at every dial, so two
+  devices on the same WireGuard or Tailscale network, or with public IPv6,
+  reach each other from anywhere that network routes: no server, no third
+  party, nothing published outside the account. A stale or hostile hint costs
+  one failed attempt and can never lead to a wrong machine (connections are
+  authenticated by the device's key), and a relayed record cannot have its
+  routes rewritten in transit (the hints ride the device's own signature).
+  Pairing a NEW device stays a same-room gesture, deliberately. Recipes in
+  [beyond the LAN](doc/beyond-the-lan.md).
+- **A serverless account can rendezvous through a relay you host.** The
+  existing `relay_url` setting now serves the serverless half too: a device
+  that is explicitly pointed at a self-hosted
+  [`iroh-relay`](https://github.com/n0-computer/iroh) signs that relay into
+  its record, and its siblings dial it through the relay across any NAT.
+  Explicit, never a default: a fleet that configured no relay signs none, and
+  no device of yours is ever dialed through a relay you did not set. In the
+  app, a device dialable only through its signed hints shows as "reachable":
+  nobody vouches it is up, the dial is what answers.
 - **A VPN that swallows the local network is now called by its name.** A
   device-wide or per-app VPN can capture multicast routing: beacons loop
   back inside the kernel while the actual network never sees a byte, which
@@ -53,8 +75,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a *revoked* device recognized until the next server contact, so a snapshot
   older than **7 days** no longer counts and the machine then waits for the
   server, as before. Logging out forgets the list. What still needs the
-  server: signing in, adding or revoking a device, and reaching machines
-  beyond your own network.
+  server: signing in, and pairing a device that is not in the same room.
+  (Adding, revoking and reaching devices all work without one; see the
+  serverless and beyond-the-LAN entries below.)
 - **And you can see it.** A machine this one hears nearby is badged *"on this
   network"* in the app — presence the machine observes itself, no server
   involved — and stays a live drop target and a right-click destination when
@@ -123,6 +146,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Android now honors the configured relay.** The phone parsed `relay_url`
+  from its `config.json` like every desktop and then ignored it, so a fleet
+  pointed at a self-hosted relay silently excluded its phone. The parsed
+  value now reaches the transport, on the same path as everywhere else.
 - **Launching the app twice now brings back the window you already have.**
   The Core always held a single-instance lock, but the app itself did not: a
   second launch (from the launcher, or the tray's "Open" while the window was

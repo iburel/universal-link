@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::sync::{Arc, Mutex};
 
-use onedevice_core::{HomeRelay, Incoming, IoStream, Opening, PeerAddr, PeerTransport};
+use onedevice_core::{HomeRelay, Incoming, IoStream, Opening, PeerAddr, PeerTransport, Reach};
 use tokio::io::DuplexStream;
 use tokio::sync::mpsc;
 
@@ -41,6 +41,14 @@ struct Route {
     /// This endpoint's LAN generation sender: bumped when ANY membership
     /// changes, because anyone's join or leave may change what this one sees.
     lan_gen: tokio::sync::watch::Sender<u64>,
+    /// What this endpoint claims about itself first-hand (`own_reach`): the
+    /// addresses a caller may PRESENT to reach it off the LAN, and the relay
+    /// hint it will sign. Empty at birth (a real endpoint has observed
+    /// nothing either), and declared by the test (`declare_reach`), which is
+    /// the double of the transport watching its own addresses move.
+    reach: Reach,
+    /// Bumped when `reach` changes: the Core's reach watcher re-pulls.
+    reach_gen: tokio::sync::watch::Sender<u64>,
     tx: mpsc::UnboundedSender<Wire>,
 }
 
@@ -71,6 +79,7 @@ impl MemorySwitchboard {
         let node_id = node_id.into();
         let (tx, rx) = mpsc::unbounded_channel();
         let lan_gen = tokio::sync::watch::channel(0).0;
+        let reach_gen = tokio::sync::watch::channel(0).0;
         let listened = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.routes.lock().unwrap().insert(
             node_id.clone(),
@@ -79,6 +88,8 @@ impl MemorySwitchboard {
                 listened: listened.clone(),
                 on_lan: false,
                 lan_gen: lan_gen.clone(),
+                reach: Reach::default(),
+                reach_gen: reach_gen.clone(),
                 tx,
             },
         );
@@ -87,9 +98,28 @@ impl MemorySwitchboard {
             relay_url,
             listened,
             lan_gen,
+            reach_gen,
             switchboard: self.clone(),
             inbox: tokio::sync::Mutex::new(rx),
         })
+    }
+
+    /// Declares what an endpoint knows first-hand about how it can be dialed:
+    /// the double of the real transport watching its addresses move (a network
+    /// joined, a VPN up). The addresses become presentable in `open` (a caller
+    /// must hold one to reach the device off the LAN), and the endpoint's own
+    /// Core hears the change through `reach_changes`. An unknown `node_id` is a
+    /// test bug, so it panics.
+    pub fn declare_reach(&self, node_id: &str, reach: Reach) {
+        let mut routes = self.routes.lock().unwrap();
+        let route = routes
+            .get_mut(node_id)
+            .expect("declare_reach: node_id unknown to the switchboard");
+        if route.reach == reach {
+            return;
+        }
+        route.reach = reach;
+        route.reach_gen.send_modify(|generation| *generation += 1);
     }
 
     /// Has this endpoint been asked to make itself reachable? See
@@ -141,6 +171,7 @@ pub struct MemoryTransport {
     relay_url: Option<String>,
     listened: Arc<std::sync::atomic::AtomicBool>,
     lan_gen: tokio::sync::watch::Sender<u64>,
+    reach_gen: tokio::sync::watch::Sender<u64>,
     switchboard: MemorySwitchboard,
     inbox: tokio::sync::Mutex<mpsc::UnboundedReceiver<Wire>>,
 }
@@ -155,13 +186,14 @@ impl std::fmt::Debug for MemoryTransport {
 impl PeerTransport for MemoryTransport {
     fn open<'a>(&'a self, peer: &'a PeerAddr) -> Opening<'a> {
         Box::pin(async move {
-            let (target, registered_relay, lan_route) = {
+            let (target, registered_relay, registered_addrs, lan_route) = {
                 let routes = self.switchboard.routes.lock().unwrap();
                 let me_on_lan = routes.get(&self.node_id).is_some_and(|r| r.on_lan);
                 match routes.get(&peer.node_id) {
                     Some(route) => (
                         route.tx.clone(),
                         route.relay_url.clone(),
+                        route.reach.addrs.clone(),
                         me_on_lan && route.on_lan,
                     ),
                     None => {
@@ -175,17 +207,28 @@ impl PeerTransport for MemoryTransport {
                     }
                 }
             };
-            // Two routes, like the real impl. The relay: it must be the one
+            // Three routes, like the real impl. The relay: it must be the one
             // the peer published, presented by the caller — a stale one does
-            // not connect. The LAN: both endpoints on it — mDNS resolves the
-            // peer regardless of what relay (if any) was presented.
+            // not connect. The addresses: the caller must PRESENT one the peer
+            // actually declared: same discipline, a stale hint dials nothing.
+            // The LAN: both endpoints on it: mDNS resolves the peer
+            // regardless of what else (if anything) was presented.
             let relay_route = registered_relay.is_some() && peer.relay_url == registered_relay;
-            if !relay_route && !lan_route {
+            let addr_route = peer
+                .addrs
+                .iter()
+                .any(|presented| registered_addrs.contains(presented));
+            if !relay_route && !addr_route && !lan_route {
                 return Err(Error::new(
                     ErrorKind::HostUnreachable,
                     format!(
-                        "peer {} unreachable: relay presented {:?}, real relay {:?}, on the LAN: {lan_route}",
-                        peer.node_id, peer.relay_url, registered_relay
+                        "peer {} unreachable: relay presented {:?}, real relay {:?}, \
+                         addrs presented {:?}, real addrs {:?}, on the LAN: {lan_route}",
+                        peer.node_id,
+                        peer.relay_url,
+                        registered_relay,
+                        peer.addrs,
+                        registered_addrs
                     ),
                 ));
             }
@@ -231,6 +274,21 @@ impl PeerTransport for MemoryTransport {
 
     fn lan_changes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.lan_gen.subscribe()
+    }
+
+    fn own_reach(&self) -> Option<Reach> {
+        // Always a claim: this transport is "bound" from registration, like
+        // the doc on the trait says the empty default is for.
+        self.switchboard
+            .routes
+            .lock()
+            .unwrap()
+            .get(&self.node_id)
+            .map(|route| route.reach.clone())
+    }
+
+    fn reach_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.reach_gen.subscribe()
     }
 
     fn listen(&self) -> onedevice_core::Listening<'_> {

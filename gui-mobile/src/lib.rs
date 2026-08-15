@@ -200,9 +200,12 @@ async fn boot_core(data_dir: &Path) -> anyhow::Result<ClientConfig> {
     // has a window in front or work in flight — the rest of the time this Core
     // still announces, but is deaf to the answers (and so is every mDNS
     // listener in the process, by the platform's design, not by a defect here).
+    // The configured relay rides too, exactly like the desktop daemon: the
+    // phone was the one device that parsed `relay_url` and then ignored it,
+    // which made "point your fleet at your relay" silently exclude Android.
     let transport = Arc::new(LazyIrohTransport::new(
         data_dir.to_path_buf(),
-        None,
+        boot.relay_url,
         boot.lan_discovery,
     ));
 

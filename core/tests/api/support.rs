@@ -647,6 +647,26 @@ fn seed_account_from_code(dir: &Path, node_id: &str, code: &str) {
 /// membership attested under the account's (`code`). Keyed by its own `node_id` —
 /// the label a device with no server to name it goes by.
 pub fn peer_record(key: &DeviceKey, name: &str, platform: &str, code: &str, seq: u64) -> Value {
+    peer_record_reaching(
+        key,
+        name,
+        platform,
+        code,
+        seq,
+        &onedevice_core::Reach::default(),
+    )
+}
+
+/// [`peer_record`], with the reach the device signs into its description:
+/// the off-LAN tests declare where a device says it can be dialed.
+pub fn peer_record_reaching(
+    key: &DeviceKey,
+    name: &str,
+    platform: &str,
+    code: &str,
+    seq: u64,
+    reach: &onedevice_core::Reach,
+) -> Value {
     let ak = onedevice_core::account_key::account_key_from_code(code).expect("valid test code");
     let node_id = key.node_id();
     json!({
@@ -656,8 +676,10 @@ pub fn peer_record(key: &DeviceKey, name: &str, platform: &str, code: &str, seq:
         "node_id": node_id,
         "seq": seq,
         "self_sig": key.sign(&onedevice_core::directory::record_message(
-            &node_id, name, platform, seq,
+            &node_id, name, platform, seq, reach,
         )),
+        "addrs": reach.addrs,
+        "relay_hint": reach.relay_hint,
         "relay_url": null,
         "attestation": onedevice_core::account_key::attest(&ak, &node_id),
         "online": false,
@@ -778,6 +800,27 @@ impl TestCore {
         let node_id = key.node_id();
         let transport: Arc<dyn onedevice_core::PeerTransport> =
             switchboard.endpoint(node_id.clone(), None);
+        switchboard.join_lan(&node_id);
+        Self::spawn_in(dir, Some((node_id.clone(), key)), None, Some(transport)).await
+    }
+
+    /// `start_in_account_on`, with a relay registered on the endpoint: a
+    /// serverless machine whose owner pointed it at a self-hosted relay
+    /// (`relay_url` in its config). What the device DECLARES about its own
+    /// reach, and therefore signs, is the test's business: `declare_reach` on
+    /// the switchboard.
+    pub async fn start_in_account_reaching(
+        code: &str,
+        switchboard: &MemorySwitchboard,
+        key: DeviceKey,
+        records: &[Value],
+        relay: Option<String>,
+    ) -> TestCore {
+        let dir = tempfile::tempdir().expect("tempdir");
+        Self::seed_in_account(dir.path(), &key, code, records);
+        let node_id = key.node_id();
+        let transport: Arc<dyn onedevice_core::PeerTransport> =
+            switchboard.endpoint(node_id.clone(), relay);
         switchboard.join_lan(&node_id);
         Self::spawn_in(dir, Some((node_id.clone(), key)), None, Some(transport)).await
     }

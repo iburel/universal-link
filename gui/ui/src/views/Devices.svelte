@@ -104,12 +104,16 @@
    *
    * Presence is the Core's `reachable` verdict; "on this network" names the
    * machines this one hears itself (mDNS) — the ones that keep working when
-   * the internet does not.
+   * the internet does not. "reachable" names the third case: nobody vouches
+   * that the device is up right now, but its record carries a route worth
+   * trying (its signed addresses or relay); calling that one "online" would
+   * claim a liveness nobody stated.
    */
   function meta(device: Device): string {
     const parts = [platformLabel(device.platform)];
     if (device.is_self) parts.push(selfLabel(device.platform));
-    if (device.reachable) parts.push(device.lan ? "on this network" : "online");
+    if (device.reachable)
+      parts.push(device.lan ? "on this network" : device.online ? "online" : "reachable");
     else {
       const last = seen(device);
       if (last) parts.push(`last seen ${last}`);

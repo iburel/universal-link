@@ -658,6 +658,7 @@ async fn a_crafted_traversal_name_is_refused_and_writes_nothing() {
     let peer = PeerAddr {
         node_id: victim.key().node_id(),
         relay_url: Some(format!("iroh+memory://{}", victim.key().node_id())),
+        addrs: Vec::new(),
     };
     let mut stream = rogue.open(&peer).await.expect("the switchboard routes");
     // A name that tries to climb up one level (Windows separator not split
@@ -1461,6 +1462,7 @@ async fn transfer_is_refused(rogue: &Arc<MemoryTransport>, node_id: &str, relay:
     let peer = PeerAddr {
         node_id: node_id.to_string(),
         relay_url: Some(relay.to_string()),
+        addrs: Vec::new(),
     };
     let mut stream = rogue
         .open(&peer)
@@ -1601,5 +1603,6 @@ fn victim_peer(core: &TestCore) -> PeerAddr {
     PeerAddr {
         node_id: core.key().node_id(),
         relay_url: Some(format!("iroh+memory://{}", core.key().node_id())),
+        addrs: Vec::new(),
     }
 }

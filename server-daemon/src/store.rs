@@ -75,6 +75,8 @@ mod tests {
                 attestation: Some("ab".repeat(64)),
                 seq: Some(7),
                 self_sig: Some("cd".repeat(64)),
+                addrs: vec!["192.0.2.7:41641".into()],
+                relay_hint: Some("https://relay.example".into()),
             }],
             revoked: vec!["d_old".into()],
         };

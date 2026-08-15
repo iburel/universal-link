@@ -50,6 +50,13 @@ const ATTESTATION_MAX: usize = 256;
 /// A device's signature over its own description (the continuum): opaque and
 /// bounded exactly like the attestation, for the same reason.
 const SELF_SIG_MAX: usize = 256;
+
+/// Address hints per device, at most; mirrors the Core's own cap on what a
+/// record may carry (`directory::MAX_ADDR_HINTS`).
+const ADDR_HINTS_MAX: usize = 16;
+
+/// One address hint, at most, in bytes (`directory::MAX_ADDR_LEN`).
+const ADDR_HINT_MAX: usize = 64;
 /// `node_id` = an Ed25519 public key in hex. Bounded here because the pairing
 /// path PINS one before any proof has been checked, so an absurd value would sit
 /// in a session; `auth.enroll`'s OIDC path verifies the proof first, which by
@@ -381,10 +388,12 @@ impl Conn {
             last_seen: None,
             // Published separately (`presence.update`) once the device has joined
             // the account (C7): enrollment alone carries neither the attestation
-            // nor the signed description.
+            // nor the signed description, reach included.
             attestation: None,
             seq: None,
             self_sig: None,
+            addrs: Vec::new(),
+            relay_hint: None,
             conn: None,
         };
         let record = entry.record();
@@ -581,6 +590,28 @@ impl Conn {
         if seq.is_some() != self_sig.is_some() {
             return Err(RpcErr::invalid_params("seq/self_sig"));
         }
+        // The reach half of the same description: opaque like the rest, and
+        // meaningless without the signature that covers it: refused alone,
+        // never stored as something no peer could ever verify.
+        let addrs = match params.get("addrs") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(list)) if list.len() <= ADDR_HINTS_MAX => Some(
+                list.iter()
+                    .map(|entry| {
+                        entry
+                            .as_str()
+                            .filter(|addr| addr.len() <= ADDR_HINT_MAX)
+                            .map(str::to_string)
+                    })
+                    .collect::<Option<Vec<String>>>()
+                    .ok_or_else(|| RpcErr::invalid_params("addrs"))?,
+            ),
+            Some(_) => return Err(RpcErr::invalid_params("addrs")),
+        };
+        let relay_hint = rpc::optional_str_max(params, "relay_hint", RELAY_URL_MAX)?;
+        if (addrs.is_some() || relay_hint.is_some()) && self_sig.is_none() {
+            return Err(RpcErr::invalid_params("reach without its signature"));
+        }
         let device_id = self
             .device_id
             .clone()
@@ -613,6 +644,11 @@ impl Conn {
             if self_sig.is_some() {
                 entry.seq = seq;
                 entry.self_sig = self_sig;
+                // Replaced WITH the signature, absent meaning empty: one
+                // signature covers the whole description, so its halves never
+                // move separately.
+                entry.addrs = addrs.unwrap_or_default();
+                entry.relay_hint = relay_hint;
             }
             let record = entry.record();
             reg.broadcast(
@@ -874,6 +910,8 @@ mod tests {
                     attestation: None,
                     seq: None,
                     self_sig: None,
+                    addrs: Vec::new(),
+                    relay_hint: None,
                     conn: Some((2, current_tx)),
                 },
             );

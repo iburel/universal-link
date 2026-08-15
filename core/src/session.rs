@@ -464,15 +464,9 @@ async fn connect_and_serve(state: &Arc<AppState>, info: &SessionInfo) -> Outcome
     // countersignature covers the name the SERVER holds, which the snapshot is
     // what told us. A server that refuses it costs a warning, not the session —
     // the record travels first-hand over dirsync regardless.
-    if let Some((seq, self_sig)) = own_signed_description(state) {
-        let published = tokio::time::timeout(
-            SETUP_TIMEOUT,
-            conn.request(
-                "presence.update",
-                json!({ "seq": seq, "self_sig": self_sig }),
-            ),
-        )
-        .await;
+    if let Some(description) = own_signed_description(state) {
+        let published =
+            tokio::time::timeout(SETUP_TIMEOUT, conn.request("presence.update", description)).await;
         match published {
             Ok(Ok(_)) => {}
             Ok(Err(SetupErr::Rpc(err))) => {
@@ -496,6 +490,11 @@ async fn connect_and_serve(state: &Arc<AppState>, info: &SessionInfo) -> Outcome
     // never heard of: a round now, not at the next tick — the two halves of one
     // account should not lag a quarter of an hour behind each other.
     state.dirsync_wake.notify_one();
+    // And the setup may have countersigned a description the SERVER held,
+    // whose reach is at best what this device published last session: the
+    // watcher re-checks it against the transport's current claim now, rather
+    // than at the next address change.
+    state.reach_wake.notify_one();
 
     // Cruising regime: relaying notifications, proxies, detecting the end of
     // the connection. `pending` retains the method: a rename's reply carries
@@ -624,18 +623,31 @@ async fn connect_and_serve(state: &Arc<AppState>, info: &SessionInfo) -> Outcome
     }
 }
 
-/// The `seq` and `self_sig` of our own record, if it stands verified — what
-/// `presence.update` publishes so the server's half can relay us. `None` for a
-/// record we have not countersigned (no trust root), which is also a record
-/// that could not travel anyway.
-fn own_signed_description(state: &AppState) -> Option<(Value, Value)> {
+/// The signed half of our own record, as `presence.update` params (`seq`,
+/// `self_sig`, and the reach hints the signature covers): a server that
+/// redistributed the proof without the hints would hand out records that
+/// verify nowhere. `None` for a record we have not countersigned (no trust
+/// root), which is also a record that could not travel anyway.
+pub(crate) fn own_signed_description(state: &AppState) -> Option<Value> {
     let s = state.session.lock().expect("lock session");
     let record = s
         .devices
         .as_ref()?
         .get(s.own_device_id.as_deref()?)
         .filter(|record| crate::directory::verify_record(record))?;
-    Some((record["seq"].clone(), record["self_sig"].clone()))
+    Some(signed_description_of(record))
+}
+
+/// The `presence.update` params carrying `record`'s signed description, for
+/// the paths that already hold the record (the reach watcher) and must not
+/// re-take the session lock.
+pub(crate) fn signed_description_of(record: &Value) -> Value {
+    json!({
+        "seq": record["seq"],
+        "self_sig": record["self_sig"],
+        "addrs": record.get("addrs").cloned().unwrap_or_else(|| json!([])),
+        "relay_hint": record.get("relay_hint").cloned().unwrap_or(Value::Null),
+    })
 }
 
 /// A message from the server in the cruising regime: a notification to apply
@@ -841,7 +853,7 @@ fn apply_event(state: &Arc<AppState>, method: &str, params: &Value) {
         // that task: awaiting the reply here would wait on ourselves). The
         // receiver is dropped on purpose — a refusal costs a log line upstream,
         // and the description travels first-hand over dirsync regardless.
-        if let Some((seq, self_sig)) = own_signed_description(state) {
+        if let Some(description) = own_signed_description(state) {
             let tx = {
                 let s = state.session.lock().expect("lock session");
                 s.server_tx.clone()
@@ -850,7 +862,7 @@ fn apply_event(state: &Arc<AppState>, method: &str, params: &Value) {
                 let (reply_tx, _reply_rx) = oneshot::channel();
                 let _ = tx.try_send(ServerCmd {
                     method: "presence.update",
-                    params: json!({ "seq": seq, "self_sig": self_sig }),
+                    params: description,
                     reply: reply_tx,
                 });
             }
@@ -923,13 +935,19 @@ pub(crate) async fn publish_attestation(state: &AppState, root: &crate::account_
 /// reason as `set_own_relay`: what we publish about ourselves does not come back
 /// to us.
 pub(crate) fn adopt_own_record(state: &AppState, attestation: &str) {
-    let mut s = state.session.lock().expect("lock session");
-    s.adopt_own(crate::state::OwnDevice {
-        identity: &state.identity,
-        name: &state.device_name,
-        attestation,
-    });
-    if let Some(devices) = s.devices.as_ref() {
-        crate::directory::save(&state.config_dir, devices);
+    {
+        let mut s = state.session.lock().expect("lock session");
+        s.adopt_own(crate::state::OwnDevice {
+            identity: &state.identity,
+            name: &state.device_name,
+            attestation,
+        });
+        if let Some(devices) = s.devices.as_ref() {
+            crate::directory::save(&state.config_dir, devices);
+        }
     }
+    // Joining is the one moment a reach becomes signable with the transport
+    // having observed nothing new: the watcher, which only hears the
+    // transport, is told to re-apply the current claim.
+    state.reach_wake.notify_one();
 }
