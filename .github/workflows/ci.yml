@@ -175,7 +175,7 @@ jobs:
       # OS-clipboard tests are re-serialized by a group (nextest runs each test
       # in its own process, defeating their in-process serialization Mutex).
       - name: Install nextest
-        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094 # v2.85.1
+        uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2.85.12
         with:
           tool: nextest
 
@@ -245,7 +245,7 @@ jobs:
       # matrix jobs' compilation caches would cost far more than the one or two
       # minutes Gradle spends fetching AGP and androidx here.
       - name: Java
-        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: temurin
           java-version: "21"
