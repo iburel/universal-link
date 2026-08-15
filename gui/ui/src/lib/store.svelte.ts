@@ -601,7 +601,18 @@ export class CoreStore {
       case "session.changed": {
         const state = params as SessionState | null;
         if (!state || typeof state.logged_in !== "boolean") return false;
-        this.session = state;
+        // Deltas carry no `configured` and no `problem` (both are
+        // session.status-only, see api.ts): a wholesale replacement would
+        // blank them until the resync answers, and the settings banner would
+        // blink off on every transition. Carry the sticky pair forward; the
+        // resync this event triggers refreshes them from the source anyway.
+        // Everything else (`account` included) is the delta's truth: a logout
+        // delta omits `account` because there IS none anymore.
+        this.session = {
+          ...state,
+          configured: this.session?.configured,
+          problem: this.session?.problem,
+        };
         return true;
       }
       // The MEMBERSHIP ended, not just a session — the Core has already obeyed
@@ -944,7 +955,20 @@ export class CoreStore {
   /** Writes `config.json`, has the Core re-read it, resyncs. Throws on refusal. */
   async #writeAndApply(input: ServerConfigInput): Promise<void> {
     await setServerConfig(input);
-    await api.sessionReload();
+    try {
+      await api.sessionReload();
+    } catch (e) {
+      // The refused reload has already RE-RECORDED the file's fresh fault in
+      // the Core (`problem` mirrors the last parse), so the state banner must
+      // be brought up to date even though nothing was applied: without this
+      // read-back it keeps showing the pre-save reason, or nothing at all.
+      try {
+        this.session = await api.sessionStatus();
+      } catch {
+        // A mute Core: the reload's own error is the one worth surfacing.
+      }
+      throw e;
+    }
     await this.resync();
   }
 

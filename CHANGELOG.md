@@ -173,13 +173,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **A settings problem now reaches the screen.** When a saved setting is
   faulty (the retired `relay_url` spelling, a mistyped `relay` value), the
-  faulty setting falls back to its default and the Core keeps running, but
-  the reason used to reach the log file and nobody else: the app showed a
+  faulty setting is simply not applied and the Core keeps running, but the
+  reason used to reach the log file and nobody else: the app showed a
   perfectly healthy screen while, say, the relay somebody explicitly chose
   had been silently dropped. `session.status` now carries the reason (with
-  its cure) as `problem`, the app shows it as a banner, and saving a sound
-  configuration clears it. Found on a real client during live validation of
-  the `relay_url` migration path.
+  its cure) as `problem` and the app shows it as a banner. The banner
+  mirrors the file: fixing the named setting (in `config.json` for the ones
+  the setup screen does not own) and reloading, a save on the Server view
+  included, withdraws it. A cured `relay` takes effect at the next Core
+  start, and the log says so. Found on a real client during live validation
+  of the `relay_url` migration path.
 - **Android now honors the configured relay.** The phone parsed the relay
   setting from its `config.json` like every desktop and then ignored it, so a
   fleet pointed at a self-hosted relay silently excluded its phone. The parsed

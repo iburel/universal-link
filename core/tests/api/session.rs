@@ -270,8 +270,14 @@ async fn reload_configures_an_unconfigured_core() {
         .await
         .expect("session.reload");
     assert_eq!(r["configured"], true, "reload must apply the config: {r}");
-    // A sound parse also means a sound file: no problem to confess.
-    assert_eq!(r["problem"], serde_json::Value::Null, "{r}");
+    // A sound parse also means a sound file: no problem to confess. The key
+    // itself must be THERE, explicitly null: indexing alone answers Null for
+    // an absent key too, and absence is the pre-fix wire shape.
+    let problem = r
+        .as_object()
+        .and_then(|o| o.get("problem"))
+        .expect("session.status must carry the problem key");
+    assert_eq!(problem, &serde_json::Value::Null, "{r}");
     // And it sticks for the next status read.
     assert_eq!(
         c.request("session.status", json!({}))
@@ -309,11 +315,44 @@ async fn reload_reports_an_invalid_config() {
     );
 }
 
-/// A device that woke up on a config whose faulty setting fell back to its
-/// default (the post-#104 `relay_url` fleet, typically): the Core runs
-/// CONFIGURED, and the reason still reaches `session.status`, because the
-/// interface is the only place the user will ever read the cure. Fixing the
-/// file and reloading is what clears it.
+/// A failed reload on a CONFIGURED Core must not cost the running config:
+/// the fresh file earned nothing, the session keeps the server it has, and
+/// the file's fault is confessed on every status read from then on.
+#[tokio::test]
+async fn a_failed_reload_keeps_the_running_config_and_confesses() {
+    let server = TestServer::start().await;
+    let core = TestCore::start_with_server(&server).await;
+    let mut c = spawn_component(
+        &core,
+        "gui-lite",
+        "custom",
+        &["session.read", "session.manage"],
+    )
+    .await;
+
+    core.stage_invalid_config("relay must be \"off\", \"n0\" or a relay URL: not a url");
+    let err = c.request("session.reload", json!({})).await.unwrap_err();
+    assert_eq!(err.app_code(), "INVALID_CONFIG");
+
+    let r = c
+        .request("session.status", json!({}))
+        .await
+        .expect("status");
+    assert_eq!(
+        r["configured"], true,
+        "a refused reload must not unconfigure the Core: {r}"
+    );
+    assert_eq!(
+        r["problem"], "relay must be \"off\", \"n0\" or a relay URL: not a url",
+        "{r}"
+    );
+}
+
+/// A device that woke up on a config whose faulty setting was not applied
+/// (the post-#104 `relay_url` fleet, typically): the Core runs CONFIGURED,
+/// and the reason still reaches `session.status`, because the interface is
+/// the only place the user will ever read the cure. Fixing the file and
+/// reloading is what clears it.
 #[tokio::test]
 async fn a_boot_problem_rides_session_status_until_a_sound_reload() {
     let server = TestServer::start().await;

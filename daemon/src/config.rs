@@ -67,9 +67,14 @@ pub struct DaemonConfig {
     /// attestations — with `"lan_discovery": false` for networks where even
     /// that is too chatty.
     pub lan_discovery: bool,
-    /// Configuration present but unusable. The daemon logs it and starts
-    /// unconfigured: a faulty `config.json` must not deprive the user of their
-    /// interface.
+    /// The human reason a part of the configuration was not honored, cure
+    /// included. Two severities behind the one field: an unreadable or
+    /// half-filled file leaves `server` at `None` (the Core starts
+    /// unconfigured), while a faulty single setting is simply not applied and
+    /// the rest of the config runs, `server` included. Either way the daemon
+    /// starts and hands the reason to the Core (`Config::config_problem`), so
+    /// the interface can show it: a faulty `config.json` must not deprive the
+    /// user of their screen, nor of the sentence naming the fault.
     pub problem: Option<String>,
 }
 
@@ -166,8 +171,9 @@ fn load_from(
     // cure beats silently downgrading that choice to the off default.
     if fields.legacy_relay_url || env("ONEDEVICE_RELAY_URL").is_some_and(|v| !v.trim().is_empty()) {
         problem.get_or_insert(
-            "relay_url was replaced by relay (#104): set relay to your relay's URL, \
-             to \"n0\" for the public relays, or remove it (the default is off)"
+            "relay_url was replaced by relay (#104): in config.json, set relay to \
+             your relay's URL, to \"n0\" for the public relays, or remove it (the \
+             default is off)"
                 .to_string(),
         );
     }

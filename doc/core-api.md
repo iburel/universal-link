@@ -108,10 +108,10 @@ against an older Core while simply not seeing that topic's events.
 
 | Method | Description |
 |---|---|
-| `session.status {}` | → `{ logged_in, server_connected, account?, configured, problem }`. `configured`: whether a server + OIDC is set, distinguishing "never configured" (→ first-run setup) from "configured but the server is down". `problem`: the human reason the config file is faulty (cure included), `null` when sound. A faulty single setting falls back to its default and the Core RUNS, so this sentence is the interface's only chance to show it; refreshed by every `session.reload`, in both directions |
+| `session.status {}` | → `{ logged_in, server_connected, account?, configured, problem }`. `configured`: whether a server + OIDC is set, distinguishing "never configured" (→ first-run setup) from "configured but the server is down". `problem`: the human reason a part of the config file was not honored (cure included), `null` when sound. A faulty single setting is simply not applied and the Core RUNS, so this sentence is the interface's only chance to show it; refreshed by every `session.reload`, in both directions. It mirrors the FILE: a `relay` change, valid or cured, only reaches the transport at the next Core start |
 | `session.login {}` | starts the OIDC flow (PKCE + loopback) → `{ auth_url }`. **The caller** opens the browser — the Core does not touch the UI. Completion signaled by `session.changed` |
 | `session.logout {}` | closes the server session |
-| `session.reload {}` | re-reads `config.json` (which the GUI's setup screen has just written) and swaps the server config in place — no restart. → the fresh `session.status`. `INVALID_CONFIG` if the file is malformed / half-filled. The Core only READS the file; the GUI is its sole writer |
+| `session.reload {}` | re-reads `config.json` (which the GUI's setup screen has just written) and swaps the server config in place, no restart. → the fresh `session.status`. `INVALID_CONFIG` if the parse reports any problem (malformed, half-filled, or a faulty single setting such as the retired `relay_url`): nothing is applied, the reason lands in `problem`. The relay setting is the one thing a sound reload does NOT apply (next Core start). The Core only READS the file; the GUI is its sole writer |
 | `session.discover { url }` | reads the **deployment descriptor** at an address the user typed and returns what to write into `config.json`: → `{ server_url, oidc_issuer, oidc_client_id, oidc_client_secret }` (the last one `null` when the IdP wants none). Writes nothing — the caller does that, then `session.reload`. Meaningful with nothing configured, which is the case it exists for. See below |
 
 Notifications (topic `session`):
@@ -820,7 +820,7 @@ Standard JSON-RPC codes + application codes in `error.data.code`:
 | `SCOPE_DENIED` | scope missing for the method or the topic |
 | `ROLE_CONFLICT` | exclusive role already taken (`clipboard-backend`) |
 | `ALREADY_LOGGED_IN` | `session.login` while a session is open (re-logging in starts with `session.logout`) |
-| `INVALID_CONFIG` | `session.reload` on a malformed / half-filled `config.json` (the message carries the reason) |
+| `INVALID_CONFIG` | `session.reload` on a `config.json` whose parse reports a problem, a faulty single setting included (the message carries the reason) |
 | `SERVER_UNREACHABLE` | operation requiring the server, offline |
 | `NO_DESCRIPTOR` | `session.discover`: the address answered but publishes no deployment descriptor (server older than that endpoint, or not one of ours) |
 | `INVALID_DESCRIPTOR` | `session.discover`: a descriptor without what a login needs (the message names the field, never the response) |

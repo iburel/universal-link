@@ -87,8 +87,8 @@ pub struct Config {
     /// the same sentence `reload_server` would return as `Err`. Carried into
     /// `session.status` (`problem`), because the interface is the only place
     /// the user will ever read it; the startup log alone reaches nobody. It
-    /// does NOT make the Core unconfigured: a faulty setting falls back to
-    /// its default and `server` keeps whatever the parse could still honor.
+    /// does NOT make the Core unconfigured: a faulty setting is simply not
+    /// applied and `server` keeps whatever the parse could still honor.
     pub config_problem: Option<String>,
     /// The device's name in the directory, chosen at enrollment (the binary
     /// will pass the hostname).

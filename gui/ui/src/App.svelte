@@ -149,10 +149,12 @@
         </p>
       {/if}
       <!-- The Core found a fault in the saved settings (config.json): the
-           faulty setting fell back to its default, the app runs, and this
-           sentence is the user's only trace of it. It clears when a sound
-           config is saved (the Server view), so no close button: it is a
-           state, not an event. -->
+           faulty setting was not applied, the app runs, and this sentence is
+           the user's only trace of it. It mirrors the file's LAST parse, so
+           fixing the file (the cure names the key; settings the setup screen
+           does not own live in config.json) and reloading, a save here
+           included, is what withdraws it. No close button: it is a state,
+           not an event. -->
       {#if store.session?.problem}
         <p class="banner error" role="alert">
           Settings problem: {store.session.problem}

@@ -1564,8 +1564,8 @@ test("createAccount keeps the code in no store state", async () => {
 
 test("a config problem confessed by the Core rides the session snapshot", async () => {
   // The post-#104 fleet state, found live: the Core RUNS configured while a
-  // faulty setting (a legacy relay_url) fell back to its default. The reason
-  // arrives in session.status `problem` and the banners read it straight from
+  // faulty setting (a legacy relay_url) was not applied. The reason arrives
+  // in session.status `problem` and the banners read it straight from
   // store.session: this pins that priming keeps the field.
   const CURE =
     "relay_url was replaced by relay (#104): set relay to your relay's URL";
@@ -1584,6 +1584,80 @@ test("a config problem confessed by the Core rides the session snapshot", async 
   await flush();
 
   expect(store.session?.configured).toBe(true);
+  expect(store.session?.problem).toBe(CURE);
+});
+
+test("the problem survives a session.changed delta instead of blinking off", async () => {
+  // Deltas carry neither `configured` nor `problem` (session.status-only
+  // fields): a wholesale replacement would blank them until the resync
+  // answers, unmounting the banner on every transition. The store carries
+  // the sticky pair forward; everything else is the delta's truth.
+  const CURE = "relay_url was replaced by relay (#104)";
+  mockCore({
+    status: CONNECTED,
+    methods: {
+      "session.status": () => ({
+        logged_in: true,
+        server_connected: false,
+        account: { email: "u@example.com" },
+        configured: true,
+        problem: CURE,
+      }),
+    },
+  });
+  await store.start();
+  await flush();
+  expect(store.session?.problem).toBe(CURE);
+
+  await emit("core:notification", {
+    method: "session.changed",
+    params: { logged_in: true, server_connected: true },
+  });
+
+  // Read synchronously, BEFORE the resync this delta triggers can answer:
+  // this is exactly the window in which the banner used to blink off.
+  expect(store.session?.server_connected).toBe(true);
+  expect(store.session?.problem).toBe(CURE);
+  expect(store.session?.configured).toBe(true);
+});
+
+test("a refused save still brings the state banner up to date", async () => {
+  // The refused reload has already re-recorded the file's fresh fault in the
+  // Core; without a read-back the banner keeps the pre-save reason. The
+  // notice (an event) carries the refusal, store.session.problem (a state)
+  // must carry the fresh truth.
+  const CURE = 'relay must be "off", "n0" or a relay URL: not a url';
+  // The Core's answer changes when the bad file lands: priming sees a sound
+  // file, the refused reload records the fault, later status reads serve it.
+  let refused = false;
+  mockCore({
+    status: CONNECTED,
+    methods: {
+      "session.status": () => ({
+        logged_in: false,
+        server_connected: false,
+        configured: true,
+        problem: refused ? CURE : null,
+      }),
+      "session.reload": () => {
+        refused = true;
+        throw appError("INVALID_CONFIG", CURE);
+      },
+    },
+  });
+  await store.start();
+  await flush();
+  expect(store.session?.problem).toBeNull();
+
+  const ok = await store.saveServerConfig({
+    server_url: "wss://relay.example/ws",
+    oidc_issuer: "https://idp.example",
+    oidc_client_id: "id",
+    oidc_client_secret: null,
+  });
+
+  expect(ok).toBe(false);
+  expect(store.notice?.kind).toBe("error");
   expect(store.session?.problem).toBe(CURE);
 });
 

@@ -126,11 +126,13 @@
     </p>
   {/if}
 
-  <!-- The Core's own word on the saved file (session.status `problem`): the
-       cure sentence is written by the Core and shown verbatim. No close
-       button: this reflects the file's state, and saving a sound config is
-       what clears it. -->
-  {#if store.session?.problem}
+  <!-- The Core's own word on the saved file (session.status `problem`),
+       shown verbatim. Only as the standalone first-run gate: embedded in the
+       App's main area, the layout's own copy is already right above and two
+       stacked role=alert banners would announce twice. No close button: this
+       reflects the file's state, and a reload of a sound file (a save here,
+       once the file is fixed) is what withdraws it. -->
+  {#if firstRun && store.session?.problem}
     <p class="banner error" role="alert">
       Settings problem: {store.session.problem}
     </p>
