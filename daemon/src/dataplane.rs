@@ -21,8 +21,9 @@
 //! The binary wires in `LazyIrohTransport`: the endpoint is only bound on the
 //! first real use (session establishment calls `home_relay`). Three reasons. A
 //! never-enrolled Core emits NO iroh traffic — a bound endpoint is not
-//! passive: relay probes every ~20 s, portmapper (UPnP/PCP/NAT-PMP), a
-//! persistent connection to the elected relay. The device key is only
+//! passive: portmapper probes (UPnP/PCP/NAT-PMP), and with a relay opted in
+//! (#104), relay probes every ~20 s and a persistent connection to the
+//! elected relay. The device key is only
 //! read/created AFTER the Core's instance lock (taken by `spawn`) — two
 //! daemons started together do not fight over `device.key`. And a bind failure
 //! does not stop the daemon from starting: it is logged and RETRIED on the
@@ -52,6 +53,37 @@ use tokio::sync::mpsc;
 /// Maximum wait for the endpoint to become reachable via a relay, after which
 /// `home_relay` returns `None` (offline, no relay to publish).
 const HOME_RELAY_WAIT: Duration = Duration::from_secs(10);
+
+/// The relay setting, three-valued (#104): infrastructure somebody CHOSE.
+/// Off is the default; riding n0's public relays is an explicit opt-in, no
+/// longer something that happens to an unconfigured device.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RelayChoice {
+    /// No relay at all (`RelayMode::Disabled`): no relay connection, no
+    /// housekeeping connection, zero unsolicited network contact at boot.
+    /// What still connects: the LAN (mDNS), any directly dialable address
+    /// (VPN tunnels, the signed hints of #87), and whatever a server
+    /// announces (#105).
+    Off,
+    /// The n0 public relays (`RelayMode::Default`), chosen instead of
+    /// inherited. The endpoint elects a home relay from the map, and THAT
+    /// election becomes the signed `relay_hint`: the opt-in is what makes
+    /// the claim honest ("never a relay nobody chose").
+    N0,
+    /// A specific relay: self-hosted, or an operator's.
+    Url(RelayUrl),
+}
+
+/// Where `own_reach`'s `relay_hint` comes from. Kept apart from the mode:
+/// the hint is a durable signed word, the mode is how the endpoint runs.
+enum HintSource {
+    /// The configured relay, verbatim (or none): it stands whether or not
+    /// the endpoint is currently connected to it.
+    Fixed(Option<String>),
+    /// n0 mode: the elected home relay, followed as the election moves (the
+    /// same watcher that follows the addresses re-signs it).
+    Elected,
+}
 
 /// Handshake budget for an INCOMING connection (QUIC accept + first stream).
 /// Each incoming one is served in its own task: a peer that connects without
@@ -100,13 +132,16 @@ pub struct IrohTransport {
     /// unspecified filtered out), maintained by `reach_task` from iroh's own
     /// watcher: the `addrs` half of `own_reach`.
     addrs: Arc<Mutex<Vec<String>>>,
-    /// The `relay_hint` half of `own_reach`: the relay this device was
-    /// EXPLICITLY configured with, and only that. Never the elected default:
-    /// a fleet that configured no relay must sign none into its records (#89:
-    /// relay use in a serverless account is explicit, never a silent
-    /// default). The elected home relay stays `home_relay`'s business, for
-    /// the server session.
-    relay_hint: Option<String>,
+    /// The `relay_hint` half of `own_reach`: a relay somebody CHOSE, and only
+    /// that (#89, amended by #104). The configured relay verbatim in URL
+    /// mode; in n0 mode the elected home relay, maintained by `reach_task`
+    /// (the opt-in is the choice, the election is its current shape); `None`
+    /// in off mode, always.
+    relay_hint: Arc<Mutex<Option<String>>>,
+    /// Off mode: `home_relay` answers `None` immediately instead of waiting
+    /// out `HOME_RELAY_WAIT` on an `online()` that can never resolve (iroh
+    /// pends forever with no relay configured).
+    relay_off: bool,
     /// Bumped by `reach_task` at every actual address change; `reach_changes`
     /// subscribes to it. Same ownership story as `lan_gen`.
     reach_gen: tokio::sync::watch::Sender<u64>,
@@ -133,16 +168,16 @@ impl Drop for IrohTransport {
 const MDNS_SERVICE: &str = "1device";
 
 impl IrohTransport {
-    /// Production endpoint. `relay`: the deployment's relay (self-hosted) if it
-    /// is configured, otherwise the n0 public relays — a server of one's own
-    /// must not structurally depend on third-party infra. Certificates
-    /// verified normally, no DNS discovery. `lan_discovery` adds the mDNS
-    /// lookup (see the module header) — resolution AND announcement: one flag,
-    /// both directions, because announcing without resolving (or the reverse)
-    /// would just be a device its siblings half-see.
+    /// Production endpoint. `relay`: the three-valued choice (#104): off by
+    /// default (no relay, no housekeeping connection), n0 or a URL as an
+    /// explicit opt-in. Certificates verified normally, no DNS discovery.
+    /// `lan_discovery` adds the mDNS lookup (see the module header):
+    /// resolution AND announcement: one flag, both directions, because
+    /// announcing without resolving (or the reverse) would just be a device
+    /// its siblings half-see.
     pub async fn bind(
         seed: [u8; 32],
-        relay: Option<RelayUrl>,
+        relay: RelayChoice,
         lan_discovery: bool,
     ) -> anyhow::Result<IrohTransport> {
         let (lan_gen, _) = tokio::sync::watch::channel(0);
@@ -156,20 +191,24 @@ impl IrohTransport {
     /// them over at the (lazy) bind.
     pub async fn bind_with_gen(
         seed: [u8; 32],
-        relay: Option<RelayUrl>,
+        relay: RelayChoice,
         lan_discovery: bool,
         lan_gen: tokio::sync::watch::Sender<u64>,
         reach_gen: tokio::sync::watch::Sender<u64>,
     ) -> anyhow::Result<IrohTransport> {
         let secret = SecretKey::from_bytes(&seed);
         let mdns = lan_lookup(&secret, lan_discovery);
-        // The hint is the CONFIGURED relay, kept apart from the mode: with no
-        // configuration the mode falls back to the n0 public relays for the
-        // server path, but nothing gets signed into the record.
-        let relay_hint = relay.as_ref().map(ToString::to_string);
-        let relay_mode = match relay {
-            Some(url) => RelayMode::custom([url]),
-            None => RelayMode::Default,
+        let relay_off = matches!(relay, RelayChoice::Off);
+        // Mode and hint derive from the same choice, so the signed word can
+        // never disagree with how the endpoint runs: off signs nothing, a URL
+        // signs itself, n0 signs whatever home relay the endpoint elects.
+        let (relay_mode, hint) = match relay {
+            RelayChoice::Off => (RelayMode::Disabled, HintSource::Fixed(None)),
+            RelayChoice::N0 => (RelayMode::Default, HintSource::Elected),
+            RelayChoice::Url(url) => {
+                let hint = HintSource::Fixed(Some(url.to_string()));
+                (RelayMode::custom([url]), hint)
+            }
         };
         let mut builder = Endpoint::builder(presets::Minimal)
             .secret_key(secret)
@@ -178,7 +217,7 @@ impl IrohTransport {
         if let Some(mdns) = &mdns {
             builder = builder.address_lookup(mdns.clone());
         }
-        Self::finish(builder, mdns, lan_gen, relay_hint, reach_gen).await
+        Self::finish(builder, mdns, lan_gen, hint, reach_gen, relay_off).await
     }
 
     /// Test endpoint: a LOCAL relay (self-signed certificate) whose
@@ -196,15 +235,71 @@ impl IrohTransport {
         relay_map: iroh::RelayMap,
         lan_discovery: bool,
     ) -> anyhow::Result<IrohTransport> {
-        let secret = SecretKey::from_bytes(&seed);
-        let mdns = lan_lookup(&secret, lan_discovery);
         // The test map's relays ARE the configured ones, same word as
         // `RelayMode::custom` in `bind_with_gen`.
-        let relay_hint = relay_map.urls::<Vec<_>>().first().map(ToString::to_string);
+        let hint = HintSource::Fixed(relay_map.urls::<Vec<_>>().first().map(ToString::to_string));
+        Self::bind_test_with(
+            seed,
+            RelayMode::Custom(relay_map),
+            hint,
+            false,
+            lan_discovery,
+        )
+        .await
+    }
+
+    /// Test endpoint in ELECTED-hint mode: the n0 opt-in's machinery
+    /// (`RelayMode::Default` electing a home relay, the election signed as the
+    /// hint) run against a LOCAL relay map instead of n0's production one, so
+    /// the tests prove the election-follows-the-watcher plumbing offline.
+    #[cfg(feature = "test-utils")]
+    pub async fn bind_test_elected(
+        seed: [u8; 32],
+        relay_map: iroh::RelayMap,
+        lan_discovery: bool,
+    ) -> anyhow::Result<IrohTransport> {
+        Self::bind_test_with(
+            seed,
+            RelayMode::Custom(relay_map),
+            HintSource::Elected,
+            false,
+            lan_discovery,
+        )
+        .await
+    }
+
+    /// Test endpoint in OFF mode: `RelayMode::Disabled`, the production
+    /// default (#104), verbatim. What the LAN and address-hint tests bind, so
+    /// they prove the routes the off default is documented to keep.
+    #[cfg(feature = "test-utils")]
+    pub async fn bind_test_off(
+        seed: [u8; 32],
+        lan_discovery: bool,
+    ) -> anyhow::Result<IrohTransport> {
+        Self::bind_test_with(
+            seed,
+            RelayMode::Disabled,
+            HintSource::Fixed(None),
+            true,
+            lan_discovery,
+        )
+        .await
+    }
+
+    #[cfg(feature = "test-utils")]
+    async fn bind_test_with(
+        seed: [u8; 32],
+        relay_mode: RelayMode,
+        hint: HintSource,
+        relay_off: bool,
+        lan_discovery: bool,
+    ) -> anyhow::Result<IrohTransport> {
+        let secret = SecretKey::from_bytes(&seed);
+        let mdns = lan_lookup(&secret, lan_discovery);
         let mut builder = Endpoint::builder(presets::Minimal)
             .secret_key(secret)
             .alpns(vec![ALPN.to_vec()])
-            .relay_mode(RelayMode::Custom(relay_map))
+            .relay_mode(relay_mode)
             .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
             .ca_tls_config(iroh::tls::CaTlsConfig::insecure_skip_verify());
         if let Some(mdns) = &mdns {
@@ -212,15 +307,16 @@ impl IrohTransport {
         }
         let (lan_gen, _) = tokio::sync::watch::channel(0);
         let (reach_gen, _) = tokio::sync::watch::channel(0);
-        Self::finish(builder, mdns, lan_gen, relay_hint, reach_gen).await
+        Self::finish(builder, mdns, lan_gen, hint, reach_gen, relay_off).await
     }
 
     async fn finish(
         builder: iroh::endpoint::Builder,
         mdns: Option<MdnsAddressLookup>,
         lan_gen: tokio::sync::watch::Sender<u64>,
-        relay_hint: Option<String>,
+        hint: HintSource,
         reach_gen: tokio::sync::watch::Sender<u64>,
+        relay_off: bool,
     ) -> anyhow::Result<IrohTransport> {
         // Subscribed BEFORE the endpoint binds: the discovery actor is already
         // running (it starts with the lookup), so waiting until after `bind`
@@ -243,9 +339,15 @@ impl IrohTransport {
             lan_events.map(|events| tokio::spawn(watch_lan(events, lan.clone(), lan_gen.clone())));
         let lan_probe = mdns.is_some().then(|| tokio::spawn(warn_if_lan_dark()));
         let addrs = Arc::new(Mutex::new(Vec::new()));
+        let (relay_hint, follow_election) = match hint {
+            HintSource::Fixed(url) => (Arc::new(Mutex::new(url)), false),
+            HintSource::Elected => (Arc::new(Mutex::new(None)), true),
+        };
         let reach_task = tokio::spawn(watch_reach(
             endpoint.clone(),
             addrs.clone(),
+            relay_hint.clone(),
+            follow_election,
             reach_gen.clone(),
         ));
         Ok(IrohTransport {
@@ -258,6 +360,7 @@ impl IrohTransport {
             lan_probe,
             addrs,
             relay_hint,
+            relay_off,
             reach_gen,
             reach_task,
         })
@@ -552,12 +655,20 @@ fn tunnel_owning_source(
 /// sibling could ever dial (loopback, unspecified). Sorted, so "changed" means
 /// changed: iroh may re-emit the same set in a different order.
 ///
+/// With `follow_election` (the n0 opt-in, #104), the SAME watcher also
+/// maintains `relay_hint`: `watch_addr` re-emits when the endpoint elects or
+/// changes its home relay, and the election is the current shape of the
+/// choice the opt-in made, re-signed like an address change, by the same
+/// wake. In fixed-hint mode the mutex is never touched here.
+///
 /// Ends when the LAST clone of the endpoint drops (iroh's watcher outlives
 /// `close` by design); the abort at the transport's drop is the real
 /// terminator.
 async fn watch_reach(
     endpoint: Endpoint,
     addrs: Arc<Mutex<Vec<String>>>,
+    relay_hint: Arc<Mutex<Option<String>>>,
+    follow_election: bool,
     reach_gen: tokio::sync::watch::Sender<u64>,
 ) {
     let mut watcher = iroh::Watcher::stream(endpoint.watch_addr());
@@ -572,7 +683,7 @@ async fn watch_reach(
         // Mutate, release, THEN bump, same discipline as the LAN set: a
         // watcher woken by the bump re-pulls and must never observe the
         // pre-mutation state.
-        let changed = {
+        let mut changed = {
             let mut held = addrs.lock().expect("lock own addrs");
             if *held == fresh {
                 false
@@ -582,6 +693,19 @@ async fn watch_reach(
                 true
             }
         };
+        if follow_election {
+            let elected = claim.relay_urls().next().map(ToString::to_string);
+            changed |= {
+                let mut held = relay_hint.lock().expect("lock relay hint");
+                if *held == elected {
+                    false
+                } else {
+                    tracing::debug!(elected = elected.is_some(), "elected home relay changed");
+                    *held = elected;
+                    true
+                }
+            };
+        }
         if changed {
             reach_gen.send_modify(|generation| *generation += 1);
         }
@@ -749,6 +873,13 @@ impl PeerTransport for IrohTransport {
 
     fn home_relay(&self) -> HomeRelay<'_> {
         Box::pin(async move {
+            // Off mode: no relay will ever be elected, and `online()` would
+            // pend the full budget for nothing. Session establishment calls
+            // this, so answering now is what keeps the off default free of
+            // a ten-second stall at every login.
+            if self.relay_off {
+                return None;
+            }
             // `online()` resolves when the endpoint is reachable via a relay;
             // bounded, because offline it would never resolve.
             if tokio::time::timeout(HOME_RELAY_WAIT, self.endpoint.online())
@@ -795,7 +926,7 @@ impl PeerTransport for IrohTransport {
     fn own_reach(&self) -> Option<Reach> {
         Some(Reach {
             addrs: self.addrs.lock().expect("lock own addrs").clone(),
-            relay_hint: self.relay_hint.clone(),
+            relay_hint: self.relay_hint.lock().expect("lock relay hint").clone(),
         })
     }
 
@@ -858,7 +989,7 @@ impl AsyncWrite for BiStream {
 /// next call — the daemon lives just fine with a broken data plane.
 pub struct LazyIrohTransport {
     config_dir: PathBuf,
-    relay: Option<RelayUrl>,
+    relay: RelayChoice,
     /// Read once, at the bind — like `relay`, a change requires a Core
     /// restart.
     lan_discovery: bool,
@@ -875,11 +1006,7 @@ pub struct LazyIrohTransport {
 }
 
 impl LazyIrohTransport {
-    pub fn new(
-        config_dir: PathBuf,
-        relay: Option<RelayUrl>,
-        lan_discovery: bool,
-    ) -> LazyIrohTransport {
+    pub fn new(config_dir: PathBuf, relay: RelayChoice, lan_discovery: bool) -> LazyIrohTransport {
         LazyIrohTransport {
             config_dir,
             relay,

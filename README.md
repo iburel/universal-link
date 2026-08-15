@@ -230,7 +230,7 @@ Core reads it in its config directory (see
   "oidc_client_id": "…apps.googleusercontent.com",
   "oidc_client_secret": "only-if-your-IdP-demands-one",
   "device_name": "Living-room laptop",
-  "relay_url": "https://your-iroh-relay.example",
+  "relay": "https://your-iroh-relay.example",
   "receive_dir": "/home/you/Downloads",
   "lan_discovery": true
 }
@@ -243,8 +243,10 @@ Core reads it in its config directory (see
   installed-app clients do, and the working reference setup sets it. Not
   confidential for an installed app — it ships with the client.
 - `device_name`: optional (default: the hostname). A plain display label.
-- `relay_url`: optional — a self-hosted iroh relay; without it, the public n0
-  relays are used.
+- `relay`: optional, **off by default** (no relay at all). A self-hosted iroh
+  relay's URL, or `"n0"` to opt into the public n0 relays explicitly. Off the
+  LAN, with no VPN or dialable address between two devices, a relay is what
+  lets them meet.
 - `receive_dir`: optional — where received files land; without it,
   `<Downloads>/1Device`.
 - `lan_discovery`: optional, default `true` — announce this device and resolve
@@ -255,7 +257,7 @@ Core reads it in its config directory (see
 
 Each of the variables `ONEDEVICE_SERVER_URL`, `ONEDEVICE_OIDC_ISSUER`,
 `ONEDEVICE_OIDC_CLIENT_ID`, `ONEDEVICE_OIDC_CLIENT_SECRET`,
-`ONEDEVICE_DEVICE_NAME`, `ONEDEVICE_RELAY_URL`,
+`ONEDEVICE_DEVICE_NAME`, `ONEDEVICE_RELAY`,
 `ONEDEVICE_RECEIVE_DIR` overrides the file (for development); one that is
 defined but empty overrides nothing. **The Core always starts**, even with no config or a broken one:
 it logs the issue, and the interface says what is wrong.

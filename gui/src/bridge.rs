@@ -195,7 +195,7 @@ pub struct ServerConfigForm {
 
 /// Writes the setup screen's fields into `config.json`, then the frontend calls
 /// `session.reload` so the Core picks them up. MERGES: the daemon's own keys
-/// (`device_name`, `receive_dir`, `relay_url`) are preserved. The Core never
+/// (`device_name`, `receive_dir`, `relay`) are preserved. The Core never
 /// writes this file — the GUI is the sole writer.
 #[tauri::command]
 pub fn set_server_config(

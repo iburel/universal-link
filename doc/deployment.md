@@ -70,7 +70,7 @@ The config folder houses:
   "oidc_client_id": "…apps.googleusercontent.com",
   "oidc_client_secret": "only-if-your-idp-requires-one",
   "device_name": "Living-room laptop",
-  "relay_url": "https://relais-iroh.example",
+  "relay": "https://relais-iroh.example",
   "receive_dir": "/home/iwan/Received"
 }
 ```
@@ -91,16 +91,23 @@ requires it at the token exchange even under PKCE (it is not confidential for a
 without it, the hostname. It is only a display label: the device's identity is
 its public key.
 
-`relay_url` is optional: the deployment's iroh relay, for whoever also self-hosts
-their relay ([`iroh-relay`]) — without it, the n0 public relays. A sovereign
-deployment's data plane then depends on no third-party infrastructure. Checked at
-startup like the rest: a typo is a `problem`, not a silently mute data plane.
-For a **serverless** account the same setting is the third rung of the
-self-hosting ladder: the device signs the configured relay into its directory
-record (`relay_hint`), and its already-paired siblings dial it through that
-relay from anywhere. Never silently: a device that configured no relay signs
-none, and none of your devices is dialed through one. The whole off-LAN story, VPN recipes included, is
-[beyond-the-lan.md](beyond-the-lan.md).
+`relay` is optional and three-valued, **off by default**: an unconfigured device
+talks only to infrastructure somebody chose. Set it to the URL of the
+deployment's iroh relay ([`iroh-relay`]) for whoever also self-hosts their
+relay, or to `"n0"` to opt into the n0 public relays explicitly (exactly the
+old unconfigured behavior, now a choice). A sovereign deployment's data plane
+depends on no third-party infrastructure. Checked at startup like the rest: a
+typo is a `problem`, not a silently mute data plane; so is the pre-rename
+`relay_url` key, refused with its cure rather than silently downgrading an
+explicit choice to off. For a **serverless** account the same setting is the
+third rung of the self-hosting ladder: the device signs its chosen relay into
+its directory record (`relay_hint`; under `"n0"`, the home relay that opt-in
+elects), and its already-paired siblings dial it through that relay from
+anywhere. Never a relay nobody chose: a device whose relay is off signs none,
+and none of your devices is dialed through one. What off costs, honestly: two
+devices behind two distinct NATs, off the LAN, with no VPN between them, need
+a relay to meet (hole punching needs the rendezvous). The whole off-LAN story,
+VPN recipes included, is [beyond-the-lan.md](beyond-the-lan.md).
 
 [`iroh-relay`]: https://github.com/n0-computer/iroh
 
@@ -114,7 +121,7 @@ overwrite.
 
 The variables `ONEDEVICE_SERVER_URL`, `ONEDEVICE_OIDC_ISSUER`,
 `ONEDEVICE_OIDC_CLIENT_ID`, `ONEDEVICE_DEVICE_NAME`,
-`ONEDEVICE_RELAY_URL`, and `ONEDEVICE_RECEIVE_DIR` override the file — a
+`ONEDEVICE_RELAY`, and `ONEDEVICE_RECEIVE_DIR` override the file; a
 variable that is defined but empty overrides nothing. Completeness is checked
 **after** the merge: a partial file that the environment completes is valid.
 

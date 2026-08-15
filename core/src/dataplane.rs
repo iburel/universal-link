@@ -129,9 +129,10 @@ pub trait PeerTransport: Send + Sync + std::fmt::Debug {
 
     /// What this device currently knows first-hand about how it can be dialed
     /// (`directory::Reach`): the socket addresses its endpoint is bound on, and
-    /// the relay it was EXPLICITLY configured with, never an elected default:
-    /// so a fleet that configured no relay signs none into its records (#89:
-    /// relay use in a serverless account is explicit, not a silent default).
+    /// the relay somebody CHOSE for it, never one nobody did (#89, amended by
+    /// #104): the configured URL verbatim, or under the explicit n0 opt-in the
+    /// home relay that opt-in elects. A fleet whose relay is off (the default)
+    /// signs none into its records.
     ///
     /// `None` is not the empty claim, it is NO claim: a lazily-bound transport
     /// whose radio never came on has observed nothing, and answering "empty"
@@ -444,7 +445,7 @@ pub(crate) fn claimed_reach(state: &AppState) -> Option<crate::directory::Reach>
         .as_ref()
         .is_some_and(|url| url.is_empty() || url.len() > crate::directory::MAX_RELAY_HINT_LEN)
     {
-        tracing::warn!("configured relay too long for a record: not signed as a hint");
+        tracing::warn!("chosen relay too long for a record: not signed as a hint");
         reach.relay_hint = None;
     }
     Some(reach)

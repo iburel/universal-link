@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 
 use onedevice_core::ServerConfig;
 
+use crate::dataplane::RelayChoice;
+
 /// The file, as we read it — every field optional, so that the environment can
 /// complete a partial file. Validating completeness BEFORE the merge would
 /// make the announced precedence a lie.
@@ -35,7 +37,11 @@ struct Fields {
     /// PKCE. Its absence is NEVER a config fault.
     oidc_client_secret: Option<String>,
     device_name: Option<String>,
-    relay_url: Option<String>,
+    relay: Option<String>,
+    /// The pre-#104 key, detected only to be REFUSED with its cure: whoever
+    /// set it chose a relay explicitly, and an unknown-field shrug would
+    /// silently downgrade that choice to the off default.
+    legacy_relay_url: bool,
     receive_dir: Option<String>,
     /// JSON boolean (the only one — the string loop in `read_file` does not
     /// apply to it). `None`: not set, defaults to on.
@@ -46,10 +52,11 @@ pub struct DaemonConfig {
     /// `None`: Core not configured. It starts anyway.
     pub server: Option<ServerConfig>,
     pub device_name: String,
-    /// The deployment's iroh relay (self-hosted). `None`: the n0 public
-    /// relays — a deployment that hosts its own server can also host its own
-    /// relay, without depending on third-party infra for its data plane.
-    pub relay_url: Option<iroh::RelayUrl>,
+    /// The relay, a three-way choice (#104): `"off"` (the default when
+    /// nothing is set: no relay, no housekeeping connection), `"n0"` (the n0
+    /// public relays, opted into explicitly), or a relay URL (self-hosted, or
+    /// a deployment's own).
+    pub relay: RelayChoice,
     /// Where received files land. Always set — the Core receives even without
     /// `config.json`: the configured directory, otherwise the user's
     /// downloads, otherwise (silent environment) the config directory.
@@ -104,7 +111,10 @@ fn load_from(
         return DaemonConfig {
             server: None,
             device_name,
-            relay_url: None,
+            // A file we cannot read might have opted in: like the LAN toggle,
+            // a broken config falls back to the quiet default, never onto a
+            // relay nobody provably chose.
+            relay: RelayChoice::Off,
             receive_dir,
             // A file we cannot read might have said `false`: a broken config
             // must not put the machine back on the air, so the toggle fails
@@ -121,7 +131,7 @@ fn load_from(
         "ONEDEVICE_OIDC_CLIENT_SECRET",
         &mut fields.oidc_client_secret,
     );
-    over("ONEDEVICE_RELAY_URL", &mut fields.relay_url);
+    over("ONEDEVICE_RELAY", &mut fields.relay);
 
     let server = match validate(&fields) {
         Ok(Some(server)) => Some(server),
@@ -135,15 +145,31 @@ fn load_from(
         }
     };
     // The relay is checked at startup like the server URLs: a typo would
-    // otherwise give a silent data plane, with no explanation.
-    let relay_url = match fields.relay_url.as_deref().map(str::parse) {
-        None => None,
-        Some(Ok(url)) => Some(url),
-        Some(Err(e)) => {
-            problem.get_or_insert(format!("relay_url is not a valid relay URL: {e}"));
-            None
-        }
+    // otherwise give a silent data plane, with no explanation. The keywords
+    // are matched case-insensitively (they are words, not URLs); anything
+    // else must parse as a relay URL. A fault falls back to off: the quiet
+    // default, never a relay nobody chose.
+    let relay = match fields.relay.as_deref().map(str::trim) {
+        None | Some("") => RelayChoice::Off,
+        Some(text) if text.eq_ignore_ascii_case("off") => RelayChoice::Off,
+        Some(text) if text.eq_ignore_ascii_case("n0") => RelayChoice::N0,
+        Some(text) => match text.parse() {
+            Ok(url) => RelayChoice::Url(url),
+            Err(e) => {
+                problem.get_or_insert(format!("relay must be \"off\", \"n0\" or a relay URL: {e}"));
+                RelayChoice::Off
+            }
+        },
     };
+    // The pre-#104 spelling named an explicit choice; refusing it with its
+    // cure beats silently downgrading that choice to the off default.
+    if fields.legacy_relay_url || env("ONEDEVICE_RELAY_URL").is_some_and(|v| !v.trim().is_empty()) {
+        problem.get_or_insert(
+            "relay_url was replaced by relay (#104): set relay to your relay's URL, \
+             to \"n0\" for the public relays, or remove it (the default is off)"
+                .to_string(),
+        );
+    }
     // The env override, like everywhere — spelled out because it is a boolean,
     // not a string the `over` helper can move. Garbage neither turns the radio
     // on nor off: the file's intent is clear, the variable's is not — reported,
@@ -166,7 +192,7 @@ fn load_from(
     DaemonConfig {
         server,
         device_name,
-        relay_url,
+        relay,
         receive_dir,
         lan_discovery,
         problem,
@@ -285,7 +311,7 @@ fn read_file(path: &Path) -> Result<Fields, String> {
         ("oidc_client_id", &mut fields.oidc_client_id),
         ("oidc_client_secret", &mut fields.oidc_client_secret),
         ("device_name", &mut fields.device_name),
-        ("relay_url", &mut fields.relay_url),
+        ("relay", &mut fields.relay),
         ("receive_dir", &mut fields.receive_dir),
     ] {
         match object.get(key) {
@@ -296,6 +322,9 @@ fn read_file(path: &Path) -> Result<Fields, String> {
             }
         }
     }
+    // The pre-#104 key is not one of the unknown fields tolerated below: it
+    // named an explicit choice, so `load_from` surfaces it with its cure.
+    fields.legacy_relay_url = matches!(object.get("relay_url"), Some(v) if !v.is_null());
     // The only boolean field, read apart from the string loop.
     match object.get("lan_discovery") {
         None | Some(serde_json::Value::Null) => {}
@@ -507,31 +536,76 @@ mod tests {
     }
 
     #[test]
-    fn a_self_hosted_relay_can_be_configured() {
+    fn the_relay_defaults_off() {
+        // Nothing set: off, and not a fault (#104: a fresh install contacts
+        // no relay nobody chose). The explicit spelling reads the same.
         let dir = tempfile::tempdir().expect("tempdir");
-        write(&dir, r#"{ "relay_url": "https://iroh-relay.example" }"#);
+        assert_eq!(load_with(&dir, &[]).relay, RelayChoice::Off);
+        write(&dir, COMPLETE);
+        assert_eq!(load_with(&dir, &[]).relay, RelayChoice::Off);
+        write(&dir, r#"{ "relay": "off" }"#);
         let config = load_with(&dir, &[]);
-        assert_eq!(
-            config.relay_url.expect("relay").to_string(),
-            "https://iroh-relay.example/"
-        );
+        assert_eq!(config.relay, RelayChoice::Off);
         assert!(config.problem.is_none());
-        // And the environment overrides, as everywhere.
-        let config = load_with(&dir, &[("ONEDEVICE_RELAY_URL", "https://other.example")]);
-        assert_eq!(
-            config.relay_url.expect("relay").to_string(),
-            "https://other.example/"
-        );
+        // A file we cannot read might have opted in: the fallback is the
+        // quiet default, never a relay nobody provably chose.
+        write(&dir, "{ this is not JSON");
+        assert_eq!(load_with(&dir, &[]).relay, RelayChoice::Off);
     }
 
     #[test]
-    fn a_broken_relay_url_is_caught_at_startup() {
+    fn n0_and_a_relay_url_are_explicit_choices() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write(&dir, r#"{ "relay_url": "not a url" }"#);
+        write(&dir, r#"{ "relay": "n0" }"#);
+        assert_eq!(load_with(&dir, &[]).relay, RelayChoice::N0);
+        // The keywords are words, not URLs: case does not matter.
+        write(&dir, r#"{ "relay": "N0" }"#);
+        assert_eq!(load_with(&dir, &[]).relay, RelayChoice::N0);
+        write(&dir, r#"{ "relay": "https://iroh-relay.example" }"#);
         let config = load_with(&dir, &[]);
-        assert!(config.relay_url.is_none());
+        let url = "https://iroh-relay.example".parse().expect("relay url");
+        assert_eq!(config.relay, RelayChoice::Url(url));
+        assert!(config.problem.is_none());
+        // And the environment overrides, as everywhere, in both directions.
+        let config = load_with(&dir, &[("ONEDEVICE_RELAY", "off")]);
+        assert_eq!(config.relay, RelayChoice::Off);
+        let config = load_with(&dir, &[("ONEDEVICE_RELAY", "https://other.example")]);
+        let url = "https://other.example".parse().expect("relay url");
+        assert_eq!(config.relay, RelayChoice::Url(url));
+    }
+
+    #[test]
+    fn a_broken_relay_value_is_caught_at_startup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(&dir, r#"{ "relay": "not a url" }"#);
+        let config = load_with(&dir, &[]);
+        assert_eq!(config.relay, RelayChoice::Off);
         let problem = config.problem.expect("typo reported");
+        assert!(problem.contains("relay"), "{problem}");
+    }
+
+    #[test]
+    fn the_old_relay_url_spelling_is_refused_with_its_cure() {
+        // Whoever set relay_url chose a relay explicitly: the unknown-field
+        // shrug would silently downgrade that choice to the off default.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(&dir, r#"{ "relay_url": "https://iroh-relay.example" }"#);
+        let config = load_with(&dir, &[]);
+        assert_eq!(config.relay, RelayChoice::Off);
+        let problem = config.problem.expect("legacy key surfaced");
         assert!(problem.contains("relay_url"), "{problem}");
+
+        // The old environment variable gets the same answer.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = load_with(
+            &dir,
+            &[("ONEDEVICE_RELAY_URL", "https://iroh-relay.example")],
+        );
+        let problem = config.problem.expect("legacy env surfaced");
+        assert!(problem.contains("relay_url"), "{problem}");
+        // An empty legacy variable overrides nothing, like everywhere.
+        let config = load_with(&dir, &[("ONEDEVICE_RELAY_URL", "  ")]);
+        assert!(config.problem.is_none());
     }
 
     #[test]

@@ -404,7 +404,7 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
     // the accept loop is.
     let dirsync_task = tokio::spawn(dirsync::run(state.clone()));
     // Own reach: re-signs our record when the transport's addresses (or its
-    // configured relay) move, so the hints the account holds about us are
+    // chosen relay) move, so the hints the account holds about us are
     // never staler than one watcher wakeup.
     let reach_task = tokio::spawn(dataplane::watch_own_reach(state.clone()));
 

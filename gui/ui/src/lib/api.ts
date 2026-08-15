@@ -239,7 +239,7 @@ export const api = {
    * Send flat files to a device (fire-and-forget). Returns a `transfer_id`, but
    * tracking goes through the `transfer.*` notifications — the caller need not
    * remember it. A folder or a missing path → `-32602`; a target outside the
-   * directory → `DEVICE_UNKNOWN`; no relay → `DEVICE_OFFLINE`.
+   * directory → `DEVICE_UNKNOWN`; no route → `DEVICE_OFFLINE`.
    */
   filesSend: (device_id: string, paths: string[]) =>
     coreRequest<{ transfer_id: string }>("files.send", { device_id, paths }),

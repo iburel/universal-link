@@ -140,8 +140,9 @@ On each PC:
      present tense (its liveness, the relay a server vouches for right now) is
      left unsigned, deliberately: a signature over it would be a stale fact
      wearing a proof. Its reach hints (`addrs`, the socket addresses its
-     endpoint stands behind; `relay_hint`, the relay it was explicitly
-     configured with) are the deliberate exception, and what makes them safe is
+     endpoint stands behind; `relay_hint`, the relay somebody chose for it:
+     a configured URL, or the home relay an explicit n0 opt-in elected) are
+     the deliberate exception, and what makes them safe is
      the line they refuse to cross: they claim no liveness, only "these are MY
      hints, as of this description". A stale hint costs one failed dial attempt,
      never a wrong peer (connections are authenticated by the node key), and an
@@ -637,7 +638,7 @@ the room; a code that carried a relay hint would work from anywhere.
 That decision used to bound the serverless account as a whole, and no longer
 does: the reach HAS been widened, by exactly the route this paragraph once
 prescribed: the directory itself. A device declares its addresses and its
-explicitly configured relay in its signed record, ordered by its `seq`
+chosen relay in its signed record, ordered by its `seq`
 (principle 3, "A device signs what it says about itself"), and its
 already-paired siblings dial those hints from anywhere a network routes
 between them (doc/beyond-the-lan.md). Never a public discovery, which would

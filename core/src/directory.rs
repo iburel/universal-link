@@ -107,7 +107,8 @@ pub(crate) const MAX_RELAY_HINT_LEN: usize = 2048;
 
 /// Where a device says it can be dialed, first-hand: the socket addresses its
 /// endpoint is bound on (LAN, VPN, public IPv6; as text, `ip:port`), and the
-/// relay it was explicitly configured with, if any. Part of the SIGNED
+/// relay somebody chose for it, if any (a configured URL, or the home relay
+/// an explicit n0 opt-in elected, #104). Part of the SIGNED
 /// description since v2: in a serverless account there is no authority to
 /// state these facts first-hand before the first dial, so the device's own
 /// signature, ordered by `seq`, is what keeps a relayer from rewriting them.

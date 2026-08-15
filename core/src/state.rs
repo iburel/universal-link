@@ -328,7 +328,7 @@ impl SessionState {
     }
 
     /// This device's word on how it can be dialed moved: its addresses, or its
-    /// configured relay. The same gesture as a rename: a fresh description under
+    /// chosen relay. The same gesture as a rename: a fresh description under
     /// a strictly higher `seq`, signed again, so peers prefer it. Returns the
     /// record as it now stands when something actually changed; `None` when the
     /// claim is already the one signed (the common case: the watcher re-checks
