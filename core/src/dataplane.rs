@@ -159,7 +159,7 @@ pub trait PeerTransport: Send + Sync + std::fmt::Debug {
     /// UNDER the local choice (an explicit local relay or opt-in wins; the
     /// announcement only fills the off default), applied at its next bind.
     /// Called at startup with the cached list and again whenever a session
-    /// learns a fresh one. Default: nothing — a transport with no relay
+    /// learns a fresh one. Default: nothing (a transport with no relay
     /// notion has nothing to fold.
     fn announce_relays(&self, relays: &[String]) {
         let _ = relays;

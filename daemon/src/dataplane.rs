@@ -79,7 +79,7 @@ pub enum RelayChoice {
 /// place from the local choice and the deployment's announcement, so the
 /// signed word can never disagree with how the endpoint runs. The decided
 /// precedence (#104/#105): an explicit local relay beats the announcement,
-/// which beats off — the announcement only ever fills the off default. Off
+/// which beats off: the announcement only ever fills the off default. Off
 /// with no announcement signs nothing and skips the relay probe; a URL
 /// signs itself; n0 signs whatever home relay the endpoint elects, and so
 /// does an announced list (the user chose the server, the operator chose

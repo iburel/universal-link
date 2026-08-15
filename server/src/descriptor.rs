@@ -71,7 +71,7 @@ fn body(config: &Config) -> Value {
 }
 
 pub async fn get(State(state): State<Arc<AppState>>) -> Response {
-    // `no-store`: a device reads this once, while being set up — and, since
+    // `no-store`: a device reads this once, while being set up, and, since
     // #105, re-reads it at each session establishment for the relay list,
     // keeping its own copy on disk. HTTP caching would only let a stale
     // `client_id` (or relay list) outlive its rotation.
@@ -173,7 +173,7 @@ mod tests {
     }
 
     /// The relay announcement (#105): a list, served verbatim, and PRESENT
-    /// even when empty — curl the endpoint and the shape says "this
+    /// even when empty: curl the endpoint and the shape says "this
     /// deployment runs no relay" rather than leaving you to wonder whether
     /// the server predates the field.
     #[test]

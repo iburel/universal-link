@@ -143,7 +143,7 @@ async fn a_revocation_forgets_the_announcement() {
 }
 
 /// A server that announces nothing leaves no trace: the empty word matches
-/// the empty cache, so nothing is stored and the transport hears nothing —
+/// the empty cache, so nothing is stored and the transport hears nothing:
 /// an off-default fleet stays exactly as quiet as before #105.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_server_announcing_nothing_changes_nothing() {
@@ -168,7 +168,7 @@ async fn a_server_announcing_nothing_changes_nothing() {
 /// previous session (seeded on disk here, the state a fleet is in after its
 /// operator removes the relays); the boot announces that cached list, and
 /// the next session, hearing the server now announce NONE, must replace the
-/// cache with the empty word and tell the transport — or the old relays
+/// cache with the empty word and tell the transport, or the old relays
 /// would come back from the cache at every boot, forever.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_withdrawn_announcement_replaces_the_cached_one() {

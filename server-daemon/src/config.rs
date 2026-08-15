@@ -368,7 +368,7 @@ mod tests {
 
     #[test]
     fn the_relay_list_is_optional_split_on_commas_and_validated() {
-        // Absent (or empty): no relays, and that is not a fault — a server
+        // Absent (or empty): no relays, and that is not a fault: a server
         // without a relay is a valid deployment (#105).
         assert!(
             load_from(&env_of(REQUIRED))
