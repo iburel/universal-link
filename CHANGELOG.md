@@ -30,6 +30,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   no device of yours is ever dialed through a relay nobody chose. In the
   app, a device dialable only through its signed hints shows as "reachable":
   nobody vouches it is up, the dial is what answers.
+- **A server now announces its relays to its fleet.** The deployment
+  descriptor gained a `relays` list: the operator states where the relays
+  are once, server-side (`ONEDEVICE_RELAYS`), and every device of the fleet
+  picks them up at each session, no per-device configuration. The
+  announcement fills the off default only (an explicit local relay setting
+  always wins), may be empty (a server without a relay stays a valid
+  deployment), and each device keeps its own copy on disk, so a fleet whose
+  server is down still meets through the operator's relays. The compose file
+  gained an optional `iroh-relay` service and the deployment guide a
+  companion-relay section: the pair (account server + relay) is the
+  recommended shape of a full deployment.
 - **The relay is now off by default, and using one is a choice.** An
   unconfigured device used to ride n0's public relays silently: the bound
   endpoint kept a housekeeping connection to the nearest one even idle. The

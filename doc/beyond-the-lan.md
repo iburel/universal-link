@@ -18,8 +18,9 @@ The ladder, each rung strictly optional:
 3. **Your own relay** (`iroh-relay`). One tiny stateless binary with a domain
    and a TLS certificate, and your devices rendezvous through it across any
    NAT. No accounts, no storage.
-4. **The full server.** Enrollment by login, presence, remote pairing:
-   [server-deployment.md](server-deployment.md).
+4. **The full server.** Enrollment by login, presence, remote pairing, and
+   the operator's relays announced to the whole fleet (no per-device relay
+   setting needed): [server-deployment.md](server-deployment.md).
 
 ## How a device is found off the LAN
 

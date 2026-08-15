@@ -738,6 +738,10 @@ impl Conn {
             }
             let (payload, abort) = s.forget(own, root.as_ref().map(|root| root.ak_pub.as_str()));
             crate::session::remove_session_file(&self.state.config_dir);
+            // The relay announcement was the server's standing word, and the
+            // standing ends with the session (#105). Records keep the hints
+            // they signed while it stood; a stale one costs a failed dial.
+            crate::relays::forget(&self.state.config_dir);
             // What the SERVER asserted belonged to this session and leaves with
             // it; the account's half — the records `forget` kept — does not.
             // `save_unrefreshed`: a logout re-checks nothing against an authority.

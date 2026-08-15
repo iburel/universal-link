@@ -58,6 +58,29 @@ async fn an_idp_without_a_secret_advertises_null() {
     assert_eq!(v["oidc_client_secret"], Value::Null);
 }
 
+/// The relay announcement (#105) over the wire: the configured list is
+/// served verbatim, and a deployment without relays serves an EMPTY list,
+/// present (the shape says "none", never "too old to know").
+#[tokio::test]
+async fn it_announces_the_deployments_relays() {
+    let env = TestEnv::start().await;
+    let (_, _, v) = descriptor(&env).await;
+    assert_eq!(v["relays"], serde_json::json!([]));
+
+    let env = TestEnv::start_with(|c| {
+        c.relays = vec![
+            "https://relay-eu.example".into(),
+            "https://relay-us.example".into(),
+        ];
+    })
+    .await;
+    let (_, _, v) = descriptor(&env).await;
+    assert_eq!(
+        v["relays"],
+        serde_json::json!(["https://relay-eu.example", "https://relay-us.example"])
+    );
+}
+
 /// A device sets itself up once; a cached copy is how a client keeps being
 /// configured with an OIDC client the deployment has already replaced.
 #[tokio::test]

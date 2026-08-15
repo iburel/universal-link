@@ -51,6 +51,15 @@ pub struct Config {
     pub pairing_ttl: Duration,
     /// Request limit per connection per minute (`None` = unlimited).
     pub max_requests_per_minute: Option<u32>,
+    /// The iroh relays this deployment runs, announced to the fleet in the
+    /// deployment descriptor (#105): a LIST, because a public deployment
+    /// wants regional relays the clients elect from, and one entry is the
+    /// common self-hosted case. May be empty: a server without a relay is a
+    /// valid deployment, and the fleet then falls back to each device's own
+    /// `relay` setting. Location only: the server states where its relays
+    /// are, never that a device must use them (an explicit local choice
+    /// wins, #104).
+    pub relays: Vec<String>,
 }
 
 #[derive(Clone, Debug)]

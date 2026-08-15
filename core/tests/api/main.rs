@@ -23,6 +23,7 @@ mod login;
 mod offlan;
 mod pairing;
 mod protocol;
+mod relays;
 mod revocation;
 mod serverless;
 mod session;

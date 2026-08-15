@@ -192,6 +192,45 @@ If you prefer the bare binary behind a reverse proxy you already manage:
 
 `systemctl stop` sends `SIGTERM`: the server exits cleanly (code 0).
 
+## The companion relay (recommended)
+
+The account server is a small control plane: it never carries your devices'
+bytes. Off the LAN, with no VPN between two devices, the data plane needs a
+relay for its rendezvous, and the clients' relay setting is **off by
+default**: an operator who runs one restores the off-LAN path for the whole
+fleet without touching a single client. The pair (account server + relay) is
+the recommended shape of a full deployment.
+
+The compose file carries an optional [`iroh-relay`] service for it, off
+unless asked for:
+
+1. Give the relay its own domain (A/AAAA to this machine), for example
+   `relay.your-server.example.com`, and set `ONEDEVICE_RELAY_DOMAIN` in
+   `.env`.
+2. Uncomment the relay block in the `Caddyfile` (Caddy terminates its TLS
+   like the server's) and copy `iroh-relay.toml.example` to
+   `iroh-relay.toml`.
+3. Announce it to the fleet: `ONEDEVICE_RELAYS=https://relay.your-server.example.com`
+   in `.env`. The server serves that list in its deployment descriptor, and
+   every device of the fleet re-reads it at each session; a device with an
+   explicit local relay setting keeps its own.
+4. `docker compose --profile relay up -d`.
+
+`ONEDEVICE_RELAYS` is a comma-separated list: a larger deployment runs
+regional relays (each entry its own machine and domain: the relay is
+stateless and scales horizontally, unlike this server, which does not need
+to), and each device elects the nearest. The relay and the account server
+never talk to each other: announcing a relay hosted anywhere else works the
+same, and a server that announces none is a valid deployment whose devices
+simply keep their own relay setting.
+
+Relays carry user bytes (end to end encrypted: a relay operator sees node
+ids, client IPs, timings and volumes, never content). The rendezvous-only
+policy planned in #88 will let a deployment cap or refuse that carriage;
+until then, size the relay for your fleet's traffic.
+
+[`iroh-relay`]: https://github.com/n0-computer/iroh
+
 ## Backup and loss of the directory
 
 The directory is a JSON file (`ONEDEVICE_SERVER_STATE`), in the `directory`
@@ -217,6 +256,8 @@ scanning and confirming), `ONEDEVICE_FRESH_TOKEN_MAX_AGE_SECS` (300), `ONEDEVICE
 JWKS fetches — the issuer's signing keys are re-fetched on a key-id miss, i.e. a
 key rotation, but no more often than this),
 `ONEDEVICE_MAX_REQUESTS_PER_MINUTE` (120; `0` = unlimited),
+`ONEDEVICE_RELAYS` (none; comma-separated relay URLs announced to the fleet
+in the deployment descriptor, see "The companion relay" above),
 `ONEDEVICE_LOG` (log level). Detail and semantics:
 [`server-daemon/src/config.rs`](../server-daemon/src/config.rs) and
 [`server-api.md`](server-api.md).

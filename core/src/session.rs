@@ -209,6 +209,10 @@ fn drop_session(state: &AppState) {
         // the answer to that is an AK rotation, not a deletion an attacker has
         // already outrun.
         remove_session_file(&state.config_dir);
+        // The relay announcement ends with the server relationship too
+        // (#105): a struck-off device does not keep riding the operator's
+        // relays.
+        crate::relays::forget(&state.config_dir);
         // What the SERVER asserted leaves with the session; what the ACCOUNT can
         // still prove — the records `forget` kept — stays, because a server
         // striking this device off its directory does not end a membership only
@@ -495,6 +499,19 @@ async fn connect_and_serve(state: &Arc<AppState>, info: &SessionInfo) -> Outcome
     // watcher re-checks it against the transport's current claim now, rather
     // than at the next address change.
     state.reach_wake.notify_one();
+
+    // The deployment's relay announcement (#105), re-read at every session:
+    // the descriptor is the operator's standing word on where the relays
+    // are, and the Core keeps its own copy so a boot with the server down
+    // still binds with the operator's relays. Fetched BEFORE the first
+    // relay probe below, which is what triggers the lazy bind: the common
+    // path applies a fresh announcement to the very bind it configures.
+    // Bounded (the HTTP layer's own timeout), to a host that just answered
+    // our WebSocket handshake; no word (an older server, a failed fetch)
+    // changes nothing, the cache stands.
+    if let Some(fresh) = crate::relays::fetch(state.connector.as_ref(), &info.server_url).await {
+        crate::relays::apply(state, &fresh);
+    }
 
     // Cruising regime: relaying notifications, proxies, detecting the end of
     // the connection. `pending` retains the method: a rename's reply carries

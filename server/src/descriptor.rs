@@ -21,8 +21,8 @@ use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
-use crate::OidcConfig;
 use crate::state::AppState;
+use crate::{Config, OidcConfig};
 
 /// Route path. A `/.well-known/` URI because the input is a domain name and the
 /// question is "what is deployed here" (RFC 8615). The name is not registered
@@ -54,22 +54,30 @@ pub const PATH: &str = "/.well-known/1device.json";
 /// deployment's OAuth client on its IdP's own consent screen. It grants nothing
 /// on an account, the directory, or a device: those are behind the ID token and
 /// the device key.
-fn body(oidc: &OidcConfig) -> Value {
+fn body(config: &Config) -> Value {
+    let oidc: &OidcConfig = &config.oidc;
     json!({
         "api_version": crate::API_VERSION,
         "oidc_issuer": oidc.issuer_url,
         "oidc_client_id": oidc.client_id,
         "oidc_client_secret": oidc.client_secret,
+        // The deployment's relays (#105): a list, possibly empty. This is the
+        // one deliberate amendment to the "no addresses" stance guarded below:
+        // the operator pays for the relays, the operator says where they are.
+        // Location, not command: the client's own explicit setting wins
+        // (#104), and the server's OWN address is still never dictated here.
+        "relays": config.relays,
     })
 }
 
 pub async fn get(State(state): State<Arc<AppState>>) -> Response {
-    // `no-store`: a device reads this once, while being set up. Nothing gains
-    // from keeping a copy — and a cached one is a way to keep configuring
-    // clients with a `client_id` the deployment has since rotated.
+    // `no-store`: a device reads this once, while being set up — and, since
+    // #105, re-reads it at each session establishment for the relay list,
+    // keeping its own copy on disk. HTTP caching would only let a stale
+    // `client_id` (or relay list) outlive its rotation.
     (
         [(header::CACHE_CONTROL, "no-store")],
-        axum::Json(body(&state.config.oidc)),
+        axum::Json(body(&state.config)),
     )
         .into_response()
 }
@@ -80,14 +88,27 @@ mod tests {
 
     use super::*;
 
-    fn oidc(client_secret: Option<&str>) -> OidcConfig {
-        OidcConfig {
-            issuer_url: "https://accounts.google.com".into(),
-            client_id: "abc.apps.googleusercontent.com".into(),
-            client_secret: client_secret.map(str::to_string),
-            max_fresh_token_age: Duration::from_secs(300),
-            jwks_refresh_min_interval: Duration::from_secs(60),
+    fn config(client_secret: Option<&str>, relays: &[&str]) -> Config {
+        Config {
+            bind_addr: "127.0.0.1:0".parse().expect("addr"),
+            oidc: OidcConfig {
+                issuer_url: "https://accounts.google.com".into(),
+                client_id: "abc.apps.googleusercontent.com".into(),
+                client_secret: client_secret.map(str::to_string),
+                max_fresh_token_age: Duration::from_secs(300),
+                jwks_refresh_min_interval: Duration::from_secs(60),
+            },
+            heartbeat_interval: Duration::from_secs(20),
+            heartbeat_max_missed: 2,
+            nonce_ttl: Duration::from_secs(60),
+            pairing_ttl: Duration::from_secs(120),
+            max_requests_per_minute: None,
+            relays: relays.iter().map(|r| r.to_string()).collect(),
         }
+    }
+
+    fn oidc(client_secret: Option<&str>) -> Config {
+        config(client_secret, &[])
     }
 
     #[test]
@@ -118,9 +139,13 @@ mod tests {
         );
     }
 
-    /// Guards the decision documented on `body`: the address is the client's,
-    /// not the server's to dictate. A field added here later would silently make
-    /// the server able to point its own clients elsewhere.
+    /// Guards the decision documented on `body`: the server's OWN address is
+    /// the client's, not the server's to dictate. A field added here later
+    /// would silently make the server able to point its own clients
+    /// elsewhere. `relays` (#105) is the one amendment this guard has ever
+    /// accepted, made through the front door: it names infrastructure the
+    /// operator runs FOR the fleet, the client's explicit setting still wins
+    /// (#104), and the server keeps not naming itself.
     #[test]
     fn it_does_not_dictate_where_to_connect() {
         let v = body(&oidc(None));
@@ -140,9 +165,29 @@ mod tests {
                 "api_version",
                 "oidc_client_id",
                 "oidc_client_secret",
-                "oidc_issuer"
+                "oidc_issuer",
+                "relays",
             ],
             "unexpected descriptor shape"
+        );
+    }
+
+    /// The relay announcement (#105): a list, served verbatim, and PRESENT
+    /// even when empty — curl the endpoint and the shape says "this
+    /// deployment runs no relay" rather than leaving you to wonder whether
+    /// the server predates the field.
+    #[test]
+    fn it_announces_the_deployments_relays_as_a_list() {
+        let v = body(&config(None, &[]));
+        assert_eq!(v["relays"], serde_json::json!([]));
+
+        let v = body(&config(
+            None,
+            &["https://relay-eu.example", "https://relay-us.example"],
+        ));
+        assert_eq!(
+            v["relays"],
+            serde_json::json!(["https://relay-eu.example", "https://relay-us.example"])
         );
     }
 }

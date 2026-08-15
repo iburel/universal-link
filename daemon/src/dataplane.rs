@@ -62,8 +62,9 @@ pub enum RelayChoice {
     /// No relay at all (`RelayMode::Disabled`): no relay connection, no
     /// housekeeping connection, zero unsolicited network contact at boot.
     /// What still connects: the LAN (mDNS), any directly dialable address
-    /// (VPN tunnels, the signed hints of #87), and, once #105 lands, whatever
-    /// a server announces.
+    /// (VPN tunnels, the signed hints of #87), and whatever relays the
+    /// device's server announces (#105): the announcement fills exactly
+    /// this default (`resolve_relay`).
     Off,
     /// The n0 public relays (`RelayMode::Default`), chosen instead of
     /// inherited. The endpoint elects a home relay from the map, and THAT
@@ -74,12 +75,22 @@ pub enum RelayChoice {
     Url(RelayUrl),
 }
 
-/// Mode, signed hint and the `home_relay` short-circuit, derived from the
-/// one choice in one place, so the signed word can never disagree with how
-/// the endpoint runs: off signs nothing and skips the relay probe, a URL
-/// signs itself, n0 signs whatever home relay the endpoint elects.
-fn resolve_relay(relay: RelayChoice) -> (RelayMode, HintSource, bool) {
+/// Mode, signed hint and the `home_relay` short-circuit, derived in one
+/// place from the local choice and the deployment's announcement, so the
+/// signed word can never disagree with how the endpoint runs. The decided
+/// precedence (#104/#105): an explicit local relay beats the announcement,
+/// which beats off — the announcement only ever fills the off default. Off
+/// with no announcement signs nothing and skips the relay probe; a URL
+/// signs itself; n0 signs whatever home relay the endpoint elects, and so
+/// does an announced list (the user chose the server, the operator chose
+/// the relays: the election is chosen all the way down).
+fn resolve_relay(relay: RelayChoice, announced: &[RelayUrl]) -> (RelayMode, HintSource, bool) {
     match relay {
+        RelayChoice::Off if !announced.is_empty() => (
+            RelayMode::custom(announced.iter().cloned()),
+            HintSource::Elected,
+            false,
+        ),
         RelayChoice::Off => (RelayMode::Disabled, HintSource::Fixed(None), true),
         RelayChoice::N0 => (RelayMode::Default, HintSource::Elected, false),
         RelayChoice::Url(url) => {
@@ -185,19 +196,22 @@ const MDNS_SERVICE: &str = "1device";
 impl IrohTransport {
     /// Production endpoint. `relay`: the three-valued choice (#104): off by
     /// default (no relay, no housekeeping connection), n0 or a URL as an
-    /// explicit opt-in. Certificates verified normally, no DNS discovery.
-    /// `lan_discovery` adds the mDNS lookup (see the module header):
-    /// resolution AND announcement: one flag, both directions, because
-    /// announcing without resolving (or the reverse) would just be a device
-    /// its siblings half-see.
+    /// explicit opt-in. `announced`: the deployment's relay announcement
+    /// (#105), folded in under the local choice by `resolve_relay`.
+    /// Certificates verified normally, no DNS discovery. `lan_discovery`
+    /// adds the mDNS lookup (see the module header): resolution AND
+    /// announcement: one flag, both directions, because announcing without
+    /// resolving (or the reverse) would just be a device its siblings
+    /// half-see.
     pub async fn bind(
         seed: [u8; 32],
         relay: RelayChoice,
+        announced: Vec<RelayUrl>,
         lan_discovery: bool,
     ) -> anyhow::Result<IrohTransport> {
         let (lan_gen, _) = tokio::sync::watch::channel(0);
         let (reach_gen, _) = tokio::sync::watch::channel(0);
-        Self::bind_with_gen(seed, relay, lan_discovery, lan_gen, reach_gen).await
+        Self::bind_with_gen(seed, relay, announced, lan_discovery, lan_gen, reach_gen).await
     }
 
     /// `bind`, with the LAN and reach generation channels supplied by the
@@ -207,13 +221,14 @@ impl IrohTransport {
     pub async fn bind_with_gen(
         seed: [u8; 32],
         relay: RelayChoice,
+        announced: Vec<RelayUrl>,
         lan_discovery: bool,
         lan_gen: tokio::sync::watch::Sender<u64>,
         reach_gen: tokio::sync::watch::Sender<u64>,
     ) -> anyhow::Result<IrohTransport> {
         let secret = SecretKey::from_bytes(&seed);
         let mdns = lan_lookup(&secret, lan_discovery);
-        let (relay_mode, hint, relay_off) = resolve_relay(relay);
+        let (relay_mode, hint, relay_off) = resolve_relay(relay, &announced);
         let mut builder = Endpoint::builder(presets::Minimal)
             .secret_key(secret)
             .alpns(vec![ALPN.to_vec()])
@@ -281,7 +296,7 @@ impl IrohTransport {
         seed: [u8; 32],
         lan_discovery: bool,
     ) -> anyhow::Result<IrohTransport> {
-        let (relay_mode, hint, relay_off) = resolve_relay(RelayChoice::Off);
+        let (relay_mode, hint, relay_off) = resolve_relay(RelayChoice::Off, &[]);
         Self::bind_test_with(seed, relay_mode, hint, relay_off, lan_discovery).await
     }
 
@@ -996,6 +1011,16 @@ pub struct LazyIrohTransport {
     /// Read once, at the bind — like `relay`, a change requires a Core
     /// restart.
     lan_discovery: bool,
+    /// The deployment's announced relays (#105), parsed and deduplicated:
+    /// handed over by the Core (`announce_relays`) from its disk cache at
+    /// startup and from the descriptor at each session establishment. Read
+    /// at the bind, where `resolve_relay` folds it in under the local
+    /// choice; a change that lands after the bind applies at the next
+    /// start, and says so.
+    announced: Mutex<Vec<RelayUrl>>,
+    /// What the bind actually consumed, so a post-bind announcement change
+    /// is told apart from a repeat of the same list.
+    bound_announced: Mutex<Option<Vec<RelayUrl>>>,
     /// The LAN generation channel, created HERE so `lan_changes` can hand out
     /// receivers before the endpoint exists: the sender is given to the inner
     /// transport at the (lazy) bind, and a receiver taken while still unbound
@@ -1014,6 +1039,8 @@ impl LazyIrohTransport {
             config_dir,
             relay,
             lan_discovery,
+            announced: Mutex::new(Vec::new()),
+            bound_announced: Mutex::new(None),
             lan_gen: tokio::sync::watch::channel(0).0,
             reach_gen: tokio::sync::watch::channel(0).0,
             cell: tokio::sync::OnceCell::new(),
@@ -1032,15 +1059,20 @@ impl LazyIrohTransport {
                 // the Core's instance lock.
                 let seed = onedevice_core::load_or_generate_device_seed(&self.config_dir)
                     .map_err(|e| wrap("device identity", format!("{e:#}")))?;
+                // The announcement as it stands at THIS bind: what the fleet
+                // heard from its operator, folded in under the local choice.
+                let announced = self.announced.lock().expect("lock announced").clone();
                 let transport = IrohTransport::bind_with_gen(
                     seed,
                     self.relay.clone(),
+                    announced.clone(),
                     self.lan_discovery,
                     self.lan_gen.clone(),
                     self.reach_gen.clone(),
                 )
                 .await
                 .map_err(|e| wrap("binding the iroh endpoint", format!("{e:#}")))?;
+                *self.bound_announced.lock().expect("lock bound announced") = Some(announced);
                 tracing::info!(
                     node_id = %transport.endpoint.id().fmt_short(),
                     "iroh data plane bound"
@@ -1157,6 +1189,43 @@ impl PeerTransport for LazyIrohTransport {
         // Same sender the inner transport bumps once bound.
         self.reach_gen.subscribe()
     }
+
+    fn announce_relays(&self, relays: &[String]) {
+        // Parsed here, at the seam where strings become routes, with the
+        // same tolerance as `peer_to_addr`: a garbled entry is skipped, not
+        // fatal, so one bad URL in an announcement cannot mask the good
+        // ones. Deduplicated so a sloppy announcement costs nothing.
+        let mut seen = HashSet::new();
+        let parsed: Vec<RelayUrl> = relays
+            .iter()
+            .filter_map(|raw| match raw.parse::<RelayUrl>() {
+                Ok(url) => Some(url),
+                Err(e) => {
+                    tracing::debug!(relay = %raw, error = %e, "unparseable announced relay: skipped");
+                    None
+                }
+            })
+            .filter(|url| seen.insert(url.to_string()))
+            .collect();
+        let stale = {
+            *self.announced.lock().expect("lock announced") = parsed.clone();
+            // Only the off default consumes the announcement (precedence:
+            // the local word wins), so only there is a post-bind change
+            // worth a line: the endpoint keeps the map it bound with.
+            matches!(self.relay, RelayChoice::Off)
+                && self
+                    .bound_announced
+                    .lock()
+                    .expect("lock bound announced")
+                    .as_ref()
+                    .is_some_and(|used| *used != parsed)
+        };
+        if stale {
+            tracing::info!(
+                "the deployment's relay announcement changed: applied at the next Core start"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1165,19 +1234,30 @@ mod tests {
 
     use super::*;
 
+    fn custom_urls(mode: RelayMode) -> Vec<String> {
+        match mode {
+            RelayMode::Custom(map) => map
+                .urls::<Vec<_>>()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            other => panic!("expected a custom relay map, not {other:?}"),
+        }
+    }
+
     #[test]
     fn resolve_relay_maps_each_choice_to_its_mode_hint_and_probe() {
         // Off, the default: Disabled (no housekeeping connection), nothing
         // signed, and the home_relay probe short-circuited. This is the
         // production arm the daemon and the phone actually run; a regression
         // here silently puts fresh installs back on relays nobody chose.
-        let (mode, hint, off) = resolve_relay(RelayChoice::Off);
+        let (mode, hint, off) = resolve_relay(RelayChoice::Off, &[]);
         assert!(matches!(mode, RelayMode::Disabled));
         assert!(matches!(hint, HintSource::Fixed(None)));
         assert!(off, "off must skip the home_relay wait");
 
         // n0: the stock map, and the ELECTION as the signed word.
-        let (mode, hint, off) = resolve_relay(RelayChoice::N0);
+        let (mode, hint, off) = resolve_relay(RelayChoice::N0, &[]);
         assert!(matches!(mode, RelayMode::Default));
         assert!(
             matches!(hint, HintSource::Elected),
@@ -1187,20 +1267,62 @@ mod tests {
 
         // A URL: a one-relay map, the URL itself as the signed word.
         let url: RelayUrl = "https://relay.example".parse().expect("relay url");
-        let (mode, hint, off) = resolve_relay(RelayChoice::Url(url.clone()));
-        match mode {
-            RelayMode::Custom(map) => {
-                let urls: Vec<String> = map
-                    .urls::<Vec<_>>()
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect();
-                assert_eq!(urls, vec![url.to_string()]);
-            }
-            other => panic!("a URL must map to a custom relay map, not {other:?}"),
-        }
+        let (mode, hint, off) = resolve_relay(RelayChoice::Url(url.clone()), &[]);
+        assert_eq!(custom_urls(mode), vec![url.to_string()]);
         assert!(matches!(hint, HintSource::Fixed(Some(u)) if u == url.to_string()));
         assert!(!off);
+    }
+
+    #[test]
+    fn the_announcement_fills_the_off_default_and_never_beats_the_local_word() {
+        let eu: RelayUrl = "https://relay-eu.example".parse().expect("relay url");
+        let us: RelayUrl = "https://relay-us.example".parse().expect("relay url");
+        let announced = vec![eu.clone(), us.clone()];
+
+        // Off + an announcement: the whole list becomes the map, the
+        // election becomes the signed word (chosen all the way down: the
+        // user chose the server, the operator chose the relays), and the
+        // home_relay probe runs.
+        let (mode, hint, off) = resolve_relay(RelayChoice::Off, &announced);
+        assert_eq!(custom_urls(mode), vec![eu.to_string(), us.to_string()]);
+        assert!(matches!(hint, HintSource::Elected));
+        assert!(!off);
+
+        // The precedence (#104): an explicit local relay beats the
+        // announcement.
+        let local: RelayUrl = "https://relay.mine.example".parse().expect("relay url");
+        let (mode, hint, _) = resolve_relay(RelayChoice::Url(local.clone()), &announced);
+        assert_eq!(custom_urls(mode), vec![local.to_string()]);
+        assert!(matches!(hint, HintSource::Fixed(Some(u)) if u == local.to_string()));
+        let (mode, _, _) = resolve_relay(RelayChoice::N0, &announced);
+        assert!(matches!(mode, RelayMode::Default));
+    }
+
+    #[test]
+    fn announced_relays_are_parsed_deduplicated_and_stored_for_the_bind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lazy = LazyIrohTransport::new(dir.path().to_path_buf(), RelayChoice::Off, false);
+        PeerTransport::announce_relays(
+            &lazy,
+            &[
+                "https://relay-eu.example".to_string(),
+                "not a url".to_string(),
+                "https://relay-eu.example".to_string(),
+            ],
+        );
+        let held: Vec<String> = lazy
+            .announced
+            .lock()
+            .expect("lock announced")
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(held, vec!["https://relay-eu.example/".to_string()]);
+        // Hearing an announcement is not a use: nothing may bind for it.
+        assert!(
+            !dir.path().join("device.key").exists(),
+            "announcing must not bind"
+        );
     }
 
     #[test]
