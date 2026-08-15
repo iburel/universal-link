@@ -106,8 +106,11 @@ enum HintSource {
     /// The configured relay, verbatim (or none): it stands whether or not
     /// the endpoint is currently connected to it.
     Fixed(Option<String>),
-    /// n0 mode: the elected home relay, followed as the election moves (the
-    /// same watcher that follows the addresses re-signs it).
+    /// The elected home relay, followed as the election moves (the same
+    /// watcher that follows the addresses re-signs it). Two modes elect: the
+    /// explicit n0 opt-in, and the off default filled by a server
+    /// announcement (#105); either way the election is a relay somebody
+    /// chose, which is what lets it be signed.
     Elected,
 }
 
@@ -1072,7 +1075,17 @@ impl LazyIrohTransport {
                 )
                 .await
                 .map_err(|e| wrap("binding the iroh endpoint", format!("{e:#}")))?;
-                *self.bound_announced.lock().expect("lock bound announced") = Some(announced);
+                *self.bound_announced.lock().expect("lock bound announced") = Some(announced.clone());
+                // An announcement that landed DURING the bind saw
+                // `bound_announced` still unset and said nothing; the bind
+                // consumed the older list, so the late word gets its line
+                // here instead of vanishing.
+                let current = self.announced.lock().expect("lock announced").clone();
+                if announcement_outran_by_the_bind(&self.relay, Some(&announced), &current) {
+                    tracing::info!(
+                        "the deployment's relay announcement changed during the bind: applied at the next Core start"
+                    );
+                }
                 tracing::info!(
                     node_id = %transport.endpoint.id().fmt_short(),
                     "iroh data plane bound"
@@ -1207,25 +1220,27 @@ impl PeerTransport for LazyIrohTransport {
             })
             .filter(|url| seen.insert(url.to_string()))
             .collect();
-        let stale = {
-            *self.announced.lock().expect("lock announced") = parsed.clone();
-            // Only the off default consumes the announcement (precedence:
-            // the local word wins), so only there is a post-bind change
-            // worth a line: the endpoint keeps the map it bound with.
-            matches!(self.relay, RelayChoice::Off)
-                && self
-                    .bound_announced
-                    .lock()
-                    .expect("lock bound announced")
-                    .as_ref()
-                    .is_some_and(|used| *used != parsed)
-        };
-        if stale {
+        *self.announced.lock().expect("lock announced") = parsed.clone();
+        let bound = self.bound_announced.lock().expect("lock bound announced");
+        if announcement_outran_by_the_bind(&self.relay, bound.as_deref(), &parsed) {
             tracing::info!(
                 "the deployment's relay announcement changed: applied at the next Core start"
             );
         }
     }
+}
+
+/// Whether a fresh announcement arrived too late for the running endpoint:
+/// only the off default consumes the announcement (precedence: the local
+/// word wins), so only there is a post-bind change worth a line, and only
+/// when the bind consumed something else. `bound` is what the bind actually
+/// used (`None`: not bound yet, the fresh word will be consumed normally).
+fn announcement_outran_by_the_bind(
+    relay: &RelayChoice,
+    bound: Option<&[RelayUrl]>,
+    fresh: &[RelayUrl],
+) -> bool {
+    matches!(relay, RelayChoice::Off) && bound.is_some_and(|used| used != fresh)
 }
 
 #[cfg(test)]
@@ -1323,6 +1338,37 @@ mod tests {
             !dir.path().join("device.key").exists(),
             "announcing must not bind"
         );
+    }
+
+    #[test]
+    fn a_late_announcement_is_reported_only_when_the_bind_consumed_another() {
+        let eu: RelayUrl = "https://relay-eu.example".parse().expect("relay url");
+        let us: RelayUrl = "https://relay-us.example".parse().expect("relay url");
+
+        // Not bound yet: the fresh word will be consumed normally, no line.
+        assert!(!announcement_outran_by_the_bind(
+            &RelayChoice::Off,
+            None,
+            std::slice::from_ref(&eu)
+        ));
+        // Bound with the same list: a repeat, no line.
+        assert!(!announcement_outran_by_the_bind(
+            &RelayChoice::Off,
+            Some(std::slice::from_ref(&eu)),
+            std::slice::from_ref(&eu)
+        ));
+        // Bound with another list: the word arrived too late, say so.
+        assert!(announcement_outran_by_the_bind(
+            &RelayChoice::Off,
+            Some(std::slice::from_ref(&eu)),
+            std::slice::from_ref(&us)
+        ));
+        // A local choice never consumes the announcement: never a line.
+        assert!(!announcement_outran_by_the_bind(
+            &RelayChoice::N0,
+            Some(std::slice::from_ref(&eu)),
+            std::slice::from_ref(&us)
+        ));
     }
 
     #[test]

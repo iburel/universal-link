@@ -87,7 +87,9 @@ into its `config.json`.
   self-hosted case), and possibly empty because a server without a relay is a
   valid deployment. The one deliberate exception to "no addresses": these
   name infrastructure run FOR the fleet, never the server itself, and a
-  device's own explicit relay setting always wins over the announcement. The
+  device's own explicit relay (a URL or n0) always wins over the
+  announcement; the off default, written out or not, is what the
+  announcement fills. The
   Core re-reads this at every session establishment and keeps its own copy
   (`announced-relays.json`), so a boot with the server down still binds with
   the operator's relays.

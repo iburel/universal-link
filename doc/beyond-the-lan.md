@@ -27,7 +27,8 @@ The ladder, each rung strictly optional:
 Every device signs, in its own directory record, where it can be dialed: the
 socket addresses its endpoint stands behind (`addrs`: LAN, VPN and public IPv6
 addresses alike) and the relay somebody chose for it (`relay_hint`: the
-configured URL, or the home relay an explicit `"n0"` opt-in elected). The
+configured URL, or the home relay elected under an explicit `"n0"` opt-in
+or a server's announced relays). The
 records travel between your devices in the directory exchange they already
 run, and at dial time the hints are handed to the
 transport as candidates, tried alongside whatever mDNS resolves. When a
@@ -107,12 +108,14 @@ Two properties are deliberate and worth knowing:
 
 - **Relaying your devices' bytes is explicit, never a default.** The relay
   setting is off unless somebody set it, and a device whose relay is off
-  contacts none at all: no relay connection, no housekeeping traffic, and it
-  signs no relay into its record, so no sibling of yours is ever dialed
-  through a relay you did not choose. The n0 public relays still exist as one
-  of the choices (`"n0"`), and that opt-in signs the home relay it elects,
-  exactly as a configured URL signs itself: everything in `relay_hint` is a
-  relay somebody chose.
+  contacts none at all (no relay connection, no housekeeping traffic, nothing
+  signed into its record), with one deliberate exception: a device that
+  belongs to a server account uses the relays its operator announces
+  ([server-deployment.md](server-deployment.md)), somebody's choice too. The
+  n0 public relays still exist as one of the choices (`"n0"`), and that
+  opt-in signs the home relay it elects, exactly as a configured URL signs
+  itself and an announced relay signs its election: everything in
+  `relay_hint` is a relay somebody chose.
 - **What a relay operator sees.** Never content (everything is end-to-end
   encrypted), but a relay in use sees node ids, client IPs, timings and
   volumes. That operator is you, which is the point of this rung.

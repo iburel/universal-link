@@ -17,15 +17,18 @@
 //! relays, so the serverless half of the continuum stays dialable off the
 //! LAN. The copy dies where the directory cache dies: when the Core stops
 //! acting for the server session (logout, revocation) or for the account
-//! (leave) — the announcement was the server's standing word, and the
-//! standing ends with the relationship. Records signed while it stood keep
-//! their `relay_hint` (a hint is not a promise; a stale one costs one failed
-//! dial), and the reach watcher re-signs honestly after the next bind.
+//! (leave). The announcement was the server's standing word, and the
+//! standing ends with the relationship: [`forget`] empties the transport's
+//! in-memory copy along with the disk one, so a bind later in the SAME run
+//! (a pairing window, a dial) does not ride the departed operator's relays.
+//! Records signed while the word stood keep their `relay_hint` (a hint is
+//! not a promise; a stale one costs one failed dial), and the reach watcher
+//! re-signs honestly after the next bind.
 //!
 //! Everything read here is bounded and fail-closed: entries that are not
 //! strings, blank, or oversized are dropped, the list is deduplicated and
 //! clamped, and a fetch that fails (network, an older server without the
-//! field) is NO word — the cache stands, nothing is wiped by an error.
+//! field) is NO word: the cache stands, nothing is wiped by an error.
 
 use std::path::Path;
 
@@ -58,7 +61,7 @@ pub(crate) fn load(config_dir: &Path) -> Vec<String> {
     }
 }
 
-/// Persists the announcement — including the empty one: "this deployment
+/// Persists the announcement, the empty one included: "this deployment
 /// announced none" is a word too, and it must survive a restart so a relay
 /// the operator withdrew does not come back from an older cache.
 fn store(config_dir: &Path, relays: &[String]) {
@@ -68,10 +71,21 @@ fn store(config_dir: &Path, relays: &[String]) {
     }
 }
 
-/// Removes the cache — logout, revocation, leaving the account: the
-/// announcement was the server's standing word, and the standing ended. Same
-/// fallback as the directory cache: emptying reads as no announcement.
-pub(crate) fn forget(config_dir: &Path) {
+/// Forgets the announcement, disk AND transport: logout, revocation, leaving
+/// the account. The disk half alone would not do: the transport keeps the
+/// last list it was handed for its next bind, and a pairing window opened
+/// after the logout (in the same run) would otherwise still bind, ride and
+/// SIGN the departed operator's relays. Callers hold the session lock, like
+/// every state-then-disk teardown; `announce_relays` only ever touches the
+/// transport's own leaf state, never ours, so no ordering cycle is possible.
+pub(crate) fn forget(state: &AppState) {
+    remove_cache(&state.config_dir);
+    state.transport.announce_relays(&[]);
+}
+
+/// The disk half of [`forget`]. Same fallback as the directory cache:
+/// emptying reads as no announcement.
+fn remove_cache(config_dir: &Path) {
     let path = config_dir.join(FILE);
     match std::fs::remove_file(&path) {
         Ok(()) => {}
@@ -86,8 +100,8 @@ pub(crate) fn forget(config_dir: &Path) {
 }
 
 /// Reads the deployment descriptor and returns its relay list, sanitized.
-/// `None` is NO word — an unreachable server, a non-200, a body that is not
-/// a descriptor, or a server too old to carry the field — and the caller
+/// `None` is NO word (an unreachable server, a non-200, a body that is not
+/// a descriptor, or a server too old to carry the field) and the caller
 /// changes nothing on no word. `Some(vec![])` by contrast IS a word: this
 /// deployment runs no relay.
 pub(crate) async fn fetch(
@@ -107,10 +121,20 @@ pub(crate) async fn fetch(
 }
 
 /// Applies a freshly fetched announcement: nothing if it matches the cache,
-/// otherwise persist it and hand it to the transport. The transport applies
-/// it at its next bind; a change that arrives after the endpoint is up is
-/// its to log ("applied at the next start").
+/// otherwise persist it and hand it to the transport (which folds it into
+/// its next bind; a change that lands after the endpoint is up is the
+/// transport's to log as "applied at the next start").
+///
+/// The whole gesture runs under the session lock, checked against a live
+/// relationship: the session task races the teardowns (logout, revocation,
+/// leave all mark the state under this lock BEFORE forgetting), and an
+/// `apply` that slipped in after a teardown would otherwise resurrect the
+/// cache the teardown just removed and re-arm the transport.
 pub(crate) fn apply(state: &AppState, fresh: &[String]) {
+    let s = state.session.lock().expect("lock session");
+    if !s.logged_in || s.left_the_account {
+        return;
+    }
     if load(&state.config_dir) == fresh {
         return;
     }
@@ -118,6 +142,8 @@ pub(crate) fn apply(state: &AppState, fresh: &[String]) {
         relays = fresh.len(),
         "the deployment's relay announcement changed"
     );
+    // Disk under the lock that checked the state (state-then-disk, like every
+    // directory mutation); the transport's leaf state never takes ours back.
     store(&state.config_dir, fresh);
     state.transport.announce_relays(fresh);
 }
@@ -168,7 +194,7 @@ mod tests {
         assert!(load(dir.path()).is_empty(), "garbage is no announcement");
 
         store(dir.path(), &relays);
-        forget(dir.path());
+        remove_cache(dir.path());
         assert!(load(dir.path()).is_empty(), "forgotten");
     }
 
@@ -196,5 +222,72 @@ mod tests {
             .map(|n| json!(format!("https://relay-{n}.example")))
             .collect();
         assert_eq!(sanitize(&many).len(), MAX_ANNOUNCED);
+    }
+
+    /// A canned HTTP server for one connection: answers `response` verbatim,
+    /// then closes. What `fetch` looks like from the wire's side.
+    async fn one_shot_server(response: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut sink = [0u8; 4096];
+            let _ = stream.read(&mut sink).await;
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+        format!("ws://{addr}/ws")
+    }
+
+    fn http_json(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    /// The no-word / empty-word boundary, from the wire: a list is a word
+    /// (empty included), everything else is silence that must change nothing.
+    #[tokio::test]
+    async fn fetch_tells_a_word_from_silence() {
+        let connector = crate::PlainConnector;
+
+        // A list is a word, sanitized like the cache.
+        let body = r#"{"api_version":1,"relays":[" https://relay-eu.example ","https://relay-eu.example"]}"#;
+        let url = one_shot_server(Box::leak(http_json(body).into_boxed_str())).await;
+        assert_eq!(
+            fetch(&connector, &url).await,
+            Some(vec!["https://relay-eu.example".to_string()])
+        );
+
+        // The EMPTY list is a word: this deployment runs no relay.
+        let body = r#"{"api_version":1,"relays":[]}"#;
+        let url = one_shot_server(Box::leak(http_json(body).into_boxed_str())).await;
+        assert_eq!(fetch(&connector, &url).await, Some(Vec::new()));
+
+        // A server too old to carry the field: no word.
+        let body = r#"{"api_version":1,"oidc_issuer":"https://idp.example"}"#;
+        let url = one_shot_server(Box::leak(http_json(body).into_boxed_str())).await;
+        assert_eq!(fetch(&connector, &url).await, None);
+
+        // No descriptor at all (404): no word.
+        let url = one_shot_server(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(fetch(&connector, &url).await, None);
+
+        // A body that is not JSON: no word.
+        let url = one_shot_server(Box::leak(http_json("not json").into_boxed_str())).await;
+        assert_eq!(fetch(&connector, &url).await, None);
+
+        // Nothing listening: no word.
+        assert_eq!(fetch(&connector, "ws://127.0.0.1:9/ws").await, None);
     }
 }

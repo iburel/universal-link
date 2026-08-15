@@ -105,10 +105,13 @@ its directory record (`relay_hint`; under `"n0"`, the home relay that opt-in
 elects), and its already-paired siblings dial it through that relay from
 anywhere. A device that belongs to a server account also hears its
 deployment's relay announcement ([server-api.md](server-api.md#deployment-descriptor)):
-the announcement fills the off default, and an explicit local setting here
-always wins over it. Never a relay nobody chose: a device whose relay is off
-signs none, and none of your devices is dialed through one. What off costs,
-honestly: two
+the announcement fills the off default, and an explicit local relay here (a
+URL or `"n0"`) wins over it; `"off"` IS the default, written out or not, so
+it is exactly what the announcement fills. Never a relay nobody chose: with
+no announcement, a device whose relay is off signs none and none of your
+devices is dialed through one; under an announcement, the elected relay is
+one your operator chose and you accepted by joining their server. What off
+costs, honestly: two
 devices behind two distinct NATs, off the LAN, with no VPN between them, need
 a relay to meet (hole punching needs the rendezvous). The whole off-LAN story,
 VPN recipes included, is [beyond-the-lan.md](beyond-the-lan.md).

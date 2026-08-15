@@ -76,6 +76,9 @@ services:
       - "443:443"
     environment:
       ONEDEVICE_DOMAIN: ${ONEDEVICE_DOMAIN}
+      # For the optional relay block in the Caddyfile (empty and unused
+      # while that block stays commented out).
+      ONEDEVICE_RELAY_DOMAIN: ${ONEDEVICE_RELAY_DOMAIN:-}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data      # certificates — BACK THESE UP, otherwise re-issuance

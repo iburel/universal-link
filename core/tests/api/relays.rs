@@ -49,6 +49,19 @@ async fn the_announcement_is_learned_cached_rebound_and_forgotten() {
     let cache = core.config_dir().join("announced-relays.json");
     assert!(cache.exists(), "the announcement is cached on disk");
 
+    // A reconnection re-reads the descriptor, and the UNCHANGED word is not
+    // re-pushed: the transport hears the operator's list exactly once per
+    // actual change, however many sessions come and go.
+    server.cut();
+    wait_server_connected(&mut c, false).await;
+    server.restore();
+    wait_server_connected(&mut c, true).await;
+    assert_eq!(
+        switchboard.announced(&node_id).len(),
+        1,
+        "an unchanged announcement must not be re-pushed on reconnection"
+    );
+
     // A restart with the server cut: the boot announces the CACHED list to
     // the transport (same switchboard, same endpoint), before any session.
     server.cut();
@@ -61,7 +74,9 @@ async fn the_announcement_is_learned_cached_rebound_and_forgotten() {
     .await;
     assert_eq!(switchboard.announced(&node_id)[1], announced);
 
-    // Logout: the standing word ends with the relationship.
+    // Logout: the standing word ends with the relationship, on disk AND in
+    // the transport: a bind later in this same run (a pairing window, a
+    // dial) must not ride the departed operator's relays.
     let mut c = manager(&core).await;
     c.request("session.logout", json!({}))
         .await
@@ -69,6 +84,61 @@ async fn the_announcement_is_learned_cached_rebound_and_forgotten() {
     assert!(
         !cache.exists(),
         "the announcement does not outlive the session"
+    );
+    assert_eq!(
+        switchboard.announced(&node_id).last(),
+        Some(&Vec::new()),
+        "the transport must hear the emptying too"
+    );
+}
+
+/// A server REVOKING the device ends the standing word exactly like a
+/// logout: the struck device does not keep riding, or caching, the
+/// operator's relays.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revocation_forgets_the_announcement() {
+    let server = TestServer::start_with(announcing).await;
+    let mut admin = server.online_device("PC-Admin", "macos").await;
+    let switchboard = MemorySwitchboard::new();
+    let core = TestCore::start_enrolled_on(&server, &switchboard).await;
+    let node_id = core.node_id();
+    let mut c = manager(&core).await;
+    wait_server_connected(&mut c, true).await;
+    let cache = core.config_dir().join("announced-relays.json");
+    eventually(
+        async || cache.exists(),
+        "the announcement reaching the disk",
+    )
+    .await;
+
+    admin
+        .conn
+        .request(
+            "devices.revoke",
+            json!({
+                "device_id": core.device_id(),
+                "id_token": server.oidc.id_token(TEST_SUB),
+            }),
+        )
+        .await
+        .expect("devices.revoke");
+
+    eventually(
+        async || {
+            let r = c
+                .request("session.status", json!({}))
+                .await
+                .expect("session.status");
+            r["logged_in"] == json!(false)
+        },
+        "abandonment of the session after revocation",
+    )
+    .await;
+    assert!(!cache.exists(), "a struck device keeps no announcement");
+    assert_eq!(
+        switchboard.announced(&node_id).last(),
+        Some(&Vec::new()),
+        "the transport must hear the emptying too"
     );
 }
 
