@@ -1,0 +1,9 @@
+# Configuration of the optional compose-hosted iroh relay (service `relay`
+# in docker-compose.yml). Copy to `iroh-relay.toml` in this directory: the
+# service mounts it read-only.
+#
+# Plain HTTP on the compose-internal port: Caddy terminates TLS on the
+# relay's public domain (see the Caddyfile), exactly like the server's. With
+# no `[tls]` section the relay serves everything over this one socket.
+
+http_bind_addr = "[::]:3340"

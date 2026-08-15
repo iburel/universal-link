@@ -633,7 +633,9 @@ impl Stranger {
 
     /// Sends `frame` to `target` and returns its answer — `None` when the Core
     /// closed the stream without a word, which is how it refuses a device it will
-    /// not talk to.
+    /// not talk to. The refusal is a drop, and the drop can land BEFORE the
+    /// frame's bytes do (the serve loop refuses without reading): a failed
+    /// write is that same refusal arriving early, never a harness fault.
     pub(crate) async fn say(&self, target: &TestCore, frame: Value) -> Option<Value> {
         let peer = PeerAddr {
             node_id: target.node_id(),
@@ -645,7 +647,9 @@ impl Stranger {
             .open(&peer)
             .await
             .expect("the switchboard routes");
-        peer_write(&mut stream, &frame).await;
+        if !peer_try_write(&mut stream, &frame).await {
+            return None;
+        }
         peer_read(&mut stream).await
     }
 

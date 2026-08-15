@@ -116,6 +116,13 @@ async fn the_account_striking_this_device_reaches_it_and_it_leaves() {
     // simply never exist on the leaving device — and its erasure would be
     // asserted against nothing.
     seed_revocation(c.config_dir(), &code, &DeviceKey::generate().node_id());
+    // And the relay announcement a server once made to C (#105): the standing
+    // ended with the relationship, and leaving the account ends the last one.
+    std::fs::write(
+        c.config_dir().join("announced-relays.json"),
+        r#"{"relays":["https://relay-old.example"]}"#,
+    )
+    .expect("seed the announced relays");
 
     ca.request("devices.revoke", json!({ "device_id": struck_id }))
         .await
@@ -153,6 +160,7 @@ async fn the_account_striking_this_device_reaches_it_and_it_leaves() {
         "directory.json",
         "revoked.json",
         "device.key",
+        "announced-relays.json",
     ] {
         assert!(
             !c.config_dir().join(gone).exists(),
@@ -160,6 +168,11 @@ async fn the_account_striking_this_device_reaches_it_and_it_leaves() {
         );
     }
     assert!(keepsake.exists(), "the human's file left with the account");
+    assert_eq!(
+        switchboard.announced(&struck_id).last(),
+        Some(&Vec::new()),
+        "the transport must hear the announcement emptied too"
+    );
     assert_eq!(
         c.secret("account-key-seed"),
         None,

@@ -463,6 +463,9 @@ pub(crate) fn leave(state: &std::sync::Arc<crate::state::AppState>) {
         crate::session::remove_session_file(&state.config_dir);
         crate::directory::remove(&state.config_dir);
         crate::directory::remove_revoked(&state.config_dir);
+        // A device out of the account keeps nothing of the deployment's
+        // relay announcement either (#105).
+        crate::relays::forget(state);
         // Broadcast under the session lock (order: session then registry): the
         // order of notifications is the order of states, and nothing may slip a
         // stale directory event in after these.

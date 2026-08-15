@@ -863,6 +863,7 @@ mod tests {
                 nonce_ttl: Duration::from_secs(60),
                 pairing_ttl: Duration::from_secs(120),
                 max_requests_per_minute: None,
+                relays: Vec::new(),
             },
             Arc::new(MemoryStore::default()),
             DurableState::default(),

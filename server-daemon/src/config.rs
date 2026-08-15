@@ -98,6 +98,7 @@ fn load_from(env: &dyn Fn(&str) -> Option<String>) -> Result<Config, String> {
         &mut errors,
     );
     let max_requests_per_minute = optional_rate_limit(env, &mut errors);
+    let relays = relay_list(env, &mut errors);
 
     if !errors.is_empty() {
         return Err(errors.join(" ; "));
@@ -118,7 +119,30 @@ fn load_from(env: &dyn Fn(&str) -> Option<String>) -> Result<Config, String> {
         nonce_ttl: nonce_ttl.expect("validated"),
         pairing_ttl: pairing_ttl.expect("validated"),
         max_requests_per_minute: max_requests_per_minute.expect("validated"),
+        relays,
     })
+}
+
+/// `ONEDEVICE_RELAYS`: the deployment's iroh relays, comma-separated URLs
+/// (#105). Optional, and empty means none: a server without a relay is a
+/// valid deployment. Each entry must be an http(s) URL: the fleet will hand
+/// them to its transport, and a typo caught here beats a fleet that silently
+/// elects nothing.
+fn relay_list(env: &dyn Fn(&str) -> Option<String>, errors: &mut Vec<String>) -> Vec<String> {
+    let Some(raw) = non_empty(env, "ONEDEVICE_RELAYS") else {
+        return Vec::new();
+    };
+    let mut relays = Vec::new();
+    for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        if entry.starts_with("http://") || entry.starts_with("https://") {
+            relays.push(entry.to_string());
+        } else {
+            errors.push(format!(
+                "ONEDEVICE_RELAYS entries must start with http:// or https:// : {entry}"
+            ));
+        }
+    }
+    relays
 }
 
 /// Required variable: present and non-empty. A variable SET BUT EMPTY
@@ -340,6 +364,41 @@ mod tests {
         vars.push(("ONEDEVICE_NONCE_TTL_SECS", "many"));
         let err = load_from(&env_of(&vars)).expect_err("must fail");
         assert!(err.contains("ONEDEVICE_NONCE_TTL_SECS"), "{err}");
+    }
+
+    #[test]
+    fn the_relay_list_is_optional_split_on_commas_and_validated() {
+        // Absent (or empty): no relays, and that is not a fault: a server
+        // without a relay is a valid deployment (#105).
+        assert!(
+            load_from(&env_of(REQUIRED))
+                .expect("valid")
+                .relays
+                .is_empty()
+        );
+        let mut vars = REQUIRED.to_vec();
+        vars.push(("ONEDEVICE_RELAYS", "  "));
+        assert!(load_from(&env_of(&vars)).expect("valid").relays.is_empty());
+
+        // A list: split on commas, entries trimmed, blanks dropped.
+        let mut vars = REQUIRED.to_vec();
+        vars.push((
+            "ONEDEVICE_RELAYS",
+            " https://relay-eu.example , https://relay-us.example ,",
+        ));
+        assert_eq!(
+            load_from(&env_of(&vars)).expect("valid").relays,
+            vec![
+                "https://relay-eu.example".to_string(),
+                "https://relay-us.example".to_string()
+            ]
+        );
+
+        // A non-URL entry is refused at startup, like every other typo.
+        let mut vars = REQUIRED.to_vec();
+        vars.push(("ONEDEVICE_RELAYS", "relay-eu.example"));
+        let err = load_from(&env_of(&vars)).expect_err("must fail");
+        assert!(err.contains("ONEDEVICE_RELAYS"), "{err}");
     }
 
     #[test]

@@ -153,6 +153,18 @@ pub trait PeerTransport: Send + Sync + std::fmt::Debug {
         tokio::sync::watch::channel(0).1
     }
 
+    /// Hands the transport the relay list the deployment announced (#105):
+    /// the descriptor's word, cached on disk between sessions
+    /// (`crate::relays`). The transport folds it into its relay resolution
+    /// UNDER the local choice (an explicit local relay or opt-in wins; the
+    /// announcement only fills the off default), applied at its next bind.
+    /// Called at startup with the cached list and again whenever a session
+    /// learns a fresh one. Default: nothing (a transport with no relay
+    /// notion has nothing to fold.
+    fn announce_relays(&self, relays: &[String]) {
+        let _ = relays;
+    }
+
     /// The endpoints currently visible on the local network (mDNS), as
     /// `node_id`s. An ADDRESS-BOOK fact, never a trust fact: anything can
     /// announce anything, so the callers only match these against peers

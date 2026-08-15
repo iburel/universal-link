@@ -243,10 +243,12 @@ Core reads it in its config directory (see
   installed-app clients do, and the working reference setup sets it. Not
   confidential for an installed app — it ships with the client.
 - `device_name`: optional (default: the hostname). A plain display label.
-- `relay`: optional, **off by default** (no relay at all). A self-hosted iroh
-  relay's URL, or `"n0"` to opt into the public n0 relays explicitly. Off the
-  LAN, with no VPN or dialable address between two devices, a relay is what
-  lets them meet.
+- `relay`: optional, **off by default**: no relay at all, unless the device
+  belongs to a server whose deployment announces its own relays (the
+  announcement fills exactly this default). A self-hosted iroh relay's URL,
+  or `"n0"` to opt into the public n0 relays explicitly, wins over any
+  announcement. Off the LAN, with no VPN or dialable address between two
+  devices, a relay is what lets them meet.
 - `receive_dir`: optional — where received files land; without it,
   `<Downloads>/1Device`.
 - `lan_discovery`: optional, default `true` — announce this device and resolve

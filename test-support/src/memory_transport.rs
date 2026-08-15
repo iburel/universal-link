@@ -49,6 +49,11 @@ struct Route {
     reach: Reach,
     /// Bumped when `reach` changes: the Core's reach watcher re-pulls.
     reach_gen: tokio::sync::watch::Sender<u64>,
+    /// Every list `announce_relays` handed this endpoint, in order: the
+    /// double records what the real transport would fold into its next bind
+    /// (#105), so a test can assert both the content and that an unchanged
+    /// announcement was not re-pushed.
+    announced: Vec<Vec<String>>,
     tx: mpsc::UnboundedSender<Wire>,
 }
 
@@ -90,6 +95,7 @@ impl MemorySwitchboard {
                 lan_gen: lan_gen.clone(),
                 reach: Reach::default(),
                 reach_gen: reach_gen.clone(),
+                announced: Vec::new(),
                 tx,
             },
         );
@@ -120,6 +126,18 @@ impl MemorySwitchboard {
         }
         route.reach = reach;
         route.reach_gen.send_modify(|generation| *generation += 1);
+    }
+
+    /// The relay lists `announce_relays` handed to this endpoint so far,
+    /// oldest first. An unknown `node_id` is a test bug, so it panics.
+    pub fn announced(&self, node_id: &str) -> Vec<Vec<String>> {
+        self.routes
+            .lock()
+            .unwrap()
+            .get(node_id)
+            .expect("announced: node_id unknown to the switchboard")
+            .announced
+            .clone()
     }
 
     /// Has this endpoint been asked to make itself reachable? See
@@ -184,6 +202,14 @@ impl std::fmt::Debug for MemoryTransport {
 }
 
 impl PeerTransport for MemoryTransport {
+    fn announce_relays(&self, relays: &[String]) {
+        let mut routes = self.switchboard.routes.lock().unwrap();
+        let route = routes
+            .get_mut(&self.node_id)
+            .expect("announce_relays: node_id unknown to the switchboard");
+        route.announced.push(relays.to_vec());
+    }
+
     fn open<'a>(&'a self, peer: &'a PeerAddr) -> Opening<'a> {
         Box::pin(async move {
             let (target, registered_relay, registered_addrs, lan_route) = {

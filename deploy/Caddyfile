@@ -8,3 +8,11 @@
 {$ONEDEVICE_DOMAIN} {
 	reverse_proxy server:8080
 }
+
+# The optional iroh relay (compose profile `relay`): uncomment, set
+# ONEDEVICE_RELAY_DOMAIN in .env, and announce the https URL to the fleet
+# with ONEDEVICE_RELAYS. Caddy relays the protocol's HTTP upgrade natively,
+# like the WebSocket above.
+# {$ONEDEVICE_RELAY_DOMAIN} {
+# 	reverse_proxy relay:3340
+# }

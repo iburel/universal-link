@@ -52,7 +52,7 @@ pub(crate) enum DiscoverError {
 
 /// The descriptor URL and the `server_url` that follow from what was typed.
 /// `None` if nothing usable does.
-fn addresses(input: &str) -> Option<(String, String)> {
+pub(crate) fn addresses(input: &str) -> Option<(String, String)> {
     let input = input.trim();
     // No scheme means TLS. This fetch decides where the login goes and which
     // client id it uses, so the default has to be the protected one; cleartext

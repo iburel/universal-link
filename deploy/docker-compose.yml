@@ -33,6 +33,10 @@ services:
       # `:-` so an existing .env that predates this setting stays valid without
       # a compose warning; empty = the deployment has no client secret.
       ONEDEVICE_OIDC_CLIENT_SECRET: ${ONEDEVICE_OIDC_CLIENT_SECRET:-}
+      # The relays this deployment announces to its fleet (comma-separated
+      # URLs, see .env.example). Empty = the deployment runs no relay, which
+      # is a valid shape: devices then fall back to their own relay setting.
+      ONEDEVICE_RELAYS: ${ONEDEVICE_RELAYS:-}
       # Optional (defaults baked into the binary) — uncomment as needed:
       # ONEDEVICE_MAX_REQUESTS_PER_MINUTE: "120"
       # ONEDEVICE_LOG: "info"
@@ -43,6 +47,27 @@ services:
     expose:
       - "8080"
 
+  # Optional: the deployment's own iroh relay, the recommended companion of
+  # the account server (doc/server-deployment.md). Off unless started with
+  # `docker compose --profile relay up -d`; to make the fleet use it, set
+  # ONEDEVICE_RELAY_DOMAIN in .env, uncomment the relay block in the
+  # Caddyfile, copy iroh-relay.toml.example to iroh-relay.toml, and announce
+  # it with ONEDEVICE_RELAYS above. Stateless: no volume, nothing to back
+  # up. Nothing couples it to the server: they never talk to each other and
+  # scale on different axes; they only share this file for convenience.
+  relay:
+    image: docker.io/n0computer/iroh-relay:v1.0.3
+    profiles: ["relay"]
+    restart: unless-stopped
+    command: ["--config-path", "/etc/iroh-relay.toml"]
+    volumes:
+      - ./iroh-relay.toml:/etc/iroh-relay.toml:ro
+    # Plain HTTP inside the compose network: Caddy terminates TLS on the
+    # relay's public domain, exactly like the server's. Never expose it
+    # directly.
+    expose:
+      - "3340"
+
   caddy:
     image: caddy:2
     restart: unless-stopped
@@ -51,6 +76,9 @@ services:
       - "443:443"
     environment:
       ONEDEVICE_DOMAIN: ${ONEDEVICE_DOMAIN}
+      # For the optional relay block in the Caddyfile (empty and unused
+      # while that block stays commented out).
+      ONEDEVICE_RELAY_DOMAIN: ${ONEDEVICE_RELAY_DOMAIN:-}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data      # certificates — BACK THESE UP, otherwise re-issuance

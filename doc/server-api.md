@@ -55,7 +55,8 @@ client reads it before it is able to log in.
   "api_version": 1,
   "oidc_issuer": "https://accounts.google.com",
   "oidc_client_id": "1234.apps.googleusercontent.com",
-  "oidc_client_secret": "GOCSPX-…"
+  "oidc_client_secret": "GOCSPX-…",
+  "relays": ["https://relay-eu.example", "https://relay-us.example"]
 }
 ```
 
@@ -80,10 +81,24 @@ into its `config.json`.
   `wss://<host>/ws` itself (the path is fixed by this API). A server behind a
   reverse proxy has no reliable knowledge of its public origin, and a URL it
   dictated would be a redirect it controls.
+- `relays` is the deployment's relay announcement: the iroh relays the
+  operator runs for the fleet, a list because a public deployment wants
+  regional relays the endpoint elects from (one entry is the common
+  self-hosted case), and possibly empty because a server without a relay is a
+  valid deployment. The one deliberate exception to "no addresses": these
+  name infrastructure run FOR the fleet, never the server itself, and a
+  device's own explicit relay (a URL or n0) always wins over the
+  announcement; the off default, written out or not, is what the
+  announcement fills. The
+  Core re-reads this at every session establishment and keeps its own copy
+  (`announced-relays.json`), so a boot with the server down still binds with
+  the operator's relays.
 - `api_version` is the number `auth.enroll` also answers: a client can tell,
   before enrolling, whether this server speaks its protocol.
-- `Cache-Control: no-store` — read once, when a device is set up. A cached copy is
-  how a client keeps being configured with an OIDC client already replaced.
+- `Cache-Control: no-store`: read when a device is set up, and re-read at each
+  session establishment for `relays`; the Core keeps its own copy of those. An
+  HTTP-cached copy is how a client keeps being configured with an OIDC client
+  (or a relay list) already replaced.
 - **404** = a server older than this endpoint; the client falls back to asking the
   user for the fields.
 - The `/.well-known/` name is not IANA-registered. What registration guards

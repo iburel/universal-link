@@ -147,8 +147,9 @@ fn load_from(
     // The relay is checked at startup like the server URLs: a typo would
     // otherwise give a silent data plane, with no explanation. The keywords
     // are matched case-insensitively (they are words, not URLs); anything
-    // else must parse as a relay URL. A fault falls back to off: the quiet
-    // default, never a relay nobody chose.
+    // else must parse as a relay URL. A fault falls back to off, the quiet
+    // default (which a server's announcement may fill, #105): never onto n0
+    // or a mangled URL nobody provably chose.
     let relay = match fields.relay.as_deref().map(str::trim) {
         None | Some("") => RelayChoice::Off,
         Some(text) if text.eq_ignore_ascii_case("off") => RelayChoice::Off,

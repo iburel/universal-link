@@ -209,6 +209,10 @@ fn drop_session(state: &AppState) {
         // the answer to that is an AK rotation, not a deletion an attacker has
         // already outrun.
         remove_session_file(&state.config_dir);
+        // The relay announcement ends with the server relationship too
+        // (#105): a struck-off device does not keep riding the operator's
+        // relays.
+        crate::relays::forget(state);
         // What the SERVER asserted leaves with the session; what the ACCOUNT can
         // still prove — the records `forget` kept — stays, because a server
         // striking this device off its directory does not end a membership only
@@ -482,6 +486,21 @@ async fn connect_and_serve(state: &Arc<AppState>, info: &SessionInfo) -> Outcome
             }
         }
     }
+    // The deployment's relay announcement (#105), re-read at every session:
+    // the descriptor is the operator's standing word on where the relays
+    // are, and the Core keeps its own copy so a boot with the server down
+    // still binds with the operator's relays. Fetched BEFORE the wakes
+    // below: the dirsync round they trigger dials peers, the dial is what
+    // binds the lazy endpoint, and a fresh device's first bind must consume
+    // the announcement rather than beat it (an endpoint binds its relay map
+    // once; a word that loses this race waits for the next Core start).
+    // Bounded (the HTTP layer's own timeout), to a host that just answered
+    // our WebSocket handshake; no word (an older server, a failed fetch)
+    // changes nothing, the cache stands.
+    if let Some(fresh) = crate::relays::fetch(state.connector.as_ref(), &info.server_url).await {
+        crate::relays::apply(state, &fresh);
+    }
+
     // Cache primed: replay what setup set aside.
     for (method, params) in std::mem::take(&mut conn.buffered) {
         apply_event(state, &method, &params);

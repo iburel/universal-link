@@ -22,6 +22,7 @@ mod http;
 mod identity;
 mod login;
 mod pairing;
+mod relays;
 mod rpc;
 mod secrets;
 mod session;
@@ -389,6 +390,15 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
 
     if let Some(info) = session_info {
         start_session_task(&state, info);
+    }
+
+    // The deployment's cached relay announcement (#105), handed to the
+    // transport BEFORE anything can bind it: a Core that boots with the
+    // server down still binds with the operator's relays. An empty cache
+    // announces nothing, which is exactly what an off default should hear.
+    let cached_relays = relays::load(&state.config_dir);
+    if !cached_relays.is_empty() {
+        state.transport.announce_relays(&cached_relays);
     }
 
     let accept_state = state.clone();
