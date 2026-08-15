@@ -371,8 +371,9 @@ fields: `seq` (u64); `self_sig`, the device's own signature, under the key its
 `node_id` IS, over `{node_id, name, platform, seq, addrs, relay_hint}`; and the
 two reach hints that signature covers: `addrs` (a list of socket addresses, as
 text, where the device says it can be dialed; at most 16 entries of at most 64
-bytes each) and `relay_hint` (the relay it was EXPLICITLY configured with, or
-null; never an elected default). So a description can travel from device to
+bytes each) and `relay_hint` (a relay somebody CHOSE for it, or null: the
+configured URL, or the home relay an explicit n0 opt-in elected, never a
+relay nobody chose). So a description can travel from device to
 device without the one relaying it being trusted with it, and `seq`, which only
 its owner can raise, is what makes one description supersede another.
 Deliberately NOT signed: `relay_url`, `online`, `last_seen`, `status`,

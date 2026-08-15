@@ -62,8 +62,8 @@ pub enum RelayChoice {
     /// No relay at all (`RelayMode::Disabled`): no relay connection, no
     /// housekeeping connection, zero unsolicited network contact at boot.
     /// What still connects: the LAN (mDNS), any directly dialable address
-    /// (VPN tunnels, the signed hints of #87), and whatever a server
-    /// announces (#105).
+    /// (VPN tunnels, the signed hints of #87), and, once #105 lands, whatever
+    /// a server announces.
     Off,
     /// The n0 public relays (`RelayMode::Default`), chosen instead of
     /// inherited. The endpoint elects a home relay from the map, and THAT
@@ -72,6 +72,21 @@ pub enum RelayChoice {
     N0,
     /// A specific relay: self-hosted, or an operator's.
     Url(RelayUrl),
+}
+
+/// Mode, signed hint and the `home_relay` short-circuit, derived from the
+/// one choice in one place, so the signed word can never disagree with how
+/// the endpoint runs: off signs nothing and skips the relay probe, a URL
+/// signs itself, n0 signs whatever home relay the endpoint elects.
+fn resolve_relay(relay: RelayChoice) -> (RelayMode, HintSource, bool) {
+    match relay {
+        RelayChoice::Off => (RelayMode::Disabled, HintSource::Fixed(None), true),
+        RelayChoice::N0 => (RelayMode::Default, HintSource::Elected, false),
+        RelayChoice::Url(url) => {
+            let hint = HintSource::Fixed(Some(url.to_string()));
+            (RelayMode::custom([url]), hint, false)
+        }
+    }
 }
 
 /// Where `own_reach`'s `relay_hint` comes from. Kept apart from the mode:
@@ -198,18 +213,7 @@ impl IrohTransport {
     ) -> anyhow::Result<IrohTransport> {
         let secret = SecretKey::from_bytes(&seed);
         let mdns = lan_lookup(&secret, lan_discovery);
-        let relay_off = matches!(relay, RelayChoice::Off);
-        // Mode and hint derive from the same choice, so the signed word can
-        // never disagree with how the endpoint runs: off signs nothing, a URL
-        // signs itself, n0 signs whatever home relay the endpoint elects.
-        let (relay_mode, hint) = match relay {
-            RelayChoice::Off => (RelayMode::Disabled, HintSource::Fixed(None)),
-            RelayChoice::N0 => (RelayMode::Default, HintSource::Elected),
-            RelayChoice::Url(url) => {
-                let hint = HintSource::Fixed(Some(url.to_string()));
-                (RelayMode::custom([url]), hint)
-            }
-        };
+        let (relay_mode, hint, relay_off) = resolve_relay(relay);
         let mut builder = Endpoint::builder(presets::Minimal)
             .secret_key(secret)
             .alpns(vec![ALPN.to_vec()])
@@ -268,22 +272,17 @@ impl IrohTransport {
         .await
     }
 
-    /// Test endpoint in OFF mode: `RelayMode::Disabled`, the production
-    /// default (#104), verbatim. What the LAN and address-hint tests bind, so
-    /// they prove the routes the off default is documented to keep.
+    /// Test endpoint in OFF mode: the production default (#104), THROUGH the
+    /// production mapping (`resolve_relay`), so the LAN and address-hint
+    /// tests prove the routes the off default is documented to keep against
+    /// the very derivation the daemon runs.
     #[cfg(feature = "test-utils")]
     pub async fn bind_test_off(
         seed: [u8; 32],
         lan_discovery: bool,
     ) -> anyhow::Result<IrohTransport> {
-        Self::bind_test_with(
-            seed,
-            RelayMode::Disabled,
-            HintSource::Fixed(None),
-            true,
-            lan_discovery,
-        )
-        .await
+        let (relay_mode, hint, relay_off) = resolve_relay(RelayChoice::Off);
+        Self::bind_test_with(seed, relay_mode, hint, relay_off, lan_discovery).await
     }
 
     #[cfg(feature = "test-utils")]
@@ -683,32 +682,36 @@ async fn watch_reach(
         // Mutate, release, THEN bump, same discipline as the LAN set: a
         // watcher woken by the bump re-pulls and must never observe the
         // pre-mutation state.
-        let mut changed = {
-            let mut held = addrs.lock().expect("lock own addrs");
-            if *held == fresh {
-                false
-            } else {
-                tracing::debug!(addrs = fresh.len(), "own direct addresses changed");
-                *held = fresh;
-                true
-            }
-        };
+        let addr_count = fresh.len();
+        let mut changed = update_if_changed(&addrs, fresh);
+        if changed {
+            tracing::debug!(addrs = addr_count, "own direct addresses changed");
+        }
         if follow_election {
             let elected = claim.relay_urls().next().map(ToString::to_string);
-            changed |= {
-                let mut held = relay_hint.lock().expect("lock relay hint");
-                if *held == elected {
-                    false
-                } else {
-                    tracing::debug!(elected = elected.is_some(), "elected home relay changed");
-                    *held = elected;
-                    true
-                }
-            };
+            let stands = elected.is_some();
+            if update_if_changed(&relay_hint, elected) {
+                tracing::debug!(elected = stands, "elected home relay changed");
+                changed = true;
+            }
         }
         if changed {
             reach_gen.send_modify(|generation| *generation += 1);
         }
+    }
+}
+
+/// Replaces `slot` when `fresh` differs, saying whether it did: the compare
+/// half of the mutate-release-THEN-bump discipline, shared by the address
+/// set and the elected hint so neither half of the claim can drift from it.
+/// The lock is released before the caller bumps.
+fn update_if_changed<T: PartialEq>(slot: &Mutex<T>, fresh: T) -> bool {
+    let mut held = slot.lock().expect("lock reach slot");
+    if *held == fresh {
+        false
+    } else {
+        *held = fresh;
+        true
     }
 }
 
@@ -1161,6 +1164,67 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
+
+    #[test]
+    fn resolve_relay_maps_each_choice_to_its_mode_hint_and_probe() {
+        // Off, the default: Disabled (no housekeeping connection), nothing
+        // signed, and the home_relay probe short-circuited. This is the
+        // production arm the daemon and the phone actually run; a regression
+        // here silently puts fresh installs back on relays nobody chose.
+        let (mode, hint, off) = resolve_relay(RelayChoice::Off);
+        assert!(matches!(mode, RelayMode::Disabled));
+        assert!(matches!(hint, HintSource::Fixed(None)));
+        assert!(off, "off must skip the home_relay wait");
+
+        // n0: the stock map, and the ELECTION as the signed word.
+        let (mode, hint, off) = resolve_relay(RelayChoice::N0);
+        assert!(matches!(mode, RelayMode::Default));
+        assert!(
+            matches!(hint, HintSource::Elected),
+            "the opt-in signs its election"
+        );
+        assert!(!off);
+
+        // A URL: a one-relay map, the URL itself as the signed word.
+        let url: RelayUrl = "https://relay.example".parse().expect("relay url");
+        let (mode, hint, off) = resolve_relay(RelayChoice::Url(url.clone()));
+        match mode {
+            RelayMode::Custom(map) => {
+                let urls: Vec<String> = map
+                    .urls::<Vec<_>>()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect();
+                assert_eq!(urls, vec![url.to_string()]);
+            }
+            other => panic!("a URL must map to a custom relay map, not {other:?}"),
+        }
+        assert!(matches!(hint, HintSource::Fixed(Some(u)) if u == url.to_string()));
+        assert!(!off);
+    }
+
+    #[test]
+    fn update_if_changed_reports_only_actual_changes() {
+        let slot = Mutex::new(Some("https://a.example".to_string()));
+        // Same value: no report, no wasted re-signing wakeup.
+        assert!(!update_if_changed(
+            &slot,
+            Some("https://a.example".to_string())
+        ));
+        // A different value lands and reports: the elected-hint half of the
+        // claim (and the address half) both ride exactly this.
+        assert!(update_if_changed(
+            &slot,
+            Some("https://b.example".to_string())
+        ));
+        assert_eq!(
+            *slot.lock().expect("slot"),
+            Some("https://b.example".to_string())
+        );
+        // Withdrawal is a change too (a home relay lost is a claim to drop).
+        assert!(update_if_changed(&slot, None));
+        assert_eq!(*slot.lock().expect("slot"), None);
+    }
 
     #[test]
     fn the_macos_notice_names_the_switch_to_flip() {

@@ -26,8 +26,9 @@ The ladder, each rung strictly optional:
 Every device signs, in its own directory record, where it can be dialed: the
 socket addresses its endpoint stands behind (`addrs`: LAN, VPN and public IPv6
 addresses alike) and the relay somebody chose for it (`relay_hint`: the
-configured URL, or the home relay an explicit `"n0"` opt-in elected). The records travel between your devices in the directory
-exchange they already run, and at dial time the hints are handed to the
+configured URL, or the home relay an explicit `"n0"` opt-in elected). The
+records travel between your devices in the directory exchange they already
+run, and at dial time the hints are handed to the
 transport as candidates, tried alongside whatever mDNS resolves. When a
 device's addresses move (it joined a network, a VPN came up), it re-signs its
 record on the spot and tells the account.
