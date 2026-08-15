@@ -1483,6 +1483,13 @@ fn lan_declaration(state: &AppState) -> Value {
                 attestation: "",
             },
             None,
+            // What the transport knows right now (it is bound, the pairing
+            // window is what bound it), CLAMPED to what a record may carry:
+            // signed over-long, the peer's verify would refuse the whole
+            // declaration and the pairing with it. Declared here so the
+            // account can dial this device off the LAN from its very first
+            // record.
+            &crate::dataplane::claimed_reach(state).unwrap_or_default(),
         )
     })
 }
@@ -1690,9 +1697,12 @@ async fn accept_lan(state: &Arc<AppState>, payload: LanPayload) -> Result<Value,
     // block, and nothing here may wait on it while holding state.
     let ours = standing(state, &key);
 
+    // No relay and no address hints, deliberately (see below): the LAN is the
+    // route, mDNS the resolution.
     let peer = PeerAddr {
         node_id: payload.node_id.clone(),
         relay_url: None,
+        addrs: Vec::new(),
     };
     let offline = |what: &'static str| {
         move |e: std::io::Error| {
@@ -2244,6 +2254,11 @@ fn join_locally(state: &Arc<AppState>, root: &crate::account_key::AccountRoot) {
     if let Some(devices) = s.devices.as_ref() {
         crate::directory::save_unrefreshed(&state.config_dir, devices);
     }
+    // Joining is the one moment a reach becomes signable with the transport
+    // having observed nothing new: the watcher, which only hears the
+    // transport, is told to re-apply the current claim. (It will block on the
+    // session lock until this function releases it.)
+    state.reach_wake.notify_one();
     // A device that already held a record of its own has just got its account key
     // back, which changes nothing anyone is watching the directory for.
     if had {

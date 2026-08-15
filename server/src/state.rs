@@ -89,13 +89,20 @@ pub struct DeviceEntry {
     pub attestation: Option<String>,
     /// The device's signed description (the continuum): `seq` orders it,
     /// `self_sig` is the device's own signature over `{node_id, name, platform,
-    /// seq}`. Opaque here exactly like the attestation — carried and rebroadcast,
-    /// never interpreted; it is what lets a PEER relay this record to devices
-    /// this server never met. Dropped on a rename (`devices.rename`): the
-    /// signature covered the old name, and the device republishes over its own
-    /// connection once it hears.
+    /// seq, addrs, relay_hint}`. Opaque here exactly like the attestation:
+    /// carried and rebroadcast, never interpreted; it is what lets a PEER relay
+    /// this record to devices this server never met. Dropped on a rename
+    /// (`devices.rename`): the signature covered the old name, and the device
+    /// republishes over its own connection once it hears.
     pub seq: Option<u64>,
     pub self_sig: Option<String>,
+    /// The reach half of that description: where the device says it can be
+    /// dialed (socket addresses, an explicitly configured relay). Same opaque
+    /// treatment; replaced together with `seq`/`self_sig`, since one signature
+    /// covers them all. Kept through a rename: the addresses did not move with
+    /// the name, and peers only ever trust them through the signature anyway.
+    pub addrs: Vec<String>,
+    pub relay_hint: Option<String>,
     /// Current connection: one device = at most one connection.
     pub conn: Option<(ConnId, Sender<OutMsg>)>,
 }
@@ -112,6 +119,8 @@ impl DeviceEntry {
             "attestation": self.attestation,
             "seq": self.seq,
             "self_sig": self.self_sig,
+            "addrs": self.addrs,
+            "relay_hint": self.relay_hint,
             "online": self.conn.is_some(),
             "status": self.status,
             "last_seen": self.last_seen,
@@ -139,6 +148,8 @@ impl Registry {
                         attestation: d.attestation,
                         seq: d.seq,
                         self_sig: d.self_sig,
+                        addrs: d.addrs,
+                        relay_hint: d.relay_hint,
                         relay_url: None,
                         status: None,
                         last_seen: None,
@@ -169,6 +180,8 @@ impl Registry {
                     attestation: d.attestation.clone(),
                     seq: d.seq,
                     self_sig: d.self_sig.clone(),
+                    addrs: d.addrs.clone(),
+                    relay_hint: d.relay_hint.clone(),
                 })
                 .collect(),
             revoked: self.revoked.iter().cloned().collect(),

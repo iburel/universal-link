@@ -90,6 +90,11 @@ pub struct AppState {
     /// a nudge landing between two rounds is not lost (same reasoning as a
     /// transfer's cancel token).
     pub dirsync_wake: tokio::sync::Notify,
+    /// Nudges the reach watcher (`dataplane::watch_own_reach`) to re-apply the
+    /// transport's claim: joining an account is the one moment a reach becomes
+    /// signable without the transport observing anything new, and the watcher
+    /// only hears the transport. Same `notify_one` reasoning as `dirsync_wake`.
+    pub reach_wake: tokio::sync::Notify,
     pub reconnect_base_delay: std::time::Duration,
     /// Fired by `system.shutdown` (the tray's Quit): a component asked the Core
     /// to stop. The library only signals — the binary awaits it next to the OS
@@ -283,9 +288,11 @@ impl SessionState {
             tracing::warn!("our own directory record does not carry our signature: minted again");
             devices.remove(&id);
         }
-        let record = devices
-            .entry(id.clone())
-            .or_insert_with(|| crate::directory::own_record(&id, own, None));
+        let record = devices.entry(id.clone()).or_insert_with(|| {
+            // A first minting claims no reach: the transport has observed
+            // nothing yet, and the reach watcher re-signs when it does.
+            crate::directory::own_record(&id, own, None, &crate::directory::Reach::default())
+        });
         if record.get("self_sig").is_none() {
             crate::directory::countersign_own(record, own.identity);
         }
@@ -308,10 +315,49 @@ impl SessionState {
     pub fn rename_own(&mut self, own: OwnDevice<'_>, name: &str) -> Option<Value> {
         let id = self.own_device_id.clone()?;
         let devices = self.devices.as_mut()?;
-        let previous = devices.get(&id)?.get("seq").and_then(Value::as_u64);
-        let renamed = crate::directory::own_record(&id, OwnDevice { name, ..own }, previous);
+        let held = devices.get(&id)?;
+        let previous = held.get("seq").and_then(Value::as_u64);
+        // The reach is carried forward: a rename changes the name, not where
+        // this device can be dialed. (A held reach that lost the published
+        // shape, an edited store, re-mints empty; the watcher restores it.)
+        let reach = crate::directory::record_reach(held).unwrap_or_default();
+        let renamed =
+            crate::directory::own_record(&id, OwnDevice { name, ..own }, previous, &reach);
         devices.insert(id, renamed.clone());
         Some(renamed)
+    }
+
+    /// This device's word on how it can be dialed moved: its addresses, or its
+    /// configured relay. The same gesture as a rename: a fresh description under
+    /// a strictly higher `seq`, signed again, so peers prefer it. Returns the
+    /// record as it now stands when something actually changed; `None` when the
+    /// claim is already the one signed (the common case: the watcher re-checks
+    /// far more often than networks move), or when this Core has no record of
+    /// its own to refresh.
+    pub fn refresh_own_reach(
+        &mut self,
+        identity: &crate::identity::DeviceIdentity,
+        reach: &crate::directory::Reach,
+    ) -> Option<Value> {
+        let id = self.own_device_id.clone()?;
+        let record = self.devices.as_mut()?.get_mut(&id)?;
+        if crate::directory::record_reach(record).as_ref() == Some(reach) {
+            return None;
+        }
+        // On a candidate, so a description that cannot be countersigned (a
+        // store edited into an unsignable shape) is left untouched rather than
+        // half-mutated: an unsigned reach would be exactly the unproven claim
+        // the whole design refuses. Said out loud: a claim refused HERE means
+        // the record's hints stop following the machine, which no user-visible
+        // failure would otherwise name.
+        let mut candidate = record.clone();
+        crate::directory::set_reach(&mut candidate, reach);
+        if !crate::directory::countersign_own(&mut candidate, identity) {
+            tracing::warn!("our own record cannot be re-signed: its reach hints will go stale");
+            return None;
+        }
+        *record = candidate;
+        Some(record.clone())
     }
 
     /// Has the account struck this `node_id` off? A tombstone counts only once
@@ -698,7 +744,13 @@ pub fn enrich_device(
         .get("relay_url")
         .and_then(Value::as_str)
         .is_some_and(|url| !url.trim().is_empty());
-    v["reachable"] = json!(lan_visible || (server_connected && online && has_relay));
+    // Third route: the device's own signed word on where it can be dialed
+    // (`addrs`, `relay_hint`). No liveness rides on it (the claim is "worth
+    // trying", the dial is what answers), so it counts with no server link
+    // and no `online` flag: that absence of an authority is exactly the
+    // situation the hints exist for.
+    let has_hints = crate::directory::record_reach(record).is_some_and(|reach| !reach.is_empty());
+    v["reachable"] = json!(lan_visible || (server_connected && online && has_relay) || has_hints);
     v
 }
 
@@ -1062,6 +1114,7 @@ mod tests {
                 attestation: "sig",
             },
             None,
+            &crate::directory::Reach::default(),
         );
         forged["node_id"] = json!(node_id);
         assert!(!crate::directory::verify_record(&forged), "the premise");
@@ -1167,6 +1220,76 @@ mod tests {
 
         assert!(s.rename_own(own_device(&identity), "Laptop").is_none());
         assert!(s.devices.is_none());
+    }
+
+    /// A reach that moved is re-signed and supersedes, exactly like a rename;
+    /// one that did not move re-signs nothing: the watcher re-checks far more
+    /// often than networks change, and every needless re-mint is a "new" record
+    /// the whole account would store and relay for nothing.
+    #[test]
+    fn a_reach_that_moved_supersedes_and_one_that_did_not_is_silent() {
+        let identity = identity();
+        let mut s = in_account_without_a_session(&identity);
+        let before_seq = s.devices.as_ref().expect("a directory")[&identity.node_id()]["seq"]
+            .as_u64()
+            .expect("a seq");
+        let reach = crate::directory::Reach {
+            addrs: vec!["192.0.2.7:41641".to_string()],
+            relay_hint: Some("https://relay.example".to_string()),
+        };
+
+        let refreshed = s
+            .refresh_own_reach(&identity, &reach)
+            .expect("a moved reach re-signs");
+        assert_eq!(refreshed["addrs"], json!(["192.0.2.7:41641"]));
+        assert_eq!(refreshed["relay_hint"], json!("https://relay.example"));
+        assert!(refreshed["seq"].as_u64().expect("a seq") > before_seq);
+        assert!(crate::directory::verify_record(&refreshed), "{refreshed}");
+
+        // The same claim again: nothing.
+        assert!(s.refresh_own_reach(&identity, &reach).is_none());
+        // And the name it signs is the one the record carries: a rename that
+        // follows keeps the reach, a refresh that follows keeps the name.
+        let renamed = s
+            .rename_own(own_device(&identity), "Atelier")
+            .expect("our own record");
+        assert_eq!(renamed["addrs"], json!(["192.0.2.7:41641"]));
+        assert!(crate::directory::verify_record(&renamed), "{renamed}");
+
+        // A device with no record of its own refreshes nothing.
+        let mut fresh = SessionState::new(None);
+        assert!(fresh.refresh_own_reach(&identity, &reach).is_none());
+    }
+
+    /// The signed hints are a route of their own: a device whose record carries
+    /// them is worth dialing with no server link, no `online` flag and no LAN
+    /// sighting, and one whose record carries none is exactly as unreachable
+    /// as before they existed.
+    #[test]
+    fn signed_hints_make_a_device_reachable_on_their_own() {
+        let (ak, _) = account();
+        let bare = sibling(8, "Atelier", 5, &ak);
+        let reaching = {
+            let identity = key(9);
+            let attestation = crate::account_key::attest(&ak, &identity.node_id());
+            crate::directory::signed_record_reaching(
+                &identity,
+                "Nomad",
+                5,
+                &attestation,
+                &crate::directory::Reach {
+                    addrs: vec!["203.0.113.9:41641".to_string()],
+                    relay_hint: None,
+                },
+            )
+        };
+        let lan = std::collections::BTreeSet::new();
+
+        let bare = enrich_device(&bare, None, false, &lan);
+        assert_eq!(bare["reachable"], json!(false));
+        let reaching = enrich_device(&reaching, None, false, &lan);
+        assert_eq!(reaching["reachable"], json!(true), "{reaching}");
+        assert_eq!(reaching["lan"], json!(false), "not a LAN claim");
     }
 
     /// The label the server hands out replaces the self-minted one, and the record

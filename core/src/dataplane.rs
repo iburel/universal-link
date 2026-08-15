@@ -67,12 +67,19 @@ use crate::state::AppState;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerAddr {
     pub node_id: String,
-    /// The relay the peer published in the directory. `None`: the peer has not
-    /// (yet) published one — still reachable if the transport currently sees
-    /// its `node_id` on the local network (`lan_peers`), otherwise opening
-    /// fails. `resolve_peer` copies the directory as-is; it is the callers
-    /// that gate on `peer_reachable` before opening.
+    /// The relay to dial through: what the peer published via the server
+    /// (`presence.update`) when there is one (the freshest word) or, failing
+    /// that, the relay it SIGNED into its record (`relay_hint`). `None`: no
+    /// relay anywhere; still reachable through `addrs`, or if the transport
+    /// currently sees its `node_id` on the local network (`lan_peers`),
+    /// otherwise opening fails. `resolve_peer` copies the directory as-is; it
+    /// is the callers that gate on `peer_reachable` before opening.
     pub relay_url: Option<String>,
+    /// The socket addresses the peer signed into its record (`addrs`), fed to
+    /// the transport as dial hints alongside whatever mDNS resolves. Hints,
+    /// not facts: a stale one costs a failed attempt, the node key
+    /// authenticates whoever answers.
+    pub addrs: Vec<String>,
 }
 
 /// A stream to a peer, later. `async fn` cannot be used in a trait object,
@@ -119,6 +126,31 @@ pub trait PeerTransport: Send + Sync + std::fmt::Debug {
 
     /// The local relay to publish in the directory via `presence.update`.
     fn home_relay(&self) -> HomeRelay<'_>;
+
+    /// What this device currently knows first-hand about how it can be dialed
+    /// (`directory::Reach`): the socket addresses its endpoint is bound on, and
+    /// the relay it was EXPLICITLY configured with, never an elected default:
+    /// so a fleet that configured no relay signs none into its records (#89:
+    /// relay use in a serverless account is explicit, not a silent default).
+    ///
+    /// `None` is not the empty claim, it is NO claim: a lazily-bound transport
+    /// whose radio never came on has observed nothing, and answering "empty"
+    /// would have the reach watcher wipe, at every boot, the perfectly good
+    /// hints the record signed last session. Must never bind such a transport:
+    /// unbound is a reason to stay silent, not to turn the radio on. Default:
+    /// a standing empty claim, the honest answer of a transport that is
+    /// always "bound" (the in-memory double).
+    fn own_reach(&self) -> Option<crate::directory::Reach> {
+        Some(crate::directory::Reach::default())
+    }
+
+    /// Wakes whenever [`Self::own_reach`] may have changed; same contract as
+    /// `lan_changes`: a generation counter, no payload, the watcher re-pulls.
+    /// Default: a receiver whose sender is already gone, so the reach watcher
+    /// applies the current claim once and ends.
+    fn reach_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        tokio::sync::watch::channel(0).1
+    }
 
     /// The endpoints currently visible on the local network (mDNS), as
     /// `node_id`s. An ADDRESS-BOOK fact, never a trust fact: anything can
@@ -350,6 +382,148 @@ pub(crate) async fn watch_lan_presence(state: Arc<AppState>) {
     }
 }
 
+/// The reach half of the same vigil: whenever the transport's own claim moves
+/// (its addresses changed, which is what a laptop changing networks or a VPN
+/// coming up looks like), this device re-signs its record with the new hints
+/// (the same gesture as a rename: strictly higher `seq`, fresh signature),
+/// persists it, re-announces itself on the `devices` topic, and nudges the
+/// gossip so the account hears it now rather than at the next tick. Runs for
+/// the life of the Core; applies the current claim once and ends by itself on
+/// a transport with nothing to watch (its `reach_changes` errors immediately).
+pub(crate) async fn watch_own_reach(state: Arc<AppState>) {
+    // `None` once the transport's channel closed (a transport with nothing to
+    // watch): the task then lives on the wake alone, because joining an
+    // account must apply the claim whether or not addresses ever move.
+    let mut changes = Some(state.transport.reach_changes());
+    loop {
+        // Applied BEFORE the first wait too: a transport bound before this
+        // task started already has a claim to publish.
+        apply_own_reach(&state);
+        let transport_moved = async {
+            match changes.as_mut() {
+                Some(receiver) => receiver.changed().await.is_ok(),
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            still_open = transport_moved => {
+                if !still_open {
+                    changes = None;
+                }
+            }
+            _ = state.reach_wake.notified() => {}
+        }
+    }
+}
+
+/// The transport's current claim, clamped to what a record may carry: a
+/// transport observes as many addresses as the machine has (a Docker host
+/// grows one bridge per compose project, a VPN adds its own), while the
+/// record's shape is bounded (`MAX_ADDR_HINTS`, `MAX_ADDR_LEN`) so a roster
+/// entry bounds the work and the dials it can cost a sibling. Clamped HERE,
+/// at the signing boundary, whatever the transport: an over-long claim signed
+/// as-is would fail `record_reach`'s fail-closed read, and the whole reach
+/// machinery would silently freeze on exactly the machines with the most
+/// networks. `None` when the transport has no claim at all (unbound).
+pub(crate) fn claimed_reach(state: &AppState) -> Option<crate::directory::Reach> {
+    let mut reach = state.transport.own_reach()?;
+    let before = reach.addrs.len();
+    reach
+        .addrs
+        .retain(|addr| addr.len() <= crate::directory::MAX_ADDR_LEN);
+    reach.addrs.truncate(crate::directory::MAX_ADDR_HINTS);
+    if reach.addrs.len() < before {
+        tracing::warn!(
+            observed = before,
+            kept = reach.addrs.len(),
+            "this machine has more addresses than a record may carry: hints truncated"
+        );
+    }
+    if reach
+        .relay_hint
+        .as_ref()
+        .is_some_and(|url| url.is_empty() || url.len() > crate::directory::MAX_RELAY_HINT_LEN)
+    {
+        tracing::warn!("configured relay too long for a record: not signed as a hint");
+        reach.relay_hint = None;
+    }
+    Some(reach)
+}
+
+fn apply_own_reach(state: &AppState) {
+    // Transport snapshots BEFORE the state locks (the transport has a lock of
+    // its own), and the leaf lock released before taking `session`.
+    let Some(reach) = claimed_reach(state) else {
+        // No claim is not an empty claim: an unbound transport has observed
+        // nothing, and signing "empty" here would wipe, at every boot, the
+        // hints the record carries from last session.
+        return;
+    };
+    let lan: std::collections::BTreeSet<String> = state.transport.lan_peers().into_iter().collect();
+    let in_account = state
+        .account_root
+        .lock()
+        .expect("lock account_root")
+        .is_some();
+    if !in_account {
+        // No trust root: no record of ours travels anywhere, so there is
+        // nothing to keep signed. (Joining an account re-mints the record and
+        // the next change re-applies; the watcher never dies over this.)
+        return;
+    }
+    let republish = {
+        let mut s = state.session.lock().expect("lock session");
+        let Some(record) = s.refresh_own_reach(&state.identity, &reach) else {
+            return;
+        };
+        // Disk under the same lock (state-then-disk, like every directory
+        // mutation), and unrefreshed: nothing here re-checked the records
+        // against the authority the freshness bound is about.
+        if let Some(devices) = s.devices.as_ref() {
+            crate::directory::save_unrefreshed(&state.config_dir, devices);
+        }
+        let params = json!({
+            "device": crate::state::enrich_device(
+                &record,
+                s.own_device_id.as_deref(),
+                s.server_connected,
+                &lan,
+            )
+        });
+        // Under the session lock (order: session then registry), like every
+        // devices broadcast.
+        state.registry.lock().expect("lock registry").notify_topic(
+            "devices",
+            "device.updated",
+            &params,
+        );
+        s.server_tx
+            .clone()
+            .map(|tx| (tx, crate::session::signed_description_of(&record)))
+    };
+    // A live session holds our OLD description (seq, signature, hints): told
+    // the new one, fire-and-forget, or the server would redistribute
+    // yesterday's word for the rest of the session. A refusal costs nothing
+    // durable: the description travels first-hand over dirsync regardless,
+    // and a graft never lets the server's lag roll a newer proof back.
+    if let Some((tx, description)) = republish {
+        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+        let _ = tx.try_send(crate::state::ServerCmd {
+            method: "presence.update",
+            params: description,
+            reply: reply_tx,
+        });
+    }
+    tracing::info!(
+        addrs = reach.addrs.len(),
+        relay_hint = reach.relay_hint.is_some(),
+        "reach changed: our record re-signed for the account to hear"
+    );
+    // The account's other devices should hear where we moved NOW: a device
+    // that changed networks is exactly one whose old hints are failing.
+    state.dirsync_wake.notify_one();
+}
+
 /// Is the peer `node_id` a device of the account? C7: presence in the directory
 /// NO LONGER SUFFICES — the server could inject a `node_id` there. A valid
 /// attestation under OUR account key (AK_pub, derived from the recovery code,
@@ -459,19 +633,37 @@ pub(crate) fn resolve_peer(state: &AppState, device_id: &str) -> Option<PeerAddr
     if !crate::account_key::verify(&ak_pub, &node_id, att) {
         return None;
     }
+    let (relay_url, addrs) = routes_of(record);
+    Some(PeerAddr {
+        node_id,
+        relay_url,
+        addrs,
+    })
+}
+
+/// The routes a record offers, composed once for both resolvers: the
+/// present-tense relay (`relay_url`, the server's word) preferred over the
+/// signed one (`relay_hint`, the device's own), plus the signed address
+/// hints. A reach that lost the published shape reads as none: those hints
+/// were nobody's word.
+fn routes_of(record: &Value) -> (Option<String>, Vec<String>) {
+    let reach = crate::directory::record_reach(record).unwrap_or_default();
     let relay_url = record
         .get("relay_url")
         .and_then(Value::as_str)
-        .map(str::to_string);
-    Some(PeerAddr { node_id, relay_url })
+        .map(str::to_string)
+        .or(reach.relay_hint);
+    (relay_url, reach.addrs)
 }
 
-/// Is this RESOLVED peer reachable right now? A published relay is a route,
-/// and so is being visible on the local network (mDNS): the transport dials
-/// either. Reachability is an address fact, not a trust fact — every caller
-/// holds a peer that `resolve_peer` already attested (C7).
+/// Is this RESOLVED peer reachable right now? A relay is a route (published
+/// or signed), and so are signed address hints, and so is being visible on
+/// the local network (mDNS): the transport dials any of them. Reachability is
+/// an address fact, not a trust fact: every caller holds a peer that
+/// `resolve_peer` already attested (C7).
 pub(crate) fn peer_reachable(state: &AppState, peer: &PeerAddr) -> bool {
     peer.relay_url.is_some()
+        || !peer.addrs.is_empty()
         || state
             .transport
             .lan_peers()
@@ -480,10 +672,11 @@ pub(crate) fn peer_reachable(state: &AppState, peer: &PeerAddr) -> bool {
 }
 
 /// Every reachable device of the account, EXCEPT this one: attested under our
-/// key (C7) and with a route to it — a published relay, or its `node_id` seen
-/// on the local network. The recipients of a clipboard `clip_announce`
-/// broadcast (`clipnet::propagate`). Empty when we have no trust root or no
-/// directory snapshot (not joined / never connected) — fail-closed.
+/// key (C7) and with a route to it: a relay (published or signed), signed
+/// address hints, or its `node_id` seen on the local network. The recipients
+/// of a clipboard `clip_announce` broadcast (`clipnet::propagate`). Empty when
+/// we have no trust root or no directory snapshot (not joined / never
+/// connected): fail-closed.
 pub(crate) fn account_peers(state: &AppState) -> Vec<PeerAddr> {
     // Transport snapshot BEFORE the state locks: the transport has a lock of
     // its own, and nothing here may hold ours while calling into it.
@@ -511,16 +704,17 @@ pub(crate) fn account_peers(state: &AppState) -> Vec<PeerAddr> {
             if !crate::account_key::verify(&ak_pub, &node_id, att) {
                 return None;
             }
-            // The relay is kept when both routes exist: iroh dials it and the
-            // LAN in parallel and takes what answers.
-            let relay_url = record
-                .get("relay_url")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            if relay_url.is_none() && !lan.contains(&node_id) {
+            // Every route is kept when several exist: iroh dials the relay,
+            // the hints and the LAN in parallel and takes what answers.
+            let (relay_url, addrs) = routes_of(record);
+            if relay_url.is_none() && addrs.is_empty() && !lan.contains(&node_id) {
                 return None;
             }
-            Some(PeerAddr { node_id, relay_url })
+            Some(PeerAddr {
+                node_id,
+                relay_url,
+                addrs,
+            })
         })
         .collect()
 }

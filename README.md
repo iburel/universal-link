@@ -118,7 +118,8 @@ The design details (and what is deliberately deferred) live in
 [server deployment](doc/server-deployment.md),
 [identity providers](doc/identity-providers.md),
 [first link](doc/first-link.md),
-[Core deployment](doc/deployment.md). Release by release:
+[Core deployment](doc/deployment.md),
+[beyond the LAN](doc/beyond-the-lan.md). Release by release:
 [CHANGELOG.md](CHANGELOG.md).
 
 ## Architecture at a glance
@@ -482,6 +483,9 @@ Log level: `ONEDEVICE_LOG=debug` (not `RUST_LOG`).
 - [`doc/first-link.md`](doc/first-link.md) — bringing up a link end to end (two
   machines, real Google login, transfer) and its troubleshooting.
 - [`doc/deployment.md`](doc/deployment.md) — the Core running locally.
+- [`doc/beyond-the-lan.md`](doc/beyond-the-lan.md): serverless accounts past
+  the local network. The self-hosting ladder, and the recipes (WireGuard,
+  Tailscale, a self-hosted relay).
 - [`CHANGELOG.md`](CHANGELOG.md) — what each release added.
 
 ## License

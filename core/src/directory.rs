@@ -34,14 +34,18 @@
 //! forever — the tombstone is the only thing that keeps it out).
 //!
 //! **A record signs itself.** A device is the authority on its own description:
-//! it signs `{node_id, name, platform, seq}` with the very key its `node_id` IS
-//! ([`record_message`]), so no one who relays that record can rewrite the name,
-//! and `seq` — which only its owner can raise — is what makes one description
-//! supersede another. Deliberately NOT signed: `relay_url`, `online`,
-//! `last_seen`, `status`. Those are said in the present tense, and a peer states
-//! them first-hand over an authenticated stream (or a server states them, and
-//! there the server is the authority anyway) — a signature over them would be a
-//! stale fact wearing a proof.
+//! it signs `{node_id, name, platform, seq, addrs, relay_hint}` with the very
+//! key its `node_id` IS ([`record_message`]), so no one who relays that record
+//! can rewrite the name (or plant a route), and `seq`, which only its owner can
+//! raise, is what makes one description supersede another. Deliberately NOT
+//! signed: `relay_url`, `online`, `last_seen`, `status`. Those are said in the
+//! present tense, and a peer states them first-hand over an authenticated stream
+//! (or a server states them, and there the server is the authority anyway); a
+//! signature over them would be a stale fact wearing a proof. The reach hints
+//! ([`Reach`]) are the line between the two: they claim no liveness, only "these
+//! are MY hints, as of this description", a claim only a signature can carry
+//! across a relayer, and whose staleness costs one failed dial, never a wrong
+//! peer.
 //!
 //! A record the SERVER minted carries no such signature, and that is not a
 //! defect: with a server in the picture the server owns the name
@@ -77,7 +81,91 @@ const REVOKED_FILE: &str = "revoked.json";
 /// Domain separation (and version) for a device's signature over its own
 /// description. Distinct from the account key's domains: this one is a DEVICE
 /// saying what it is, not the ACCOUNT saying who belongs.
-const RECORD_DOMAIN: &[u8] = b"1device-dir-record-v1:";
+///
+/// `v2`: the description grew the device's reachability hints (`addrs`,
+/// `relay_hint`). Bumped while no released build had ever signed a `v1`
+/// record (v0.6.0 predates the directory record entirely), so nothing in the
+/// field stops verifying: the version moved so that the two framings can
+/// never be mistaken for each other, not to migrate anyone.
+const RECORD_DOMAIN: &[u8] = b"1device-dir-record-v2:";
+
+/// Address hints a record may carry, at most. Every hint is one dial attempt
+/// a sibling may waste on it, and one line every device of the account
+/// persists. Real machines DO exceed it (iroh has seen macOS hosts with more
+/// than 25 interfaces: VPN TUNs, Docker bridges), which is why the device's
+/// own claim is clamped to this bound before signing
+/// (`dataplane::claimed_reach`) rather than trusted to fit.
+pub(crate) const MAX_ADDR_HINTS: usize = 16;
+
+/// One address hint, at most, in bytes. A socket address in text form,
+/// `[IPv6%zone]:port` included, fits well under this.
+pub(crate) const MAX_ADDR_LEN: usize = 64;
+
+/// A relay hint, at most, in bytes. Mirrors the server's own cap on a
+/// published `relay_url` (`RELAY_URL_MAX`).
+pub(crate) const MAX_RELAY_HINT_LEN: usize = 2048;
+
+/// Where a device says it can be dialed, first-hand: the socket addresses its
+/// endpoint is bound on (LAN, VPN, public IPv6; as text, `ip:port`), and the
+/// relay it was explicitly configured with, if any. Part of the SIGNED
+/// description since v2: in a serverless account there is no authority to
+/// state these facts first-hand before the first dial, so the device's own
+/// signature, ordered by `seq`, is what keeps a relayer from rewriting them.
+/// A stale or poisoned hint costs a failed dial attempt, never a
+/// man-in-the-middle: connections are authenticated by the node key.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reach {
+    pub addrs: Vec<String>,
+    pub relay_hint: Option<String>,
+}
+
+impl Reach {
+    pub fn is_empty(&self) -> bool {
+        self.addrs.is_empty() && self.relay_hint.is_none()
+    }
+}
+
+/// The reach a record carries, read fail-closed: absent fields are an empty
+/// claim (a record from before the fields existed, or a device with nothing
+/// to say), but a field that IS there and does not have the published shape
+/// (`addrs` not an array of strings, an entry too long, too many of them, a
+/// `relay_hint` that is not a string) is `None`, and a caller treating that
+/// as "no reach" would verify a signature over bytes the record does not
+/// carry. Callers refuse the record instead.
+pub(crate) fn record_reach(record: &Value) -> Option<Reach> {
+    let addrs = match record.get("addrs") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(entries)) if entries.len() <= MAX_ADDR_HINTS => entries
+            .iter()
+            .map(|entry| match entry.as_str() {
+                Some(addr) if addr.len() <= MAX_ADDR_LEN => Some(addr.to_string()),
+                _ => None,
+            })
+            .collect::<Option<Vec<String>>>()?,
+        Some(_) => return None,
+    };
+    let relay_hint = match record.get("relay_hint") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(url)) if url.len() <= MAX_RELAY_HINT_LEN && !url.is_empty() => {
+            Some(url.clone())
+        }
+        Some(_) => return None,
+    };
+    Some(Reach { addrs, relay_hint })
+}
+
+/// Writes `reach` onto the record, in the shape [`record_reach`] reads back:
+/// `addrs` always present (an empty array is an empty claim said out loud),
+/// `relay_hint` present-and-null when there is none, like `relay_url`. Said
+/// explicitly so that a superseding description can never leave a stale hint
+/// behind by merely omitting the field.
+pub(crate) fn set_reach(record: &mut Value, reach: &Reach) {
+    record["addrs"] = json!(reach.addrs);
+    record["relay_hint"] = match &reach.relay_hint {
+        Some(url) => json!(url),
+        None => Value::Null,
+    };
+}
 
 /// Persists the map — called under the session lock at every mutation (the
 /// same state-then-disk discipline as `session.json` at login), so the file
@@ -237,17 +325,34 @@ pub(crate) fn save_revoked(config_dir: &Path, revoked: &BTreeMap<String, String>
 /// The bytes a device signs to stand behind its own description. Every field is
 /// length-prefixed: `name` is arbitrary text the user chose, and a plain
 /// concatenation would let two different descriptions produce one message
-/// (`"Ada" + "|Bo"` against `"Ada|Bo"`).
+/// (`"Ada" + "|Bo"` against `"Ada|Bo"`). The address list is additionally
+/// count-prefixed, so its boundary with the relay hint cannot be forged
+/// either; an absent relay hint signs as the empty string, which no real
+/// relay URL can be.
 ///
 /// Public because the same encoding has to be reproducible outside the Core — a
 /// test harness standing in for a peer signs exactly these bytes.
-pub fn record_message(node_id: &str, name: &str, platform: &str, seq: u64) -> Vec<u8> {
-    let mut msg = RECORD_DOMAIN.to_vec();
-    msg.extend_from_slice(&seq.to_be_bytes());
-    for field in [node_id, name, platform] {
+pub fn record_message(
+    node_id: &str,
+    name: &str,
+    platform: &str,
+    seq: u64,
+    reach: &Reach,
+) -> Vec<u8> {
+    fn push(msg: &mut Vec<u8>, field: &str) {
         msg.extend_from_slice(&(field.len() as u64).to_be_bytes());
         msg.extend_from_slice(field.as_bytes());
     }
+    let mut msg = RECORD_DOMAIN.to_vec();
+    msg.extend_from_slice(&seq.to_be_bytes());
+    for field in [node_id, name, platform] {
+        push(&mut msg, field);
+    }
+    msg.extend_from_slice(&(reach.addrs.len() as u64).to_be_bytes());
+    for addr in &reach.addrs {
+        push(&mut msg, addr);
+    }
+    push(&mut msg, reach.relay_hint.as_deref().unwrap_or(""));
     msg
 }
 
@@ -274,7 +379,16 @@ pub fn verify_record(record: &Value) -> bool {
     let Some(seq) = record.get("seq").and_then(Value::as_u64) else {
         return false;
     };
-    crate::account_key::verify_detached(node_id, &record_message(node_id, name, platform, seq), sig)
+    // A reach that does not have the published shape is not "no reach": the
+    // signature would then be checked over bytes the record does not carry.
+    let Some(reach) = record_reach(record) else {
+        return false;
+    };
+    crate::account_key::verify_detached(
+        node_id,
+        &record_message(node_id, name, platform, seq, &reach),
+        sig,
+    )
 }
 
 /// Entries a peer may hand us in one roster, records and tombstones together.
@@ -285,7 +399,8 @@ pub fn verify_record(record: &Value) -> bool {
 const MAX_ROSTER: usize = 512;
 
 /// The fields a peer's roster is allowed to carry onto a record we ALREADY hold:
-/// the signed description, and the attestation that came verified alongside it.
+/// the signed description (reach hints included, since v2) and the
+/// attestation that came verified alongside it.
 ///
 /// What is left out is left out on purpose. `device_id` is our own key for the
 /// record and is not covered by any signature — taking a peer's would let
@@ -296,7 +411,22 @@ const MAX_ROSTER: usize = 512;
 /// (it is one the user is told exists). What a peer says about ITSELF, first-hand,
 /// still reaches us the same way it always has — over its own authenticated
 /// stream, or from a server that owns those facts.
-const CARRIED: [&str; 5] = ["name", "platform", "seq", "self_sig", "attestation"];
+///
+/// `addrs` and `relay_hint` are the deliberate exception to that rule, and what
+/// makes them safe is exactly what the present-tense fields lack: they are
+/// covered by the device's own signature, ordered by its `seq`. They claim no
+/// liveness, only "these are MY hints, as of this description", and the worst
+/// a stale one costs is a failed dial attempt, never a connection to the wrong
+/// key.
+const CARRIED: [&str; 7] = [
+    "name",
+    "platform",
+    "seq",
+    "self_sig",
+    "attestation",
+    "addrs",
+    "relay_hint",
+];
 
 /// A directory as handed to a peer: the records and the tombstones, filtered down
 /// to what that peer can verify with the account key alone. Deliberately not a
@@ -411,10 +541,21 @@ pub(crate) fn shareable(record: &Value, ak_pub: &str) -> bool {
 /// Copies onto `held` what an incoming record is allowed to carry (see
 /// [`CARRIED`]) — the caller has already established that the incoming record is
 /// shareable and supersedes the one held.
+///
+/// A carried field the incoming record does NOT have is removed rather than
+/// left: the superseding description is taken whole. Leaving a hold-over would
+/// compose a record half of one description and half of another: one whose
+/// signature covers neither, so it would verify nowhere and quietly stop
+/// traveling.
 pub(crate) fn carry_over(held: &mut Value, incoming: &Value) {
     for field in CARRIED {
-        if let Some(value) = incoming.get(field) {
-            held[field] = value.clone();
+        match incoming.get(field) {
+            Some(value) => held[field] = value.clone(),
+            None => {
+                if let Some(held) = held.as_object_mut() {
+                    held.remove(field);
+                }
+            }
         }
     }
 }
@@ -422,15 +563,18 @@ pub(crate) fn carry_over(held: &mut Value, incoming: &Value) {
 /// Signs, with this device's own key, the description `record` ALREADY carries —
 /// the name included, which is the point: where a server names this device, the
 /// server keeps the name, and this device countersigns it rather than contest it.
-/// That one signature is what lets its record travel to siblings the server never
-/// met ([`shareable`]). The `seq` is minted strictly above whatever the record
-/// carried, so the countersigned description supersedes the one it replaces on
-/// every device that held it.
+/// The reach hints the record carries are signed the same way: they are this
+/// device's own word wherever they came from (its watcher put them there, or a
+/// server carried them back). That one signature is what lets its record travel
+/// to siblings the server never met ([`shareable`]). The `seq` is minted strictly
+/// above whatever the record carried, so the countersigned description supersedes
+/// the one it replaces on every device that held it.
 ///
 /// `false` — and the record untouched — when there is nothing here this device
-/// could stand behind: a description missing a field, or one whose `node_id` is
-/// not this device's own (we never sign another device's description; that rule
-/// belongs to [`crate::state::SessionState::absorb`] and holds here too).
+/// could stand behind: a description missing a field, a reach without the
+/// published shape, or a `node_id` that is not this device's own (we never sign
+/// another device's description; that rule belongs to
+/// [`crate::state::SessionState::absorb`] and holds here too).
 pub(crate) fn countersign_own(
     record: &mut Value,
     identity: &crate::identity::DeviceIdentity,
@@ -444,14 +588,25 @@ pub(crate) fn countersign_own(
     if node_id != identity.node_id() {
         return false;
     }
+    let Some(reach) = record_reach(record) else {
+        return false;
+    };
+    // Re-written in the published shape before signing, so the bytes signed are
+    // exactly the bytes a verifier will read back (`addrs` absent and `addrs`
+    // empty sign the same, and must therefore be carried the same).
+    set_reach(record, &reach);
     let seq = next_seq(record.get("seq").and_then(Value::as_u64));
     record["seq"] = json!(seq);
-    record["self_sig"] = json!(identity.sign(&record_message(&node_id, &name, &platform, seq)));
+    record["self_sig"] =
+        json!(identity.sign(&record_message(&node_id, &name, &platform, seq, &reach)));
     true
 }
 
 /// Carries a signed description this Core already HELD onto the fresh record a
-/// server just handed it — or keeps the fresh one's own, if it verifies. What it
+/// server just handed it, or keeps the fresh one's own, if it verifies. When
+/// BOTH prove themselves, the newest `seq` wins, exactly as it does between
+/// peers: the server's copy of a description can lag the device's latest word
+/// (a reach re-signed mid-session), and lag is not authority. What it
 /// returns is the only question that matters downstream: does the record now
 /// stand behind its description? `false` strips `self_sig` from the fresh
 /// record rather than leave it wearing a signature that proves nothing — the
@@ -465,15 +620,51 @@ pub(crate) fn countersign_own(
 /// own claim is exactly that, and a floor taken on a stranger's word could pin
 /// a device's real descriptions under an absurd number forever.
 pub(crate) fn graft_signature(fresh: &mut Value, held: &Value) -> bool {
-    if verify_record(fresh) {
+    // A held description that proves itself STRICTLY NEWER than the fresh
+    // record's claim is tried first: a reach refresh mints local `seq`s while
+    // a session lives, and a server event carrying yesterday's description
+    // must not roll them back. The composite check keeps the server's word on
+    // everything it owns: a name the server changed makes the graft fail,
+    // and the server's description stands.
+    let fresh_seq = fresh.get("seq").and_then(Value::as_u64);
+    let held_newer = verify_record(held)
+        && held
+            .get("seq")
+            .and_then(Value::as_u64)
+            .is_some_and(|held_seq| fresh_seq.is_none_or(|fresh_seq| held_seq > fresh_seq));
+    if !held_newer && verify_record(fresh) {
         return true;
     }
     if let (Some(seq), Some(sig)) = (held.get("seq"), held.get("self_sig")) {
-        fresh["seq"] = seq.clone();
-        fresh["self_sig"] = sig.clone();
-        if verify_record(fresh) {
+        // The proof travels with everything it was minted over: the reach
+        // hints ride along with `seq` and `self_sig`, or the composite could
+        // never verify (an old server hands back records without them). Tried
+        // on a candidate, so a graft that fails leaves the fresh record
+        // exactly as the server said it, never wearing hints it cannot
+        // prove.
+        let mut candidate = fresh.clone();
+        candidate["seq"] = seq.clone();
+        candidate["self_sig"] = sig.clone();
+        for field in ["addrs", "relay_hint"] {
+            match held.get(field) {
+                Some(value) => candidate[field] = value.clone(),
+                None => {
+                    if let Some(candidate) = candidate.as_object_mut() {
+                        candidate.remove(field);
+                    }
+                }
+            }
+        }
+        if verify_record(&candidate) {
+            *fresh = candidate;
             return true;
         }
+    }
+    // The newer held description did not carry over (the server renamed the
+    // device: the composite covers a name the record no longer makes). The
+    // fresh record's OWN proof, older but real, still beats going bare.
+    if held_newer && verify_record(fresh) {
+        return true;
     }
     let floor = verify_record(held)
         .then(|| held.get("seq").and_then(Value::as_u64))
@@ -494,9 +685,12 @@ pub(crate) fn graft_signature(fresh: &mut Value, held: &Value) -> bool {
 
 /// A record for a device we had never heard of, as it enters OUR directory:
 /// keyed and labelled by its `node_id` (the one label a relayer cannot rewrite),
-/// and stripped of everything the relayer could not know first-hand. So a device
-/// arrives known but not reachable — until the transport hears it on the local
-/// network, or a server that owns those facts fills them in.
+/// and stripped of everything the relayer could not know first-hand. What stays
+/// is what the device SIGNED, its reach hints included: a device can arrive
+/// known and worth dialing, off any LAN, on its own word alone. What still waits
+/// to be filled in first-hand is the present tense (a route somebody vouches
+/// for now, a liveness), from the transport hearing it, or a server that owns
+/// those facts.
 pub(crate) fn as_learned(record: &Value, node_id: &str) -> Value {
     let mut learned = record.clone();
     learned["device_id"] = json!(node_id);
@@ -540,27 +734,34 @@ fn next_seq(previous: Option<u64>) -> u64 {
 /// `previous_seq` is the `seq` of the description this one replaces, when there
 /// is one (a rename): the new record must supersede it everywhere it has already
 /// been seen.
+///
+/// `reach` is what this device currently knows first-hand about how it can be
+/// dialed; empty at a first minting (the transport has observed nothing yet;
+/// the reach watcher re-signs when it does).
 pub(crate) fn own_record(
     device_id: &str,
     own: crate::state::OwnDevice<'_>,
     previous_seq: Option<u64>,
+    reach: &Reach,
 ) -> Value {
     let node_id = own.node_id();
     let platform = std::env::consts::OS;
     let seq = next_seq(previous_seq);
-    json!({
+    let mut record = json!({
         "device_id": device_id,
         "name": own.name,
         "platform": platform,
         "node_id": node_id,
         "seq": seq,
-        "self_sig": own.identity.sign(&record_message(&node_id, own.name, platform, seq)),
+        "self_sig": own.identity.sign(&record_message(&node_id, own.name, platform, seq, reach)),
         "relay_url": Value::Null,
         "attestation": own.attestation,
         "online": true,
         "status": Value::Null,
         "last_seen": Value::Null,
-    })
+    });
+    set_reach(&mut record, reach);
+    record
 }
 
 /// A record as another device of the account would have signed it, at an EXACT
@@ -574,21 +775,36 @@ pub(crate) fn signed_record(
     seq: u64,
     attestation: &str,
 ) -> Value {
+    signed_record_reaching(identity, name, seq, attestation, &Reach::default())
+}
+
+/// [`signed_record`], with the reach the device stands behind, for the tests
+/// exercising what a signed hint may and may not do.
+#[cfg(test)]
+pub(crate) fn signed_record_reaching(
+    identity: &crate::identity::DeviceIdentity,
+    name: &str,
+    seq: u64,
+    attestation: &str,
+    reach: &Reach,
+) -> Value {
     let node_id = identity.node_id();
     let platform = "linux";
-    json!({
+    let mut record = json!({
         "device_id": node_id,
         "name": name,
         "platform": platform,
         "node_id": node_id,
         "seq": seq,
-        "self_sig": identity.sign(&record_message(&node_id, name, platform, seq)),
+        "self_sig": identity.sign(&record_message(&node_id, name, platform, seq, reach)),
         "relay_url": Value::Null,
         "attestation": attestation,
         "online": false,
         "status": Value::Null,
         "last_seen": Value::Null,
-    })
+    });
+    set_reach(&mut record, reach);
+    record
 }
 
 fn now_secs() -> u64 {
@@ -713,7 +929,7 @@ mod tests {
     #[test]
     fn an_own_record_has_the_shape_of_a_server_one() {
         let identity = identity();
-        let record = own_record("dev-1", own(&identity), None);
+        let record = own_record("dev-1", own(&identity), None, &Reach::default());
 
         assert_eq!(record["device_id"], json!("dev-1"));
         assert_eq!(record["name"], json!("Office-PC"));
@@ -724,6 +940,10 @@ mod tests {
         assert_eq!(record["relay_url"], json!(null));
         assert_eq!(record["last_seen"], json!(null));
         assert_eq!(record["status"], json!(null));
+        // The reach, said out loud even when empty: an explicit empty claim,
+        // never an omission a stale hint could hide behind.
+        assert_eq!(record["addrs"], json!([]));
+        assert_eq!(record["relay_hint"], json!(null));
         // Our own liveness needs no server.
         assert_eq!(record["online"], json!(true));
         // And what the serverless half adds: a description this device stands
@@ -738,7 +958,7 @@ mod tests {
     #[test]
     fn a_signature_covers_the_description_and_only_that() {
         let identity = identity();
-        let record = own_record("dev-1", own(&identity), None);
+        let record = own_record("dev-1", own(&identity), None, &Reach::default());
 
         for volatile in ["relay_url", "online", "last_seen", "status", "device_id"] {
             let mut altered = record.clone();
@@ -753,6 +973,14 @@ mod tests {
             altered[described] = json!("something else");
             assert!(!verify_record(&altered), "{described} must be covered");
         }
+        // The reach hints are covered: a relayer that plants a route (a
+        // well-formed one, not just garbage) un-proves the description.
+        let mut rerouted = record.clone();
+        rerouted["addrs"] = json!(["192.0.2.1:1"]);
+        assert!(!verify_record(&rerouted), "addrs must be covered");
+        let mut rerelayed = record.clone();
+        rerelayed["relay_hint"] = json!("https://liar.example");
+        assert!(!verify_record(&rerelayed), "relay_hint must be covered");
         // The ordering token is covered too: without it, whoever relays a record
         // could bump `seq` and shadow every later description of that device.
         let mut replayed = record.clone();
@@ -764,7 +992,7 @@ mod tests {
     #[test]
     fn verify_record_is_fail_closed() {
         let identity = identity();
-        let record = own_record("dev-1", own(&identity), None);
+        let record = own_record("dev-1", own(&identity), None, &Reach::default());
 
         for missing in ["node_id", "name", "platform", "seq", "self_sig"] {
             let mut incomplete = record.clone();
@@ -773,6 +1001,29 @@ mod tests {
                 .expect("an object")
                 .remove(missing);
             assert!(!verify_record(&incomplete), "{missing} missing");
+        }
+        // A reach without the published shape is not "no reach": refused, so a
+        // signature is never checked over bytes the record does not carry.
+        let malformed: [Value; 5] = [
+            json!("not-a-list"),
+            json!([7]),
+            json!([[]]),
+            json!(std::iter::repeat_n("a", MAX_ADDR_HINTS + 1).collect::<Vec<_>>()),
+            json!(["a".repeat(MAX_ADDR_LEN + 1)]),
+        ];
+        for bad in malformed {
+            let mut altered = record.clone();
+            altered["addrs"] = bad.clone();
+            assert!(!verify_record(&altered), "addrs {bad} must be refused");
+        }
+        for bad in [
+            json!(7),
+            json!(""),
+            json!("a".repeat(MAX_RELAY_HINT_LEN + 1)),
+        ] {
+            let mut altered = record.clone();
+            altered["relay_hint"] = bad.clone();
+            assert!(!verify_record(&altered), "relay_hint {bad} must be refused");
         }
         // A record the SERVER minted: no signature, and none claimed.
         assert!(!verify_record(&json!({
@@ -789,6 +1040,7 @@ mod tests {
             "Office-PC",
             std::env::consts::OS,
             record["seq"].as_u64().expect("a seq"),
+            &Reach::default(),
         )));
         assert!(!verify_record(&stolen));
     }
@@ -796,20 +1048,50 @@ mod tests {
     /// The encoding of what a device signs is a compatibility contract: records
     /// are persisted and travel between devices, so a version of this project that
     /// framed the same description differently would stop verifying every record
-    /// already in the field. Length prefixes, deliberately — the pair below is
-    /// what a plain concatenation would collapse into one message.
+    /// already in the field. Length prefixes, deliberately: the pairs below are
+    /// what a plain concatenation would collapse into one message. (`v2` replaced
+    /// `v1` wholesale before any release ever signed a record; see
+    /// `RECORD_DOMAIN`; these vectors are computed independently of the code.)
     #[test]
     fn the_signed_message_matches_its_published_framing() {
+        let reach = Reach {
+            addrs: vec!["192.0.2.7:41641".to_string()],
+            relay_hint: Some("https://relay.example".to_string()),
+        };
         assert_eq!(
-            hex::encode(record_message("ab12", "Ada", "linux", 7)),
-            "316465766963652d6469722d7265636f72642d76313a\
-             0000000000000007\
-             000000000000000461623132000000000000000341646100000000000000056c696e7578",
+            hex::encode(record_message("ab12", "Ada", "linux", 7, &reach)),
+            "316465766963652d6469722d7265636f72642d76323a00000000000000070000\
+             00000000000461623132000000000000000341646100000000000000056c696e\
+             75780000000000000001000000000000000f3139322e302e322e373a34313634\
+             31000000000000001568747470733a2f2f72656c61792e6578616d706c65",
+        );
+        // An empty reach: the shape every record minted before a transport
+        // observation carries.
+        assert_eq!(
+            hex::encode(record_message("ab12", "Ada", "linux", 7, &Reach::default())),
+            "316465766963652d6469722d7265636f72642d76323a00000000000000070000\
+             00000000000461623132000000000000000341646100000000000000056c696e\
+             757800000000000000000000000000000000",
         );
         assert_ne!(
-            record_message("ab12", "Ada", "|Bo", 7),
-            record_message("ab12", "Ada|Bo", "", 7),
+            record_message("ab12", "Ada", "|Bo", 7, &Reach::default()),
+            record_message("ab12", "Ada|Bo", "", 7, &Reach::default()),
             "a field boundary must not be forgeable"
+        );
+        // The address list is count-prefixed: an address cannot slide over
+        // into the relay hint, nor the reverse.
+        let two_addrs = Reach {
+            addrs: vec!["a".to_string(), "b".to_string()],
+            relay_hint: None,
+        };
+        let addr_and_relay = Reach {
+            addrs: vec!["a".to_string()],
+            relay_hint: Some("b".to_string()),
+        };
+        assert_ne!(
+            record_message("ab12", "Ada", "linux", 7, &two_addrs),
+            record_message("ab12", "Ada", "linux", 7, &addr_and_relay),
+            "the list boundary must not be forgeable either"
         );
     }
 
@@ -859,13 +1141,52 @@ mod tests {
         assert!(bare.get("self_sig").is_none());
     }
 
+    /// Between two descriptions that both prove themselves, the newest `seq`
+    /// wins, exactly as between peers: the server's copy can lag the device's
+    /// latest word (a reach re-signed mid-session), and lag is not authority.
+    #[test]
+    fn between_two_proven_descriptions_the_graft_keeps_the_newest() {
+        let identity = identity();
+        let reach = Reach {
+            addrs: vec!["10.8.0.2:41641".to_string()],
+            relay_hint: None,
+        };
+        // The held record is the device's LATEST word (a reach re-signed
+        // mid-session, seq 9); the server hands back yesterday's proven
+        // description (seq 5). Lag is not authority: the graft keeps seq 9,
+        // hints riding with the proof they are covered by.
+        let held = signed_record_reaching(&identity, "Office-PC", 9, "sig", &reach);
+        let mut fresh = crate::directory::signed_record(&identity, "Office-PC", 5, "sig");
+        fresh["platform"] = json!("linux");
+        fresh["online"] = json!(true);
+        assert!(verify_record(&fresh), "the premise: both prove themselves");
+
+        assert!(graft_signature(&mut fresh, &held));
+        assert_eq!(fresh["seq"], json!(9), "{fresh}");
+        assert_eq!(fresh["addrs"], json!(["10.8.0.2:41641"]));
+        assert!(verify_record(&fresh), "{fresh}");
+        assert_eq!(
+            fresh["online"],
+            json!(true),
+            "the server's present tense stays"
+        );
+
+        // The other way round: a held record OLDER than the fresh one's own
+        // proof displaces nothing.
+        let stale_held = signed_record_reaching(&identity, "Office-PC", 3, "sig", &reach);
+        let mut newest = crate::directory::signed_record(&identity, "Office-PC", 12, "sig");
+        assert!(graft_signature(&mut newest, &stale_held));
+        assert_eq!(newest["seq"], json!(12), "{newest}");
+        assert_eq!(newest["addrs"], json!([]), "no stale hints grafted on");
+    }
+
     /// A held proof is grafted onto a fresh record only if the composite proves
     /// itself — a record renamed since goes bare rather than wear a signature
     /// that covers a description it no longer makes.
     #[test]
     fn a_grafted_signature_must_prove_the_composite_or_leave_it_bare() {
         let identity = identity();
-        let held = own_record("d_1", own(&identity), None);
+        let held = own_record("d_1", own(&identity), None, &Reach::default());
 
         // The fresh record makes the same description: the proof carries over.
         let same_description = || {
@@ -895,7 +1216,7 @@ mod tests {
         );
 
         // A record that already proves itself is left exactly as it is.
-        let mut already = own_record("d_3", own(&identity), Some(99));
+        let mut already = own_record("d_3", own(&identity), Some(99), &Reach::default());
         let before = already.clone();
         assert!(graft_signature(&mut already, &json!({})));
         assert_eq!(already, before);
@@ -910,13 +1231,128 @@ mod tests {
         // A held record that does not PROVE itself lends no floor either: an
         // unproven `seq` kept as a floor could pin a device's real descriptions
         // under an absurd number forever.
-        let mut unproven = own_record("d_4", own(&identity), None);
+        let mut unproven = own_record("d_4", own(&identity), None, &Reach::default());
         unproven["self_sig"] = json!("junk");
         unproven["seq"] = json!(u64::MAX);
         let mut fresh = same_description();
         fresh["name"] = json!("Renamed-By-The-Server");
         assert!(!graft_signature(&mut fresh, &unproven));
         assert!(fresh.get("seq").is_none(), "{fresh}");
+    }
+
+    /// The reach hints ride the same signature as the name: a device that
+    /// countersigns a server's description signs the hints the record carries,
+    /// and a proof grafted onto a fresh server record brings its hints along,
+    /// or proves nothing and leaves the record as the server said it.
+    #[test]
+    fn reach_hints_travel_with_the_proof_and_never_without_it() {
+        let identity = identity();
+        let reach = Reach {
+            addrs: vec!["192.0.2.7:41641".to_string()],
+            relay_hint: Some("https://relay.example".to_string()),
+        };
+        // Countersigning covers the hints the record carries.
+        let mut record = json!({
+            "device_id": "d_1", "node_id": identity.node_id(),
+            "name": "Office-PC", "platform": "linux",
+        });
+        set_reach(&mut record, &reach);
+        assert!(countersign_own(&mut record, &identity));
+        assert!(verify_record(&record), "{record}");
+        assert_eq!(record_reach(&record), Some(reach.clone()));
+        // A record whose reach does not have the published shape is not ours
+        // to sign: refused untouched, like a missing field.
+        let mut garbled = record.clone();
+        garbled["addrs"] = json!("everywhere");
+        let before = garbled.clone();
+        assert!(!countersign_own(&mut garbled, &identity));
+        assert_eq!(garbled, before);
+
+        // A fresh record from a server that does not carry reach: the graft
+        // brings seq, signature AND hints, and the composite proves itself.
+        let fresh_description = || {
+            json!({
+                "device_id": "d_2", "node_id": identity.node_id(),
+                "name": "Office-PC", "platform": "linux",
+                "online": true,
+            })
+        };
+        let mut fresh = fresh_description();
+        assert!(graft_signature(&mut fresh, &record));
+        assert!(verify_record(&fresh), "{fresh}");
+        assert_eq!(record_reach(&fresh), Some(reach));
+
+        // Renamed while away: the graft fails, and the hints it tried must
+        // not linger on a record that cannot prove them.
+        let mut renamed = fresh_description();
+        renamed["name"] = json!("Renamed-By-The-Server");
+        assert!(!graft_signature(&mut renamed, &record));
+        assert!(renamed.get("self_sig").is_none(), "{renamed}");
+        assert!(renamed.get("addrs").is_none(), "{renamed}");
+        assert!(renamed.get("relay_hint").is_none(), "{renamed}");
+    }
+
+    /// What an incoming description does not say anymore is gone: a superseding
+    /// record without hints must take the stale ones with it, or the held record
+    /// would wear a signature covering neither description.
+    #[test]
+    fn a_superseding_description_takes_its_absent_fields_with_it() {
+        let identity = identity();
+        let reach = Reach {
+            addrs: vec!["192.0.2.7:41641".to_string()],
+            relay_hint: None,
+        };
+        let mut held = signed_record_reaching(&identity, "Office-PC", 5, "sig", &reach);
+        // A fresher description that says nothing about its reach: fields
+        // absent entirely, the shape a pre-hints build would relay.
+        let mut incoming = signed_record(&identity, "Office-PC", 6, "sig");
+        for field in ["addrs", "relay_hint"] {
+            incoming.as_object_mut().expect("an object").remove(field);
+        }
+        assert!(
+            verify_record(&incoming),
+            "absent signs as empty: {incoming}"
+        );
+
+        carry_over(&mut held, &incoming);
+
+        assert!(held.get("addrs").is_none(), "{held}");
+        assert!(
+            verify_record(&held),
+            "the carried description proves itself whole: {held}"
+        );
+    }
+
+    /// The reach is read fail-closed, and absence is an empty claim, not an
+    /// error, and not a distinct message either (`record_message` signs both
+    /// the same, so `set_reach` writes the explicit form).
+    #[test]
+    fn a_reach_is_read_fail_closed() {
+        assert_eq!(record_reach(&json!({})), Some(Reach::default()));
+        assert_eq!(
+            record_reach(&json!({ "addrs": null, "relay_hint": null })),
+            Some(Reach::default())
+        );
+        let full = json!({
+            "addrs": ["192.0.2.7:41641"], "relay_hint": "https://relay.example",
+        });
+        assert_eq!(
+            record_reach(&full),
+            Some(Reach {
+                addrs: vec!["192.0.2.7:41641".to_string()],
+                relay_hint: Some("https://relay.example".to_string()),
+            })
+        );
+        for (field, bad) in [
+            ("addrs", json!({"a": 1})),
+            ("addrs", json!([null])),
+            ("relay_hint", json!([])),
+            ("relay_hint", json!("")),
+        ] {
+            let mut record = full.clone();
+            record[field] = bad.clone();
+            assert_eq!(record_reach(&record), None, "{field} = {bad}");
+        }
     }
 
     /// `seq` orders a device's own descriptions, and nothing else has to be

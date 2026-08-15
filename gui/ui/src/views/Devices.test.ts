@@ -136,6 +136,29 @@ test("a machine heard on the local network says so, even without the server", ()
   expect(row.querySelector(".dot.online")).not.toBeNull();
 });
 
+test("a machine dialable only through its signed hints says reachable, not online", () => {
+  // Off the LAN, no server vouching: the record carries a route worth trying
+  // (its signed addresses or relay), and that is all the phrase may claim.
+  store.devices = [
+    {
+      device_id: "d_hinted",
+      name: "Nomad Laptop",
+      platform: "linux",
+      online: false,
+      lan: false,
+      reachable: true,
+      last_seen: null,
+      is_self: false,
+    },
+  ];
+
+  const view = render(Devices, { store, now: NOW });
+  const row = view.querySelector("li")!;
+  expect(row.textContent).toContain("Linux · reachable");
+  expect(row.textContent).not.toContain("online");
+  expect(row.querySelector(".dot.online")).not.toBeNull();
+});
+
 test("renaming sends the cleaned name to the Core", async () => {
   const rename = vi.spyOn(store, "renameDevice").mockResolvedValue();
 

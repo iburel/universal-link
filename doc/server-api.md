@@ -143,6 +143,8 @@ The central object, carried by `devices.list` and every notification:
   "attestation": "<hex signature, or null>",
   "seq": 1753791245,
   "self_sig": "<hex signature, or null>",
+  "addrs": ["192.0.2.7:41641"],
+  "relay_hint": "https://relay.example/… or null",
   "online": true,
   "status": null,
   "last_seen": "2026-07-09T15:04:05Z"
@@ -159,13 +161,24 @@ The central object, carried by `devices.list` and every notification:
   below. Unlike `relay_url`, it SURVIVES going offline (it is bound to the
   `node_id`, which is stable).
 - `seq` + `self_sig`: the device's **signed description** — its own signature
-  over `{node_id, name, platform, seq}`, published alongside the attestation
-  (`presence.update`) and carried just as blind. It is what lets a *peer* relay
-  this record to devices this server never met (the serverless half of the
-  account — `doc/architecture.md`, the continuum). The pair comes and survives
-  together: one without the other is refused. A `devices.rename` that changes
-  the name **drops both** — the signature covered the old name — and the device
-  republishes over its own connection once it hears the rename.
+  over `{node_id, name, platform, seq, addrs, relay_hint}`, published alongside
+  the attestation (`presence.update`) and carried just as blind. It is what lets
+  a *peer* relay this record to devices this server never met (the serverless
+  half of the account: `doc/architecture.md`, the continuum). The pair comes
+  and survives together: one without the other is refused. A `devices.rename`
+  that changes the name **drops both** (the signature covered the old name),
+  and the device republishes over its own connection once it hears the rename.
+- `addrs` + `relay_hint`: the **reach half** of that same description: where
+  the device says it can be dialed (socket addresses as text, at most 16 of at
+  most 64 bytes each) and the relay it was explicitly configured with. Opaque
+  like the rest; every `presence.update` replaces them together with
+  `seq`/`self_sig` (one signature covers the whole description), and they are
+  refused without `self_sig`. Durable like the attestation: unlike
+  `relay_url`, the hints are the device's signed word, not this connection's
+  presence. A rename is the one asymmetry: it drops `seq`/`self_sig` (they
+  covered the old name) but KEEPS the hints: the addresses did not move with
+  the name, peers only ever trust them through a signature anyway, and the
+  record goes honestly unsigned until its device re-countersigns.
 - `status`: an optional free field, reserved for extensibility (idle, busy…). v1
   defines no value for it.
 - `platform` is a **closed set**: `auth.enroll` refuses anything else with a
@@ -295,7 +308,7 @@ confirmation screen alone; the residual risk that follows is in
 | `devices.list {}` | session | Snapshot of the account's directory → `[ device, … ]` |
 | `devices.rename { device_id, name }` | session | Renames any device of the account (handy from the GUI of another PC) |
 | `devices.revoke { device_id, id_token }` | session + fresh OIDC | Strikes the device from the directory; its existing connection is closed (`DEVICE_REVOKED`) |
-| `presence.update { status?, relay_url?, attestation?, seq?, self_sig? }` | session | Updates its own record; broadcast to the others via `device.updated`. `attestation` = opaque account blob (C7), carried without being interpreted; `seq`/`self_sig` = the signed description, equally opaque, both-or-neither (the continuum) |
+| `presence.update { status?, relay_url?, attestation?, seq?, self_sig?, addrs?, relay_hint? }` | session | Updates its own record; broadcast to the others via `device.updated`. `attestation` = opaque account blob (C7), carried without being interpreted; `seq`/`self_sig` = the signed description, equally opaque, both-or-neither (the continuum); `addrs`/`relay_hint` = the description's reach half, refused without `self_sig` (one signature covers it all) |
 
 `proof` = Ed25519 signature of the current nonce by the device's private key.
 

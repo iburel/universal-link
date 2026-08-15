@@ -36,6 +36,7 @@ pub use crate::dataplane::{
     ALPN, Closing, FileHeader, HomeRelay, Incoming, Listening, Opening, OutgoingFile, PeerAddr,
     PeerTransport, read_offer, receive_bodies, send_transfer,
 };
+pub use crate::directory::Reach;
 pub use crate::identity::load_or_generate_device_seed;
 pub use crate::pairing::{
     LAN_PAYLOAD_TAG as PAIRING_LAN_CODE_TAG, PAYLOAD_TAG as PAIRING_CODE_TAG,
@@ -157,6 +158,9 @@ pub struct CoreHandle {
     /// Directory exchanges with the account's other devices (`dirsync`). Same
     /// lifecycle: it holds an `Arc<AppState>` and is `abort()`ed at drop.
     dirsync_task: tokio::task::JoinHandle<()>,
+    /// Keeps our own record's signed reach hints in step with the transport.
+    /// Same lifecycle; already finished on a transport with nothing to watch.
+    reach_task: tokio::task::JoinHandle<()>,
     /// Dropped at `drop` — hence before a restart reclaims the socket.
     _instance: transport::InstanceGuard,
 }
@@ -210,6 +214,7 @@ impl Drop for CoreHandle {
         self.dataplane_task.abort();
         self.lan_presence_task.abort();
         self.dirsync_task.abort();
+        self.reach_task.abort();
         // Closes the established IPC connections: a cleanly stopped Core does
         // not leave its components on a mute socket (in a separate process the
         // problem does not exist, in an in-process lib the tasks would leak).
@@ -335,6 +340,7 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
         clipboard: Mutex::new(crate::clipboard::ClipboardState::new()),
         clipboard_reset: tokio::sync::Notify::new(),
         dirsync_wake: tokio::sync::Notify::new(),
+        reach_wake: tokio::sync::Notify::new(),
         reconnect_base_delay: config.reconnect_base_delay,
         shutdown_request: tokio::sync::Notify::new(),
     });
@@ -397,6 +403,10 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
     // in whom they know. Independent of the server session, for the same reason
     // the accept loop is.
     let dirsync_task = tokio::spawn(dirsync::run(state.clone()));
+    // Own reach: re-signs our record when the transport's addresses (or its
+    // configured relay) move, so the hints the account holds about us are
+    // never staler than one watcher wakeup.
+    let reach_task = tokio::spawn(dataplane::watch_own_reach(state.clone()));
 
     Ok(CoreHandle {
         ipc_path: config.ipc_path,
@@ -405,6 +415,7 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
         dataplane_task,
         lan_presence_task,
         dirsync_task,
+        reach_task,
         _instance: instance,
     })
 }

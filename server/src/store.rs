@@ -34,9 +34,10 @@ pub struct DurableState {
 
 /// A device reduced to what SURVIVES a disconnection and a restart: its
 /// identity, its account, the C7 attestation, and its signed description
-/// (`seq`/`self_sig` — bound to the name, which is durable too). Neither
-/// `relay_url`, nor `status`, nor `last_seen`, nor the connection — all of that
-/// is session-specific and republishes itself on reconnect.
+/// (`seq`/`self_sig`, with the reach hints the signature covers; bound to the
+/// name, which is durable too). Neither `relay_url`, nor `status`, nor
+/// `last_seen`, nor the connection: all of that is session-specific and
+/// republishes itself on reconnect.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DurableDevice {
     pub account: String,
@@ -50,6 +51,11 @@ pub struct DurableDevice {
     pub seq: Option<u64>,
     #[serde(default)]
     pub self_sig: Option<String>,
+    /// `default`: snapshots written before the off-LAN hints carry neither.
+    #[serde(default)]
+    pub addrs: Vec<String>,
+    #[serde(default)]
+    pub relay_hint: Option<String>,
 }
 
 /// Memory store: retains the last saved snapshot. This is the default EPHEMERAL

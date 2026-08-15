@@ -48,6 +48,7 @@ async fn the_core_transfer_protocol_survives_real_quic() {
     let peer = PeerAddr {
         node_id: node_id(&seed_a),
         relay_url: Some(relay_url.to_string()),
+        addrs: Vec::new(),
     };
 
     // Content larger than one chunk: the bodies are streamed, not framed.
@@ -121,6 +122,7 @@ async fn two_endpoints_reach_each_other_over_the_lan_without_any_relay() {
     let peer = PeerAddr {
         node_id: node_id(&seed_a),
         relay_url: None,
+        addrs: Vec::new(),
     };
 
     let contents = b"across the room, not the internet".to_vec();
@@ -234,4 +236,129 @@ async fn a_lazy_transport_stays_silent_until_first_use() {
     );
     // And closing a transport that was never bound is a non-event.
     transport.close().await;
+}
+
+/// A signed address hint is a route of its own: two endpoints with NO relay
+/// and NO discovery (nothing but an explicit `addrs` entry on the dial)
+/// still connect over real sockets and run the production transfer protocol.
+/// This is the daemon half of the off-LAN brick (#87): the Core learns the
+/// hints from the gossip, this proves iroh actually dials them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_direct_address_hint_dials_with_no_relay_and_no_discovery() {
+    let seed_a = [8u8; 32];
+    let seed_b = [9u8; 32];
+    let a = IrohTransport::bind_test(seed_a, iroh::RelayMap::empty(), false)
+        .await
+        .expect("endpoint A");
+    let b = IrohTransport::bind_test(seed_b, iroh::RelayMap::empty(), false)
+        .await
+        .expect("endpoint B");
+
+    // Where A actually listens, as a sibling's directory would carry it: its
+    // bound sockets, the unspecified host replaced by the loopback the test
+    // dials (a real record carries the interface addresses instead: same
+    // shape, same dial path).
+    let addrs: Vec<String> = a
+        .endpoint()
+        .bound_sockets()
+        .into_iter()
+        .map(|socket| {
+            if socket.ip().is_unspecified() {
+                let localhost = match socket {
+                    std::net::SocketAddr::V4(_) => "127.0.0.1".parse().expect("v4"),
+                    std::net::SocketAddr::V6(_) => "::1".parse().expect("v6"),
+                };
+                std::net::SocketAddr::new(localhost, socket.port()).to_string()
+            } else {
+                socket.to_string()
+            }
+        })
+        .collect();
+    assert!(!addrs.is_empty(), "a bound endpoint has sockets");
+    let peer = PeerAddr {
+        node_id: node_id(&seed_a),
+        relay_url: None,
+        addrs,
+    };
+
+    let contents = b"dialed by hint, nothing else existed".to_vec();
+    let src_dir = tempfile::tempdir().expect("tempdir source");
+    let src = src_dir.path().join("hint.txt");
+    std::fs::write(&src, &contents).expect("write the source");
+    let dest_dir = tempfile::tempdir().expect("tempdir dest");
+
+    let written = timeout(Duration::from_secs(20), async {
+        let respond = async {
+            let (peer_id, mut stream) = a.accept().await.expect("accept A");
+            assert_eq!(peer_id, node_id(&seed_b), "incoming peer's identity");
+            let manifest = read_offer(&mut stream).await.expect("offer");
+            receive_bodies(&mut stream, dest_dir.path(), &manifest, &mut |_, _| {})
+                .await
+                .expect("receive")
+        };
+        let ask = async {
+            let files = vec![OutgoingFile {
+                name: "hint.txt".into(),
+                source: Some(src.clone()),
+                size: contents.len() as u64,
+                is_dir: false,
+            }];
+            let mut stream = b.open(&peer).await.expect("open B->A by address hint");
+            send_transfer(&mut stream, &files, &mut |_, _| {})
+                .await
+                .expect("send");
+        };
+        let (written, ()) = tokio::join!(respond, ask);
+        written
+    })
+    .await
+    .expect("hint-dialed transfer within the deadline");
+
+    assert_eq!(written.len(), 1);
+    assert_eq!(std::fs::read(&written[0]).expect("received file"), contents);
+    a.close().await;
+    b.close().await;
+}
+
+/// What `own_reach` claims as a relay is the CONFIGURED one, and only that
+/// (#89: relay use is explicit, never a silent default). And an UNBOUND lazy
+/// transport claims nothing at all, config included: no claim is not an empty
+/// claim: answering "empty" would have the reach watcher wipe the hints a
+/// record signed last session, at every boot, before anything binds.
+#[tokio::test(flavor = "multi_thread")]
+async fn own_reach_claims_the_configured_relay_and_only_that() {
+    // Unbound: NO claim, and asking must not bind.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let url: RelayUrl = "https://relay.self-hosted.example"
+        .parse()
+        .expect("relay url");
+    let lazy = LazyIrohTransport::new(dir.path().to_path_buf(), Some(url), false);
+    assert_eq!(lazy.own_reach(), None, "unbound is silent");
+    assert!(
+        !dir.path().join("device.key").exists(),
+        "asking must not bind"
+    );
+
+    // Not configured: no relay claimed, a bound endpoint included, however
+    // real the relays it might elect by default for the server path.
+    let bare = IrohTransport::bind_test([10u8; 32], iroh::RelayMap::empty(), false)
+        .await
+        .expect("endpoint");
+    assert_eq!(bare.own_reach().expect("bound claims").relay_hint, None);
+    bare.close().await;
+
+    // Configured on a REAL endpoint: the claim is the config, verbatim.
+    let (relay_map, relay_url, _guard) = run_relay_server().await.expect("local relay");
+    let configured = IrohTransport::bind_test([11u8; 32], relay_map, false)
+        .await
+        .expect("endpoint");
+    let claimed: RelayUrl = configured
+        .own_reach()
+        .expect("bound claims")
+        .relay_hint
+        .expect("the configured relay")
+        .parse()
+        .expect("relay url");
+    assert_eq!(claimed, relay_url);
+    configured.close().await;
 }

@@ -140,6 +140,78 @@ async fn presence_update_carries_the_signed_description_whole() {
     }
 }
 
+/// The reach half rides the same description: carried whole with the
+/// signature that covers it, replaced with it, and refused without it. Alone
+/// it would be stored as a claim no peer could ever verify.
+#[tokio::test]
+async fn the_reach_rides_the_signed_description_and_never_travels_alone() {
+    let env = TestEnv::start().await;
+    let mut a = online_device(&env, "alice", "pc-a", "linux").await;
+    let mut b = online_device(&env, "alice", "pc-b", "macos").await;
+    a.conn.drain().await;
+    b.conn.drain().await;
+
+    let self_sig = "ef".repeat(64);
+    b.conn
+        .request(
+            "presence.update",
+            json!({
+                "seq": 42, "self_sig": self_sig,
+                "addrs": ["10.8.0.2:41641"], "relay_hint": "https://relay.example",
+            }),
+        )
+        .await
+        .expect("presence.update");
+    let params = a.conn.expect_notification("device.updated").await;
+    assert_eq!(params["device"]["addrs"], json!(["10.8.0.2:41641"]));
+    assert_eq!(
+        params["device"]["relay_hint"],
+        json!("https://relay.example")
+    );
+
+    // A new description without hints takes the old ones with it: one
+    // signature covers the whole description, its halves never move apart.
+    b.conn
+        .request(
+            "presence.update",
+            json!({ "seq": 43, "self_sig": "ab".repeat(64) }),
+        )
+        .await
+        .expect("presence.update without reach");
+    let params = a.conn.expect_notification("device.updated").await;
+    assert_eq!(params["device"]["addrs"], json!([]));
+    assert_eq!(params["device"]["relay_hint"], json!(null));
+
+    // Reach without its signature: refused, never stored.
+    for alone in [
+        json!({ "addrs": ["10.8.0.2:41641"] }),
+        json!({ "relay_hint": "https://relay.example" }),
+    ] {
+        let err = b
+            .conn
+            .request("presence.update", alone)
+            .await
+            .expect_err("reach without its signature");
+        assert_eq!(err.code, -32602);
+    }
+    // And a malformed or oversized list is refused outright.
+    for bad in [
+        json!({ "seq": 44, "self_sig": "cd".repeat(64), "addrs": "everywhere" }),
+        json!({ "seq": 44, "self_sig": "cd".repeat(64), "addrs": [7] }),
+        json!({
+            "seq": 44, "self_sig": "cd".repeat(64),
+            "addrs": std::iter::repeat_n("a", 17).collect::<Vec<_>>(),
+        }),
+    ] {
+        let err = b
+            .conn
+            .request("presence.update", bad)
+            .await
+            .expect_err("a reach without the published shape");
+        assert_eq!(err.code, -32602);
+    }
+}
+
 /// A rename that changes the name DROPS the signed description: the signature
 /// covered the old name, and rebroadcasting it would be a claim the server
 /// knows is stale. The device republishes over its own connection once it
@@ -155,7 +227,10 @@ async fn a_rename_drops_the_signed_description_it_invalidates() {
     b.conn
         .request(
             "presence.update",
-            json!({ "seq": 7, "self_sig": "ab".repeat(64) }),
+            json!({
+                "seq": 7, "self_sig": "ab".repeat(64),
+                "addrs": ["10.8.0.2:41641"], "relay_hint": "https://relay.example",
+            }),
         )
         .await
         .expect("presence.update");
@@ -177,6 +252,11 @@ async fn a_rename_drops_the_signed_description_it_invalidates() {
     assert_eq!(record["name"], "renamed-b");
     assert_eq!(record["seq"], json!(null), "covered the old name");
     assert_eq!(record["self_sig"], json!(null));
+    // The reach stays: the addresses did not move with the name. The record
+    // is honestly unsigned until the device re-countersigns, and peers only
+    // ever trust the hints through the signature anyway.
+    assert_eq!(record["addrs"], json!(["10.8.0.2:41641"]));
+    assert_eq!(record["relay_hint"], json!("https://relay.example"));
 
     // A rename to the SAME name invalidates nothing, and drops nothing.
     b.conn.drain().await;

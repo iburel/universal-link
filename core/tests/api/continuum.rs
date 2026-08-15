@@ -497,6 +497,7 @@ async fn revoking_through_the_server_strikes_the_serverless_half_too() {
                     "PC-Victim",
                     std::env::consts::OS,
                     seq,
+                    &onedevice_core::Reach::default(),
                 )),
             }),
         )
@@ -567,6 +568,7 @@ async fn revoking_through_the_server_strikes_the_serverless_half_too() {
                     "PC-Victim-2",
                     std::env::consts::OS,
                     seq2,
+                    &onedevice_core::Reach::default(),
                 )),
             }),
         )
@@ -696,4 +698,63 @@ async fn a_device_with_a_server_sponsors_over_the_local_network() {
             .all(|d| d["node_id"] != json!(fresh.node_id())),
         "the joiner joined the account, not the deployment: {listed:?}"
     );
+}
+
+/// The reach rides the server like the rest of the signed description. A
+/// device whose transport observes fresh addresses re-signs and republishes
+/// (`presence.update`, opaque to the server); a sibling of the server's half
+/// receives a record that carries the hints AND still proves itself: one
+/// signature covers the name, the `seq` and the reach, so the server cannot
+/// redistribute the proof without the hints, nor the reverse.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_server_carries_the_reach_to_its_own_half() {
+    let server = TestServer::start().await;
+    let switchboard = MemorySwitchboard::new();
+    let code = onedevice_core::account_key::generate_recovery_code();
+    let a = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
+    let b = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
+    let mut ca = manager(&a).await;
+    let mut cb = manager(&b).await;
+    wait_server_connected(&mut ca, true).await;
+    wait_server_connected(&mut cb, true).await;
+    wait_attested(&mut cb, a.device_id()).await;
+
+    // A's transport observes where it can be dialed (a VPN came up, say).
+    switchboard.declare_reach(
+        &a.node_id(),
+        onedevice_core::Reach {
+            addrs: vec!["10.8.0.7:41641".to_string()],
+            relay_hint: None,
+        },
+    );
+
+    eventually(
+        async || {
+            record_of(&mut cb, &a.node_id())
+                .await
+                .is_some_and(|d| d["addrs"] == json!(["10.8.0.7:41641"]))
+        },
+        "A's signed addresses to reach B through the server",
+    )
+    .await;
+    let learned = record_of(&mut cb, &a.node_id())
+        .await
+        .expect("A's record on B");
+    assert!(
+        onedevice_core::directory::verify_record(&learned),
+        "the proof arrived WITH the hints it covers: {learned}"
+    );
+    // And the SERVER holds them: both Cores share a switchboard, so the
+    // gossip could have carried the reach on its own; the server's own copy
+    // is what pins the presence.update hop this test is about. Converging,
+    // because the republication is fire-and-forget beside the gossip nudge.
+    eventually(
+        async || {
+            server_directory(&server).await.iter().any(|d| {
+                d["node_id"] == json!(a.node_id()) && d["addrs"] == json!(["10.8.0.7:41641"])
+            })
+        },
+        "the reach to be published to the server, not only gossiped",
+    )
+    .await;
 }

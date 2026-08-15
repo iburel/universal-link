@@ -133,12 +133,19 @@ On each PC:
      device that never dials again never learns, and loses nothing by it, since
      the account already refuses it everywhere.
    - **A device signs what it says about itself**: its directory record carries
-     its own signature over `{node_id, name, platform, seq}`, so a description
-     can pass from device to device without the one relaying it being trusted
-     with it, and only its owner can raise the `seq` that makes a new
-     description supersede the one already known. What a device says in the
-     present tense — its relay, its liveness — is left unsigned, deliberately:
-     a signature over it would be a stale fact wearing a proof.
+     its own signature over `{node_id, name, platform, seq, addrs, relay_hint}`,
+     so a description can pass from device to device without the one relaying it
+     being trusted with it, and only its owner can raise the `seq` that makes a
+     new description supersede the one already known. What a device says in the
+     present tense (its liveness, the relay a server vouches for right now) is
+     left unsigned, deliberately: a signature over it would be a stale fact
+     wearing a proof. Its reach hints (`addrs`, the socket addresses its
+     endpoint stands behind; `relay_hint`, the relay it was explicitly
+     configured with) are the deliberate exception, and what makes them safe is
+     the line they refuse to cross: they claim no liveness, only "these are MY
+     hints, as of this description". A stale hint costs one failed dial attempt,
+     never a wrong peer (connections are authenticated by the node key), and an
+     unsigned hint would be a route any relayer could plant.
    - **The continuum: one account, half on a server, half not.** The account is
      the union the ACCOUNT KEY defines; a deployment lists the subset that
      enrolled with it, and is the authority on that subset's names and routes —
@@ -163,9 +170,11 @@ On each PC:
      attested under the account key, so a compromised member cannot invent a
      sibling, rename one, or bring a struck-off one back. What it can do is stay
      silent, and silence costs nothing: an account is not made of what a peer
-     chooses to mention. What a courier could not witness (a route, a liveness)
-     is dropped on arrival, so a device learns of a sibling **known but not
-     reachable** until it hears it for itself.
+     chooses to mention. What a courier could not witness (a vouched route, a
+     liveness) is dropped on arrival; what the described device SIGNED, its
+     reach hints included, arrives whole, so a device can learn of a sibling
+     **known and worth dialing** on that sibling's own word, and everything
+     else waits until it hears it for itself.
    - **The first introduction, with no server to make it.** That exchange
      presupposes two devices that already hold each other's record, which the
      recovery code typed into each machine does not give: each then knows only
@@ -230,8 +239,11 @@ provides:
   the relay, including when a device never published one. Discovery only ever
   provides an *address*: an impostor announcing someone else's NodeId fails the
   QUIC handshake, and the account attestation still gates every stream. Turning it
-  off also turns off pairing over the local network ("On the local network"), which
-  is the one route a device with no server has to reach another.
+  off also turns off pairing over the local network ("On the local network").
+  For devices already in the account, mDNS is no longer the only serverless
+  route: the signed reach hints of the directory (doc/beyond-the-lan.md) let
+  already-paired devices dial each other across any network that routes between
+  them.
 
 ## The Client
 
@@ -620,12 +632,19 @@ was rather than surface later as a failed pairing.
 
 Deliberately LAN-only, and not relayed — decided, not omitted. The code's secret
 travels by a screen and a camera, so the window it opens should be as narrow as
-the room; a code that carried a relay hint would work from anywhere. The same
-decision bounds the serverless account as a whole: its records carry no relay,
-so two of its devices see each other where mDNS does, and nowhere else. If that
-reach is ever widened, the honest route is the directory itself (a device
-declaring its relay in its signed record) — never a public discovery that would
-announce every device's whereabouts to anyone holding its `node_id`.
+the room; a code that carried a relay hint would work from anywhere.
+
+That decision used to bound the serverless account as a whole, and no longer
+does: the reach HAS been widened, by exactly the route this paragraph once
+prescribed: the directory itself. A device declares its addresses and its
+explicitly configured relay in its signed record, ordered by its `seq`
+(principle 3, "A device signs what it says about itself"), and its
+already-paired siblings dial those hints from anywhere a network routes
+between them (doc/beyond-the-lan.md). Never a public discovery, which would
+announce every device's whereabouts to anyone holding its `node_id`; the
+hints travel only inside the account's authenticated exchanges. Pairing stays
+in the room: introducing a device is a physical gesture, and only devices
+already in the account carry hints worth dialing.
 
 ### The fresh token, and what it proves
 

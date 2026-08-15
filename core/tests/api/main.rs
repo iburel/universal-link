@@ -20,6 +20,7 @@ mod hello;
 mod lanpair;
 mod leave;
 mod login;
+mod offlan;
 mod pairing;
 mod protocol;
 mod revocation;

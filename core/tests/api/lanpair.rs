@@ -638,6 +638,7 @@ impl Stranger {
         let peer = PeerAddr {
             node_id: target.node_id(),
             relay_url: None,
+            addrs: Vec::new(),
         };
         let mut stream = self
             .transport
