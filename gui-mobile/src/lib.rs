@@ -172,25 +172,42 @@ async fn boot_core(data_dir: &Path) -> anyhow::Result<ClientConfig> {
     let _ = std::fs::remove_file(&ipc_path);
     let receive_dir = data_dir.join("received");
 
+    // Seed the server at boot from the same parse the daemon uses, so a
+    // returning (already configured) user connects without waiting for the
+    // frontend's first session.reload. A half-filled file is logged and left
+    // unconfigured.
+    let boot = onedevice_daemon::config::load(data_dir);
+
     // How the Core re-reads its config on `session.reload` (after the frontend
     // writes config.json via set_server_config): the SAME parse the daemon
     // uses. On Android there are no env overrides, so this just reads the file.
     let reload_dir = data_dir.to_path_buf();
+    let boot_relay = boot.relay.clone();
     let reload_server: Arc<dyn Fn() -> Result<Option<ServerConfig>, String> + Send + Sync> =
         Arc::new(move || {
             let parsed = onedevice_daemon::config::load(&reload_dir);
+            // The relay was baked into the transport at boot: a reload applies
+            // the server config live but not the relay. Same honesty as the
+            // desktop daemon: say when the file now wants something the
+            // running process is not doing.
+            if parsed.problem.is_none() && parsed.relay != boot_relay {
+                tracing::info!("the relay setting changed: applied at the next Core start");
+            }
             match parsed.problem {
                 Some(problem) => Err(problem),
                 None => Ok(parsed.server),
             }
         });
 
-    // Seed the server at boot from the same parse, so a returning (already
-    // configured) user connects without waiting for the frontend's first
-    // session.reload. A half-filled file is logged and left unconfigured.
-    let boot = onedevice_daemon::config::load(data_dir);
     if let Some(problem) = &boot.problem {
-        tracing::warn!(problem = %problem, "config.json present but invalid; starting unconfigured");
+        // Same split as the desktop daemon: an unreadable file leaves the Core
+        // unconfigured, a faulty single setting was simply not applied and
+        // the rest runs. Either way the reason rides `session.status` below.
+        if boot.server.is_none() {
+            tracing::warn!(problem = %problem, "config.json present but invalid; starting unconfigured");
+        } else {
+            tracing::warn!(problem = %problem, "configuration problem: a faulty setting was not applied, the rest of the config runs");
+        }
     }
 
     // LAN discovery obeys config.json exactly like the desktop daemon (same
@@ -214,6 +231,7 @@ async fn boot_core(data_dir: &Path) -> anyhow::Result<ClientConfig> {
         ipc_path: ipc_path.clone(),
         config_dir: data_dir.to_path_buf(),
         server: boot.server,
+        config_problem: boot.problem,
         reload_server,
         device_name: device_name(),
         secret_store: Arc::new(FileSecretStore::new(data_dir)),

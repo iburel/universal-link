@@ -133,8 +133,11 @@ variable that is defined but empty overrides nothing. Completeness is checked
 **after** the merge: a partial file that the environment completes is valid.
 
 **The Core always starts**, even without configuration or with a faulty
-configuration: it logs it and runs logged out (`session.login` answers
-`SERVER_UNREACHABLE`). Refusing to start would leave the GUI stuck on a "Connecting
+configuration. An unreadable or half-filled file leaves it unconfigured
+(`session.login` answers `SERVER_UNREACHABLE`); a faulty single setting is
+simply not applied and the rest of the config runs. Either way the reason,
+cure included, reaches the app as a banner (`session.status` `problem`), not
+just the log. Refusing to start would leave the GUI stuck on a "Connecting
 to the Core…" forever, without ever being able to say why.
 
 ## Log

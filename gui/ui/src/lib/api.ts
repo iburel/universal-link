@@ -53,6 +53,16 @@ export interface SessionState {
    * re-reads it) — hence optional. See {@link Api.sessionReload}.
    */
   configured?: boolean;
+  /**
+   * The human reason a part of the Core's config file was not honored, cure
+   * included; `null` when the file is sound. A faulty single setting is
+   * simply not applied and the Core RUNS (often `configured: true`), so this
+   * sentence is the only trace the user ever gets: the interface shows it as
+   * a banner. Same presence rule as `configured`: in `session.status`, absent
+   * from deltas (and from a Core that predates it); the store carries both
+   * across deltas so the banner does not blink.
+   */
+  problem?: string | null;
 }
 
 /**
@@ -168,7 +178,9 @@ export const api = {
   /**
    * Re-reads `config.json` (which the shell has just written via
    * `setServerConfig`) and applies it in place — no restart. Returns the fresh
-   * `session.status`. `INVALID_CONFIG` if the file is malformed/half-filled.
+   * `session.status`. `INVALID_CONFIG` if the parse reports any problem
+   * (malformed, half-filled, or a faulty single setting): nothing is applied
+   * and the reason lands in {@link SessionState.problem}.
    */
   sessionReload: () => coreRequest<SessionState>("session.reload"),
   /**

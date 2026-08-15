@@ -501,6 +501,12 @@ impl Conn {
             .lock()
             .expect("lock server_config")
             .is_some();
+        let problem = self
+            .state
+            .config_problem
+            .lock()
+            .expect("lock config_problem")
+            .clone();
         let mut v = self
             .state
             .session
@@ -508,6 +514,10 @@ impl Conn {
             .expect("lock session")
             .status_record();
         v["configured"] = json!(configured);
+        // The config file's health, cure sentence included (`null` when sound):
+        // the one channel through which a faulty setting that fell back to its
+        // default is ever confessed to the user.
+        v["problem"] = json!(problem);
         v
     }
 
@@ -559,10 +569,30 @@ impl Conn {
 
     fn session_reload(&self) -> Result<Value, RpcErr> {
         self.require_scope("session.manage")?;
-        let server = (self.state.reload_server)()
-            .map_err(|reason| RpcErr::app_message("INVALID_CONFIG", reason))?;
-        *self.state.server_config.lock().expect("lock server_config") = server;
-        Ok(self.session_status_result())
+        // Both arms refresh `config_problem`: `session.status` mirrors the
+        // LAST parse of the file. A failed reload keeps the running server
+        // config (the fresh file earned nothing) but its reason is still what
+        // the interface must show from now on; a sound reload clears a stale
+        // boot-time reason along with applying the config.
+        match (self.state.reload_server)() {
+            Ok(server) => {
+                *self.state.server_config.lock().expect("lock server_config") = server;
+                *self
+                    .state
+                    .config_problem
+                    .lock()
+                    .expect("lock config_problem") = None;
+                Ok(self.session_status_result())
+            }
+            Err(reason) => {
+                *self
+                    .state
+                    .config_problem
+                    .lock()
+                    .expect("lock config_problem") = Some(reason.clone());
+                Err(RpcErr::app_message("INVALID_CONFIG", reason))
+            }
+        }
     }
 
     /// Revokes a device of the account. The server demands a fresh ID token:

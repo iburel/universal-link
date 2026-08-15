@@ -140,6 +140,7 @@ impl TestCore {
             ipc_path: self.ipc_path.clone(),
             config_dir: self.dir.path().to_path_buf(),
             server: self.server_cfg.clone(),
+            config_problem: None,
             reload_server: {
                 let s = self.server_cfg.clone();
                 Arc::new(move || Ok::<_, String>(s.clone()))

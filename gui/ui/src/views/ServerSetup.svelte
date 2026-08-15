@@ -126,6 +126,18 @@
     </p>
   {/if}
 
+  <!-- The Core's own word on the saved file (session.status `problem`),
+       shown verbatim. Only as the standalone first-run gate: embedded in the
+       App's main area, the layout's own copy is already right above and two
+       stacked role=alert banners would announce twice. No close button: this
+       reflects the file's state, and a reload of a sound file (a save here,
+       once the file is fixed) is what withdraws it. -->
+  {#if firstRun && store.session?.problem}
+    <p class="banner error" role="alert">
+      Settings problem: {store.session.problem}
+    </p>
+  {/if}
+
   {#if warnLoggedIn}
     <p class="banner warn" role="status">
       You are signed in. Changing the server will require signing in again.

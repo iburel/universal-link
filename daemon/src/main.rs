@@ -62,8 +62,19 @@ async fn run() -> anyhow::Result<Outcome> {
     let settings = config::load(&endpoint.config_dir);
     if let Some(problem) = &settings.problem {
         // We start anyway: the IPC is the only channel through which the GUI
-        // can tell the user what is wrong.
-        tracing::error!(%problem, "unusable configuration: Core started unconfigured");
+        // can tell the user what is wrong. Two distinct truths: an unreadable
+        // or half-filled file leaves the Core unconfigured, while a faulty
+        // single setting (a legacy `relay_url`, a mistyped `relay`) is simply
+        // not applied and the rest of the config still runs.
+        if settings.server.is_none() {
+            tracing::error!(%problem, "unusable configuration: Core started unconfigured");
+        } else {
+            tracing::error!(
+                %problem,
+                "configuration problem: a faulty setting was not applied, \
+                 the rest of the config runs"
+            );
+        }
     } else if settings.server.is_none() {
         tracing::info!("Core not configured yet: the GUI's setup screen will write config.json");
     }
@@ -79,6 +90,7 @@ async fn run() -> anyhow::Result<Outcome> {
     // the device is enrolled. A never-configured Core emits no iroh traffic,
     // and a bind failure does not deprive the user of the IPC (it is logged
     // and retried).
+    let boot_relay = settings.relay.clone();
     let transport = Arc::new(dataplane::LazyIrohTransport::new(
         endpoint.config_dir.clone(),
         settings.relay,
@@ -94,6 +106,13 @@ async fn run() -> anyhow::Result<Outcome> {
         dyn Fn() -> Result<Option<onedevice_core::ServerConfig>, String> + Send + Sync,
     > = Arc::new(move || {
         let parsed = config::load(&reload_dir);
+        // The relay choice was baked into the transport at boot: a reload
+        // applies the server config live but not the relay. Same honesty as
+        // a late relay announcement (dataplane.rs): say when the file now
+        // wants something the running process is not doing.
+        if parsed.problem.is_none() && parsed.relay != boot_relay {
+            tracing::info!("the relay setting changed: applied at the next Core start");
+        }
         match parsed.problem {
             Some(problem) => Err(problem),
             None => Ok(parsed.server),
@@ -104,6 +123,7 @@ async fn run() -> anyhow::Result<Outcome> {
         ipc_path: endpoint.ipc_path.clone(),
         config_dir: endpoint.config_dir.clone(),
         server: settings.server,
+        config_problem: settings.problem,
         reload_server,
         device_name: settings.device_name,
         secret_store: secrets.store(),
