@@ -519,6 +519,48 @@ async fn fill_writes_remote_files_to_disk() {
     assert_eq!(std::fs::read(&dest2).unwrap(), b"the second file!!");
 }
 
+/// The announced relay role on the paste path (#88): a fill whose payload
+/// exceeds the cap, with the relay as the only route, fails with its OWN
+/// bare code - not `PEER_GONE`, whose remedy (the source is gone) would
+/// send the user the wrong way when the source is right there, one network
+/// hop too far.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_over_cap_fill_keeps_its_own_code() {
+    let server = TestServer::start().await;
+    let switchboard = MemorySwitchboard::new();
+    let code = onedevice_core::account_key::generate_recovery_code();
+    let a = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
+    let b = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
+    let mut ca = backend(&a).await;
+    let mut cb = backend(&b).await;
+    subscribe(&mut ca).await;
+    subscribe(&mut cb).await;
+    wait_server_connected(&mut ca, true).await;
+    wait_server_connected(&mut cb, true).await;
+    wait_reachable(&mut ca, b.device_id()).await;
+    wait_reachable(&mut cb, a.device_id()).await;
+
+    // The destination PULLS, so it is the initiator whose transport enforces
+    // the role: armed on B.
+    switchboard.set_payload_cap(&b.node_id(), Some(16));
+
+    let f = a.write_source("big.txt", &[7u8; 64]);
+    let tx = announce_files(&mut ca, &[f]).await;
+    let note = cb.wait_notification("clipboard.remote_updated").await;
+    let file_id = note["files"][0]["file_id"].as_str().unwrap().to_string();
+
+    let dest = b.config_dir().join("paste-big.txt");
+    cb.request(
+        "transactions.fill",
+        json!({ "tx_id": tx, "entries": [{ "file_id": file_id, "dest_path": dest.to_string_lossy() }] }),
+    )
+    .await
+    .unwrap();
+    let failed = cb.wait_notification("transfer.failed").await;
+    assert_eq!(failed["error"], json!("NO_DIRECT_PATH"));
+    assert!(!dest.exists() || std::fs::read(&dest).unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn fill_writes_local_files_to_disk() {
     // A local paste (fill on the same device that copied): no network, bytes

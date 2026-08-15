@@ -559,7 +559,7 @@ Notifications (topic `transfers`):
 | `transfer.incoming { transfer_id, device_id, files }` | a device sends us files (`files` = manifest `[{name, size}]`) |
 | `transfer.started { transfer_id, device_id, files, total }` | the actual start of a send (will include `transactions.fill` fills) |
 | `transfer.progress { transfer_id, done, total }` | throttled by the Core (~2/s; the first and last point are always emitted) |
-| `transfer.finished { transfer_id, paths? }` / `transfer.failed { transfer_id, error }` | end (`paths` = files written, on the receiving side; `error: "cancelled"` on cancellation) |
+| `transfer.finished { transfer_id, paths? }` / `transfer.failed { transfer_id, error }` | end (`paths` = files written, on the receiving side). `error` is a bare code when the Core minted one - `"cancelled"` on cancellation, `"NO_DIRECT_PATH"` when the deployment's rendezvous-only relays refused an over-cap payload with no direct path (#88) - otherwise the failure's own words |
 
 ## Transactions
 
@@ -840,6 +840,7 @@ Standard JSON-RPC codes + application codes in `error.data.code`:
 | `FILE_CHANGED` | the file behind a manifest entry is no longer the frozen one (size, identity, or mtime): the read is refused rather than serving different bytes |
 | `MANIFEST_TOO_LARGE` | announce refused: the copy exceeds the v1 manifest cap |
 | `PEER_GONE` | data channel: the source device vanished mid-stream (`DEVICE_OFFLINE` is its control-plane twin, at `transactions.open`) |
+| `NO_DIRECT_PATH` | the deployment's relays are rendezvous-only above a cap (#88, announced with the relay list) and hole punching produced no direct path for an over-cap payload. Carried in `transfer.failed.error` (sends and fills) and as a data-channel error code (paste pipe). The PAIR fails, not one device: the same network or a VPN between the two restores the path |
 | `TIMEOUT` | data channel: stall timeout on the Core side |
 
 ## Versioning

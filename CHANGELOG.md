@@ -8,6 +8,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A deployment can now make its relays rendezvous-only.** A relay plays
+  two roles: the meeting point for hole punching (tiny, a few KB per device
+  per day) and the fallback that carries the bytes when no direct path can
+  be punched (the expensive one, on the operator's bill). One server-side
+  setting (`ONEDEVICE_RELAY_MAX_PAYLOAD`, a size in bytes) now splits them:
+  the announced relays keep introducing devices, payloads up to the cap may
+  still ride them - clipboard-sized things keep working everywhere - and
+  anything larger requires the punched direct connection. The role rides the
+  same announcement as the relays themselves, so the fleet picks it up with
+  no per-device configuration, keeps honoring it when the server is down,
+  and sheds it with the relationship at logout. What the cap costs,
+  honestly: the rare pair that genuinely cannot hole-punch (both ends behind
+  symmetric NAT or CGNAT, for example two phones on mobile data) can no
+  longer move large payloads through the operator's relay; the failure is a
+  clean sentence naming the pair and its remedies - the same network, or a
+  VPN between the two - never a silent stall. A device whose own `relay`
+  setting names other infrastructure is outside the operator's word, and the
+  deployment guide now pairs the setting with a relay-side rate limit for
+  clients that predate it.
 - **A serverless account now works beyond the local network.** Every device
   signs, in its own directory record, where it can be dialed: the addresses
   its endpoint stands behind (LAN, VPN and public IPv6 alike), re-signed on

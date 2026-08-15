@@ -225,9 +225,25 @@ same, and a server that announces none is a valid deployment whose devices
 simply keep their own relay setting.
 
 Relays carry user bytes (end to end encrypted: a relay operator sees node
-ids, client IPs, timings and volumes, never content). The rendezvous-only
-policy planned in #88 will let a deployment cap or refuse that carriage;
-until then, size the relay for your fleet's traffic.
+ids, client IPs, timings and volumes, never content). That carriage is
+yours to bound: set `ONEDEVICE_RELAY_MAX_PAYLOAD` (bytes) in `.env` and the
+announced relays become **rendezvous-only above the cap**. A relay's cheap
+role - the meeting point for hole punching, a few KB per device per day -
+always stays; payloads up to the cap may still ride it, so clipboard-sized
+things keep working everywhere; anything larger requires the punched direct
+path, and when two devices genuinely cannot reach each other directly
+(symmetric NAT on both ends, double CGNAT) the operation fails with a clean
+sentence naming the remedies rather than silently riding your bandwidth.
+`0` is the strict form; unset keeps the historical fallback. Two notes:
+
+- The cap is enforced by every device of the fleet, at the source. It is a
+  policy, not a wall: pair it with the per-client rate limit shown in
+  `iroh-relay.toml.example`, which the relay enforces physically whatever
+  the client runs.
+- Like the relay list it rides with, a change is picked up at each session
+  and applied at each device's next Core start; a device using its own
+  explicit `relay` setting is on its own infrastructure and outside this
+  word.
 
 [`iroh-relay`]: https://github.com/n0-computer/iroh
 
@@ -258,7 +274,9 @@ key rotation, but no more often than this),
 `ONEDEVICE_MAX_REQUESTS_PER_MINUTE` (120; `0` = unlimited),
 `ONEDEVICE_RELAYS` (none; comma-separated relay URLs announced to the fleet
 in the deployment descriptor, see "The companion relay" above),
-`ONEDEVICE_LOG` (log level). Detail and semantics:
+`ONEDEVICE_RELAY_MAX_PAYLOAD` (none = the announced relays also carry
+payload; a byte count makes them rendezvous-only above it, `0` strictly so;
+requires `ONEDEVICE_RELAYS`), `ONEDEVICE_LOG` (log level). Detail and semantics:
 [`server-daemon/src/config.rs`](../server-daemon/src/config.rs) and
 [`server-api.md`](server-api.md).
 

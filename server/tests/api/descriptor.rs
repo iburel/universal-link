@@ -81,6 +81,30 @@ async fn it_announces_the_deployments_relays() {
     );
 }
 
+/// The relays' role (#88) over the wire: null when the deployment lets its
+/// relays carry payload (the historical behavior), the byte cap when they
+/// are rendezvous-only above it. Present either way, like the list.
+#[tokio::test]
+async fn it_states_the_relays_role() {
+    let env = TestEnv::start().await;
+    let (_, _, v) = descriptor(&env).await;
+    assert_eq!(v["relay_max_payload"], Value::Null);
+    assert!(
+        v.as_object()
+            .expect("an object")
+            .contains_key("relay_max_payload"),
+        "the key must be there even when unset: {v}"
+    );
+
+    let env = TestEnv::start_with(|c| {
+        c.relays = vec!["https://relay.example".into()];
+        c.relay_max_payload = Some(1_048_576);
+    })
+    .await;
+    let (_, _, v) = descriptor(&env).await;
+    assert_eq!(v["relay_max_payload"], 1_048_576);
+}
+
 /// A device sets itself up once; a cached copy is how a client keeps being
 /// configured with an OIDC client the deployment has already replaced.
 #[tokio::test]

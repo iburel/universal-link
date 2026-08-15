@@ -99,6 +99,7 @@ fn load_from(env: &dyn Fn(&str) -> Option<String>) -> Result<Config, String> {
     );
     let max_requests_per_minute = optional_rate_limit(env, &mut errors);
     let relays = relay_list(env, &mut errors);
+    let relay_max_payload = relay_max_payload(env, &relays, &mut errors);
 
     if !errors.is_empty() {
         return Err(errors.join(" ; "));
@@ -120,6 +121,7 @@ fn load_from(env: &dyn Fn(&str) -> Option<String>) -> Result<Config, String> {
         pairing_ttl: pairing_ttl.expect("validated"),
         max_requests_per_minute: max_requests_per_minute.expect("validated"),
         relays,
+        relay_max_payload,
     })
 }
 
@@ -143,6 +145,32 @@ fn relay_list(env: &dyn Fn(&str) -> Option<String>, errors: &mut Vec<String>) ->
         }
     }
     relays
+}
+
+/// `ONEDEVICE_RELAY_MAX_PAYLOAD`: the role the announced relays play (#88).
+/// Absent or empty = no policy, the relays also carry payload bytes as the
+/// fallback (the historical behavior). A number = rendezvous-only above that
+/// many bytes per operation; `0` is the strict form (the relays only ever
+/// introduce devices). Refused when no relay is announced: the cap governs
+/// the relays named in `ONEDEVICE_RELAYS`, so without them it is a typo or a
+/// misunderstanding, and catching it here beats a fleet that silently
+/// ignores it.
+fn relay_max_payload(
+    env: &dyn Fn(&str) -> Option<String>,
+    relays: &[String],
+    errors: &mut Vec<String>,
+) -> Option<u64> {
+    const KEY: &str = "ONEDEVICE_RELAY_MAX_PAYLOAD";
+    let raw = non_empty(env, KEY)?;
+    let cap = parse::<u64>(KEY, &raw, errors)?;
+    if relays.is_empty() {
+        errors.push(format!(
+            "{KEY} needs ONEDEVICE_RELAYS: the cap states the role of the \
+             announced relays, announce them first"
+        ));
+        return None;
+    }
+    Some(cap)
 }
 
 /// Required variable: present and non-empty. A variable SET BUT EMPTY
@@ -399,6 +427,49 @@ mod tests {
         vars.push(("ONEDEVICE_RELAYS", "relay-eu.example"));
         let err = load_from(&env_of(&vars)).expect_err("must fail");
         assert!(err.contains("ONEDEVICE_RELAYS"), "{err}");
+    }
+
+    /// The relays' role (#88): absent = no policy; a number = rendezvous-only
+    /// above it, `0` included (the strict form); and a cap without announced
+    /// relays is refused, because it would govern nothing.
+    #[test]
+    fn the_relay_payload_cap_is_optional_and_needs_the_relays() {
+        assert_eq!(
+            load_from(&env_of(REQUIRED))
+                .expect("valid")
+                .relay_max_payload,
+            None
+        );
+
+        let mut vars = REQUIRED.to_vec();
+        vars.push(("ONEDEVICE_RELAYS", "https://relay.example"));
+        vars.push(("ONEDEVICE_RELAY_MAX_PAYLOAD", "1048576"));
+        assert_eq!(
+            load_from(&env_of(&vars)).expect("valid").relay_max_payload,
+            Some(1_048_576)
+        );
+
+        let mut strict = REQUIRED.to_vec();
+        strict.push(("ONEDEVICE_RELAYS", "https://relay.example"));
+        strict.push(("ONEDEVICE_RELAY_MAX_PAYLOAD", "0"));
+        assert_eq!(
+            load_from(&env_of(&strict))
+                .expect("valid")
+                .relay_max_payload,
+            Some(0)
+        );
+
+        let mut orphan = REQUIRED.to_vec();
+        orphan.push(("ONEDEVICE_RELAY_MAX_PAYLOAD", "1048576"));
+        let err = load_from(&env_of(&orphan)).expect_err("must fail");
+        assert!(err.contains("ONEDEVICE_RELAY_MAX_PAYLOAD"), "{err}");
+        assert!(err.contains("ONEDEVICE_RELAYS"), "{err}");
+
+        let mut bad = REQUIRED.to_vec();
+        bad.push(("ONEDEVICE_RELAYS", "https://relay.example"));
+        bad.push(("ONEDEVICE_RELAY_MAX_PAYLOAD", "a lot"));
+        let err = load_from(&env_of(&bad)).expect_err("must fail");
+        assert!(err.contains("ONEDEVICE_RELAY_MAX_PAYLOAD"), "{err}");
     }
 
     #[test]

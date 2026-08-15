@@ -394,6 +394,27 @@ impl ClipboardState {
         })
     }
 
+    /// Upper bound, in bytes, of what a paste session on `tx_id` can pull
+    /// from its source: every inline format's advisory size plus the file
+    /// manifest. What a sized open (#88) states for the consumer pipe -
+    /// a bound, not a measurement: the consumer usually reads one format,
+    /// and a format with no advisory size counts for nothing. Honest effort
+    /// on both sides; the relay-side rate limit is the backstop either way.
+    pub fn payload_bound(&self, tx_id: &str) -> u64 {
+        let Some(t) = self.transactions.get(tx_id) else {
+            return 0;
+        };
+        let formats = t
+            .formats
+            .iter()
+            .filter_map(|f| f.size)
+            .fold(0u64, u64::saturating_add);
+        t.files
+            .iter()
+            .map(|f| f.size)
+            .fold(formats, u64::saturating_add)
+    }
+
     /// Whether `tx_id` is a materialized clip (its inline bytes are cached
     /// here). A materialized clip is served locally and stays openable even when
     /// its source is offline (`transactions.open` skips the reachability check).

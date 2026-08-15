@@ -60,6 +60,18 @@ pub struct Config {
     /// are, never that a device must use them (an explicit local choice
     /// wins, #104).
     pub relays: Vec<String>,
+    /// The role the announced relays play (#88): `None` = the relays also
+    /// carry payload bytes when no direct path exists (the historical
+    /// behavior), `Some(cap)` = rendezvous-only above the cap. Payloads of at
+    /// most `cap` bytes may ride the relays (clipboard text keeps working
+    /// everywhere); anything larger requires a direct path, and the Core
+    /// fails the operation cleanly (`NO_DIRECT_PATH`) instead of silently
+    /// billing the operator. `Some(0)` is the strict form: the relays only
+    /// ever introduce devices. Announced next to `relays` in the descriptor:
+    /// location and role travel together, and like the location it only
+    /// governs the announced relays - a device using its own explicit relay
+    /// is on its own infrastructure.
+    pub relay_max_payload: Option<u64>,
 }
 
 #[derive(Clone, Debug)]

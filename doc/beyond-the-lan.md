@@ -93,8 +93,9 @@ Tailscale ACL beyond "these machines may talk" is required.
 For devices behind networks you do not control (mobile data, hotel Wi-Fi,
 carrier NAT), a relay is the rendezvous: hole punching needs a meeting point,
 and when no direct path can be punched the relay carries the bytes as a
-fallback. The stock [`iroh-relay`](https://github.com/n0-computer/iroh) binary
-is stateless: no accounts, no storage, one domain, one TLS certificate.
+fallback - unless its operator announced it rendezvous-only (below). The
+stock [`iroh-relay`](https://github.com/n0-computer/iroh) binary is
+stateless: no accounts, no storage, one domain, one TLS certificate.
 
 1. Run `iroh-relay` on a machine with a public address, behind your TLS
    (a container or the plain binary; its own docs cover flags and ports).
@@ -119,6 +120,15 @@ Two properties are deliberate and worth knowing:
 - **What a relay operator sees.** Never content (everything is end-to-end
   encrypted), but a relay in use sees node ids, client IPs, timings and
   volumes. That operator is you, which is the point of this rung.
+- **The operator decides whether the relay carries bytes at all.** A server
+  deployment can announce its relays **rendezvous-only above a byte cap**
+  (`ONEDEVICE_RELAY_MAX_PAYLOAD`,
+  [server-deployment.md](server-deployment.md)): introductions and
+  capped-size payloads still ride, larger payloads require the punched
+  direct path, and a pair that genuinely cannot punch one gets a clean
+  sentence naming the remedies - the same network, or a VPN between the two
+  (the recipes above). The role rides the same announcement as the relays'
+  location and never governs a relay you configured locally yourself.
 
 ## The fine print
 

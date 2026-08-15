@@ -48,6 +48,11 @@ const APP_MESSAGES: Record<string, string> = {
   // cannot be withdrawn, so the Core refuses to let a device bar itself.
   CANNOT_REVOKE_SELF:
     "This device cannot revoke itself — do it from another device on the account.",
+  // A rendezvous-only deployment (#88): the relay introduced the devices but
+  // will not carry the payload, and hole punching found no direct path. The
+  // PAIR is what fails, never one device - and the remedies are the pair's.
+  NO_DIRECT_PATH:
+    "These two devices could not reach each other directly, and this deployment's relay introduces devices without carrying their files. The same network, or a VPN between them, would give them a direct path.",
   // Deliberately absent: `session.discover`'s NO_DESCRIPTOR, which the setup
   // screen acts on rather than reports (it reveals the fields to fill in), and
   // INVALID_DESCRIPTOR, whose own message names the field at fault — more use to
@@ -123,6 +128,18 @@ const PAIRING_REASONS: Record<string, string> = {
 
 export function pairingFailure(reason: string): string {
   return PAIRING_REASONS[reason] ?? `The link failed (${reason}).`;
+}
+
+/**
+ * The sentence for a failed transfer's row. Mid-transfer failures arrive as
+ * `transfer.failed { error }` - a bare code when the Core minted one (today
+ * `NO_DIRECT_PATH`, #88), otherwise the error's own words; codes get their
+ * `APP_MESSAGES` sentence, words are carried verbatim under the usual
+ * "Send failed:" lead. (`cancelled` never reaches here - the row words a
+ * cancellation itself, it is an outcome, not a failure.)
+ */
+export function transferFailure(error: string): string {
+  return APP_MESSAGES[error] ?? `Send failed: ${error}`;
 }
 
 /**

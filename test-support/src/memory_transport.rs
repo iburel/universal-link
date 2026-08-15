@@ -49,11 +49,19 @@ struct Route {
     reach: Reach,
     /// Bumped when `reach` changes: the Core's reach watcher re-pulls.
     reach_gen: tokio::sync::watch::Sender<u64>,
-    /// Every list `announce_relays` handed this endpoint, in order: the
-    /// double records what the real transport would fold into its next bind
-    /// (#105), so a test can assert both the content and that an unchanged
-    /// announcement was not re-pushed.
-    announced: Vec<Vec<String>>,
+    /// Every word `announce_relays` handed this endpoint, in order - the
+    /// relay list and, since #88, the announced payload cap riding with it:
+    /// the double records what the real transport would fold into its next
+    /// bind (#105), so a test can assert both the content and that an
+    /// unchanged announcement was not re-pushed.
+    announced: Vec<(Vec<String>, Option<u64>)>,
+    /// The payload cap this endpoint ENFORCES on its sized opens - the double
+    /// of #88's "the announced relays are the effective source and they are
+    /// rendezvous-only above the cap". A test knob (`set_payload_cap`),
+    /// deliberately separate from the `announced` recording above: whether a
+    /// heard word becomes an enforced one is the daemon's derivation
+    /// (`resolve_relay`), proven by the daemon's own tests.
+    payload_cap: Option<u64>,
     tx: mpsc::UnboundedSender<Wire>,
 }
 
@@ -96,6 +104,7 @@ impl MemorySwitchboard {
                 reach: Reach::default(),
                 reach_gen: reach_gen.clone(),
                 announced: Vec::new(),
+                payload_cap: None,
                 tx,
             },
         );
@@ -131,6 +140,16 @@ impl MemorySwitchboard {
     /// The relay lists `announce_relays` handed to this endpoint so far,
     /// oldest first. An unknown `node_id` is a test bug, so it panics.
     pub fn announced(&self, node_id: &str) -> Vec<Vec<String>> {
+        self.announced_words(node_id)
+            .into_iter()
+            .map(|(relays, _)| relays)
+            .collect()
+    }
+
+    /// The whole words `announce_relays` handed to this endpoint so far -
+    /// each relay list with the payload cap that rode with it (#88), oldest
+    /// first. An unknown `node_id` is a test bug, so it panics.
+    pub fn announced_words(&self, node_id: &str) -> Vec<(Vec<String>, Option<u64>)> {
         self.routes
             .lock()
             .unwrap()
@@ -138,6 +157,22 @@ impl MemorySwitchboard {
             .expect("announced: node_id unknown to the switchboard")
             .announced
             .clone()
+    }
+
+    /// Arms the double of the announced relay role (#88) on one endpoint:
+    /// its sized opens (`open_for_payload`) above `cap` bytes then require a
+    /// DIRECT route - a presented address the peer declared, or the shared
+    /// fake LAN - and fail with a `NO_DIRECT_PATH`-prefixed error when only
+    /// the relay route would carry them, exactly like the real transport
+    /// after a failed hole punch. An unknown `node_id` is a test bug, so it
+    /// panics.
+    pub fn set_payload_cap(&self, node_id: &str, cap: Option<u64>) {
+        self.routes
+            .lock()
+            .unwrap()
+            .get_mut(node_id)
+            .expect("set_payload_cap: node_id unknown to the switchboard")
+            .payload_cap = cap;
     }
 
     /// Has this endpoint been asked to make itself reachable? See
@@ -202,12 +237,52 @@ impl std::fmt::Debug for MemoryTransport {
 }
 
 impl PeerTransport for MemoryTransport {
-    fn announce_relays(&self, relays: &[String]) {
+    fn announce_relays(&self, relays: &[String], relay_max_payload: Option<u64>) {
         let mut routes = self.switchboard.routes.lock().unwrap();
         let route = routes
             .get_mut(&self.node_id)
             .expect("announce_relays: node_id unknown to the switchboard");
-        route.announced.push(relays.to_vec());
+        route.announced.push((relays.to_vec(), relay_max_payload));
+    }
+
+    fn open_for_payload<'a>(&'a self, peer: &'a PeerAddr, payload: u64) -> Opening<'a> {
+        Box::pin(async move {
+            // The double of the enforced role (#88): an over-cap payload
+            // needs a direct route. Direct here = a presented address the
+            // peer declared, or the shared fake LAN - the relay route is
+            // exactly what the cap refuses. Checked on the CALLER's own
+            // route entry: the policy is what this device's transport heard
+            // and enforces, not a property of the callee.
+            let over_cap = {
+                let routes = self.switchboard.routes.lock().unwrap();
+                let cap = routes
+                    .get(&self.node_id)
+                    .and_then(|route| route.payload_cap);
+                cap.is_some_and(|cap| payload > cap)
+            };
+            if over_cap {
+                let direct = {
+                    let routes = self.switchboard.routes.lock().unwrap();
+                    let me_on_lan = routes.get(&self.node_id).is_some_and(|r| r.on_lan);
+                    routes.get(&peer.node_id).is_some_and(|route| {
+                        let lan_route = me_on_lan && route.on_lan;
+                        let addr_route = peer
+                            .addrs
+                            .iter()
+                            .any(|presented| route.reach.addrs.contains(presented));
+                        lan_route || addr_route
+                    })
+                };
+                if !direct {
+                    return Err(Error::other(format!(
+                        "{}: the deployment's relays are rendezvous-only and no direct \
+                         path formed (in-memory double)",
+                        onedevice_core::NO_DIRECT_PATH
+                    )));
+                }
+            }
+            self.open(peer).await
+        })
     }
 
     fn open<'a>(&'a self, peer: &'a PeerAddr) -> Opening<'a> {

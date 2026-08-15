@@ -579,6 +579,7 @@ impl TestServer {
             pairing_ttl: Duration::from_secs(120),
             max_requests_per_minute: None,
             relays: Vec::new(),
+            relay_max_payload: None,
         };
         let server = onedevice_server::spawn(config)
             .await
