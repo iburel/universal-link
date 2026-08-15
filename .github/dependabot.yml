@@ -50,6 +50,24 @@ updates:
       - dependency-name: "tao"
         update-types:
           - version-update:semver-major
+      # base64 is capped to the minor the rest of the tree requires (0.22
+      # today): a dozen third-party crates name it too (reqwest, axum,
+      # jsonwebtoken, serde_with, ...), so a lone bump of our copies does not
+      # move base64, it adds a third entry to a lock that already carries
+      # 0.21 (swift-rs) and 0.22. Same 0.x-minor-files-as-major mechanics as
+      # tao above (0.23 arrived as its own PR, #116). Lift when the tree's
+      # heavyweights (reqwest, axum) require the next minor.
+      - dependency-name: "base64"
+        update-types:
+          - version-update:semver-major
+      # netdev is in the tree because iroh's netwatch already carries it, and
+      # the daemon's LAN probe reuses that exact version by design (#79:
+      # zero new crates). A lone bump forks netdev into two lock entries and
+      # voids that rationale. Lift when the pinned iroh's netwatch moves to
+      # the next netdev minor. (0.46 arrived as its own PR, #115.)
+      - dependency-name: "netdev"
+        update-types:
+          - version-update:semver-major
 
   # The mobile shell is EXCLUDED from the workspace (see gui-mobile/Cargo.toml),
   # so it carries its OWN Cargo.lock, which the `/` entry above never reads. That
@@ -66,6 +84,15 @@ updates:
         update-types:
           - minor
           - patch
+    ignore:
+      # Same cap as the workspace's (the `/` entry above): this lock also
+      # carries base64 0.21 (swift-rs) and 0.22 (wry, tauri-codegen, reqwest,
+      # ...), and gui-mobile/Cargo.toml deliberately matches the version the
+      # Core decodes with. 0.23 arrived as its own PR, #114. Lift together
+      # with the workspace cap.
+      - dependency-name: "base64"
+        update-types:
+          - version-update:semver-major
 
   # The frontend lockfile, which no entry covered: postcss sat seven patch
   # releases behind, on a HIGH advisory, before a security alert surfaced it.

@@ -45,7 +45,9 @@ android_system_properties = "0.1"
 anyhow = "1"
 # Inline bytes of a materialized clipboard announce travel base64-encoded
 # (doc/core-api.md); same crate and version the Core decodes them with. Already
-# in the lock via `core`, so no new crate enters the tree.
+# in the lock via `core`, so no new crate enters the tree. Capped like the
+# workspace's copies (.github/dependabot.yml): a lone bump would add a third
+# base64 to this lock.
 base64 = "0.22"
 serde_json = "1"
 tauri = { version = "2", default-features = false, features = [

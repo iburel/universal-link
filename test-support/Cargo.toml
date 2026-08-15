@@ -11,7 +11,8 @@ publish = false
 
 [dependencies]
 axum = "0.8"
-# PKCE code_challenge verification (S256) on the fake OIDC side.
+# PKCE code_challenge verification (S256) on the fake OIDC side. Version
+# aligned with core's, which is capped (.github/dependabot.yml).
 base64 = "0.22"
 # Aligned with core/Cargo.toml, which explains why this is no longer an exact pin.
 ed25519-dalek = { version = "3", features = ["rand_core"] }

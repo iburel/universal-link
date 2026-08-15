@@ -51,7 +51,9 @@ iroh-mdns-address-lookup = "0.4"
 n0-future = "0.3"
 # Interface table for the LAN probe: which interface owns the looped beacon's
 # source address, and whether it is tunnel-shaped (a VPN swallowing
-# multicast). Already in the tree at this exact version (iroh → netwatch).
+# multicast). Already in the tree at this exact version (iroh → netwatch),
+# and capped to it in .github/dependabot.yml: a lone bump here would fork
+# netdev into two lock entries. Lift both together when netwatch moves.
 netdev = "0.45"
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
