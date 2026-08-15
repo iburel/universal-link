@@ -596,6 +596,32 @@ mod tests {
         let problem = config.problem.expect("legacy key surfaced");
         assert!(problem.contains("relay_url"), "{problem}");
 
+        // On a fleet device the legacy key sits NEXT TO a working server
+        // config: the problem must not cost the device its server. The relay
+        // alone falls back, the server keeps running, and the reason travels
+        // with it (`Config::config_problem`) so the interface can show the
+        // cure. Regression pin: found live on a real client, where the boot
+        // log claimed "unconfigured" while the Core ran configured and the
+        // screen showed nothing.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            &dir,
+            r#"{
+                "server_url": "wss://host/ws",
+                "oidc_issuer": "https://idp.example",
+                "oidc_client_id": "public-id",
+                "relay_url": "https://iroh-relay.example"
+            }"#,
+        );
+        let config = load_with(&dir, &[]);
+        assert!(
+            config.server.is_some(),
+            "a faulty relay spelling must not unconfigure the server"
+        );
+        assert_eq!(config.relay, RelayChoice::Off);
+        let problem = config.problem.expect("legacy key surfaced");
+        assert!(problem.contains("relay_url"), "{problem}");
+
         // The old environment variable gets the same answer.
         let dir = tempfile::tempdir().expect("tempdir");
         let config = load_with(

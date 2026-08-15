@@ -62,8 +62,19 @@ async fn run() -> anyhow::Result<Outcome> {
     let settings = config::load(&endpoint.config_dir);
     if let Some(problem) = &settings.problem {
         // We start anyway: the IPC is the only channel through which the GUI
-        // can tell the user what is wrong.
-        tracing::error!(%problem, "unusable configuration: Core started unconfigured");
+        // can tell the user what is wrong. Two distinct truths: an unreadable
+        // or half-filled file leaves the Core unconfigured, while a faulty
+        // single setting (a legacy `relay_url`, a mistyped `relay`) fell back
+        // to its default and the rest of the config still runs.
+        if settings.server.is_none() {
+            tracing::error!(%problem, "unusable configuration: Core started unconfigured");
+        } else {
+            tracing::error!(
+                %problem,
+                "configuration problem: the faulty setting fell back to its default, \
+                 the rest of the config runs"
+            );
+        }
     } else if settings.server.is_none() {
         tracing::info!("Core not configured yet: the GUI's setup screen will write config.json");
     }
@@ -104,6 +115,7 @@ async fn run() -> anyhow::Result<Outcome> {
         ipc_path: endpoint.ipc_path.clone(),
         config_dir: endpoint.config_dir.clone(),
         server: settings.server,
+        config_problem: settings.problem,
         reload_server,
         device_name: settings.device_name,
         secret_store: secrets.store(),

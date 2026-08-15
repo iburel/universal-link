@@ -210,6 +210,7 @@ impl TestCore {
             ipc_path: ipc_path.clone(),
             config_dir: dir.path().to_path_buf(),
             server: Some(server_cfg.clone()),
+            config_problem: None,
             reload_server: Arc::new(move || Ok::<_, String>(Some(server_cfg.clone()))),
             device_name: CORE_DEVICE_NAME.into(),
             secret_store: Arc::new(onedevice_core::FileSecretStore::new(dir.path())),

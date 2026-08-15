@@ -108,7 +108,7 @@ against an older Core while simply not seeing that topic's events.
 
 | Method | Description |
 |---|---|
-| `session.status {}` | → `{ logged_in, server_connected, account?, configured }`. `configured`: whether a server + OIDC is set — distinguishes "never configured" (→ first-run setup) from "configured but the server is down" |
+| `session.status {}` | → `{ logged_in, server_connected, account?, configured, problem }`. `configured`: whether a server + OIDC is set, distinguishing "never configured" (→ first-run setup) from "configured but the server is down". `problem`: the human reason the config file is faulty (cure included), `null` when sound. A faulty single setting falls back to its default and the Core RUNS, so this sentence is the interface's only chance to show it; refreshed by every `session.reload`, in both directions |
 | `session.login {}` | starts the OIDC flow (PKCE + loopback) → `{ auth_url }`. **The caller** opens the browser — the Core does not touch the UI. Completion signaled by `session.changed` |
 | `session.logout {}` | closes the server session |
 | `session.reload {}` | re-reads `config.json` (which the GUI's setup screen has just written) and swaps the server config in place — no restart. → the fresh `session.status`. `INVALID_CONFIG` if the file is malformed / half-filled. The Core only READS the file; the GUI is its sole writer |

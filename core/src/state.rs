@@ -55,6 +55,13 @@ pub struct AppState {
     /// fresh `config.json`, the Core re-reads it — no process restart. LEAF
     /// lock (cloned/released before any other, never across an await).
     pub server_config: Mutex<Option<crate::ServerConfig>>,
+    /// The human reason the persisted config is faulty, `None` when it is
+    /// sound. Seeded at spawn, refreshed by every `session.reload` (a reload
+    /// that fails leaves `server_config` alone but the file's fresh fault is
+    /// still the truth to show). Served by `session.status` (`problem`): the
+    /// interface is where a cure sentence reaches the user, a log line does
+    /// not. LEAF lock, same rule as `server_config`.
+    pub config_problem: Mutex<Option<String>>,
     /// Re-reads the persisted config and returns the server it describes (or a
     /// human reason it is unusable). Injected by the daemon, which owns
     /// `config.json` parsing; `session.reload` calls it to apply what the GUI

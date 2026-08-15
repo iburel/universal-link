@@ -763,6 +763,23 @@ impl TestCore {
         Self::spawn_in(dir, None, None, None).await
     }
 
+    /// A Core that booted on a config whose faulty setting fell back to its
+    /// default (the daemon passes the parse's reason through): CONFIGURED, yet
+    /// carrying a problem. The state a fleet device wakes up in after the
+    /// `relay_url` to `relay` rename (#104), and the reason `session.status`
+    /// grew its `problem` field.
+    pub async fn start_configured_with_problem(server: &TestServer, reason: &str) -> TestCore {
+        let (dir, enrolled) = Self::seed_enrolled(server).await;
+        Self::spawn_full(
+            dir,
+            Some(enrolled),
+            Some(server_cfg(server)),
+            None,
+            Some(reason.to_string()),
+        )
+        .await
+    }
+
     /// A Core that has joined the account with NO server in the picture: nothing
     /// configured, no session — just `device.key`, the trust root and the account
     /// key in the keyring, which is everything `account.join` writes. The
@@ -1110,6 +1127,16 @@ impl TestCore {
         server_cfg: Option<onedevice_core::ServerConfig>,
         transport: Option<Arc<dyn onedevice_core::PeerTransport>>,
     ) -> TestCore {
+        Self::spawn_full(dir, enrolled, server_cfg, transport, None).await
+    }
+
+    async fn spawn_full(
+        dir: tempfile::TempDir,
+        enrolled: Option<(String, DeviceKey)>,
+        server_cfg: Option<onedevice_core::ServerConfig>,
+        transport: Option<Arc<dyn onedevice_core::PeerTransport>>,
+        config_problem: Option<String>,
+    ) -> TestCore {
         // Without a supplied transport, an isolated transport (its own memory
         // switchboard): the tests that do not exercise the data plane have no
         // one on the other side. Registered under the device's node_id if it is
@@ -1133,6 +1160,7 @@ impl TestCore {
             ipc_path: ipc_path_for(dir.path()),
             config_dir: dir.path().to_path_buf(),
             server: server_cfg.clone(),
+            config_problem,
             reload_server: {
                 let slot = reload_slot.clone();
                 Arc::new(move || slot.lock().expect("reload slot").clone())
@@ -1245,6 +1273,7 @@ impl TestCore {
             ipc_path: self.handle.ipc_path().to_path_buf(),
             config_dir: self.dir.path().to_path_buf(),
             server: self.server_cfg.clone(),
+            config_problem: None,
             reload_server: {
                 let s = self.server_cfg.clone();
                 Arc::new(move || Ok::<_, String>(s.clone()))

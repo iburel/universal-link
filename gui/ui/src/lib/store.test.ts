@@ -1562,6 +1562,31 @@ test("createAccount keeps the code in no store state", async () => {
 
 // -- Server configuration ---------------------------------------------------
 
+test("a config problem confessed by the Core rides the session snapshot", async () => {
+  // The post-#104 fleet state, found live: the Core RUNS configured while a
+  // faulty setting (a legacy relay_url) fell back to its default. The reason
+  // arrives in session.status `problem` and the banners read it straight from
+  // store.session: this pins that priming keeps the field.
+  const CURE =
+    "relay_url was replaced by relay (#104): set relay to your relay's URL";
+  mockCore({
+    status: CONNECTED,
+    methods: {
+      "session.status": () => ({
+        logged_in: false,
+        server_connected: false,
+        configured: true,
+        problem: CURE,
+      }),
+    },
+  });
+  await store.start();
+  await flush();
+
+  expect(store.session?.configured).toBe(true);
+  expect(store.session?.problem).toBe(CURE);
+});
+
 test("saveServerConfig writes the config, reloads the Core, then resyncs", async () => {
   const CONFIGURED: SessionState = {
     logged_in: false,

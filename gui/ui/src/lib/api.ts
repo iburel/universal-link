@@ -53,6 +53,15 @@ export interface SessionState {
    * re-reads it) — hence optional. See {@link Api.sessionReload}.
    */
   configured?: boolean;
+  /**
+   * The human reason the Core's config file is faulty, cure included; `null`
+   * when the file is sound. A faulty single setting falls back to its default
+   * and the Core RUNS (often `configured: true`), so this sentence is the only
+   * trace the user ever gets: the interface shows it as a banner. Same
+   * presence rule as `configured`: in `session.status`, absent from deltas
+   * (and from a Core that predates it).
+   */
+  problem?: string | null;
 }
 
 /**

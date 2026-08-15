@@ -83,6 +83,13 @@ pub struct Config {
     /// = nothing configured, `Err` = a human reason it is unusable. The daemon
     /// supplies it (it owns `config.json` parsing); tests pass a trivial one.
     pub reload_server: Arc<dyn Fn() -> Result<Option<ServerConfig>, String> + Send + Sync>,
+    /// The human reason the persisted config is faulty at startup, when it is:
+    /// the same sentence `reload_server` would return as `Err`. Carried into
+    /// `session.status` (`problem`), because the interface is the only place
+    /// the user will ever read it; the startup log alone reaches nobody. It
+    /// does NOT make the Core unconfigured: a faulty setting falls back to
+    /// its default and `server` keeps whatever the parse could still honor.
+    pub config_problem: Option<String>,
     /// The device's name in the directory, chosen at enrollment (the binary
     /// will pass the hostname).
     pub device_name: String,
@@ -331,6 +338,7 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
         config_dir: config.config_dir,
         identity: device_identity,
         server_config: Mutex::new(config.server),
+        config_problem: Mutex::new(config.config_problem),
         reload_server: config.reload_server,
         device_name: config.device_name,
         secrets: config.secret_store,

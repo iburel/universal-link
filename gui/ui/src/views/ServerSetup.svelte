@@ -126,6 +126,16 @@
     </p>
   {/if}
 
+  <!-- The Core's own word on the saved file (session.status `problem`): the
+       cure sentence is written by the Core and shown verbatim. No close
+       button: this reflects the file's state, and saving a sound config is
+       what clears it. -->
+  {#if store.session?.problem}
+    <p class="banner error" role="alert">
+      Settings problem: {store.session.problem}
+    </p>
+  {/if}
+
   {#if warnLoggedIn}
     <p class="banner warn" role="status">
       You are signed in. Changing the server will require signing in again.

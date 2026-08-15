@@ -190,7 +190,14 @@ async fn boot_core(data_dir: &Path) -> anyhow::Result<ClientConfig> {
     // session.reload. A half-filled file is logged and left unconfigured.
     let boot = onedevice_daemon::config::load(data_dir);
     if let Some(problem) = &boot.problem {
-        tracing::warn!(problem = %problem, "config.json present but invalid; starting unconfigured");
+        // Same split as the desktop daemon: an unreadable file leaves the Core
+        // unconfigured, a faulty single setting fell back to its default and
+        // the rest runs. Either way the reason rides `session.status` below.
+        if boot.server.is_none() {
+            tracing::warn!(problem = %problem, "config.json present but invalid; starting unconfigured");
+        } else {
+            tracing::warn!(problem = %problem, "configuration problem: the faulty setting fell back to its default");
+        }
     }
 
     // LAN discovery obeys config.json exactly like the desktop daemon (same
@@ -214,6 +221,7 @@ async fn boot_core(data_dir: &Path) -> anyhow::Result<ClientConfig> {
         ipc_path: ipc_path.clone(),
         config_dir: data_dir.to_path_buf(),
         server: boot.server,
+        config_problem: boot.problem,
         reload_server,
         device_name: device_name(),
         secret_store: Arc::new(FileSecretStore::new(data_dir)),

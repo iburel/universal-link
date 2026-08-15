@@ -148,6 +148,16 @@
           Core unreachable — the information shown is frozen.
         </p>
       {/if}
+      <!-- The Core found a fault in the saved settings (config.json): the
+           faulty setting fell back to its default, the app runs, and this
+           sentence is the user's only trace of it. It clears when a sound
+           config is saved (the Server view), so no close button: it is a
+           state, not an event. -->
+      {#if store.session?.problem}
+        <p class="banner error" role="alert">
+          Settings problem: {store.session.problem}
+        </p>
+      {/if}
       {#if store.notice}
         <p class="banner {store.notice.kind}" role="status">
           <span>{store.notice.text}</span>
