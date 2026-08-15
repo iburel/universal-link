@@ -17,11 +17,11 @@
     "@tauri-apps/plugin-opener": "^2.5.4"
   },
   "devDependencies": {
-    "@sveltejs/vite-plugin-svelte": "^7.2.0",
-    "happy-dom": "^20.11.1",
-    "svelte": "^5.56.8",
+    "@sveltejs/vite-plugin-svelte": "^7.3.0",
+    "happy-dom": "^20.11.2",
+    "svelte": "^5.56.9",
     "typescript": "^7.0.2",
-    "vite": "^8.1.5",
+    "vite": "^8.2.1",
     "vitest": "^4.1.10"
   }
 }
