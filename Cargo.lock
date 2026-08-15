@@ -3719,6 +3719,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "netdev"
+version = "0.46.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe5837045c9eeadc61432b095a6b10debefc0609241657771a194d48b2f39520"
+dependencies = [
+ "block2",
+ "dispatch2",
+ "dlopen2",
+ "ipnet",
+ "jni 0.21.1",
+ "libc",
+ "mac-addr",
+ "ndk-context",
+ "netlink-packet-core",
+ "netlink-packet-route",
+ "netlink-sys",
+ "objc2-core-foundation",
+ "objc2-system-configuration",
+ "once_cell",
+ "plist",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "netlink-packet-core"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3782,7 +3806,7 @@ dependencies = [
  "n0-error",
  "n0-future",
  "n0-watcher",
- "netdev",
+ "netdev 0.45.0",
  "netlink-packet-core",
  "netlink-packet-route",
  "netlink-proto",
@@ -4377,7 +4401,7 @@ dependencies = [
  "keyring",
  "libc",
  "n0-future",
- "netdev",
+ "netdev 0.46.0",
  "onedevice-core",
  "onedevice-daemon",
  "onedevice-ipc-client",
