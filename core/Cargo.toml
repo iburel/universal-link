@@ -7,7 +7,9 @@ publish = false
 
 [dependencies]
 anyhow = "1"
-# PKCE: code_verifier and state as base64url, S256 challenge.
+# PKCE: code_verifier and state as base64url, S256 challenge. Capped to the
+# minor the rest of the tree requires (.github/dependabot.yml): a lone bump
+# would add a third base64 to the lock.
 base64 = "0.22"
 # Device identity (= iroh identity): generated on first startup
 # (`rand_core`) and used to sign proofs of possession.
