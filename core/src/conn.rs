@@ -32,16 +32,34 @@ use crate::{API_VERSION, framing};
 const OUT_QUEUE_DEPTH: usize = 256;
 /// Beyond this, a write that makes no progress counts as a dead connection.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Budget for a `sync.*` facade forward (the proxy norm, like the server
+/// proxies): a backend that does not answer within it reads as absent.
+const SYNC_FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Bounds for fields that are stored and later rebroadcast.
 const NAME_MAX: usize = 128;
 const VERSION_MAX: usize = 64;
 
-const ROLES: [&str; 5] = ["gui", "clipboard-backend", "menu-backend", "tray", "custom"];
-/// A single clipboard backend active at a time (doc/core-api.md, "Roles").
-const EXCLUSIVE_ROLE: &str = "clipboard-backend";
+const ROLES: [&str; 6] = [
+    "gui",
+    "clipboard-backend",
+    "menu-backend",
+    "sync-backend",
+    "tray",
+    "custom",
+];
+/// One active holder at a time for these roles (doc/core-api.md, "Roles"):
+/// a second `hello` (or approve) naming one already taken is `ROLE_CONFLICT`.
+/// Replacing an official backend with a third-party one is a configuration
+/// choice, which is exactly what exclusivity protects.
+const EXCLUSIVE_ROLES: [&str; 2] = ["clipboard-backend", "sync-backend"];
 
-const SCOPES: [&str; 10] = [
+/// Is `role` taken by an active connection, where that matters (exclusivity)?
+fn exclusive_role_taken(reg: &crate::state::Registry, role: &str) -> bool {
+    EXCLUSIVE_ROLES.contains(&role) && reg.role_taken(role)
+}
+
+const SCOPES: [&str; 15] = [
     "session.read",
     "session.manage",
     "devices.read",
@@ -50,9 +68,20 @@ const SCOPES: [&str; 10] = [
     "transfers.read",
     "clipboard.read",
     "clipboard.write",
+    "transactions.publish",
+    "peers.message",
+    "sync.serve",
+    "sync.read",
+    "sync.manage",
     "components.approve",
     "system.shutdown",
 ];
+
+/// The `sync.*` facade methods a `sync.read` holder may call: the topic's
+/// snapshot method (the resync rule: snapshot, then subscribe). Everything
+/// else in the namespace is a gesture, under `sync.manage`. Additive: the
+/// vocabulary freeze (#84) extends this list, never shrinks it.
+const SYNC_READ_METHODS: [&str; 1] = ["sync.status"];
 
 /// Never grantable through the approval prompt — only by the bootstrap trust
 /// roots (otherwise: self-escalation).
@@ -68,6 +97,7 @@ fn topic_scope(topic: &str) -> Option<&'static str> {
         // events drive a confirmation screen and carry the device asking to
         // join. Whoever watches one is whoever may answer it.
         "pairing" => Some("session.manage"),
+        "sync" => Some("sync.read"),
         _ => None,
     }
 }
@@ -365,7 +395,15 @@ impl Conn {
             "clipboard.current" => self.clipboard_current(),
             "transactions.open" => self.transactions_open(params),
             "transactions.fill" => self.transactions_fill(params),
+            "transactions.publish" => self.transactions_publish(params),
+            "transactions.revoke" => self.transactions_revoke(params),
+            "transactions.adopt" => self.transactions_adopt(params).await,
+            "peers.send" => self.peers_send(params).await,
             "system.shutdown" => self.system_shutdown(),
+            // The backend's own method first; every other `sync.*` name is the
+            // routed facade, forwarded to the exclusive sync backend.
+            "sync.emit" => self.sync_emit(params),
+            m if m.starts_with("sync.") => self.sync_forward(m, params).await,
             _ => {
                 // Phase first: an unenrolled component learns nothing about
                 // the surface, not even which methods exist.
@@ -448,7 +486,7 @@ impl Conn {
             return Err(RpcErr::app("INVALID_TOKEN"));
         }
 
-        if role == EXCLUSIVE_ROLE && reg.role_taken(EXCLUSIVE_ROLE) {
+        if exclusive_role_taken(&reg, &role) {
             return Err(RpcErr::app("ROLE_CONFLICT"));
         }
         // Hello accepted: it is now that a spawn token is consumed — a refused
@@ -1173,7 +1211,7 @@ impl Conn {
         if scopes.iter().any(|s| !request.scopes.contains(s)) {
             return Err(RpcErr::invalid_params("scopes"));
         }
-        if request.role == EXCLUSIVE_ROLE && reg.role_taken(EXCLUSIVE_ROLE) {
+        if exclusive_role_taken(&reg, &request.role) {
             // The request survives: approvable once the incumbent has left.
             return Err(RpcErr::app("ROLE_CONFLICT"));
         }
@@ -1308,6 +1346,7 @@ impl Conn {
             formats,
             files,
             sensitive,
+            producer: crate::clipboard::Producer::Clipboard,
             origin: crate::clipboard::Origin::Local {
                 announcer: self.conn_id,
             },
@@ -1366,17 +1405,117 @@ impl Conn {
             .current_record())
     }
 
+    /// Publishes a LONG-LIVED transaction over `paths` (doc/core-api.md,
+    /// "Transactions"): the very manifest freeze and guards of a clipboard
+    /// announce, but OUTSIDE the election - the current clip is untouched,
+    /// nothing supersedes the published transaction, and it serves any number
+    /// of sessions until `transactions.revoke`, until this connection closes (a
+    /// grant dies with its holder), or until the account's grants die with the
+    /// session (logout / Core stop). Guarded by the producer scope alone, no
+    /// role: any component may be a producer.
+    fn transactions_publish(&self, params: &Value) -> Result<Value, RpcErr> {
+        self.require_scope("transactions.publish")?;
+        let paths = rpc::required_str_array(params, "paths")?;
+        if paths.is_empty() {
+            return Err(RpcErr::invalid_params("paths"));
+        }
+        let files = crate::clipboard::freeze_manifest(&paths)?;
+        let device_id = self
+            .state
+            .session
+            .lock()
+            .expect("lock session")
+            .own_device_id
+            .clone();
+        let tx = crate::clipboard::Transaction {
+            tx_id: format!("tx_{}", random_hex(16)),
+            device_id,
+            seq: 0, // outside the election: never compared
+            // Files-only by construction: a `FETCH` answers `FORMAT_UNKNOWN`,
+            // and no inline pull ever reaches the publisher (which is not a
+            // clipboard backend and answers no `clipboard.get_data`).
+            formats: Vec::new(),
+            files,
+            sensitive: false,
+            producer: crate::clipboard::Producer::Published {
+                owners: vec![self.conn_id],
+            },
+            origin: crate::clipboard::Origin::Local {
+                announcer: self.conn_id,
+            },
+            superseded: false,
+            sessions: 0,
+            materialized: std::collections::HashMap::new(),
+        };
+        // The publisher gets the full frozen record back - relative wire paths
+        // and Core-assigned `file_id`s, never the source paths: the manifest it
+        // will speak to its peers about, exactly what an adopter installs.
+        let record = {
+            let mut cb = self.state.clipboard.lock().expect("lock clipboard");
+            let tx_id = cb.publish(tx);
+            cb.published_record(&tx_id).expect("just published")
+        };
+        Ok(record)
+    }
+
+    /// Revokes a published transaction: the right to read ends NOW - open
+    /// channels are cut with `TX_STALE` (the same cutting path a logout takes)
+    /// and new opens refuse. Idempotent on an unknown `tx_id` (a revoke retried
+    /// after a timeout, or racing the publisher's own teardown, is not an
+    /// error); a CLIPBOARD transaction is `-32602` - its lifecycle belongs to
+    /// the election, not to a revoker.
+    fn transactions_revoke(&self, params: &Value) -> Result<Value, RpcErr> {
+        self.require_scope("transactions.publish")?;
+        let tx_id = rpc::required_str(params, "tx_id")?;
+        let removed = self
+            .state
+            .clipboard
+            .lock()
+            .expect("lock clipboard")
+            .revoke(&tx_id)?;
+        if removed {
+            self.state.clipboard_reset.notify_waiters();
+        }
+        Ok(json!({}))
+    }
+
+    /// Installs a transaction PUBLISHED on another device of the account, so
+    /// the untouched consumer machinery (`transactions.open`, `transactions.fill`,
+    /// the data channel) can then reach it: fetches the frozen manifest from
+    /// the source (`tx_fetch` on the data plane), re-validates it fail-closed
+    /// (exactly like a remote clip announce), and returns the installed record.
+    /// The entry dies with this connection, like a published one - re-adopting
+    /// after a reconnect is cheap and idempotent.
+    async fn transactions_adopt(&self, params: &Value) -> Result<Value, RpcErr> {
+        self.require_scope("transactions.publish")?;
+        let device_id = rpc::required_str(params, "device_id")?;
+        let tx_id = rpc::required_str(params, "tx_id")?;
+        crate::clipnet::adopt(&self.state, self.conn_id, &device_id, &tx_id).await
+    }
+
     /// Opens a consumer channel for `tx_id`: mints an unguessable `channel_token`
     /// bound to this component (peer credentials). The transaction must be
     /// openable — a superseded clip accepts no NEW session (`TX_STALE`). The
     /// session itself begins when the data channel attaches with the token.
+    /// Consuming requires the scope of the transaction's PRODUCER
+    /// (doc/core-api.md, "Transactions"): `clipboard.read` for a clipboard
+    /// transaction, `transactions.publish` for a published one. A caller
+    /// holding neither learns nothing (`SCOPE_DENIED` before any lookup).
     fn transactions_open(&self, params: &Value) -> Result<Value, RpcErr> {
-        self.require_scope("clipboard.read")?;
+        let scopes = self.require_enrolled()?;
+        let has = |s: &str| scopes.iter().any(|x| x == s);
+        if !has("clipboard.read") && !has("transactions.publish") {
+            return Err(RpcErr::app("SCOPE_DENIED"));
+        }
         let tx_id = rpc::required_str(params, "tx_id")?;
         let (origin, materialized) = {
             let cb = self.state.clipboard.lock().expect("lock clipboard");
             if !cb.is_openable(&tx_id) {
                 return Err(RpcErr::app("TX_STALE"));
+            }
+            let needed = cb.consume_scope_of(&tx_id).expect("openable transaction");
+            if !has(needed) {
+                return Err(RpcErr::app("SCOPE_DENIED"));
             }
             (cb.origin_of(&tx_id), cb.is_materialized(&tx_id))
         };
@@ -1422,15 +1561,29 @@ impl Conn {
     /// parents and writes them directly (an OS-watched skeleton admits no
     /// temp+rename). The `file_id`s must be non-`dir` manifest entries.
     fn transactions_fill(&self, params: &Value) -> Result<Value, RpcErr> {
-        self.require_scope("clipboard.read")?;
+        // Same per-producer consuming scope as `transactions.open`.
+        let scopes = self.require_enrolled()?;
+        let has = |s: &str| scopes.iter().any(|x| x == s);
+        if !has("clipboard.read") && !has("transactions.publish") {
+            return Err(RpcErr::app("SCOPE_DENIED"));
+        }
         let tx_id = rpc::required_str(params, "tx_id")?;
         let entries = parse_fill_entries(params)?;
-        let plan = self
-            .state
-            .clipboard
-            .lock()
-            .expect("lock clipboard")
-            .fill_plan(&tx_id, &entries)?;
+        let plan = {
+            let cb = self.state.clipboard.lock().expect("lock clipboard");
+            // Same precedence as `transactions.open`: unknown OR superseded is
+            // `TX_STALE` first, the wrong scope second - one state, one answer,
+            // whichever verb asks (and a scope-less probe learns nothing a
+            // superseded clip's existence included).
+            if !cb.is_openable(&tx_id) {
+                return Err(RpcErr::app("TX_STALE"));
+            }
+            let needed = cb.consume_scope_of(&tx_id).expect("openable transaction");
+            if !has(needed) {
+                return Err(RpcErr::app("SCOPE_DENIED"));
+            }
+            cb.fill_plan(&tx_id, &entries)?
+        };
         let (transfer_id, cancel) = self
             .state
             .transfers
@@ -1445,6 +1598,121 @@ impl Conn {
             cancel,
         ));
         Ok(json!({ "transfer_id": transfer_id }))
+    }
+
+    // -- Peer messages ------------------------------------------------------
+
+    /// Sends an opaque, capped payload to the components holding the SAME role
+    /// on another device of the account (doc/core-api.md, "peers.*"). The
+    /// sender's role is stamped HERE, from the registry - a role talks to
+    /// itself across devices, and no caller chooses whose mailbox it reaches.
+    /// One bounded round-trip, so `COMPONENT_ABSENT` is the remote Core's word;
+    /// delivery stays best-effort (the sender retries on its own schedule).
+    async fn peers_send(&self, params: &Value) -> Result<Value, RpcErr> {
+        let role = {
+            let reg = self.state.registry.lock().expect("lock registry");
+            match &reg.conns.get(&self.conn_id).expect("live connection").phase {
+                Phase::Fresh => return Err(RpcErr::app("NOT_ENROLLED")),
+                Phase::Pending(_) => return Err(RpcErr::app("PENDING_APPROVAL")),
+                Phase::Active(a) if a.has_scope("peers.message") => a.role.clone(),
+                Phase::Active(_) => return Err(RpcErr::app("SCOPE_DENIED")),
+            }
+        };
+        let device_id = rpc::required_str(params, "device_id")?;
+        let payload = params
+            .get("payload")
+            .cloned()
+            .ok_or_else(|| RpcErr::invalid_params("payload"))?;
+        // Messaging one's own device is a loopback nothing needs: refused
+        // rather than dialled.
+        let own = self
+            .state
+            .session
+            .lock()
+            .expect("lock session")
+            .own_device_id
+            .clone();
+        if own.as_deref() == Some(device_id.as_str()) {
+            return Err(RpcErr::invalid_params("device_id"));
+        }
+        crate::peers::send(&self.state, &role, &device_id, payload).await
+    }
+
+    // -- The sync facade ----------------------------------------------------
+
+    /// Forwards a `sync.*` method to the connected exclusive `sync-backend`
+    /// (the `clipboard.get_data` pattern, in the other direction) and relays
+    /// its reply verbatim - errors included: the vocabulary's semantics live
+    /// in the component, the Core checks scopes and caches nothing. No backend
+    /// connected (or holding `sync.serve`), a backend that dies mid-flight, or
+    /// one that does not answer in time: `COMPONENT_ABSENT`, an honest state
+    /// the interface can phrase.
+    async fn sync_forward(&self, method: &str, params: &Value) -> Result<Value, RpcErr> {
+        // Phase first (through `require_scope`), then the read/manage split:
+        // the snapshot methods under `sync.read`, every gesture under
+        // `sync.manage`.
+        let scope = if SYNC_READ_METHODS.contains(&method) {
+            "sync.read"
+        } else {
+            "sync.manage"
+        };
+        self.require_scope(scope)?;
+        // Find the backend and enqueue under ONE registry lock; the await
+        // happens strictly after its release (the write invariant).
+        let issued = {
+            let mut reg = self.state.registry.lock().expect("lock registry");
+            reg.conn_for_role_scope("sync-backend", "sync.serve")
+                // Never oneself: a backend calling the facade would enqueue a
+                // request its own blocked dispatch could never answer, and
+                // burn the whole budget for a guaranteed timeout.
+                .filter(|target| *target != self.conn_id)
+                .and_then(|target| {
+                    reg.issue_request(target, method, params.clone())
+                        .map(|(id, rx)| (target, id, rx))
+                })
+        };
+        let Some((target, req_id, reply_rx)) = issued else {
+            return Err(RpcErr::app("COMPONENT_ABSENT"));
+        };
+        match tokio::time::timeout(SYNC_FORWARD_TIMEOUT, reply_rx).await {
+            // The backend's reply, result or error, relayed as-is.
+            Ok(Ok(outcome)) => outcome,
+            // Waiter dropped: the backend's connection tore down mid-flight.
+            Ok(Err(_)) => Err(RpcErr::app("COMPONENT_ABSENT")),
+            Err(_) => {
+                // Reclaim the abandoned waiter; a very late reply is dropped
+                // by `deliver_response` as a stray.
+                self.state
+                    .registry
+                    .lock()
+                    .expect("lock registry")
+                    .cancel_request(target, req_id);
+                Err(RpcErr::app("COMPONENT_ABSENT"))
+            }
+        }
+    }
+
+    /// The backend publishes a `sync` topic notification through the Core -
+    /// the one component-originated topic, gated exactly like announcing is
+    /// for the clipboard: the exclusive role AND its serving scope. The Core
+    /// checks the shape (a `sync.*` name, an object for params) and relays;
+    /// it interprets nothing.
+    fn sync_emit(&self, params: &Value) -> Result<Value, RpcErr> {
+        self.require_sync_backend()?;
+        let method = rpc::required_str(params, "method")?;
+        if !method.starts_with("sync.") || method == "sync.emit" {
+            return Err(RpcErr::invalid_params("method"));
+        }
+        let payload = params
+            .get("params")
+            .filter(|v| v.is_object())
+            .ok_or_else(|| RpcErr::invalid_params("params"))?;
+        self.state
+            .registry
+            .lock()
+            .expect("lock registry")
+            .notify_topic("sync", &method, payload);
+        Ok(json!({}))
     }
 
     // -- Lifecycle ----------------------------------------------------------
@@ -1481,6 +1749,19 @@ impl Conn {
         }
     }
 
+    /// Publishing on the `sync` topic is bound to the exclusive `sync-backend`
+    /// role AND the `sync.serve` scope, the `require_clipboard_backend`
+    /// pattern. Phase before scope (an unenrolled connection learns nothing).
+    fn require_sync_backend(&self) -> Result<(), RpcErr> {
+        let reg = self.state.registry.lock().expect("lock registry");
+        match &reg.conns.get(&self.conn_id).expect("live connection").phase {
+            Phase::Fresh => Err(RpcErr::app("NOT_ENROLLED")),
+            Phase::Pending(_) => Err(RpcErr::app("PENDING_APPROVAL")),
+            Phase::Active(a) if a.role == "sync-backend" && a.has_scope("sync.serve") => Ok(()),
+            Phase::Active(_) => Err(RpcErr::app("SCOPE_DENIED")),
+        }
+    }
+
     /// Announcing (and answering `clipboard.get_data`) is bound to the exclusive
     /// `clipboard-backend` role AND the `clipboard.write` scope: a component
     /// with the scope but another role cannot mint clipboard transactions.
@@ -1490,7 +1771,7 @@ impl Conn {
         match &reg.conns.get(&self.conn_id).expect("live connection").phase {
             Phase::Fresh => Err(RpcErr::app("NOT_ENROLLED")),
             Phase::Pending(_) => Err(RpcErr::app("PENDING_APPROVAL")),
-            Phase::Active(a) if a.role == EXCLUSIVE_ROLE && a.has_scope("clipboard.write") => {
+            Phase::Active(a) if a.role == "clipboard-backend" && a.has_scope("clipboard.write") => {
                 Ok(())
             }
             Phase::Active(_) => Err(RpcErr::app("SCOPE_DENIED")),
@@ -1500,14 +1781,30 @@ impl Conn {
     /// Removes the connection from the registry, and its pending enrollment
     /// request if any (a requester that has left has nothing left to approve).
     fn teardown(&mut self) {
-        let mut reg = self.state.registry.lock().expect("lock registry");
-        if let Some(entry) = reg.conns.remove(&self.conn_id)
-            && let Phase::Pending(request_id) = entry.phase
         {
-            reg.pending.remove(&request_id);
+            let mut reg = self.state.registry.lock().expect("lock registry");
+            if let Some(entry) = reg.conns.remove(&self.conn_id)
+                && let Phase::Pending(request_id) = entry.phase
+            {
+                reg.pending.remove(&request_id);
+            }
+            // Reclaim any data-channel token this connection minted but that
+            // never attached (an abandoned paste): otherwise the grant would
+            // linger.
+            reg.drop_channel_tokens_of(self.conn_id);
         }
-        // Reclaim any data-channel token this connection minted but that never
-        // attached (an abandoned paste): otherwise the grant would linger.
-        reg.drop_channel_tokens_of(self.conn_id);
+        // A published transaction dies with its publisher, an adopted one with
+        // its adopter (a grant dies with its holder - and without this, a Core
+        // that never restarts would accumulate orphans no supersession sweeps).
+        // Leaf lock, taken alone, after the registry's is released.
+        let removed = self
+            .state
+            .clipboard
+            .lock()
+            .expect("lock clipboard")
+            .revoke_owned_by(self.conn_id);
+        if removed {
+            self.state.clipboard_reset.notify_waiters();
+        }
     }
 }

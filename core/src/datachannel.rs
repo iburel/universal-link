@@ -201,20 +201,49 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    // The reset `Notify` wakes EVERY session (Core stop, logout, or a targeted
+    // `transactions.revoke`); only the sessions whose transaction is gone are
+    // cut. `notify_waiters` stores no permit, so the waiter is LATCHED: pinned,
+    // enabled before the first liveness check, and re-armed BEFORE each
+    // re-check - a wake landing while a request is being served (the handler
+    // awaits below, and streams re-check on their own) is seen at the next
+    // loop turn, and one landing in the re-arm gap is seen by the check.
+    let mut reset = std::pin::pin!(state.clipboard_reset.notified());
+    reset.as_mut().enable();
+    if !state
+        .clipboard
+        .lock()
+        .expect("lock clipboard")
+        .is_live(tx_id)
+    {
+        let _ = write_error(&mut write, "TX_STALE").await;
+        return;
+    }
     loop {
-        let (tag, payload) = tokio::select! {
-            // A clipboard-wide reset (Core stop, logout): the transaction is
-            // gone — cut the session with `TX_STALE`.
-            _ = state.clipboard_reset.notified() => {
-                let _ = write_error(&mut write, "TX_STALE").await;
-                break;
+        // One request, KEPT IN FLIGHT across wakes for someone else's
+        // revocation: `read_msg` is not cancel-safe, and dropping it mid-frame
+        // would desynchronize the channel.
+        let mut read = std::pin::pin!(bounded(read_msg(&mut reader)));
+        let msg = loop {
+            tokio::select! {
+                biased;
+                _ = reset.as_mut() => {
+                    reset.set(state.clipboard_reset.notified());
+                    reset.as_mut().enable();
+                    if state.clipboard.lock().expect("lock clipboard").is_live(tx_id) {
+                        continue;
+                    }
+                    let _ = write_error(&mut write, "TX_STALE").await;
+                    return;
+                }
+                m = read.as_mut() => break m,
             }
-            msg = bounded(read_msg(&mut reader)) => match msg {
-                Ok(Some(msg)) => msg,
-                // EOF (channel closed = paste abandoned), stall, or framing
-                // violation: end the session.
-                _ => break,
-            },
+        };
+        let (tag, payload) = match msg {
+            Ok(Some(msg)) => msg,
+            // EOF (channel closed = paste abandoned), stall, or framing
+            // violation: end the session.
+            _ => break,
         };
         let ended = match tag {
             TAG_READ => handle_read(state, tx_id, &payload, &mut write).await,
@@ -286,10 +315,14 @@ where
                 return Ok(false);
             }
             match entry.source() {
-                Some(source) => stream_range(write, source, offset, len).await?,
-                None => write_error(write, "FILE_CHANGED").await?,
+                // A revocation mid-range ends the session (`stream_range`
+                // re-checks between chunks).
+                Some(source) => stream_range(state, tx_id, write, source, offset, len).await,
+                None => {
+                    write_error(write, "FILE_CHANGED").await?;
+                    Ok(false)
+                }
             }
-            Ok(false)
         }
     }
 }
@@ -479,13 +512,20 @@ fn finish(result: std::io::Result<()>) -> Relay {
 
 /// Streams `[offset, offset+len)` of `source`, clamped to the file's end, as
 /// `DATA` chunks followed by `EOF`. Reading past the end yields the
-/// intersection (possibly nothing) then `EOF` — never an error.
+/// intersection (possibly nothing) then `EOF` - never an error. Returns
+/// whether the SESSION must end: the right to read can end mid-range
+/// (`transactions.revoke`, logout), so liveness is re-checked between chunks -
+/// the leaf lock, taken and released synchronously - and the cut surfaces as
+/// the mid-read `ERROR { TX_STALE }` the channel contract already defines
+/// (error propagable mid-read, never a silent truncation).
 async fn stream_range<W>(
+    state: &AppState,
+    tx_id: &str,
     write: &mut W,
     source: &std::path::Path,
     offset: u64,
     len: u64,
-) -> std::io::Result<()>
+) -> std::io::Result<bool>
 where
     W: AsyncWrite + Unpin,
 {
@@ -496,6 +536,15 @@ where
     let mut pos = offset;
     let mut buf = vec![0u8; CHUNK];
     while remaining > 0 {
+        if !state
+            .clipboard
+            .lock()
+            .expect("lock clipboard")
+            .is_live(tx_id)
+        {
+            write_error(write, "TX_STALE").await?;
+            return Ok(true);
+        }
         let want = remaining.min(CHUNK as u64) as usize;
         let n = bounded(file.read(&mut buf[..want])).await?;
         if n == 0 {
@@ -505,7 +554,8 @@ where
         pos += n as u64;
         remaining -= n as u64;
     }
-    write_msg(write, TAG_EOF, &[]).await
+    write_msg(write, TAG_EOF, &[]).await?;
+    Ok(false)
 }
 
 /// Streams a whole in-memory blob — a materialized inline payload — as `DATA`

@@ -5,11 +5,12 @@
 //! paste model (doc/core-api.md, "Transactions").
 //!
 //! A **transaction** is the right to read a frozen set of resources, minted by
-//! the source Core at the announce (`clipboard.updated`). The clipboard is its
-//! first producer — a future shared folder will be a long-lived one. This
-//! module owns the table (born / superseded / deleted) and the freezing of the
-//! file manifest; serving the bytes lives in `datachannel`, and the source→peer
-//! relay will come with the network plane.
+//! the source Core at the announce (`clipboard.updated`) or at a publish
+//! (`transactions.publish` - the long-lived producer, outside the clipboard's
+//! election, revoked explicitly). This module owns the table (born /
+//! superseded / deleted / revoked) and the freezing of the file manifest;
+//! serving the bytes lives in `datachannel`, and the source→peer relay in
+//! `clipnet`.
 //!
 //! What travels: at the announce, only metadata (formats, and for files a
 //! manifest of paths + sizes + identity). No byte is read here. Inline formats
@@ -124,6 +125,25 @@ pub enum Origin {
     Remote { node_id: String, device_id: String },
 }
 
+/// Who minted a transaction - and therefore which scope consuming it requires
+/// and how long it lives (doc/core-api.md, "Transactions": consuming a
+/// transaction requires the scope of its producer).
+#[derive(Clone, Debug)]
+pub enum Producer {
+    /// Announced by `clipboard.updated`: in the last-copier-wins election,
+    /// superseded by the next announce, consumed under `clipboard.read`.
+    Clipboard,
+    /// Published by `transactions.publish` (or installed by
+    /// `transactions.adopt` on a destination): OUTSIDE the election - never the
+    /// current clip, never superseded, no automatic expiry. It ends by
+    /// `transactions.revoke`, by the LAST of `owners`' connections closing (a
+    /// grant dies with its holder - and an entry several components adopted is
+    /// co-owned, so no adopter's grant hangs on another's connection), or with
+    /// every other transaction at logout/Core stop. Consumed under
+    /// `transactions.publish`.
+    Published { owners: Vec<ConnId> },
+}
+
 /// How a paste session on a transaction is served — the routing decision the
 /// data channel makes when a session opens. Distinct from `Origin`: a
 /// **materialized** clip is served `Local` (from its cached bytes) whatever its
@@ -151,6 +171,9 @@ pub struct Transaction {
     /// The file manifest (empty unless a `files` format was announced).
     pub files: Vec<FileEntry>,
     pub sensitive: bool,
+    /// Who minted it: the clipboard (election, supersession) or a publisher
+    /// (long-lived, revocable). Decides the consuming scope.
+    pub producer: Producer,
     /// Where the bytes live and how a paste reaches them.
     pub origin: Origin,
     /// Superseded by a newer announce: refuses new sessions (`TX_STALE`), but a
@@ -474,6 +497,132 @@ impl ClipboardState {
                 Some(f) => Lookup::File(f.clone()),
                 None => Lookup::NoSuchFile,
             },
+        }
+    }
+
+    // -- Published transactions (the long-lived producer) --------------------
+
+    /// Installs a PUBLISHED transaction: a plain table insert, outside the
+    /// last-copier-wins election - `current` is untouched, nothing is
+    /// superseded, and the entry never appears in `clipboard.current` or a
+    /// `clip_announce`. Returns the `tx_id` (re-minted in the astronomically
+    /// unlikely collision case, so an existing transaction is never clobbered).
+    pub fn publish(&mut self, mut tx: Transaction) -> String {
+        while self.transactions.contains_key(&tx.tx_id) {
+            tx.tx_id = format!("tx_{}", crate::state::random_hex(16));
+        }
+        let tx_id = tx.tx_id.clone();
+        self.transactions.insert(tx_id.clone(), tx);
+        tx_id
+    }
+
+    /// Installs a published transaction ADOPTED from a peer (its `tx_id` is the
+    /// source's, so a collision is meaningful): an id already installed as an
+    /// adopted entry makes the caller a CO-OWNER and answers the record - the
+    /// idempotent re-adopt, without ever binding one adopter's grant to
+    /// another's connection; an id this Core itself published answers the
+    /// record untouched; a collision with a clipboard transaction refuses
+    /// (`TX_STALE`, disclosing nothing). Returns the installed record.
+    pub fn install_adopted(&mut self, tx: Transaction) -> Result<Value, RpcErr> {
+        if let Some(existing) = self.transactions.get_mut(&tx.tx_id) {
+            match (&mut existing.producer, &existing.origin) {
+                // Already adopted here: the caller JOINS the owners, so its
+                // grant lives with its own connection, never with the first
+                // adopter's - the entry stays until its LAST owner leaves.
+                (Producer::Published { owners }, Origin::Remote { .. }) => {
+                    if let Producer::Published { owners: joining } = &tx.producer {
+                        for owner in joining {
+                            if !owners.contains(owner) {
+                                owners.push(*owner);
+                            }
+                        }
+                    }
+                }
+                // The id names a transaction THIS Core published (adopting
+                // one's own device makes no one an owner): the publisher's
+                // lifetime rules stand, the record is simply answered.
+                (Producer::Published { .. }, Origin::Local { .. }) => {}
+                (Producer::Clipboard, _) => return Err(RpcErr::app("TX_STALE")),
+            }
+            return Ok(self.transactions[&tx.tx_id].record());
+        }
+        let record = tx.record();
+        self.transactions.insert(tx.tx_id.clone(), tx);
+        Ok(record)
+    }
+
+    /// Does `tx_id` still exist at all? What a session woken by the reset
+    /// `Notify` re-checks: a targeted revocation wakes every waiter, and only
+    /// the sessions whose transaction is actually gone are cut.
+    pub fn is_live(&self, tx_id: &str) -> bool {
+        self.transactions.contains_key(tx_id)
+    }
+
+    /// The record of a PUBLISHED transaction - what a `tx_fetch` serves to an
+    /// adopting peer. `None` for an unknown id AND for a clipboard transaction
+    /// (not adoptable; its metadata travels by `clip_announce`), so the refusal
+    /// discloses nothing.
+    pub fn published_record(&self, tx_id: &str) -> Option<Value> {
+        self.transactions
+            .get(tx_id)
+            .filter(|t| matches!(t.producer, Producer::Published { .. }))
+            .map(Transaction::record)
+    }
+
+    /// The scope consuming `tx_id` requires - the scope of its producer
+    /// (doc/core-api.md, "Transactions"). `None` if the transaction is gone.
+    pub fn consume_scope_of(&self, tx_id: &str) -> Option<&'static str> {
+        self.transactions.get(tx_id).map(|t| match t.producer {
+            Producer::Clipboard => "clipboard.read",
+            Producer::Published { .. } => "transactions.publish",
+        })
+    }
+
+    /// Revokes a published transaction: removes it NOW, whatever its session
+    /// count (the caller then wakes the reset `Notify` to cut the open
+    /// channels). Idempotent - an unknown `tx_id` is `Ok(false)`, nothing to
+    /// wake. A CLIPBOARD transaction is not the caller's to revoke: `-32602`
+    /// (its lifecycle is the election's).
+    pub fn revoke(&mut self, tx_id: &str) -> Result<bool, RpcErr> {
+        match self.transactions.get(tx_id) {
+            None => Ok(false),
+            Some(t) => match t.producer {
+                Producer::Published { .. } => {
+                    self.transactions.remove(tx_id);
+                    Ok(true)
+                }
+                Producer::Clipboard => Err(RpcErr::invalid_params("tx_id")),
+            },
+        }
+    }
+
+    /// Withdraws `conn_id` from every published transaction it co-owns - its
+    /// publisher, or one adopter among several, is gone, and a grant dies with
+    /// its holder. An entry is removed once its LAST owner leaves. Returns
+    /// whether anything was removed (the caller then wakes the reset `Notify`).
+    pub fn revoke_owned_by(&mut self, conn_id: ConnId) -> bool {
+        let before = self.transactions.len();
+        self.transactions.retain(|_, t| match &mut t.producer {
+            Producer::Clipboard => true,
+            Producer::Published { owners } => {
+                owners.retain(|o| *o != conn_id);
+                !owners.is_empty()
+            }
+        });
+        self.transactions.len() != before
+    }
+
+    /// Evicts a published entry whose SOURCE declared it stale (a relayed
+    /// `TX_STALE` on an adopted transaction): the local record is a promise the
+    /// source no longer backs. Returns whether anything was removed. A
+    /// clipboard transaction is left alone - its lifecycle is the election's.
+    pub fn evict_published(&mut self, tx_id: &str) -> bool {
+        match self.transactions.get(tx_id) {
+            Some(t) if matches!(t.producer, Producer::Published { .. }) => {
+                self.transactions.remove(tx_id);
+                true
+            }
+            _ => false,
         }
     }
 }
@@ -1012,6 +1161,7 @@ mod tests {
                 formats,
                 files,
                 sensitive,
+                producer: Producer::Clipboard,
                 origin: Origin::Remote {
                     node_id: "n".into(),
                     device_id: "d".into(),

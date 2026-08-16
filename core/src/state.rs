@@ -985,6 +985,16 @@ impl Registry {
             .any(|c| matches!(&c.phase, Phase::Active(a) if a.role == role))
     }
 
+    /// The active connection holding `role` with `scope` - the `sync.*`
+    /// facade's routing lookup. For an exclusive role there is at most one;
+    /// were there several (a non-exclusive role someday), any one serves.
+    pub fn conn_for_role_scope(&self, role: &str, scope: &str) -> Option<ConnId> {
+        self.conns.iter().find_map(|(id, e)| match &e.phase {
+            Phase::Active(a) if a.role == role && a.has_scope(scope) => Some(*id),
+            _ => None,
+        })
+    }
+
     /// Pushes a notification to all active connections carrying `scope` — with
     /// no subscription: it is the duty attached to the scope
     /// (`component.pending` → `components.approve`).
@@ -999,6 +1009,27 @@ impl Registry {
                 let _ = entry.tx.try_send(OutMsg::Frame(frame.clone()));
             }
         }
+    }
+
+    /// Pushes a notification to every active connection holding BOTH `role`
+    /// and `scope` - the `peer.message` delivery (a peer message lands on the
+    /// components holding the same role as its sender, doc/core-api.md
+    /// "peers.*"; no subscription, like `component.pending`). Returns whether
+    /// at least one target existed - the wire ack's `delivered`; the
+    /// queue-full drop stays best-effort, as for every notification.
+    pub fn notify_role_scope(&self, role: &str, scope: &str, method: &str, params: &Value) -> bool {
+        let frame = rpc::notification(method, params);
+        let mut delivered = false;
+        for entry in self.conns.values() {
+            if let Phase::Active(a) = &entry.phase
+                && a.role == role
+                && a.has_scope(scope)
+            {
+                delivered = true;
+                let _ = entry.tx.try_send(OutMsg::Frame(frame.clone()));
+            }
+        }
+        delivered
     }
 
     /// Pushes a notification to the active connections subscribed to `topic`

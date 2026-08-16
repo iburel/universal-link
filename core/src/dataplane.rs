@@ -649,9 +649,9 @@ async fn answer_struck_off(peer: String, mut stream: Box<dyn IoStream>, revocati
 }
 
 /// The `device_id` (server label) associated with a `node_id`, taken from the
-/// last snapshot. Used to name the sender in `transfer.incoming`; `None` (not
-/// found) falls back to the `node_id`.
-fn device_id_for(state: &AppState, node_id: &str) -> Option<String> {
+/// last snapshot. Used to name the sender in `transfer.incoming` and
+/// `peer.message`; `None` (not found) falls back to the `node_id`.
+pub(crate) fn device_id_for(state: &AppState, node_id: &str) -> Option<String> {
     let s = state.session.lock().expect("lock session");
     s.devices.as_ref()?.iter().find_map(|(id, record)| {
         (record.get("node_id").and_then(Value::as_str) == Some(node_id)).then(|| id.clone())
@@ -1196,6 +1196,8 @@ async fn serve_incoming(
         Some("clip_announce") => crate::clipnet::recv_announce(state, peer, first, stream).await,
         Some("clip_push") => crate::clipnet::recv_push(state, peer, first, stream).await,
         Some("clip_session") => crate::clipnet::serve_session(state, first, stream).await,
+        Some("tx_fetch") => crate::clipnet::serve_tx_fetch(state, first, stream).await,
+        Some("peer_msg") => crate::peers::recv(state, peer, first, stream).await,
         Some("dir_sync") => crate::dirsync::recv_sync(state, peer, first, stream).await,
         other => {
             tracing::debug!(peer = %peer, kind = ?other, "unknown incoming frame type: abandoned");

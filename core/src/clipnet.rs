@@ -33,10 +33,11 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
 
-use crate::clipboard::{FillPlan, Origin, ServeMode, Transaction};
+use crate::clipboard::{FillPlan, Origin, Producer, ServeMode, Transaction};
 use crate::connector::IoStream;
 use crate::datachannel;
 use crate::dataplane::{self, PeerAddr};
+use crate::rpc::RpcErr;
 use crate::state::{AppState, ConnId};
 
 /// Budget for opening a stream to the source (resolution + iroh handshake).
@@ -174,6 +175,7 @@ fn build_remote_tx(state: &AppState, peer_node_id: &str, first: &Value) -> Optio
         formats,
         files,
         sensitive,
+        producer: crate::clipboard::Producer::Clipboard,
         origin: Origin::Remote {
             node_id: peer_node_id.to_string(),
             device_id,
@@ -601,16 +603,44 @@ pub(crate) async fn pipe_consumer<R, W>(
     // Downstream: the source's frames → the consumer, plus the terminal
     // conditions. The sole writer of consumer-facing errors.
     let down = async {
-        let reset = state.clipboard_reset.notified();
-        tokio::pin!(reset);
+        // The reset `Notify` wakes EVERY session (Core stop, logout, or a
+        // targeted `transactions.revoke`); only the sessions whose entry is
+        // gone are cut. `notify_waiters` stores no permit, so the waiter must
+        // be LATCHED across every await in this loop (the relay write to the
+        // consumer included): pinned, enabled before the first liveness
+        // check, and re-armed BEFORE each re-check - a wake landing in any
+        // gap is then seen either by the check or by the fresh waiter.
+        let mut reset = std::pin::pin!(state.clipboard_reset.notified());
+        reset.as_mut().enable();
+        if !state
+            .clipboard
+            .lock()
+            .expect("lock clipboard")
+            .is_live(tx_id)
+        {
+            let _ = datachannel::write_error(&mut consumer_write, "TX_STALE").await;
+            return;
+        }
         loop {
-            let msg = tokio::select! {
-                biased;
-                _ = &mut reset => {
-                    let _ = datachannel::write_error(&mut consumer_write, "TX_STALE").await;
-                    return;
+            // One frame from the source, KEPT IN FLIGHT across wakes for
+            // someone else's revocation: `read_msg` is not cancel-safe, and
+            // dropping it mid-frame would desynchronize the relay.
+            let mut read =
+                std::pin::pin!(datachannel::bounded(datachannel::read_msg(&mut net_read)));
+            let msg = loop {
+                tokio::select! {
+                    biased;
+                    _ = reset.as_mut() => {
+                        reset.set(state.clipboard_reset.notified());
+                        reset.as_mut().enable();
+                        if state.clipboard.lock().expect("lock clipboard").is_live(tx_id) {
+                            continue;
+                        }
+                        let _ = datachannel::write_error(&mut consumer_write, "TX_STALE").await;
+                        return;
+                    }
+                    m = read.as_mut() => break m,
                 }
-                m = datachannel::bounded(datachannel::read_msg(&mut net_read)) => m,
             };
             match msg {
                 Ok(Some((tag, payload))) => {
@@ -622,8 +652,13 @@ pub(crate) async fn pipe_consumer<R, W>(
                     }
                     // A session-ending ERROR (TX_STALE/PEER_GONE) forwarded from
                     // the source ends the session; the source closes after it, so
-                    // stop rather than re-report on the trailing EOF.
+                    // stop rather than re-report on the trailing EOF. A relayed
+                    // TX_STALE also evicts an ADOPTED entry: the source no
+                    // longer backs the promise the local record makes.
                     if tag == datachannel::TAG_ERROR && datachannel::error_ends_session(&payload) {
+                        if error_code(&payload).as_deref() == Some("TX_STALE") {
+                            evict_stale_published(state, tx_id);
+                        }
                         return;
                     }
                 }
@@ -697,11 +732,34 @@ pub(crate) async fn run_fill(
         return;
     };
 
+    // A fill is a session: a revocation must cut it too, not only the consumer
+    // channels. The watcher latches the reset wake (pinned + enabled, liveness
+    // checked before each park so a wake in the re-arm gap is never lost) and
+    // resolves only when OUR transaction is gone - a wake for someone else's
+    // revocation parks again.
+    let revoked = async {
+        let mut reset = std::pin::pin!(state.clipboard_reset.notified());
+        reset.as_mut().enable();
+        loop {
+            if !state
+                .clipboard
+                .lock()
+                .expect("lock clipboard")
+                .is_live(&tx_id)
+            {
+                return;
+            }
+            reset.as_mut().await;
+            reset.set(state.clipboard_reset.notified());
+            reset.as_mut().enable();
+        }
+    };
     // `biased` + fill FIRST: on a tie, a completed fill is not reported
-    // cancelled.
+    // cancelled (nor cut by a revocation that lost the race).
     let outcome = tokio::select! {
         biased;
         r = fill_entries(&state, &tx_id, &mode, &plan, &transfer_id) => r,
+        _ = revoked => Err("TX_STALE".to_string()),
         _ = cancel.notified() => Err("cancelled".to_string()),
     };
     state
@@ -709,7 +767,34 @@ pub(crate) async fn run_fill(
         .lock()
         .expect("lock clipboard")
         .end_session(&tx_id);
+    // A fill that died on TX_STALE evicts an ADOPTED entry, like the consumer
+    // pipe: the source declared the id stale, the local record is a promise
+    // nobody backs. (A local TX_STALE means the entry is already gone: no-op.)
+    if matches!(&outcome, Err(e) if e == "TX_STALE") {
+        evict_stale_published(&state, &tx_id);
+    }
     finish_fill(&state, &transfer_id, outcome);
+}
+
+/// Removes a published entry whose source declared it stale, and cuts any
+/// sibling session still relaying it (the reset `Notify`, which every survivor
+/// re-checks). No-op on a clipboard transaction or an already-gone id.
+fn evict_stale_published(state: &AppState, tx_id: &str) {
+    let removed = state
+        .clipboard
+        .lock()
+        .expect("lock clipboard")
+        .evict_published(tx_id);
+    if removed {
+        state.clipboard_reset.notify_waiters();
+    }
+}
+
+/// The `code` of a data-channel `ERROR` payload, if it parses as one.
+fn error_code(payload: &[u8]) -> Option<String> {
+    serde_json::from_slice::<Value>(payload)
+        .ok()
+        .and_then(|v| v["code"].as_str().map(str::to_string))
 }
 
 /// Deregisters the transfer then emits the terminal event ONCE (order matters:
@@ -921,6 +1006,164 @@ impl RemoteSession {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Published transactions across devices: `tx_fetch` / `transactions.adopt`
+// (doc/core-api.md, "Transactions" - the long-lived producer, #83).
+// ---------------------------------------------------------------------------
+
+/// Whole-exchange budget for an adopt (connect + one frame each way): the
+/// house exchange norm, well under the caller's patience and the callers'
+/// serialization of their own connection.
+const ADOPT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Source side of a `tx_fetch` (a peer's `transactions.adopt`): answers the
+/// frozen record of a PUBLISHED transaction, or `TX_STALE` - a clipboard
+/// transaction is not adoptable (its metadata travels by `clip_announce`), and
+/// an unknown id answers the same, disclosing nothing. The peer is already
+/// attested (C7 ran in `serve`); possession of the unguessable `tx_id` is the
+/// authorization, as everywhere on this plane.
+pub(crate) async fn serve_tx_fetch(
+    state: Arc<AppState>,
+    first: Value,
+    mut stream: Box<dyn IoStream>,
+) {
+    let stale = json!({ "type": "tx_error", "code": "TX_STALE" });
+    let reply = match first.get("tx_id").and_then(Value::as_str) {
+        None => stale.clone(),
+        Some(tx_id) => {
+            let record = state
+                .clipboard
+                .lock()
+                .expect("lock clipboard")
+                .published_record(tx_id);
+            match record {
+                Some(mut record) => {
+                    record["type"] = json!("tx_manifest");
+                    record
+                }
+                None => stale.clone(),
+            }
+        }
+    };
+    let Ok(mut bytes) = serde_json::to_vec(&reply) else {
+        return;
+    };
+    // The reply must fit one control frame: a manifest too large to travel is
+    // its own honest refusal - the v1 bound lazy enumeration will lift, same
+    // as a clip too large to propagate. Headroom as in `propagate`.
+    if bytes.len() + 64 > dataplane::MAX_FRAME as usize {
+        bytes = serde_json::to_vec(&json!({ "type": "tx_error", "code": "MANIFEST_TOO_LARGE" }))
+            .expect("serialize tx_error");
+    }
+    // The reply can be a whole manifest: a peer that never grants stream
+    // credit must not pin this handler's slot forever (the accept loop's
+    // budget) - the house no-progress bound, as every responder applies.
+    if datachannel::bounded(dataplane::write_frame(&mut stream, &bytes))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    // QUIC lifecycle: hold the reply until the initiator closes.
+    let _ = stream.shutdown().await;
+    let _ = tokio::time::timeout(LINGER, dataplane::drain(&mut stream)).await;
+}
+
+/// Destination side of `transactions.adopt`: fetches the frozen manifest of a
+/// transaction PUBLISHED on `device_id` and installs it locally - outside the
+/// election, owned by the adopting connection - so the untouched consumer
+/// machinery (`transactions.open`/`transactions.fill`, the data channel) then
+/// serves it exactly like a remote clip. Errors follow `files.send`'s
+/// targeting doctrine: `DEVICE_UNKNOWN` (absent, or attested under a foreign
+/// key - indistinguishable, fail-closed), `DEVICE_OFFLINE` (no route known, or
+/// nothing usable answered in time), `TX_STALE` (the source does not back that
+/// id - or answered something that is not a valid manifest: nothing installs),
+/// and `MANIFEST_TOO_LARGE` relayed as itself.
+pub(crate) async fn adopt(
+    state: &Arc<AppState>,
+    owner: ConnId,
+    device_id: &str,
+    tx_id: &str,
+) -> Result<Value, RpcErr> {
+    let peer =
+        dataplane::resolve_peer(state, device_id).ok_or_else(|| RpcErr::app("DEVICE_UNKNOWN"))?;
+    if !dataplane::peer_reachable(state, &peer) {
+        return Err(RpcErr::app("DEVICE_OFFLINE"));
+    }
+    let reply = tokio::time::timeout(ADOPT_TIMEOUT, fetch_manifest(state, &peer, tx_id))
+        .await
+        .map_err(|_| RpcErr::app("DEVICE_OFFLINE"))?
+        .map_err(|_| RpcErr::app("DEVICE_OFFLINE"))?;
+    match reply.get("type").and_then(Value::as_str) {
+        Some("tx_manifest") => {}
+        Some("tx_error") => {
+            // Only the codes this exchange defines travel through; anything
+            // else collapses into the fail-closed refusal.
+            let code = match reply.get("code").and_then(Value::as_str) {
+                Some("MANIFEST_TOO_LARGE") => "MANIFEST_TOO_LARGE",
+                _ => "TX_STALE",
+            };
+            // The source's own word that it no longer backs the id: a record
+            // this Core already installed (a re-adopt probing after a
+            // reconnect) is a promise nobody backs - evict it, exactly as a
+            // relayed TX_STALE would.
+            if code == "TX_STALE" {
+                evict_stale_published(state, tx_id);
+            }
+            return Err(RpcErr::app(code));
+        }
+        _ => return Err(RpcErr::app("TX_STALE")),
+    }
+    // Fail-closed manifest re-validation, exactly like a remote clip announce
+    // (`validate_remote_manifest`): a hostile record installs nothing. The
+    // local entry is rebuilt from what WE asked and verified - the requested
+    // `tx_id`, the resolved peer - never from the reply's own claims.
+    let files = reply
+        .get("files")
+        .and_then(Value::as_array)
+        .and_then(|a| crate::clipboard::validate_remote_manifest(a))
+        .filter(|f| !f.is_empty())
+        .ok_or_else(|| RpcErr::app("TX_STALE"))?;
+    let tx = Transaction {
+        tx_id: tx_id.to_string(),
+        device_id: Some(device_id.to_string()),
+        seq: 0, // outside the election: never compared
+        formats: Vec::new(),
+        files,
+        sensitive: false,
+        producer: Producer::Published {
+            owners: vec![owner],
+        },
+        origin: Origin::Remote {
+            node_id: peer.node_id.clone(),
+            device_id: device_id.to_string(),
+        },
+        superseded: false,
+        sessions: 0,
+        materialized: HashMap::new(),
+    };
+    state
+        .clipboard
+        .lock()
+        .expect("lock clipboard")
+        .install_adopted(tx)
+}
+
+/// One `tx_fetch` round-trip: open, ask, read the one reply, close.
+async fn fetch_manifest(
+    state: &Arc<AppState>,
+    peer: &PeerAddr,
+    tx_id: &str,
+) -> std::io::Result<Value> {
+    let mut stream = state.transport.open(peer).await?;
+    let frame = serde_json::to_vec(&json!({ "type": "tx_fetch", "tx_id": tx_id }))?;
+    dataplane::write_frame(&mut stream, &frame).await?;
+    let reply = dataplane::read_frame(&mut stream).await?;
+    // Initiator closes after reading the reply (QUIC lifecycle).
+    let _ = stream.shutdown().await;
+    serde_json::from_slice(&reply).map_err(|_| datachannel::unexpected("tx_fetch reply"))
 }
 
 fn timed_out(what: &str) -> std::io::Error {

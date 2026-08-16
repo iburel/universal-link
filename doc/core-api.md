@@ -61,6 +61,7 @@ only through these two paths, never via the prompt.
 | `gui` | the only role that receives approval requests (with the `components.approve` scope) |
 | `clipboard-backend` | **exclusive**: only one active at a time; a second `hello` with this role → `ROLE_CONFLICT` (replacing the official backend with a third-party one is a configuration choice) |
 | `menu-backend` | — |
+| `sync-backend` | **exclusive**, exactly like the clipboard backend (one active at a time, `ROLE_CONFLICT`, replaceable by configuration): the engine answering the routed `sync.*` facade. The two exclusive roles are two slots, one holder each |
 | `tray` | — |
 | `custom` | generic third-party components |
 
@@ -75,7 +76,12 @@ only through these two paths, never via the prompt.
 | `files.send` | `files.send`, `files.cancel` (any transfer, outgoing or incoming — components are the user's trusted agents; the `transfer_id` is random, non-enumerable) |
 | `transfers.read` | the `transfers` topic |
 | `clipboard.write` | `clipboard.updated`, answering `clipboard.get_data` — both additionally require the `clipboard-backend` role (announcing is the exclusive backend's privilege) |
-| `clipboard.read` | the `clipboard` topic, `clipboard.current`, `transactions.open`, `transactions.fill` |
+| `clipboard.read` | the `clipboard` topic, `clipboard.current`, and consuming a CLIPBOARD transaction through `transactions.open` / `transactions.fill` (consuming requires the scope of the producer - see [Transactions](#transactions)) |
+| `transactions.publish` | `transactions.publish`, `transactions.revoke`, `transactions.adopt`, and consuming a PUBLISHED transaction through `transactions.open` / `transactions.fill`. No role attached: any component may be a producer |
+| `peers.message` | `peers.send`, and receiving `peer.message` (the scope is the subscription) |
+| `sync.serve` | answering the routed `sync.*` facade and publishing the `sync` topic (`sync.emit`) - both additionally require the `sync-backend` role |
+| `sync.read` | the `sync` topic and its snapshot method `sync.status` |
+| `sync.manage` | every other `sync.*` gesture |
 | `components.approve` | `components.*` — never grantable via the prompt |
 | `system.shutdown` | `system.shutdown` — stops the whole Core (the tray's Quit) |
 
@@ -84,12 +90,14 @@ Verification: per method and per topic. Example profiles — menu manager:
 Core is actually connected to the server: the directory cache is served offline
 too, so without it the menu would offer targets that cannot be reached); tray:
 `session.read + devices.read + transfers.read`; clipboard manager:
-`devices.read + clipboard.read + clipboard.write`.
+`devices.read + clipboard.read + clipboard.write`; sync engine (#84):
+`sync.serve + transactions.publish + peers.message + devices.read +
+session.read + transfers.read`.
 
 ## Subscribing to events
 
 ```
-events.subscribe { topics: ["session", "devices", "transfers", "clipboard", "pairing"] }
+events.subscribe { topics: ["session", "devices", "transfers", "clipboard", "pairing", "sync"] }
 ```
 
 Topics filtered by scopes. Notifications are named (below, by namespace). After a
@@ -561,14 +569,54 @@ Notifications (topic `transfers`):
 | `transfer.progress { transfer_id, done, total }` | throttled by the Core (~2/s; the first and last point are always emitted) |
 | `transfer.finished { transfer_id, paths? }` / `transfer.failed { transfer_id, error }` | end (`paths` = files written, on the receiving side). `error` is a bare code when the Core minted one - `"cancelled"` on cancellation, `"NO_DIRECT_PATH"` when the deployment's rendezvous-only relays refused an over-cap payload with no direct path (#88) - otherwise the failure's own words |
 
+## `peers.*`
+
+Messages between the components of one account, across its devices - the
+control-plane counterpart of what the directory exchange does internally,
+exposed as an extension point. The payload is the components' own dialect:
+the Core carries it, caps it, and interprets nothing.
+
+| Method | Description |
+|---|---|
+| `peers.send { device_id, payload }` | → `{}`. Delivers `payload` (any JSON value, required, at most 64 KiB serialized - `PAYLOAD_TOO_LARGE` beyond, refused before anything is dialled) to the components holding the SAME role on `device_id`. The sender's role is stamped by the Core from this connection, never chosen; one's own `device_id` is `-32602` |
+
+Targeting follows `files.send`'s doctrine: `device_id` is resolved by the
+directory, C7 attestation verified before any opening - absent or attested
+under a foreign key → `DEVICE_UNKNOWN` (fail-closed, indistinguishable);
+known but with no route to it, or nothing usable answering within the
+exchange budget → `DEVICE_OFFLINE`. The device answered but no component
+there holds the sender's role with the `peers.message` scope →
+`COMPONENT_ABSENT`, the remote Core's word - deliberately silent on why
+(role not held, scope missing, or a frame it refused as malformed): the
+answer owes the sender no inventory of the peer's components.
+
+On arrival the message is pushed as `peer.message { device_id, payload }` to
+every active connection holding the sender's role and the `peers.message`
+scope - with no topic and no subscription, like `component.pending`: the
+scope is the subscription. `device_id` names the sender as THIS device's
+directory knows it (the node the transport authenticated), never as anything
+in the frame claims.
+
+Best-effort by design: the reply only says the message was queued to at
+least one matching component (a full write queue still drops it, as for
+every notification), there is no store-and-forward, and an offline peer
+simply never hears it - the sender retries on its own schedule, and the
+`devices` topic already says when a peer becomes reachable. Two deliberate
+bends worth stating: the payload is the one exception to "the control plane
+carries control, never payloads", bounded by its cap - which is why the cap
+speaks its own code; and `custom` is ONE role, so third-party components
+sharing it share the channel and discriminate their own dialect inside the
+payload.
+
 ## Transactions
 
 The object at the heart of everything that serves bytes across devices: a
 **transaction** is a capability minted by the source Core that grants the right
 to read a frozen set of resources. The clipboard is its first producer (one
-copy = one transaction); a shared folder will simply be a long-lived
-transaction with an explicit revocation instead of an automatic expiry. The
-`tx_id` is unguessable and never reused: holding it (plus being an
+copy = one transaction); `transactions.publish` is the second - the
+long-lived transaction with an explicit revocation instead of an automatic
+expiry that shared folders will ride (see *Producing transactions* below).
+The `tx_id` is unguessable and never reused: holding it (plus being an
 authenticated device of the account, on the network side) is the
 authorization, and the source verifies that every requested `format` /
 `file_id` belongs to the transaction before serving a byte.
@@ -593,9 +641,44 @@ Two kinds of resources, split by who holds the bytes:
   replaced file, or a same-size rewrite fails with `FILE_CHANGED`, never a
   silent truncation and never silently different bytes.
 
+### Producing transactions
+
+The second producer: any component holding the `transactions.publish` scope
+(no role attached - producing is not the clipboard backend's privilege) may
+mint a transaction OUTSIDE the clipboard's election. A published transaction
+is never the current clip, is superseded by nothing, and is invisible to
+`clipboard.current` and to the clipboard's network announces.
+
+| Method | Description |
+|---|---|
+| `transactions.publish { paths[] }` | → the frozen record `{ tx_id, formats: [], files: [{file_id, path, size, dir?}], device_id? }` - relative wire paths and Core-assigned `file_id`s, never the source paths. The very walk and guards of a files announce (canonicalization, identity freeze, `MANIFEST_TOO_LARGE`, wire-safe names, whole-publish refusal); `paths` must be non-empty. Files only: `formats` is empty, and a `FETCH` answers `FORMAT_UNKNOWN` |
+| `transactions.revoke { tx_id }` | → `{}`. The right to read ends NOW: open channels are cut with `TX_STALE` (the very cutting path a logout takes) and new sessions refuse. Idempotent on an unknown id; a CLIPBOARD transaction is `-32602` - its lifecycle belongs to the election |
+| `transactions.adopt { device_id, tx_id }` | → the same frozen record, installed locally. Fetches the manifest from the source device (resolved and attested first: `DEVICE_UNKNOWN` / `DEVICE_OFFLINE`, as for `files.send`) and re-validates it fail-closed exactly like a remote clip announce - a hostile record installs nothing. A source that does not back the id (or an id naming a clipboard transaction): `TX_STALE`, disclosing nothing; a manifest too large for one control frame: `MANIFEST_TOO_LARGE` (the v1 bound lazy enumeration will lift). Idempotent while installed |
+
+What "long-lived" means, exactly: no automatic expiry and no supersession -
+not immortality. A published transaction ends with `transactions.revoke`,
+with its owners' connections (the publisher on the source; on a destination
+the adopters, and an entry several components adopted is co-owned - each
+grant dies with ITS holder, the entry with the last of them; re-publishing
+or re-adopting after a reconnect is cheap), and with everything else at
+logout or Core stop. Nothing survives a Core restart; the producer
+republishes.
+
+Consumption is the untouched machinery: `transactions.open`,
+`transactions.fill`, the data channel and its range reads, `FILE_CHANGED`
+and the stall timeouts included. A destination first installs the source's
+record with `transactions.adopt`; from there the transaction serves exactly
+like a remote clip - reachability checked at open, `NO_DIRECT_PATH` under a
+rendezvous-only relay cap, `PEER_GONE` when the source vanishes mid-stream.
+A source-side revoke reaches open remote sessions as the relayed `TX_STALE`
+and evicts the destination's installed record.
+
 ### Lifecycle
 
-1. **Born** at the announce (`clipboard.updated` → `tx_id`).
+1. **Born** at the announce (`clipboard.updated` → `tx_id`) - or at a
+   publish, whose transaction the election below never touches: steps 3
+   and 4 are the CLIPBOARD producer's, and *Producing transactions* above
+   says how a published one ends.
 2. **Consumed** through sessions: an open consumer channel, or an in-flight
    `transactions.fill`. Closing the channel (or the fill ending) ends the
    session — there is no explicit "paste done" call: a crashed consumer is just
@@ -617,10 +700,10 @@ Two kinds of resources, split by who holds the bytes:
 
 Supersession is the graceful exit; the source Core stopping or logging out is
 not — both **cut** active sessions (`ERROR { TX_STALE }` on open channels) and
-drop every transaction. The shared folders' future explicit revocation will
-take the same cutting path: revoking must mean *now*. Consuming a transaction
+drop every transaction. `transactions.revoke` takes that same cutting path
+for a published transaction: revoking means *now*. Consuming a transaction
 requires the scope of its producer — `clipboard.read` for a clipboard
-transaction.
+transaction, `transactions.publish` for a published one.
 
 Very large trees: v1 freezes the full manifest at the announce and **caps it**
 (65,536 entries; beyond, the announce fails with `MANIFEST_TOO_LARGE` — a
@@ -739,6 +822,35 @@ advisory: the destination backend re-applies the OS confidentiality markers
 when it takes ownership, and no component may persist a sensitive clip's
 contents (history, logs).
 
+## `sync.*`
+
+The routed facade: the interface's sync gestures go through the Core to the
+engine. Every method of the `sync.*` namespace except `sync.emit` is
+**forwarded** to the connected exclusive `sync-backend` component (the
+requests-in-both-directions principle, `clipboard.get_data`'s pattern in the
+other direction), and its reply - result or error - relays verbatim: the
+vocabulary's semantics live entirely in the engine (frozen with it, #84),
+the Core checks scopes and shapes, caches nothing, interprets nothing.
+
+- `sync.status` - the `sync` topic's snapshot method, per the resync rule -
+  requires `sync.read`; every other `sync.*` gesture requires `sync.manage`.
+  The split is per scope, not cumulative: an interface that wants both
+  holds both.
+- Engine absent, or dead: `COMPONENT_ABSENT` - also the answer for one that
+  tears down mid-request or does not answer within the proxy budget (10 s).
+  An honest state the interface can phrase; nothing is queued for a backend
+  to come, the interface simply retries on its next gesture.
+- Answering the facade requires the `sync-backend` role AND the `sync.serve`
+  scope: a connection missing either is not the engine, whatever its name.
+
+Notifications (topic `sync`, scope `sync.read`, subscription-based): they are
+published BY the backend through `sync.emit { method, params }` - the one
+component-originated topic. The Core checks the shape (`method` a `sync.*`
+name other than `sync.emit`, `params` an object), requires the backend's
+role and `sync.serve` exactly as a clipboard announce requires its own, and
+relays verbatim. The vocabulary of those notifications is the engine
+contract's (#84).
+
 ## `components.*`
 
 Reserved for the `components.approve` scope.
@@ -826,7 +938,7 @@ Standard JSON-RPC codes + application codes in `error.data.code`:
 | `PENDING_APPROVAL` | enrollment request still pending |
 | `INVALID_TOKEN` | unknown or revoked token |
 | `SCOPE_DENIED` | scope missing for the method or the topic |
-| `ROLE_CONFLICT` | exclusive role already taken (`clipboard-backend`) |
+| `ROLE_CONFLICT` | exclusive role already taken (`clipboard-backend`, `sync-backend`) |
 | `ALREADY_LOGGED_IN` | `session.login` while a session is open (re-logging in starts with `session.logout`) |
 | `INVALID_CONFIG` | `session.reload` on a `config.json` whose parse reports a problem, a faulty single setting included (the message carries the reason) |
 | `SERVER_UNREACHABLE` | operation requiring the server, offline |
@@ -840,10 +952,12 @@ Standard JSON-RPC codes + application codes in `error.data.code`:
 | `PAIRING_UNKNOWN` / `PAIRING_STATE` / `PAIRING_LIMIT` | relayed from the server as-is: unknown/expired/spent session, wrong moment (confirming before anyone scanned, or from the joining side), too many sessions at once. `PAIRING_STATE` is also the local answer for a pairing that is out of step: a code whose window is no longer the one on screen, a device that answers a dial with something other than the protocol's next frame, and confirming a pairing whose stream is gone |
 | `DEVICE_UNKNOWN` / `DEVICE_OFFLINE` | target unknown / unreachable (`pairing.accept` of a `1D2` code: the device that displayed it is not on this network) |
 | `DEVICE_REVOKED` | `pairing.accept` of a `1D2` code shown by a `node_id` the account struck off: a tombstone is permanent, and that device can only come back under a fresh identity |
+| `COMPONENT_ABSENT` | the component the call needs is not connected: no `sync-backend` holding `sync.serve` for a `sync.*` forward (also on a mid-request death or the proxy timeout), or - `peers.send` - the target device's word that nothing there holds the sender's role with `peers.message` |
+| `PAYLOAD_TOO_LARGE` | `peers.send`: the serialized `payload` exceeds the cap (64 KiB), refused before anything is dialled |
 | `TRANSFER_UNKNOWN` | unknown `transfer_id` |
 | `FORMAT_UNKNOWN` | format not present in the transaction |
 | `FILE_UNKNOWN` | `file_id` absent from the manifest — or a `dir` entry, which has no bytes to read |
-| `TX_STALE` | `tx_id` unknown or superseded: no new session. Supersession lets active sessions finish; a Core stop, logout, or (future) explicit revocation cuts them |
+| `TX_STALE` | `tx_id` unknown, superseded, or revoked: no new session. Supersession lets active sessions finish; a Core stop, logout, or `transactions.revoke` cuts them. Also `transactions.adopt`'s fail-closed refusal: a source that does not back the id, or answered something that is not a valid manifest |
 | `CLIP_STALE` | inline formats only: the source backend can no longer vouch for the announce's clipboard generation (the OS clipboard changed, the backend restarted or is gone) |
 | `FILE_CHANGED` | the file behind a manifest entry is no longer the frozen one (size, identity, or mtime): the read is refused rather than serving different bytes |
 | `MANIFEST_TOO_LARGE` | announce refused: the copy exceeds the v1 manifest cap |

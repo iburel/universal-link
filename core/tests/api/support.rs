@@ -368,6 +368,82 @@
 //!   sponsors over the local network; the joiner joins the ACCOUNT, not the
 //!   deployment. `pairing.offer` on that device still goes through the server —
 //!   the `1D1` path is what also enrolls the newcomer on the deployment.
+//!
+//! Published transactions - the generic long-lived producer (#83,
+//! `transactions.rs`):
+//! - `transactions.publish { paths[] }` → the frozen record (`tx_id`, `files`
+//!   with Core-assigned `file_id`s and relative wire paths - never the source
+//!   paths). Guarded by the `transactions.publish` scope ALONE, any role
+//!   (unlike announcing, the exclusive backend's privilege). Empty `paths` →
+//!   `-32602`; the walk's guards (caps, wire-safe names, whole-publish
+//!   refusal) are the clipboard announce's, unchanged.
+//! - A published transaction lives OUTSIDE the election: never the current
+//!   clip, never superseded, absent from `clipboard.current` and from
+//!   `clip_announce`. Its ends: `transactions.revoke`, its OWNER connection
+//!   closing (publisher or adopter - a grant dies with its holder), and the
+//!   logout/stop cut with everything else. It does NOT survive a Core restart
+//!   (nothing does; the producer republishes).
+//! - Consuming requires the scope of the PRODUCER: `clipboard.read` for a
+//!   clipboard transaction, `transactions.publish` for a published one - a
+//!   holder of neither gets `SCOPE_DENIED` before any lookup; the wrong one of
+//!   the two gets `SCOPE_DENIED` after it (and `TX_STALE` on an unknown id).
+//! - `transactions.revoke { tx_id }` cuts open channels NOW (`TX_STALE`
+//!   pushed, the logout path - the reset `Notify` wakes every session and each
+//!   re-checks its OWN transaction, so a targeted revoke spares the others).
+//!   Idempotent on an unknown id; `-32602` on a clipboard transaction.
+//! - `transactions.adopt { device_id, tx_id }` installs a transaction
+//!   published on another device: dials the resolved, attested source
+//!   (`DEVICE_UNKNOWN` / `DEVICE_OFFLINE` as `files.send`), fetches the record
+//!   (`tx_fetch` → `tx_manifest` | `tx_error` on the data plane), re-validates
+//!   the manifest fail-closed (`validate_remote_manifest` - a hostile record
+//!   installs nothing, `TX_STALE`), and returns the record. Idempotent while
+//!   installed - a re-adopt JOINS the entry's owners, so an entry several
+//!   components adopted is co-owned and dies with the LAST of them, never
+//!   with somebody else's connection. A clipboard transaction is not
+//!   adoptable (`TX_STALE`, indistinguishable from unknown). A source-side
+//!   revoke reaches remote consumers as a relayed `TX_STALE` and EVICTS the
+//!   adopted entry - and an adopt that hears the source's own `TX_STALE`
+//!   evicts what it holds too.
+//!
+//! Peer messages between same-role components (#83, `peers.rs`):
+//! - `peers.send { device_id, payload }`, scope `peers.message`, any role.
+//!   The payload is any JSON value, REQUIRED (a missing one is `-32602`, an
+//!   empty one is a message), opaque to the Core, capped at 64 KiB serialized
+//!   (`PAYLOAD_TOO_LARGE`, checked before any dial). One's own `device_id` is
+//!   `-32602`.
+//! - Routing is role-to-same-role, and the sender's role is STAMPED by its
+//!   Core from the registry, never chosen. Arrival is the subscription-less
+//!   `peer.message { device_id, payload }` push to EVERY active connection
+//!   holding the sender's role AND `peers.message`; the sender is named by
+//!   the receiver's own directory (the authenticated node), never by a claim
+//!   in the frame.
+//! - One bounded round-trip (`peer_msg` out, `peer_ack { delivered }` back):
+//!   `DEVICE_UNKNOWN` / `DEVICE_OFFLINE` follow `files.send`'s doctrine
+//!   (`DEVICE_OFFLINE` also covers a dial that produced no usable answer in
+//!   time), `COMPONENT_ABSENT` is the remote Core's word - which deliberately
+//!   does not distinguish "role not held" from "held without the scope" or a
+//!   malformed frame. Delivery stays best-effort: the ack means "queued to at
+//!   least one matching component", nothing more.
+//!
+//! The routed `sync.*` facade (#83, `sync.rs`):
+//! - Role `sync-backend` joins `clipboard-backend` as an EXCLUSIVE role: two
+//!   slots, one holder each, `ROLE_CONFLICT` at activation as before (the
+//!   refused token not consumed, the pending request surviving an occupied
+//!   approve).
+//! - Every `sync.*` method except `sync.emit` is FORWARDED to the active
+//!   `sync-backend` connection holding `sync.serve`, and the reply (result or
+//!   error) relays verbatim - the vocabulary's semantics live in the
+//!   component. No such connection, one that tears down mid-flight, or one
+//!   that does not answer within the 10 s proxy budget: `COMPONENT_ABSENT`.
+//! - The read/manage split is the Core's: `sync.status` (the `sync` topic's
+//!   snapshot method) requires `sync.read`; every other name requires
+//!   `sync.manage`. The split is per-scope, not cumulative - an interface
+//!   that wants both holds both. Phase before everything, as everywhere.
+//! - Topic `sync`, gated on `sync.read`, subscription-based. The backend
+//!   publishes it through `sync.emit { method, params }`, gated on its role
+//!   AND `sync.serve` (the announce pattern): `method` must be a `sync.*`
+//!   name other than `sync.emit`, `params` must be an object; the Core
+//!   relays verbatim and interprets nothing.
 
 #![allow(dead_code)]
 
@@ -1348,12 +1424,24 @@ impl TestComponent {
     /// Sends a JSON-RPC request and waits for its response. The notifications
     /// received in the meantime are buffered.
     pub async fn request(&mut self, method: &str, params: Value) -> Result<Value, RpcError> {
+        self.request_within(method, params, RESPONSE_TIMEOUT).await
+    }
+
+    /// Like `request`, with a caller-chosen response budget - for the rare
+    /// test whose legitimate answer only arrives after a Core-side timeout
+    /// (the sync facade's 10 s forward budget).
+    pub async fn request_within(
+        &mut self,
+        method: &str,
+        params: Value,
+        budget: Duration,
+    ) -> Result<Value, RpcError> {
         self.next_id += 1;
         let id = self.next_id;
         let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         self.send_frame(&msg.to_string()).await;
 
-        timeout(RESPONSE_TIMEOUT, async {
+        timeout(budget, async {
             loop {
                 let v = self.recv_json().await;
                 if v.get("method").is_some() {
