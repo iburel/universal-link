@@ -28,6 +28,7 @@ tokio = { version = "1", features = [
     "io-std",
     "io-util",
     "sync",
+    "time",
 ] }
 onedevice-ipc-client = { path = "../client" }
 # Resolves the platform data directory the engine persists under.

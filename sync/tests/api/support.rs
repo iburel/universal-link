@@ -71,7 +71,14 @@ pub struct TestCore {
 
 impl TestCore {
     pub async fn start() -> TestCore {
+        TestCore::start_with(|_| {}).await
+    }
+
+    /// Starts the Core after `seed` prepared its config directory (a device
+    /// key, an account root: whatever the scenario needs on disk first).
+    pub async fn start_with(seed: impl FnOnce(&Path)) -> TestCore {
         let dir = tempfile::tempdir().expect("tempdir");
+        seed(dir.path());
         let ipc_path = ipc_path_for(dir.path());
         let config = onedevice_core::Config {
             ipc_path: ipc_path.clone(),
@@ -168,7 +175,13 @@ impl Engine {
         let stdin_closed = async move {
             let _ = stop_rx.await;
         };
-        let task = tokio::spawn(onedevice_sync::run(client, events, store, stdin_closed));
+        let task = tokio::spawn(onedevice_sync::run(
+            client,
+            events,
+            store,
+            stdin_closed,
+            Duration::from_millis(200),
+        ));
         Engine { task, stop }
     }
 

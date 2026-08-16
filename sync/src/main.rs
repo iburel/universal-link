@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use onedevice_ipc_client::{ClientConfig, TokenSource};
+use onedevice_sync::orchestrator::SAFETY_TICK;
 use onedevice_sync::{Outcome, SERVED_METHODS, Store, run};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
@@ -112,7 +113,7 @@ async fn engine() -> i32 {
         let _ = stdin.read_to_end(&mut sink).await;
     };
 
-    match run(client, events, store, stdin_closed).await {
+    match run(client, events, store, stdin_closed, SAFETY_TICK).await {
         Outcome::StdinClosed => 0,
         // IPC lost / incompatible / client ended: exit non-zero so the
         // supervisor restarts us with a fresh, single-use spawn token.

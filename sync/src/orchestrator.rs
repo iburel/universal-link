@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
 
-//! The engine's event loop: consumes the IPC client's events, answers the
-//! facade's forwarded `sync.*` calls from the store, and ends on the
-//! supervised-component contract's terminal conditions.
+//! The engine's event loop: bridges the IPC client to the sans-wire engine
+//! core. Facade calls are answered from the engine's snapshot; the
+//! directory (`devices.list`) names this device and translates node ids to
+//! device ids; `peer.message` payloads go through [`crate::engine::Engine::on_message`]
+//! and whatever comes back rides `peers.send`; reachability changes and
+//! the safety tick drive [`crate::engine::Engine::pump`].
+//!
+//! Blocking discipline: replies and sends ride their own tasks (a Core
+//! that stops draining must not hold the stop signal past the
+//! supervisor's grace); directory refreshes come back through an internal
+//! channel rather than being awaited inline.
 
+use std::collections::BTreeMap;
 use std::future::Future;
+use std::time::Duration;
 
 use onedevice_ipc_client::{Client, Event, RequestError, RequestId};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
+use crate::engine::{Engine, Outgoing};
 use crate::store::Store;
 
 /// The facade methods the engine serves today. The list grows brick by brick
@@ -17,6 +29,11 @@ use crate::store::Store;
 /// name absent from it is refused with `-32601` by the IPC client itself, and
 /// the Core relays that refusal verbatim to the caller.
 pub const SERVED_METHODS: [&str; 1] = ["sync.status"];
+
+/// The slow safety net (doc/sync-engine.md, section 4): rounds also run on
+/// reachability changes and message receipt; this tick catches what those
+/// miss, and drives the periodic rescan until the watcher brick lands.
+pub const SAFETY_TICK: Duration = Duration::from_secs(15 * 60);
 
 /// Why the loop ended - mapped by `main` to a process exit code.
 #[derive(Debug, PartialEq, Eq)]
@@ -34,21 +51,21 @@ pub enum Outcome {
 }
 
 /// One step derived from an IPC event. Pure, so the exit conditions - the
-/// supervised-component contract - are unit-tested without a Core. `Status`
-/// carries a [`RequestId`], which only the client crate can mint; the unit
-/// tests therefore cover every variant but that one, which the integration
-/// suite drives.
+/// supervised-component contract - are unit-tested without a Core.
 enum Action {
-    /// A forwarded `sync.status`: answer the snapshot from the store.
+    /// A forwarded `sync.status`: answer the snapshot.
     Status(RequestId),
     /// A request in `served_methods` that this dispatch does not handle:
     /// impossible while the two lists agree, refused honestly if they ever
     /// drift (a dropped reply would burn the caller's whole facade budget).
     Unsupported(RequestId),
-    /// A connected-but-uninteresting event: nothing to do yet. Connection
-    /// establishment lands here too - the engine's snapshot lives in its own
-    /// store, so there is nothing to resynchronize from the Core until the
-    /// reconciliation bricks arrive.
+    /// Connection established: the directory must be (re)resolved.
+    Resync,
+    /// A `peer.message` notification: a dialect payload from a sibling.
+    PeerMessage(Value),
+    /// A `device.*` event: the directory changed; refresh and pump.
+    DirectoryStale,
+    /// A connected-but-uninteresting event: nothing to do.
     Idle,
     /// The loop must end.
     Exit(Outcome),
@@ -60,53 +77,268 @@ fn classify(event: Option<Event>) -> Action {
         // The client only delivers requests whose method is in
         // [`SERVED_METHODS`]: reaching this arm means the two lists drifted.
         Some(Event::Request { id, .. }) => Action::Unsupported(id),
-        Some(Event::Connected { .. }) | Some(Event::Notification { .. }) => Action::Idle,
+        Some(Event::Connected { .. }) => Action::Resync,
+        Some(Event::Notification { method, params }) if method == "peer.message" => {
+            Action::PeerMessage(params)
+        }
+        Some(Event::Notification { method, .. })
+            if method.starts_with("device.") || method == "session.changed" =>
+        {
+            Action::DirectoryStale
+        }
+        Some(Event::Notification { .. }) => Action::Idle,
         Some(Event::Disconnected) => Action::Exit(Outcome::ConnectionLost),
         Some(Event::Incompatible { .. }) => Action::Exit(Outcome::Incompatible),
         None => Action::Exit(Outcome::ClientEnded),
     }
 }
 
+/// What the spawned side tasks report back into the loop.
+enum Internal {
+    /// A fresh `devices.list` snapshot (or `None`: the Core knows of no
+    /// device at all - not joined yet; retried on the next event).
+    Directory(Option<Value>),
+}
+
+/// The directory's translation tables, rebuilt from every snapshot.
+#[derive(Default)]
+struct Directory {
+    self_node: Option<String>,
+    device_of: BTreeMap<String, String>,
+    reachable: Vec<String>,
+}
+
+impl Directory {
+    fn parse(snapshot: &Value) -> Directory {
+        let mut dir = Directory::default();
+        let Some(rows) = snapshot.as_array() else {
+            return dir;
+        };
+        for row in rows {
+            let (Some(node), Some(device)) = (
+                row.get("node_id").and_then(Value::as_str),
+                row.get("device_id").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            dir.device_of.insert(node.to_string(), device.to_string());
+            if row.get("is_self").and_then(Value::as_bool) == Some(true) {
+                dir.self_node = Some(node.to_string());
+            } else if row.get("reachable").and_then(Value::as_bool) == Some(true) {
+                dir.reachable.push(node.to_string());
+            }
+        }
+        dir
+    }
+
+    fn node_of(&self, device_id: &str) -> Option<String> {
+        self.device_of
+            .iter()
+            .find(|(_, d)| d.as_str() == device_id)
+            .map(|(n, _)| n.clone())
+    }
+}
+
+struct Loop {
+    client: Client,
+    store: Option<Store>,
+    engine: Option<Engine>,
+    directory: Directory,
+    internal_tx: mpsc::Sender<Internal>,
+}
+
 /// Runs the engine until a terminal condition. Consumes the Core `events`
-/// stream; `stdin_closed` resolves on the supervisor's graceful-stop signal.
+/// stream; `stdin_closed` resolves on the supervisor's graceful-stop
+/// signal; `tick` is the safety-net period (production: [`SAFETY_TICK`]).
 pub async fn run(
     client: Client,
     mut events: mpsc::Receiver<Event>,
     store: Store,
     stdin_closed: impl Future<Output = ()>,
+    tick: Duration,
 ) -> Outcome {
     tokio::pin!(stdin_closed);
+    let (internal_tx, mut internal_rx) = mpsc::channel::<Internal>(8);
+    let mut state = Loop {
+        client,
+        store: Some(store),
+        engine: None,
+        directory: Directory::default(),
+        internal_tx,
+    };
+    let mut ticker = tokio::time::interval(tick);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
             biased;
             () = &mut stdin_closed => break Outcome::StdinClosed,
             event = events.recv() => match classify(event) {
-                // Replies ride their own task: `Client::respond` awaits the
-                // actual socket write, and a Core that stopped draining must
-                // not hold the stop signal past the supervisor's grace.
                 Action::Status(id) => {
-                    let client = client.clone();
-                    let snapshot = store.status();
-                    tokio::spawn(async move { respond(client, id, snapshot).await });
+                    let client = state.client.clone();
+                    let snapshot = state
+                        .engine
+                        .as_ref()
+                        .map(Engine::status)
+                        .unwrap_or_else(empty_status);
+                    tokio::spawn(async move {
+                        swallow_stale(client.respond(id, snapshot).await);
+                    });
                 }
                 Action::Unsupported(id) => {
-                    let client = client.clone();
+                    let client = state.client.clone();
                     tokio::spawn(async move {
                         swallow_stale(client.respond_error(id, "SYNC_UNSUPPORTED").await);
                     });
                 }
+                Action::Resync | Action::DirectoryStale => state.request_directory(),
+                Action::PeerMessage(params) => state.on_peer_message(&params),
                 Action::Idle => {}
                 Action::Exit(outcome) => break outcome,
             },
+            Some(internal) = internal_rx.recv() => match internal {
+                Internal::Directory(snapshot) => state.on_directory(snapshot),
+            },
+            _ = ticker.tick() => state.on_tick(),
         }
     }
 }
 
-/// Answers `sync.status` with the snapshot, assembled from local state
-/// alone before the task was spawned.
-async fn respond(client: Client, id: RequestId, snapshot: serde_json::Value) {
-    swallow_stale(client.respond(id, snapshot).await);
+impl Loop {
+    /// Fires a `devices.list` on its own task; the snapshot comes back as
+    /// [`Internal::Directory`].
+    fn request_directory(&self) {
+        let client = self.client.clone();
+        let tx = self.internal_tx.clone();
+        tokio::spawn(async move {
+            let snapshot = match client.request("devices.list", json!({})).await {
+                Ok(snapshot) => Some(snapshot),
+                // SERVER_UNREACHABLE = a Core that knows of no device at
+                // all (never logged in, never joined): the engine waits.
+                Err(RequestError::Rpc(e))
+                    if e.data_code.as_deref() == Some("SERVER_UNREACHABLE") =>
+                {
+                    None
+                }
+                Err(e) => {
+                    eprintln!("[1device-sync] devices.list failed: {e}");
+                    None
+                }
+            };
+            let _ = tx.send(Internal::Directory(snapshot)).await;
+        });
+    }
+
+    fn on_directory(&mut self, snapshot: Option<Value>) {
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+        let directory = Directory::parse(&snapshot);
+        let Some(self_node) = directory.self_node.clone() else {
+            return;
+        };
+        self.directory = directory;
+        if self.engine.is_none()
+            && let Some(store) = self.store.take()
+        {
+            match Engine::open(store, self_node, unix_now()) {
+                Ok(engine) => self.engine = Some(engine),
+                // A corrupt state is deliberately NOT self-healing: report
+                // and serve nothing (the status stays empty; the facade
+                // stays honest through COMPONENT... the snapshot).
+                Err(e) => {
+                    eprintln!("[1device-sync] cannot open the engine state: {e}");
+                    return;
+                }
+            }
+        }
+        self.pump(false);
+    }
+
+    fn on_peer_message(&mut self, params: &Value) {
+        let Some(device_id) = params.get("device_id").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(payload) = params.get("payload") else {
+            return;
+        };
+        let Some(node) = self.directory.node_of(device_id) else {
+            // A sender the directory cannot name is dropped (the letter,
+            // section 1) - and the directory is probably stale: refresh.
+            self.request_directory();
+            return;
+        };
+        let Some(engine) = &mut self.engine else {
+            return;
+        };
+        let out = engine.on_message(&node, payload, unix_now());
+        self.send_all(out);
+    }
+
+    fn on_tick(&mut self) {
+        let Some(engine) = &mut self.engine else {
+            // Not resolved yet (or never joined): keep asking.
+            self.request_directory();
+            return;
+        };
+        // The periodic rescan, until the watcher brick moves detection off
+        // the tick. Synchronous by design for now: the loop owns the
+        // engine, and the tick is rare.
+        for set_id in engine.set_ids() {
+            if engine.set(&set_id).is_some_and(|s| s.root.is_some())
+                && let Err(e) = engine.rescan_set(&set_id)
+            {
+                eprintln!("[1device-sync] rescan of {set_id} failed: {e}");
+            }
+        }
+        self.pump(true);
+        self.request_directory();
+    }
+
+    fn pump(&mut self, force: bool) {
+        let reachable = self.directory.reachable.clone();
+        let Some(engine) = &mut self.engine else {
+            return;
+        };
+        let out = engine.pump(&reachable, unix_now(), force);
+        self.send_all(out);
+    }
+
+    /// Hands each outgoing message to `peers.send` on its own task:
+    /// best-effort by design (the peer retries on its own schedule, and
+    /// the `devices` topic says when someone becomes reachable).
+    fn send_all(&self, out: Vec<Outgoing>) {
+        for message in out {
+            let Some(device_id) = self.directory.device_of.get(&message.to).cloned() else {
+                continue;
+            };
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                if let Err(e) = client
+                    .request(
+                        "peers.send",
+                        json!({ "device_id": device_id, "payload": message.payload }),
+                    )
+                    .await
+                {
+                    // Ordinary: the peer is away, or holds no engine. The
+                    // pump retries on the next trigger.
+                    let _ = e;
+                }
+            });
+        }
+    }
+}
+
+fn empty_status() -> Value {
+    json!({ "sets": [], "invitations": [] })
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// A stale request id (its connection dropped mid-flight) is expected
@@ -137,20 +369,49 @@ mod tests {
     }
 
     #[test]
-    fn connection_and_notifications_are_idle_for_now() {
+    fn the_events_route_to_their_actions() {
         assert!(matches!(
             classify(Some(Event::Connected {
                 granted_scopes: Vec::new(),
                 api_version: 1,
             })),
-            Action::Idle
+            Action::Resync
         ));
         assert!(matches!(
             classify(Some(Event::Notification {
-                method: "devices.updated".into(),
+                method: "peer.message".into(),
+                params: serde_json::json!({}),
+            })),
+            Action::PeerMessage(_)
+        ));
+        assert!(matches!(
+            classify(Some(Event::Notification {
+                method: "device.updated".into(),
+                params: serde_json::json!({}),
+            })),
+            Action::DirectoryStale
+        ));
+        assert!(matches!(
+            classify(Some(Event::Notification {
+                method: "transfer.finished".into(),
                 params: serde_json::json!({}),
             })),
             Action::Idle
         ));
+    }
+
+    #[test]
+    fn the_directory_parses_self_and_reachable_rows() {
+        let snapshot = serde_json::json!([
+            { "device_id": "d_1", "node_id": "aa", "is_self": true, "reachable": true },
+            { "device_id": "d_2", "node_id": "bb", "is_self": false, "reachable": true },
+            { "device_id": "d_3", "node_id": "cc", "is_self": false, "reachable": false },
+            { "no_node": true },
+        ]);
+        let dir = Directory::parse(&snapshot);
+        assert_eq!(dir.self_node.as_deref(), Some("aa"));
+        assert_eq!(dir.reachable, ["bb"]);
+        assert_eq!(dir.node_of("d_2").as_deref(), Some("bb"));
+        assert_eq!(dir.node_of("d_9"), None);
     }
 }

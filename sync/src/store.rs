@@ -15,7 +15,7 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::identity::Identity;
 use crate::index::SetIndex;
@@ -41,13 +41,6 @@ impl Store {
         }
         let identity = Identity::load_or_generate(&root)?;
         Ok(Store { root, identity })
-    }
-
-    /// The `sync.status` snapshot: the authoritative state the notifications
-    /// merely echo. No sets and no invitations yet - the answer is honestly
-    /// empty until the membership bricks land.
-    pub fn status(&self) -> Value {
-        json!({ "sets": [], "invitations": [] })
     }
 
     pub fn identity(&self) -> &Identity {
@@ -179,6 +172,8 @@ pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> 
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -187,7 +182,6 @@ mod tests {
         let root = dir.path().join("state").join("sync");
         let first = Store::open(root.clone()).expect("open");
         assert!(root.join("sets").is_dir());
-        assert_eq!(first.status(), json!({ "sets": [], "invitations": [] }));
 
         let key = first.identity().public_hex();
         drop(first);

@@ -157,6 +157,13 @@ impl Engine {
         self.sets.keys().cloned().collect()
     }
 
+    /// The `sync.status` snapshot. Honest and empty of cards until the
+    /// facade brick teaches it to describe the sets; the engine still owns
+    /// the answer, so the shape has one home.
+    pub fn status(&self) -> Value {
+        json!({ "sets": [], "invitations": [] })
+    }
+
     fn next_round(&mut self, answer: bool) -> u64 {
         self.round_counter += 1;
         self.sent_rounds.insert(self.round_counter, answer);
