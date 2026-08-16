@@ -150,6 +150,10 @@ const PENDING_PATHS_MAX: usize = 100_000;
 /// whole index back at line rate.
 const ANSWER_INTERVAL_SECS: u64 = 1;
 
+/// Minimum seconds between needs served to one peer: a publish walks a tree
+/// in the Core, so serving must not be free to a caller.
+const SERVE_INTERVAL_SECS: u64 = 1;
+
 /// A received invitation's claim, kept for the consent card.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InviteClaim {
@@ -201,6 +205,12 @@ pub struct SetState {
     /// When we last answered each peer with a full leg (the amplification
     /// throttle). Ephemeral: a restart owes everyone an answer.
     last_answered: BTreeMap<String, u64>,
+    /// When we last served each peer a need (the publish rate limit).
+    last_served: BTreeMap<String, u64>,
+    /// When a complete leg from each peer was last absorbed: the card's
+    /// "offline since T" (section 4), which is OUR fact rather than the
+    /// directory's. Ephemeral: after a restart the directory's word does.
+    last_round: BTreeMap<String, u64>,
     /// Needer side: the needs in flight, by need_id. Ephemeral - a restart
     /// re-needs from the pending set; only the counter persists (the
     /// source keys its published slots by (peer, need_id)).
@@ -468,7 +478,15 @@ impl Engine {
                 "membership": membership,
                 "sync": sync,
                 "behind": behind,
-                "last_seen": self.directory.last_seen.get(&node).cloned().unwrap_or(Value::Null),
+                // Our own last successful round with it, which is what the
+                // card means by "offline since"; the directory's word is the
+                // fallback after a restart.
+                "last_seen": state
+                    .last_round
+                    .get(&node)
+                    .map(|at| Value::from(*at))
+                    .or_else(|| self.directory.last_seen.get(&node).cloned())
+                    .unwrap_or(Value::Null),
             }));
         }
 
@@ -505,11 +523,21 @@ impl Engine {
             })
             .collect();
 
-        let state_str = if !open_conflicts.is_empty() {
+        // Never claim to be in order before a single round completed: a
+        // freshly accepted set holds nothing, and "in_order" would be a lie
+        // the user could act on. And "conflicts" counts the MATERIALIZED
+        // ones: a record that arrived before its second version says nothing
+        // an interface could act on yet.
+        let ever_synced = !state.last_round.is_empty() || !state.watermarks.is_empty();
+        let state_str = if !conflicts.is_empty() {
             "conflicts"
         } else if effective_self == Effective::Paused {
             "paused"
-        } else if !state.pending.is_empty() || !state.needs.is_empty() || !state.parked.is_empty() {
+        } else if !state.pending.is_empty()
+            || !state.needs.is_empty()
+            || !state.parked.is_empty()
+            || (!ever_synced && any_other_active)
+        {
             "catching_up"
         } else if !any_other_active {
             "waiting"
@@ -698,6 +726,21 @@ impl Engine {
             .sets
             .remove(set_id)
             .ok_or_else(|| io::Error::other("unknown set"))?;
+        // Only a member pauses, resumes or leaves. An INVITED device has one
+        // pair of gestures (accept, decline) and nothing else: pausing what
+        // one has not accepted would sign a live status with no root, and
+        // resuming it would disarm the consent guard before consent.
+        let standing = state.membership.effective(&self_node);
+        let allowed = match status {
+            MemberStatus::Declined => standing == Effective::Invited,
+            MemberStatus::Left | MemberStatus::Paused | MemberStatus::Active => {
+                matches!(standing, Effective::Active | Effective::Paused)
+            }
+        };
+        if !allowed {
+            self.sets.insert(set_id.to_string(), state);
+            return Err(io::Error::other("gesture not available in this state"));
+        }
         if status == MemberStatus::Active {
             // Resuming is the user gesture that lifts both guards: the
             // consent claim and the disk-full stop.
@@ -725,6 +768,14 @@ impl Engine {
                     attempts: RETRY_BUDGET,
                 });
             }
+            // The set left this device: the local files stay exactly where
+            // they are (the letter, and the interface says so), and we stop
+            // touching them - no watcher, no walk, no write. The membership
+            // state stays, for the stub's proof.
+            state.root = None;
+            state.pending.clear();
+            state.needs.clear();
+            state.parked.clear();
         }
         state.announce_to_members(&self_node);
         state.persist(&self.store, set_id)?;
@@ -995,7 +1046,7 @@ impl Engine {
                 set_id,
                 need_id,
                 paths,
-            } => self.on_need(from, &set_id, need_id, paths),
+            } => self.on_need(from, &set_id, need_id, paths, now),
             Message::Offer {
                 set_id,
                 need_id,
@@ -1020,15 +1071,30 @@ impl Engine {
         set_id: &str,
         need_id: u64,
         paths: Vec<String>,
+        now: u64,
     ) -> Vec<Effect> {
+        let self_node = self.self_node.clone();
         let Some(state) = self.sets.get_mut(set_id) else {
             return Vec::new();
         };
         if state.membership.effective(from) != Effective::Active {
             return Vec::new();
         }
+        // And OUR own standing: a device that paused or left keeps its files
+        // but stops serving them.
+        if state.membership.effective(&self_node) != Effective::Active {
+            return Vec::new();
+        }
         if state.root.is_none() {
             return Vec::new();
+        }
+        // Rate limit per peer: a publish walks a tree in the Core, so
+        // serving must not be free to a caller.
+        match state.last_served.get(from) {
+            Some(at) if now.saturating_sub(*at) < SERVE_INTERVAL_SECS => return Vec::new(),
+            _ => {
+                state.last_served.insert(from.to_string(), now);
+            }
         }
         if state.published.contains_key(&(from.to_string(), need_id))
             || state.publishing.contains_key(&(from.to_string(), need_id))
@@ -1060,19 +1126,29 @@ impl Engine {
             return Vec::new();
         }
         // The per-peer slots: a peer beyond its budget supersedes its own
-        // oldest published transaction, never another member's.
+        // oldest published transaction, never another member's. The count
+        // includes the publishes IN FLIGHT - otherwise a burst of needs
+        // would open as many as it liked before any of them completed.
         let mut out = Vec::new();
-        let mine: Vec<(String, u64)> = state
+        let in_flight = state
+            .publishing
+            .keys()
+            .filter(|(peer, _)| peer == from)
+            .count();
+        let mut mine: Vec<(String, u64)> = state
             .published
             .keys()
             .filter(|(peer, _)| peer == from)
             .cloned()
             .collect();
-        if mine.len() >= PUBLISHED_PER_PEER {
-            let oldest = mine
-                .into_iter()
-                .min_by_key(|(_, id)| *id)
-                .expect("non-empty");
+        if mine.len() + in_flight >= PUBLISHED_PER_PEER {
+            if mine.is_empty() {
+                // Nothing of ours to retire: the peer is asking faster than
+                // we can publish. Its next round asks again.
+                return out;
+            }
+            mine.sort_by_key(|(_, id)| *id);
+            let oldest = mine.remove(0);
             if let Some(tx_id) = state.published.remove(&oldest) {
                 out.push(Effect::Revoke { tx_id });
             }
@@ -1300,7 +1376,10 @@ impl Engine {
                 state.hot.remove(set_path);
                 match state.apply_staged(&staged, set_path, &key) {
                     Apply::Landed => landed += 1,
-                    Apply::Failed => {}
+                    Apply::Failed => {
+                        let strikes = state.hot.entry(set_path.clone()).or_insert(0);
+                        *strikes = strikes.saturating_add(1);
+                    }
                     Apply::Conflict => {
                         // Both contents are local now: keep both,
                         // deterministically, and say so with a signed
@@ -1315,6 +1394,9 @@ impl Engine {
                             &key,
                         ) {
                             landed += 1;
+                        } else {
+                            let strikes = state.hot.entry(set_path.clone()).or_insert(0);
+                            *strikes = strikes.saturating_add(1);
                         }
                     }
                 }
@@ -1512,8 +1594,15 @@ impl Engine {
             None => true,
             Some(theirs) => matches!(self.sent_rounds.get(&theirs), Some(false)),
         };
-        if answer_due && self.answer_due_now(set_id, from, now) {
-            out.extend(self.answer_head(from, set_id, round, &their_vv));
+        if answer_due {
+            // The records ALWAYS travel (the answer to any head carries what
+            // we hold about its sender: that is what proves a leaver's
+            // terminal record and keeps a paused member visible). Only the
+            // entries DELTA is throttled, because only the delta is
+            // expensive - and a suppressed delta is declared incomplete, so
+            // it advances no watermark.
+            let with_delta = self.answer_due_now(set_id, from, now);
+            out.extend(self.answer_head(from, set_id, round, &their_vv, with_delta));
         }
         out
     }
@@ -1528,6 +1617,7 @@ impl Engine {
         set_id: &str,
         answered: u64,
         their_vv: &Vv,
+        with_delta: bool,
     ) -> Vec<Outgoing> {
         let self_node = self.self_node.clone();
         let sync_pub = self.store.identity().public_hex();
@@ -1550,7 +1640,8 @@ impl Engine {
             .collect();
         let record_pages = paginate_gossip(&records, &endorsements, &conflict_values);
 
-        let serving = state.root.is_some()
+        let serving = with_delta
+            && state.root.is_some()
             && state.membership.effective(&self_node) == Effective::Active
             && state.membership.effective(from) == Effective::Active;
         let (entry_pages, complete) = if serving {
@@ -1665,8 +1756,11 @@ impl Engine {
         state.prune_buffers(now);
         let complete = state.inflight.get(&key).is_some_and(|b| {
             b.head.as_ref().is_some_and(|(p, _)| {
-                (b.records.len() as u64) >= p.records_pages
-                    && (b.entries.len() as u64) >= p.entries_pages
+                // Exactly the declared pages, numbered 0..n: a peer that
+                // numbered them otherwise did not send the batch its head
+                // promised, and the next round resends.
+                (0..p.records_pages).all(|i| b.records.contains_key(&i))
+                    && (0..p.entries_pages).all(|i| b.entries.contains_key(&i))
             })
         });
         if !complete {
@@ -1745,6 +1839,10 @@ impl Engine {
                 state.stub = None;
             }
         }
+
+        // A complete leg landed: this is the "offline since" a card means -
+        // our own fact, not the directory's.
+        state.last_round.insert(from.to_string(), now);
 
         // What can settle without bytes settles now.
         let key = state.clock.self_component(&self_node);
@@ -2199,6 +2297,8 @@ impl SetState {
             announce: BTreeSet::new(),
             last_opened: BTreeMap::new(),
             last_answered: BTreeMap::new(),
+            last_served: BTreeMap::new(),
+            last_round: BTreeMap::new(),
             needs: BTreeMap::new(),
             need_counter: 0,
             published: BTreeMap::new(),
@@ -2710,12 +2810,18 @@ impl SetState {
             return;
         }
         let prefix = format!("{}/", tomb.path);
-        let live_descendants: Vec<String> = self
+        let mut live_descendants: Vec<String> = self
             .index
             .live()
             .filter(|e| e.path.starts_with(&prefix))
             .map(|e| e.path.clone())
             .collect();
+        // A descendant whose bytes are still on their way counts as live:
+        // the tombstone must not win a race against the child that will
+        // recreate this very directory.
+        let pending_descendant = self.pending.iter().any(|(path, versions)| {
+            path.starts_with(&prefix) && versions.iter().any(|e| !e.deleted)
+        });
         let dominates_dir = match self.index.get(&tomb.path) {
             None => true,
             Some(ours) => matches!(
@@ -2723,11 +2829,11 @@ impl SetState {
                 Relation::Descends | Relation::Equal
             ),
         };
-        if !live_descendants.is_empty() || !dominates_dir {
+        if !live_descendants.is_empty() || pending_descendant || !dominates_dir {
             // The edit wins, up the tree: the directory and every live
             // descendant dominate the tombstone from now on.
-            let mut survivors = live_descendants;
-            survivors.push(tomb.path.clone());
+            live_descendants.push(tomb.path.clone());
+            let survivors = live_descendants;
             for path in survivors {
                 let Some(mut entry) = self.index.get(&path).cloned() else {
                     continue;
@@ -3115,6 +3221,8 @@ impl SetState {
             announce: BTreeSet::new(),
             last_opened: BTreeMap::new(),
             last_answered: BTreeMap::new(),
+            last_served: BTreeMap::new(),
+            last_round: BTreeMap::new(),
             needs: BTreeMap::new(),
             need_counter: meta
                 .get("need_counter")
@@ -3307,14 +3415,6 @@ fn kind_str(kind: SetKind) -> &'static str {
     }
 }
 
-/// The version's author for the card: the node holding the greatest
-/// (value, key) component - a deterministic attribution, not a judgement.
-fn author_of(vv: &Vv) -> Option<String> {
-    vv.components()
-        .max_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)))
-        .map(|(key, _)| key.split('@').next().unwrap_or(key).to_string())
-}
-
 /// Keep both, deterministically (the letter, section 7): the winner of the
 /// plain path is the lower version_id - symmetric, arbitrary, identical
 /// everywhere - with vv = max of both plus the detector's bump; the loser
@@ -3361,7 +3461,7 @@ fn materialize_conflict(
         (local.clone(), incoming.clone())
     };
 
-    let author = loser_author(&loser.vv, &winner.vv).unwrap_or_else(|| self_node.to_string());
+    let author = author_of(&loser.vv).unwrap_or_else(|| self_node.to_string());
     let mut device = names
         .get(&author)
         .map(|n| sanitize_device_name(n))
@@ -3371,19 +3471,25 @@ fn materialize_conflict(
     }
     let base = crate::protocol::basename(set_path);
     let dir_prefix = &set_path[..set_path.len() - base.len()];
-    let mut counter = 1u32;
-    let loser_path = loop {
-        let name = conflict_copy_name(base, &device, loser.mtime, counter);
-        let candidate = format!("{dir_prefix}{name}");
-        match state.index.get(&candidate) {
-            Some(e) if !e.deleted && e.hash != loser.hash => {
-                counter += 1;
-                if counter > 32 {
-                    return false;
-                }
-            }
-            _ => break candidate,
-        }
+    // The discriminator is the LOSING version's own id, not a local
+    // counter: two devices materializing the same pair must land on the
+    // same name, and a counter would have read state that differs between
+    // them. It only appears when the plain candidate is taken by different
+    // content.
+    let plain_name = conflict_copy_name(base, &device, loser.mtime, None);
+    let plain_candidate = format!("{dir_prefix}{plain_name}");
+    let taken = state
+        .index
+        .get(&plain_candidate)
+        .is_some_and(|e| !e.deleted && e.hash != loser.hash);
+    let loser_vid = if local_wins { &rvid } else { &lvid };
+    let loser_path = if taken {
+        format!(
+            "{dir_prefix}{}",
+            conflict_copy_name(base, &device, loser.mtime, Some(&loser_vid[..8]))
+        )
+    } else {
+        plain_candidate
     };
     let occupied_same = state
         .index
@@ -3529,34 +3635,33 @@ fn conflict_id_of(a: &str, b: &str) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// The losing version's author, deterministically: the greatest component
-/// key the loser's vv holds ABOVE the winner's - identical on every
-/// detector, whatever their directories say.
-fn loser_author(loser: &Vv, winner: &Vv) -> Option<String> {
-    loser
-        .components()
-        .filter(|(key, value)| *value > winner.get(key))
+/// The version's author, for a name and for a card: the component that
+/// touched it last, ties broken by key. ONE rule, so the copy's filename
+/// and the card's row never disagree - and it reads only wire data, so
+/// every device computes the same answer.
+fn author_of(vv: &Vv) -> Option<String> {
+    vv.components()
+        .max_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)))
         .map(|(key, _)| key.split('@').next().unwrap_or(key).to_string())
-        .max()
 }
 
 /// "name (DeviceName, 2026-08-16 14h02 UTC).ext", sanitized against the
-/// full gate, deterministically truncated to the component budget, with a
-/// deterministic counter from the second collision on.
+/// full gate and deterministically truncated to the component budget. The
+/// `discriminator` (the losing version's own id, never a local counter)
+/// only appears when the plain name is taken by different content.
 fn conflict_copy_name(
     base: &str,
     device: &str,
     mtime: crate::index::Mtime,
-    counter: u32,
+    discriminator: Option<&str>,
 ) -> String {
     let (stem, ext) = match base.rfind('.') {
         Some(i) if i > 0 => base.split_at(i),
         _ => (base, ""),
     };
-    let tag = if counter <= 1 {
-        format!(" ({device}, {})", utc_stamp(mtime.secs))
-    } else {
-        format!(" ({device}, {}) {counter}", utc_stamp(mtime.secs))
+    let tag = match discriminator {
+        None => format!(" ({device}, {})", utc_stamp(mtime.secs)),
+        Some(d) => format!(" ({device}, {}) {d}", utc_stamp(mtime.secs)),
     };
     let mut stem = stem.to_string();
     loop {
@@ -4500,6 +4605,86 @@ mod tests {
                 "the record travels resolved to {letter}"
             );
         }
+    }
+
+    /// A set one was only INVITED to offers exactly two gestures. Pausing it
+    /// would sign a live status with no root; resuming it would disarm the
+    /// consent guard before consent.
+    #[test]
+    fn an_invited_set_offers_accept_and_decline_and_nothing_else() {
+        let mut rig = Rig::new(&['a', 'b']);
+        let (set_id, _root) = set_with_files(&mut rig, 'a');
+        rig.of('a')
+            .invite(&set_id, &node('b'), NOW)
+            .expect("invite");
+        let peers = rig.peers_of('a');
+        let out = rig.of('a').pump(&peers, NOW + 1, false);
+        rig.deliver(&node('a'), out, NOW + 1);
+
+        for refused in [
+            MemberStatus::Paused,
+            MemberStatus::Active,
+            MemberStatus::Left,
+        ] {
+            assert!(
+                rig.of('b').sign_status(&set_id, refused, NOW + 2).is_err(),
+                "{refused:?} must not be available to an invitee"
+            );
+        }
+        assert_eq!(
+            rig.of('b')
+                .set(&set_id)
+                .expect("state")
+                .membership
+                .effective(&node('b')),
+            Effective::Invited,
+            "and nothing was signed"
+        );
+        // Declining IS available.
+        rig.of('b')
+            .sign_status(&set_id, MemberStatus::Declined, NOW + 3)
+            .expect("decline");
+    }
+
+    /// Leaving stops touching the folder: the local files stay, and the
+    /// engine holds no root to walk, watch or write.
+    #[test]
+    fn leaving_lets_go_of_the_folder() {
+        let mut rig = Rig::new(&['a', 'b']);
+        let (set_id, _a_root) = synced_pair(&mut rig);
+        let b_root = root_of(&mut rig, 'b', &set_id);
+
+        rig.of('b')
+            .sign_status(&set_id, MemberStatus::Left, NOW + 100)
+            .expect("leave");
+        let state = rig.of('b').set(&set_id).expect("state");
+        assert!(state.root.is_none(), "no root to touch any more");
+        assert!(state.pending.is_empty());
+        // The files stay exactly where they were.
+        assert!(b_root.join("a.txt").exists());
+        // And a later scan is simply not possible: nothing to scan.
+        assert!(rig.of('b').rescan_set(&set_id).is_err());
+    }
+
+    /// A device that paused (or left) keeps its files and stops serving
+    /// them: a need from a member gets nothing.
+    #[test]
+    fn a_paused_device_stops_serving_its_bytes() {
+        let mut rig = Rig::new(&['a', 'b']);
+        let (set_id, _a_root) = synced_pair(&mut rig);
+        rig.of('a')
+            .sign_status(&set_id, MemberStatus::Paused, NOW + 100)
+            .expect("pause");
+
+        let need = Message::Need {
+            set_id: set_id.clone(),
+            need_id: 7,
+            paths: vec!["a.txt".into()],
+        };
+        let out = rig
+            .of('a')
+            .on_message(&node('b'), &need.to_value(), NOW + 101);
+        assert!(out.is_empty(), "a paused source publishes nothing: {out:?}");
     }
 
     /// The self-component guard: an active member inflating OUR component
