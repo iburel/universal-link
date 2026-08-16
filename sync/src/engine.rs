@@ -19,7 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
@@ -42,6 +42,63 @@ pub struct Outgoing {
     pub to: String,
     pub payload: Value,
 }
+
+/// What the engine wants done. The engine core never touches the network
+/// or the Core API itself: it returns effects, the orchestrator executes
+/// them (and the tests simulate them), feeding results back through the
+/// `on_*` callbacks.
+#[derive(Clone, Debug)]
+pub enum Effect {
+    /// Hand to `peers.send`.
+    Send(Outgoing),
+    /// Call `transactions.publish` on these absolute paths, then
+    /// [`Engine::on_published`] (or [`Engine::on_publish_failed`]).
+    Publish {
+        to: String,
+        set_id: String,
+        need_id: u64,
+        paths: Vec<PathBuf>,
+    },
+    /// Call `transactions.revoke`: the peer said done, or the slot was
+    /// superseded.
+    Revoke { tx_id: String },
+    /// Call `transactions.adopt` then `transactions.fill` into `staging`
+    /// (each file under its published basename), then
+    /// [`Engine::on_pull_started`] with the transfer id (or
+    /// [`Engine::on_pull_failed`]).
+    AdoptFill {
+        from: String,
+        set_id: String,
+        need_id: u64,
+        tx_id: String,
+        /// published wire name (basename) -> set path.
+        files: BTreeMap<String, String>,
+        staging: PathBuf,
+    },
+}
+
+impl Effect {
+    fn send(to: &str, message: &Message) -> Effect {
+        Effect::Send(Outgoing {
+            to: to.to_string(),
+            payload: message.to_value(),
+        })
+    }
+}
+
+/// Concurrent published transactions per peer (the letter, section 5): a
+/// third need from the same peer supersedes its oldest.
+const PUBLISHED_PER_PEER: usize = 2;
+
+/// Outstanding needs per peer on the needer side, mirroring the source cap.
+const NEEDS_PER_PEER: usize = 2;
+
+/// Files per need chunk, besides the unique-basename rule and the manifest
+/// cap far above it.
+const NEED_CHUNK_FILES: usize = 256;
+
+/// Bytes per need chunk: a sane bound on one pull.
+const NEED_CHUNK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Retries granted to a one-shot before giving up: invitations, stubs and
 /// introductions all use it. Generous - each attempt costs one message on a
@@ -104,6 +161,33 @@ pub struct SetState {
     announce: BTreeSet<String>,
     /// Throttle and change detection for round openers.
     last_opened: BTreeMap<String, (u64, Vv)>,
+    /// Needer side: the needs in flight, by need_id. Ephemeral - a restart
+    /// re-needs from the pending set; only the counter persists (the
+    /// source keys its published slots by (peer, need_id)).
+    needs: BTreeMap<u64, NeedState>,
+    /// Persisted: (peer, need_id) must never repeat across restarts.
+    need_counter: u64,
+    /// Source side: the published transactions, keyed (peer, need_id).
+    /// Ephemeral by nature - a transaction dies with the engine.
+    published: BTreeMap<(String, u64), String>,
+    /// Source side: a publish the orchestrator is running, with the
+    /// basename map the offer will carry.
+    publishing: BTreeMap<(String, u64), BTreeMap<String, String>>,
+}
+
+struct NeedState {
+    peer: String,
+    /// Set paths still expected under this need.
+    paths: BTreeSet<String>,
+    pull: Option<ActivePull>,
+}
+
+struct ActivePull {
+    tx_id: String,
+    staging: PathBuf,
+    /// published wire name (basename) -> set path.
+    files: BTreeMap<String, String>,
+    transfer: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -351,7 +435,7 @@ impl Engine {
     /// One `peer.message` payload from the device `from` (node_id, already
     /// translated and transport-authenticated by the Core). Returns what to
     /// send back.
-    pub fn on_message(&mut self, from: &str, payload: &Value, now: u64) -> Vec<Outgoing> {
+    pub fn on_message(&mut self, from: &str, payload: &Value, now: u64) -> Vec<Effect> {
         if from == self.self_node || !valid_node_id(from) {
             return Vec::new();
         }
@@ -368,7 +452,7 @@ impl Engine {
                 stats_entries,
                 stats_total_size,
                 sync_pub,
-            } => self.on_invite(
+            } => wrap(self.on_invite(
                 from,
                 set_id,
                 descriptor,
@@ -377,7 +461,7 @@ impl Engine {
                 (stats_entries, stats_total_size),
                 sync_pub,
                 now,
-            ),
+            )),
             Message::InviteAck { set_id } => {
                 if let Some(state) = self.sets.get_mut(&set_id) {
                     state.open_invites.remove(from);
@@ -391,7 +475,7 @@ impl Engine {
                 answers,
                 position,
                 sync_pub,
-            } => self.on_head(from, &set_id, round, answers, position, &sync_pub, now),
+            } => wrap(self.on_head(from, &set_id, round, answers, position, &sync_pub, now)),
             Message::Records {
                 set_id,
                 round,
@@ -402,7 +486,7 @@ impl Engine {
                 self.buffer_page(from, &set_id, round, now, |buffer| {
                     buffer.records.insert(page, (records, endorsements));
                 });
-                self.try_complete(from, &set_id, round, now)
+                wrap(self.try_complete(from, &set_id, round, now))
             }
             Message::Entries {
                 set_id,
@@ -413,8 +497,279 @@ impl Engine {
                 self.buffer_page(from, &set_id, round, now, |buffer| {
                     buffer.entries.insert(page, entries);
                 });
-                self.try_complete(from, &set_id, round, now)
+                wrap(self.try_complete(from, &set_id, round, now))
             }
+            Message::Need {
+                set_id,
+                need_id,
+                paths,
+            } => self.on_need(from, &set_id, need_id, paths),
+            Message::Offer {
+                set_id,
+                need_id,
+                tx_id,
+                files,
+            } => self.on_offer(from, &set_id, need_id, tx_id, files),
+            Message::Done {
+                set_id,
+                need_id,
+                tx_id,
+            } => self.on_done(from, &set_id, need_id, &tx_id),
+        }
+    }
+
+    /// Source side of a need: serve ONLY paths that match live, non-deleted
+    /// FILE entries of our own index (watcher-derived, inside the root by
+    /// construction), for a verified-active member, within the per-peer
+    /// slots.
+    fn on_need(
+        &mut self,
+        from: &str,
+        set_id: &str,
+        need_id: u64,
+        paths: Vec<String>,
+    ) -> Vec<Effect> {
+        let Some(state) = self.sets.get_mut(set_id) else {
+            return Vec::new();
+        };
+        if state.membership.effective(from) != Effective::Active {
+            return Vec::new();
+        }
+        let Some(root) = state.root.clone() else {
+            return Vec::new();
+        };
+        if state.published.contains_key(&(from.to_string(), need_id))
+            || state.publishing.contains_key(&(from.to_string(), need_id))
+        {
+            // A retransmitted need: the offer either flew or will.
+            return Vec::new();
+        }
+        let mut fs_paths = Vec::new();
+        let mut map = BTreeMap::new();
+        for path in &paths {
+            let live_file = state
+                .index
+                .get(path)
+                .is_some_and(|e| !e.deleted && e.kind == crate::index::EntryKind::File);
+            if !live_file {
+                // One path we cannot vouch for drops the whole need,
+                // loudly: a hostile needer learns nothing piecemeal.
+                eprintln!("[1device-sync] need for a path outside the live index, set {set_id}");
+                return Vec::new();
+            }
+            let mut fs_path = root.clone();
+            for component in path.split('/') {
+                fs_path.push(component);
+            }
+            fs_paths.push(fs_path);
+            map.insert(crate::protocol::basename(path).to_string(), path.clone());
+        }
+        if map.is_empty() {
+            return Vec::new();
+        }
+        // The per-peer slots: a peer beyond its budget supersedes its own
+        // oldest published transaction, never another member's.
+        let mut out = Vec::new();
+        let mine: Vec<(String, u64)> = state
+            .published
+            .keys()
+            .filter(|(peer, _)| peer == from)
+            .cloned()
+            .collect();
+        if mine.len() >= PUBLISHED_PER_PEER {
+            let oldest = mine
+                .into_iter()
+                .min_by_key(|(_, id)| *id)
+                .expect("non-empty");
+            if let Some(tx_id) = state.published.remove(&oldest) {
+                out.push(Effect::Revoke { tx_id });
+            }
+        }
+        state.publishing.insert((from.to_string(), need_id), map);
+        out.push(Effect::Publish {
+            to: from.to_string(),
+            set_id: set_id.to_string(),
+            need_id,
+            paths: fs_paths,
+        });
+        out
+    }
+
+    /// The publish came back: register the slot and send the offer with the
+    /// explicit basename-to-set-path map.
+    pub fn on_published(
+        &mut self,
+        to: &str,
+        set_id: &str,
+        need_id: u64,
+        tx_id: &str,
+    ) -> Vec<Effect> {
+        let Some(state) = self.sets.get_mut(set_id) else {
+            return vec![Effect::Revoke {
+                tx_id: tx_id.to_string(),
+            }];
+        };
+        let Some(map) = state.publishing.remove(&(to.to_string(), need_id)) else {
+            return vec![Effect::Revoke {
+                tx_id: tx_id.to_string(),
+            }];
+        };
+        state
+            .published
+            .insert((to.to_string(), need_id), tx_id.to_string());
+        vec![Effect::send(
+            to,
+            &Message::Offer {
+                set_id: set_id.to_string(),
+                need_id,
+                tx_id: tx_id.to_string(),
+                files: map.into_iter().collect(),
+            },
+        )]
+    }
+
+    pub fn on_publish_failed(&mut self, to: &str, set_id: &str, need_id: u64) {
+        if let Some(state) = self.sets.get_mut(set_id) {
+            state.publishing.remove(&(to.to_string(), need_id));
+        }
+    }
+
+    /// Needer side of an offer: only for our own outstanding need, from the
+    /// device we sent it to, with a map that stays inside what we asked.
+    fn on_offer(
+        &mut self,
+        from: &str,
+        set_id: &str,
+        need_id: u64,
+        tx_id: String,
+        files: Vec<(String, String)>,
+    ) -> Vec<Effect> {
+        let Some(state) = self.sets.get_mut(set_id) else {
+            return Vec::new();
+        };
+        let Some(root) = state.root.clone() else {
+            return Vec::new();
+        };
+        let Some(need) = state.needs.get_mut(&need_id) else {
+            return Vec::new();
+        };
+        if need.peer != from || need.pull.is_some() {
+            return Vec::new();
+        }
+        let mut map = BTreeMap::new();
+        for (wire, set_path) in files {
+            // The published name is the source basename, which the chunking
+            // rule made a bijection; anything outside the need is refused
+            // whole.
+            if crate::protocol::basename(&set_path) != wire
+                || !need.paths.contains(&set_path)
+                || map.insert(wire, set_path).is_some()
+            {
+                eprintln!("[1device-sync] offer outside its need, set {set_id}");
+                return Vec::new();
+            }
+        }
+        if map.is_empty() {
+            return Vec::new();
+        }
+        let staging = root
+            .join(crate::wirepath::STAGING_DIR)
+            .join(format!("pull-{need_id}"));
+        need.pull = Some(ActivePull {
+            tx_id: tx_id.clone(),
+            staging: staging.clone(),
+            files: map.clone(),
+            transfer: None,
+        });
+        vec![Effect::AdoptFill {
+            from: from.to_string(),
+            set_id: set_id.to_string(),
+            need_id,
+            tx_id,
+            files: map,
+            staging,
+        }]
+    }
+
+    /// The fill is running: remember the transfer id the outcome will name.
+    pub fn on_pull_started(&mut self, set_id: &str, need_id: u64, transfer_id: &str) {
+        if let Some(state) = self.sets.get_mut(set_id)
+            && let Some(need) = state.needs.get_mut(&need_id)
+            && let Some(pull) = &mut need.pull
+        {
+            pull.transfer = Some(transfer_id.to_string());
+        }
+    }
+
+    /// Adopt or fill refused outright (TX_STALE, offline): drop the pull;
+    /// the pending set re-needs on the next pump.
+    pub fn on_pull_failed(&mut self, set_id: &str, need_id: u64) {
+        if let Some(state) = self.sets.get_mut(set_id) {
+            state.needs.remove(&need_id);
+        }
+    }
+
+    /// A `transfer.finished` / `transfer.failed` for one of our fills. On
+    /// either outcome every staged file is verified by hash and the
+    /// complete ones are applied (the salvage rule): only the remainder is
+    /// re-needed, by the next pump.
+    pub fn on_transfer_outcome(&mut self, transfer_id: &str, _ok: bool) -> Vec<Effect> {
+        let self_node = self.self_node.clone();
+        let mut out = Vec::new();
+        let set_ids = self.set_ids();
+        for set_id in set_ids {
+            let state = self.sets.get_mut(&set_id).expect("listed");
+            let Some((&need_id, _)) = state.needs.iter().find(|(_, n)| {
+                n.pull
+                    .as_ref()
+                    .is_some_and(|p| p.transfer.as_deref() == Some(transfer_id))
+            }) else {
+                continue;
+            };
+            let need = state.needs.remove(&need_id).expect("found");
+            let pull = need.pull.expect("matched");
+            let key = state.clock.self_component(&self_node);
+            let mut landed = 0usize;
+            for (wire, set_path) in &pull.files {
+                let staged = pull.staging.join(wire);
+                if state.apply_staged_file(&staged, set_path) {
+                    landed += 1;
+                }
+            }
+            let _ = key;
+            // The staging dir has served: verified files were moved out,
+            // failures are re-pulled whole.
+            let _ = std::fs::remove_dir_all(&pull.staging);
+            let _ = state.persist(&self.store, &set_id);
+            if landed == pull.files.len() {
+                out.push(Effect::send(
+                    &need.peer,
+                    &Message::Done {
+                        set_id: set_id.clone(),
+                        need_id,
+                        tx_id: pull.tx_id.clone(),
+                    },
+                ));
+            }
+            break;
+        }
+        out
+    }
+
+    /// Source side of a done: only the peer the slot was published for may
+    /// end it.
+    fn on_done(&mut self, from: &str, set_id: &str, need_id: u64, tx_id: &str) -> Vec<Effect> {
+        let Some(state) = self.sets.get_mut(set_id) else {
+            return Vec::new();
+        };
+        match state.published.get(&(from.to_string(), need_id)) {
+            Some(held) if held == tx_id => {
+                state.published.remove(&(from.to_string(), need_id));
+                vec![Effect::Revoke {
+                    tx_id: tx_id.to_string(),
+                }]
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -712,6 +1067,9 @@ impl Engine {
             }
         }
 
+        // Directories carry no bytes: what dominates lands now.
+        state.apply_pending_dirs();
+
         // Persist the absorbed state BEFORE the watermark moves: the two
         // live in one meta.json write here, which makes the letter's
         // ordering rule an atomicity property of the rename.
@@ -731,7 +1089,7 @@ impl Engine {
     /// active members with news, retries invitations, introduces unpinned
     /// devices, keeps stub proofs going. `force` is the safety tick
     /// (opens regardless of the change heuristic).
-    pub fn pump(&mut self, reachable: &[String], now: u64, force: bool) -> Vec<Outgoing> {
+    pub fn pump(&mut self, reachable: &[String], now: u64, force: bool) -> Vec<Effect> {
         let mut out = Vec::new();
         let self_node = self.self_node.clone();
         let sync_pub = self.store.identity().public_hex();
@@ -749,10 +1107,10 @@ impl Engine {
             };
             for invitee in invites {
                 if let Some(message) = self.build_invite(&set_id, &invitee) {
-                    out.push(Outgoing {
+                    out.push(Effect::Send(Outgoing {
                         to: invitee.clone(),
                         payload: message,
-                    });
+                    }));
                     let state = self.sets.get_mut(&set_id).expect("listed");
                     let budget = state.open_invites.get_mut(&invitee).expect("listed");
                     *budget = budget.saturating_sub(1);
@@ -793,10 +1151,10 @@ impl Engine {
                     }),
                     sync_pub: sync_pub.clone(),
                 };
-                out.push(Outgoing {
+                out.push(Effect::Send(Outgoing {
                     to: target,
                     payload: head.to_value(),
-                });
+                }));
             }
 
             let state = self.sets.get(&set_id).expect("listed");
@@ -843,12 +1201,17 @@ impl Engine {
                         }),
                         sync_pub: sync_pub.clone(),
                     };
-                    out.push(Outgoing {
+                    out.push(Effect::Send(Outgoing {
                         to: peer,
                         payload: head.to_value(),
-                    });
+                    }));
                 }
             }
+
+            // Needs: pending FILE bytes pulled from peers whose absorbed
+            // watermark says they hold them.
+            let need_effects = self.pump_needs(&set_id, reachable);
+            out.extend(need_effects);
 
             // Introductions: records-only openers toward unpinned devices
             // the gossip placed in the set.
@@ -886,10 +1249,10 @@ impl Engine {
                     }),
                     sync_pub: sync_pub.clone(),
                 };
-                out.push(Outgoing {
+                out.push(Effect::Send(Outgoing {
                     to: target,
                     payload: head.to_value(),
-                });
+                }));
             }
 
             // Stub proofs: records-only openers until each member echoed our
@@ -928,11 +1291,103 @@ impl Engine {
                     }),
                     sync_pub: sync_pub.clone(),
                 };
-                out.push(Outgoing {
+                out.push(Effect::Send(Outgoing {
                     to: target,
                     payload: head.to_value(),
-                });
+                }));
             }
+        }
+        out
+    }
+
+    /// Builds the needs one pump owes: pending FILE versions grouped per
+    /// serving peer, chunked so no two paths share a basename (the
+    /// published record names files by basename: the bijection), within
+    /// the per-peer slots and the chunk bounds.
+    fn pump_needs(&mut self, set_id: &str, reachable: &[String]) -> Vec<Effect> {
+        let self_node = self.self_node.clone();
+        let mut out = Vec::new();
+        let Some(state) = self.sets.get_mut(set_id) else {
+            return out;
+        };
+        if state.root.is_none() || state.membership.effective(&self_node) != Effective::Active {
+            return out;
+        }
+        let mut claimed: BTreeSet<String> = state
+            .needs
+            .values()
+            .flat_map(|n| n.paths.iter().cloned())
+            .collect();
+        let peers: Vec<String> = reachable
+            .iter()
+            .filter(|n| **n != self_node)
+            .filter(|n| state.membership.effective(n) == Effective::Active)
+            .cloned()
+            .collect();
+        let mut minted = false;
+        for peer in peers {
+            if state.needs.values().filter(|n| n.peer == peer).count() >= NEEDS_PER_PEER {
+                continue;
+            }
+            let Some(watermark) = state.watermarks.get(&peer).cloned() else {
+                continue;
+            };
+            let mut chunk: Vec<String> = Vec::new();
+            let mut basenames: BTreeSet<String> = BTreeSet::new();
+            let mut bytes = 0u64;
+            for (path, versions) in &state.pending {
+                if claimed.contains(path) {
+                    continue;
+                }
+                let Some(entry) = versions
+                    .iter()
+                    .rfind(|e| !e.deleted && e.kind == crate::index::EntryKind::File)
+                else {
+                    continue;
+                };
+                // The peer can only serve what its advertised position
+                // covers.
+                if !watermark.covers(&entry.vv) {
+                    continue;
+                }
+                let base = crate::protocol::basename(path).to_string();
+                if !basenames.insert(base) {
+                    continue;
+                }
+                chunk.push(path.clone());
+                bytes = bytes.saturating_add(entry.size);
+                if chunk.len() >= NEED_CHUNK_FILES || bytes >= NEED_CHUNK_BYTES {
+                    break;
+                }
+            }
+            if chunk.is_empty() {
+                continue;
+            }
+            state.need_counter += 1;
+            let need_id = state.need_counter;
+            claimed.extend(chunk.iter().cloned());
+            state.needs.insert(
+                need_id,
+                NeedState {
+                    peer: peer.clone(),
+                    paths: chunk.iter().cloned().collect(),
+                    pull: None,
+                },
+            );
+            minted = true;
+            out.push(Effect::send(
+                &peer,
+                &Message::Need {
+                    set_id: set_id.to_string(),
+                    need_id,
+                    paths: chunk,
+                },
+            ));
+        }
+        if minted {
+            // The counter must never repeat across restarts: it rides the
+            // meta write.
+            let _ = state.persist(&self.store, set_id);
         }
         out
     }
@@ -991,6 +1446,10 @@ impl SetState {
             stub: None,
             announce: BTreeSet::new(),
             last_opened: BTreeMap::new(),
+            needs: BTreeMap::new(),
+            need_counter: 0,
+            published: BTreeMap::new(),
+            publishing: BTreeMap::new(),
         })
     }
 
@@ -1031,6 +1490,151 @@ impl SetState {
     #[cfg(test)]
     pub(crate) fn stub_active(&self) -> bool {
         self.stub.is_some()
+    }
+
+    /// The fast apply path (the letter, section 6, minus the conflict and
+    /// tombstone machinery the next brick brings): a staged file whose
+    /// pending entry cleanly DOMINATES the local one (or has none) is
+    /// verified by hash, moved into place filesystem-first, and only then
+    /// indexed. Anything else stays pending. Returns whether the path no
+    /// longer needs bytes.
+    fn apply_staged_file(&mut self, staged: &Path, set_path: &str) -> bool {
+        use crate::vv::Relation;
+
+        let Some(root) = self.root.clone() else {
+            return false;
+        };
+        let Some(versions) = self.pending.get(set_path) else {
+            // Nothing pending anymore (superseded mid-pull): nothing owed.
+            return true;
+        };
+        // The version this pull was FOR: the newest pending file version.
+        let Some(entry) = versions
+            .iter()
+            .rfind(|e| !e.deleted && e.kind == crate::index::EntryKind::File)
+            .cloned()
+        else {
+            return true;
+        };
+        let dominates = match self.index.get(set_path) {
+            None => true,
+            Some(ours) => matches!(
+                entry.vv.relation(&ours.vv),
+                Relation::Descends | Relation::Equal
+            ),
+        };
+        if !dominates {
+            // Concurrent with a local version: the conflict brick's work.
+            return false;
+        }
+        let Ok(hash) = crate::scan::hash_file(staged) else {
+            return false;
+        };
+        if hash != entry.hash {
+            eprintln!("[1device-sync] staged bytes do not match their entry: re-needed");
+            return false;
+        }
+        // Filesystem first, index after (load-bearing, the letter).
+        let mut dest = root.clone();
+        for component in set_path.split('/') {
+            dest.push(component);
+        }
+        if let Some(parent) = dest.parent()
+            && std::fs::create_dir_all(parent).is_err()
+        {
+            return false;
+        }
+        if std::fs::rename(staged, &dest).is_err() {
+            // EXDEV or a locked destination: the parked machinery is the
+            // next brick's; for now the pull retries whole.
+            return false;
+        }
+        #[cfg(unix)]
+        if entry.exec {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
+        }
+        // The source's mtime, then the filesystem's own rounding read BACK:
+        // the index records what the disk will report, not our wish.
+        let mtime = (|| {
+            let file = std::fs::File::options().write(true).open(&dest).ok()?;
+            let secs = u64::try_from(entry.mtime.secs).ok()?;
+            let stamp = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::new(secs, entry.mtime.nanos);
+            file.set_times(std::fs::FileTimes::new().set_modified(stamp))
+                .ok()?;
+            Some(crate::index::Mtime::of(
+                std::fs::metadata(&dest).ok()?.modified().ok()?,
+            ))
+        })()
+        .unwrap_or(entry.mtime);
+        let size = std::fs::metadata(&dest)
+            .map(|m| m.len())
+            .unwrap_or(entry.size);
+        self.index.upsert(Entry {
+            path: set_path.to_string(),
+            kind: crate::index::EntryKind::File,
+            size,
+            mtime,
+            exec: entry.exec,
+            hash,
+            vv: entry.vv.clone(),
+            deleted: false,
+        });
+        // Everything this landed version covers leaves the pending set.
+        if let Some(versions) = self.pending.get_mut(set_path) {
+            versions.retain(|held| !entry.vv.covers(&held.vv));
+            if versions.is_empty() {
+                self.pending.remove(set_path);
+            }
+        }
+        true
+    }
+
+    /// Directories carry no bytes: a pending DIR entry that dominates
+    /// applies immediately (mkdir, index, done). Runs after every absorb
+    /// and rescan.
+    fn apply_pending_dirs(&mut self) {
+        use crate::vv::Relation;
+
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        let paths: Vec<String> = self.pending.keys().cloned().collect();
+        for path in paths {
+            let Some(entry) = self.pending.get(&path).and_then(|versions| {
+                versions
+                    .iter()
+                    .rfind(|e| !e.deleted && e.kind == crate::index::EntryKind::Dir)
+                    .cloned()
+            }) else {
+                continue;
+            };
+            let dominates = match self.index.get(&path) {
+                None => true,
+                Some(ours) => matches!(
+                    entry.vv.relation(&ours.vv),
+                    Relation::Descends | Relation::Equal
+                ),
+            };
+            if !dominates {
+                continue;
+            }
+            let mut dest = root.clone();
+            for component in path.split('/') {
+                dest.push(component);
+            }
+            if std::fs::create_dir_all(&dest).is_err() {
+                continue;
+            }
+            self.index.upsert(entry.clone());
+            if let Some(versions) = self.pending.get_mut(&path) {
+                versions.retain(|held| !entry.vv.covers(&held.vv));
+                if versions.is_empty() {
+                    self.pending.remove(&path);
+                }
+            }
+        }
     }
 
     fn prune_buffers(&mut self, now: u64) {
@@ -1076,6 +1680,7 @@ impl SetState {
                     .map(|(node, budget)| (node.clone(), Value::from(*budget)))
                     .collect(),
             ),
+            "need_counter": self.need_counter,
         });
         store.save_meta(set_id, &meta)?;
         store.save_index(set_id, &self.index)
@@ -1176,6 +1781,13 @@ impl SetState {
             stub,
             announce: BTreeSet::new(),
             last_opened: BTreeMap::new(),
+            needs: BTreeMap::new(),
+            need_counter: meta
+                .get("need_counter")
+                .and_then(Value::as_u64)
+                .ok_or_else(corrupt)?,
+            published: BTreeMap::new(),
+            publishing: BTreeMap::new(),
         })
     }
 
@@ -1196,6 +1808,10 @@ impl SetState {
             .collect();
         self.announce.extend(members);
     }
+}
+
+fn wrap(out: Vec<Outgoing>) -> Vec<Effect> {
+    out.into_iter().map(Effect::Send).collect()
 }
 
 /// A fresh unguessable set id: 22 chars of the base64url alphabet, 132
@@ -1227,6 +1843,10 @@ mod tests {
 
     struct Rig {
         engines: BTreeMap<String, Engine>,
+        /// The simulated byte plane: tx_id -> published basename -> source
+        /// fs path (what transactions.publish froze).
+        txs: BTreeMap<String, BTreeMap<String, PathBuf>>,
+        tx_counter: u64,
         _dirs: Vec<tempfile::TempDir>,
     }
 
@@ -1243,6 +1863,8 @@ mod tests {
             }
             Rig {
                 engines,
+                txs: BTreeMap::new(),
+                tx_counter: 0,
                 _dirs: dirs,
             }
         }
@@ -1259,20 +1881,78 @@ mod tests {
                 .collect()
         }
 
-        /// Delivers every queued message to its engine, feeding the answers
-        /// back until quiescence. The budget assertion IS the termination
-        /// proof: no exchange may ping-pong forever.
-        fn deliver(&mut self, from: &str, out: Vec<Outgoing>, now: u64) -> u64 {
-            let mut queue: Vec<(String, Outgoing)> =
-                out.into_iter().map(|o| (from.to_string(), o)).collect();
+        /// Delivers every queued effect, simulating the Core's byte plane
+        /// (publish = freeze the source paths, adopt-and-fill = copy them
+        /// into staging, transfer.finished immediately), feeding every
+        /// answer back until quiescence. The budget assertion IS the
+        /// termination proof.
+        fn deliver(&mut self, from: &str, out: Vec<Effect>, now: u64) -> u64 {
+            let mut queue: Vec<(String, Effect)> =
+                out.into_iter().map(|e| (from.to_string(), e)).collect();
             let mut count = 0;
-            while let Some((sender, message)) = queue.pop() {
+            while let Some((producer, effect)) = queue.pop() {
                 count += 1;
-                assert!(count < 500, "message storm: the protocol must terminate");
-                let target_node = message.to.clone();
-                let target = self.engines.get_mut(&target_node).expect("target engine");
-                let more = target.on_message(&sender, &message.payload, now);
-                queue.extend(more.into_iter().map(|o| (target_node.clone(), o)));
+                assert!(count < 800, "effect storm: the protocol must terminate");
+                match effect {
+                    Effect::Send(message) => {
+                        let target_node = message.to.clone();
+                        let target = self.engines.get_mut(&target_node).expect("target engine");
+                        let more = target.on_message(&producer, &message.payload, now);
+                        queue.extend(more.into_iter().map(|e| (target_node.clone(), e)));
+                    }
+                    Effect::Publish {
+                        to,
+                        set_id,
+                        need_id,
+                        paths,
+                    } => {
+                        self.tx_counter += 1;
+                        let tx_id = format!("tx-{}", self.tx_counter);
+                        let frozen: BTreeMap<String, PathBuf> = paths
+                            .into_iter()
+                            .map(|p| {
+                                (
+                                    p.file_name()
+                                        .expect("published paths have names")
+                                        .to_string_lossy()
+                                        .into_owned(),
+                                    p,
+                                )
+                            })
+                            .collect();
+                        self.txs.insert(tx_id.clone(), frozen);
+                        let publisher = self.engines.get_mut(&producer).expect("publisher");
+                        let more = publisher.on_published(&to, &set_id, need_id, &tx_id);
+                        queue.extend(more.into_iter().map(|e| (producer.clone(), e)));
+                    }
+                    Effect::Revoke { tx_id } => {
+                        self.txs.remove(&tx_id);
+                    }
+                    Effect::AdoptFill {
+                        set_id,
+                        need_id,
+                        tx_id,
+                        files,
+                        staging,
+                        ..
+                    } => {
+                        let Some(frozen) = self.txs.get(&tx_id) else {
+                            let needer = self.engines.get_mut(&producer).expect("needer");
+                            needer.on_pull_failed(&set_id, need_id);
+                            continue;
+                        };
+                        std::fs::create_dir_all(&staging).expect("staging dir");
+                        for wire in files.keys() {
+                            let source = frozen.get(wire).expect("published file");
+                            std::fs::copy(source, staging.join(wire)).expect("fill copy");
+                        }
+                        let transfer = format!("t-{need_id}");
+                        let needer = self.engines.get_mut(&producer).expect("needer");
+                        needer.on_pull_started(&set_id, need_id, &transfer);
+                        let more = needer.on_transfer_outcome(&transfer, true);
+                        queue.extend(more.into_iter().map(|e| (producer.clone(), e)));
+                    }
+                }
             }
             count
         }
@@ -1374,24 +2054,47 @@ mod tests {
                 );
             }
         }
-        // A's three entries are parked in B's pending set, and B's
-        // watermark for A covers A's advertised position.
-        let b = rig.of('b');
-        let state = b.set(&set_id).expect("state");
-        assert_eq!(state.pending.len(), 3, "{:?}", state.pending.keys());
-        assert!(state.pending.contains_key("a.txt"));
-        assert!(state.pending.contains_key("sub/b.txt"));
-        let a_watermark = state.watermarks.get(&node('a')).expect("watermark");
+        // The bytes flowed: B's tree converged on A's, the pending set
+        // drained, and B's watermark for A covers A's position.
+        rig.settle(NOW + 30);
+        let b_state = rig.of('b').set(&set_id).expect("state");
+        assert!(b_state.pending.is_empty(), "{:?}", b_state.pending.keys());
+        let b_root_path = b_state.root.clone().expect("root");
+        assert_eq!(
+            std::fs::read_to_string(b_root_path.join("a.txt")).expect("landed"),
+            "alpha"
+        );
+        assert_eq!(
+            std::fs::read_to_string(b_root_path.join("sub").join("b.txt")).expect("landed"),
+            "beta"
+        );
+        let a_watermark = b_state.watermarks.get(&node('a')).expect("watermark");
         assert!(!a_watermark.is_empty());
 
-        // Quiescence: a further forced settle exchanges bounded chatter and
-        // changes nothing.
-        let before = rig.of('b').set(&set_id).expect("state").pending.len();
-        rig.settle(NOW + 40);
+        // Every published transaction was revoked once its done landed.
+        assert!(rig.txs.is_empty(), "done must revoke: {:?}", rig.txs.keys());
+
+        // An edit at A reaches B's disk on the next exchanges.
+        let a_root = rig
+            .of('a')
+            .set(&set_id)
+            .expect("state")
+            .root
+            .clone()
+            .expect("root");
+        std::fs::write(a_root.join("a.txt"), "alpha v2").expect("edit");
+        rig.of('a').rescan_set(&set_id).expect("rescan");
+        rig.settle(NOW + 50);
+        rig.settle(NOW + 60);
         assert_eq!(
-            rig.of('b').set(&set_id).expect("state").pending.len(),
-            before
+            std::fs::read_to_string(b_root_path.join("a.txt")).expect("landed"),
+            "alpha v2"
         );
+
+        // Quiescence: another settle moves nothing.
+        let before = rig.settle(NOW + 80);
+        let after = rig.settle(NOW + 90);
+        assert!(after <= before, "the exchange must quiet down");
     }
 
     /// Pause travels as a records-only push, the paused device keeps
@@ -1510,10 +2213,17 @@ mod tests {
             }
         }
         for follower in ['b', 'c'] {
+            let state = rig.of(follower).set(&set_id).expect("state");
+            let root = state.root.clone().expect("root");
+            assert!(
+                state.pending.is_empty(),
+                "at {follower}: {:?}",
+                state.pending.keys()
+            );
             assert_eq!(
-                rig.of(follower).set(&set_id).expect("state").pending.len(),
-                3,
-                "A's entries parked at {follower}"
+                std::fs::read_to_string(root.join("a.txt")).expect("landed"),
+                "alpha",
+                "A's bytes landed at {follower}"
             );
         }
     }
@@ -1593,7 +2303,8 @@ mod tests {
 
         let out = a.pump(&[node('d')], NOW + 1, false);
         assert!(
-            out.iter().any(|o| o.to == node('d')),
+            out.iter()
+                .any(|e| matches!(e, Effect::Send(o) if o.to == node('d'))),
             "an introduction must target the stranger"
         );
         rig.deliver(&node('a'), out, NOW + 1);
@@ -1700,7 +2411,9 @@ mod tests {
         a.rescan_set(&set_id).expect("rescan");
         a.invite(&set_id, &node('b'), NOW).expect("invite");
         for out in a.pump(&[node('b')], NOW + 1, false) {
+            let Effect::Send(out) = out else { continue };
             for back in b.on_message(&node('a'), &out.payload, NOW + 1) {
+                let Effect::Send(back) = back else { continue };
                 a.on_message(&node('b'), &back.payload, NOW + 1);
             }
         }

@@ -75,6 +75,28 @@ pub enum Message {
     },
     /// The invitee's receipt: the invitation is persisted, stop retrying.
     InviteAck { set_id: String },
+    /// "Publish these for me": wire paths of FILE entries the needer wants
+    /// the bytes of. Chunked so no two paths share a basename (the
+    /// published record names files by basename: the bijection).
+    Need {
+        set_id: String,
+        need_id: u64,
+        paths: Vec<String>,
+    },
+    /// "Adopt this and pull": the published transaction and the explicit
+    /// basename-to-set-path map.
+    Offer {
+        set_id: String,
+        need_id: u64,
+        tx_id: String,
+        files: Vec<(String, String)>,
+    },
+    /// "I have landed everything; you may revoke."
+    Done {
+        set_id: String,
+        need_id: u64,
+        tx_id: String,
+    },
 }
 
 /// A head's declared position: descriptor hash, the advertised set_vv, and
@@ -101,7 +123,10 @@ impl Message {
             | Message::Records { set_id, .. }
             | Message::Entries { set_id, .. }
             | Message::Invite { set_id, .. }
-            | Message::InviteAck { set_id } => set_id,
+            | Message::InviteAck { set_id }
+            | Message::Need { set_id, .. }
+            | Message::Offer { set_id, .. }
+            | Message::Done { set_id, .. } => set_id,
         }
     }
 
@@ -188,6 +213,44 @@ impl Message {
                 "dialect": DIALECT,
                 "type": "invite_ack",
                 "set_id": set_id,
+            }),
+            Message::Need {
+                set_id,
+                need_id,
+                paths,
+            } => json!({
+                "dialect": DIALECT,
+                "type": "need",
+                "set_id": set_id,
+                "need_id": need_id,
+                "paths": paths,
+            }),
+            Message::Offer {
+                set_id,
+                need_id,
+                tx_id,
+                files,
+            } => json!({
+                "dialect": DIALECT,
+                "type": "offer",
+                "set_id": set_id,
+                "need_id": need_id,
+                "tx_id": tx_id,
+                "files": files
+                    .iter()
+                    .map(|(wire, set_path)| json!({ "wire_path": wire, "set_path": set_path }))
+                    .collect::<Vec<_>>(),
+            }),
+            Message::Done {
+                set_id,
+                need_id,
+                tx_id,
+            } => json!({
+                "dialect": DIALECT,
+                "type": "done",
+                "set_id": set_id,
+                "need_id": need_id,
+                "tx_id": tx_id,
             }),
         }
     }
@@ -276,9 +339,63 @@ impl Message {
                 })
             }
             "invite_ack" => Some(Message::InviteAck { set_id }),
+            "need" => {
+                let paths = parse_all(value.get("paths")?, |v| {
+                    let path = v.as_str()?;
+                    crate::wirepath::check_wire_path(path).ok()?;
+                    Some(path.to_string())
+                })?;
+                // The bijection rule, enforced at the gate: one basename,
+                // one path.
+                let mut basenames = std::collections::BTreeSet::new();
+                for path in &paths {
+                    if !basenames.insert(basename(path)) {
+                        return None;
+                    }
+                }
+                Some(Message::Need {
+                    set_id,
+                    need_id: int("need_id")?,
+                    paths,
+                })
+            }
+            "offer" => {
+                let tx_id = value.get("tx_id").and_then(Value::as_str)?;
+                if tx_id.is_empty() || tx_id.len() > 128 {
+                    return None;
+                }
+                Some(Message::Offer {
+                    set_id,
+                    need_id: int("need_id")?,
+                    tx_id: tx_id.to_string(),
+                    files: parse_all(value.get("files")?, |v| {
+                        let wire = v.get("wire_path")?.as_str()?;
+                        let set_path = v.get("set_path")?.as_str()?;
+                        crate::wirepath::check_wire_path(wire).ok()?;
+                        crate::wirepath::check_wire_path(set_path).ok()?;
+                        Some((wire.to_string(), set_path.to_string()))
+                    })?,
+                })
+            }
+            "done" => {
+                let tx_id = value.get("tx_id").and_then(Value::as_str)?;
+                if tx_id.is_empty() || tx_id.len() > 128 {
+                    return None;
+                }
+                Some(Message::Done {
+                    set_id,
+                    need_id: int("need_id")?,
+                    tx_id: tx_id.to_string(),
+                })
+            }
             _ => None,
         }
     }
+}
+
+/// The last component of a wire path (already gate-checked: non-empty).
+pub fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
 }
 
 /// Parses every element or none: ONE bad item drops the whole page, loudly

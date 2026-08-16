@@ -21,7 +21,7 @@ use onedevice_ipc_client::{Client, Event, RequestError, RequestId};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use crate::engine::{Engine, Outgoing};
+use crate::engine::{Effect, Engine};
 use crate::store::Store;
 
 /// The facade methods the engine serves today. The list grows brick by brick
@@ -65,6 +65,8 @@ enum Action {
     PeerMessage(Value),
     /// A `device.*` event: the directory changed; refresh and pump.
     DirectoryStale,
+    /// A terminal `transfer.*` notification: one of our fills ended.
+    Transfer(Value, bool),
     /// A connected-but-uninteresting event: nothing to do.
     Idle,
     /// The loop must end.
@@ -86,6 +88,12 @@ fn classify(event: Option<Event>) -> Action {
         {
             Action::DirectoryStale
         }
+        Some(Event::Notification { method, params })
+            if method == "transfer.finished" || method == "transfer.failed" =>
+        {
+            let ok = method == "transfer.finished";
+            Action::Transfer(params, ok)
+        }
         Some(Event::Notification { .. }) => Action::Idle,
         Some(Event::Disconnected) => Action::Exit(Outcome::ConnectionLost),
         Some(Event::Incompatible { .. }) => Action::Exit(Outcome::Incompatible),
@@ -98,6 +106,21 @@ enum Internal {
     /// A fresh `devices.list` snapshot (or `None`: the Core knows of no
     /// device at all - not joined yet; retried on the next event).
     Directory(Option<Value>),
+    /// `transactions.publish` came back for a need (`None` = refused).
+    Published {
+        to: String,
+        set_id: String,
+        need_id: u64,
+        tx_id: Option<String>,
+    },
+    /// The adopt-and-fill choreography reached a running transfer.
+    PullStarted {
+        set_id: String,
+        need_id: u64,
+        transfer_id: String,
+    },
+    /// The adopt or the fill refused outright.
+    PullFailed { set_id: String, need_id: u64 },
 }
 
 /// The directory's translation tables, rebuilt from every snapshot.
@@ -193,11 +216,48 @@ pub async fn run(
                 }
                 Action::Resync | Action::DirectoryStale => state.request_directory(),
                 Action::PeerMessage(params) => state.on_peer_message(&params),
+                Action::Transfer(params, ok) => {
+                    let Some(transfer_id) = params
+                        .get("transfer_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                    else {
+                        continue;
+                    };
+                    let effects = match &mut state.engine {
+                        Some(engine) => engine.on_transfer_outcome(&transfer_id, ok),
+                        None => Vec::new(),
+                    };
+                    state.execute(effects);
+                }
                 Action::Idle => {}
                 Action::Exit(outcome) => break outcome,
             },
             Some(internal) = internal_rx.recv() => match internal {
                 Internal::Directory(snapshot) => state.on_directory(snapshot),
+                Internal::Published { to, set_id, need_id, tx_id } => {
+                    let effects = match &mut state.engine {
+                        Some(engine) => match tx_id {
+                            Some(tx_id) => engine.on_published(&to, &set_id, need_id, &tx_id),
+                            None => {
+                                engine.on_publish_failed(&to, &set_id, need_id);
+                                Vec::new()
+                            }
+                        },
+                        None => Vec::new(),
+                    };
+                    state.execute(effects);
+                }
+                Internal::PullStarted { set_id, need_id, transfer_id } => {
+                    if let Some(engine) = &mut state.engine {
+                        engine.on_pull_started(&set_id, need_id, &transfer_id);
+                    }
+                }
+                Internal::PullFailed { set_id, need_id } => {
+                    if let Some(engine) = &mut state.engine {
+                        engine.on_pull_failed(&set_id, need_id);
+                    }
+                }
             },
             _ = ticker.tick() => state.on_tick(),
         }
@@ -272,7 +332,7 @@ impl Loop {
             return;
         };
         let out = engine.on_message(&node, payload, unix_now());
-        self.send_all(out);
+        self.execute(out);
     }
 
     fn on_tick(&mut self) {
@@ -301,31 +361,163 @@ impl Loop {
             return;
         };
         let out = engine.pump(&reachable, unix_now(), force);
-        self.send_all(out);
+        self.execute(out);
     }
 
-    /// Hands each outgoing message to `peers.send` on its own task:
-    /// best-effort by design (the peer retries on its own schedule, and
-    /// the `devices` topic says when someone becomes reachable).
-    fn send_all(&self, out: Vec<Outgoing>) {
-        for message in out {
-            let Some(device_id) = self.directory.device_of.get(&message.to).cloned() else {
-                continue;
-            };
-            let client = self.client.clone();
-            tokio::spawn(async move {
-                if let Err(e) = client
-                    .request(
-                        "peers.send",
-                        json!({ "device_id": device_id, "payload": message.payload }),
-                    )
-                    .await
-                {
-                    // Ordinary: the peer is away, or holds no engine. The
-                    // pump retries on the next trigger.
-                    let _ = e;
+    /// Executes the engine's effects: sends ride `peers.send`, the byte
+    /// choreography rides the transactions API, everything on its own task
+    /// and best-effort by design (the pending set re-needs what a refusal
+    /// drops).
+    fn execute(&mut self, effects: Vec<Effect>) {
+        for effect in effects {
+            match effect {
+                Effect::Send(message) => {
+                    let Some(device_id) = self.directory.device_of.get(&message.to).cloned() else {
+                        continue;
+                    };
+                    let client = self.client.clone();
+                    tokio::spawn(async move {
+                        // Ordinary refusals: the peer is away, or holds no
+                        // engine. The pump retries on the next trigger.
+                        let _ = client
+                            .request(
+                                "peers.send",
+                                json!({ "device_id": device_id, "payload": message.payload }),
+                            )
+                            .await;
+                    });
                 }
-            });
+                Effect::Publish {
+                    to,
+                    set_id,
+                    need_id,
+                    paths,
+                } => {
+                    let client = self.client.clone();
+                    let tx = self.internal_tx.clone();
+                    tokio::spawn(async move {
+                        let paths: Vec<String> = paths
+                            .iter()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .collect();
+                        let tx_id = client
+                            .request("transactions.publish", json!({ "paths": paths }))
+                            .await
+                            .ok()
+                            .and_then(|r| {
+                                r.get("tx_id").and_then(Value::as_str).map(str::to_string)
+                            });
+                        let _ = tx
+                            .send(Internal::Published {
+                                to,
+                                set_id,
+                                need_id,
+                                tx_id,
+                            })
+                            .await;
+                    });
+                }
+                Effect::Revoke { tx_id } => {
+                    let client = self.client.clone();
+                    tokio::spawn(async move {
+                        let _ = client
+                            .request("transactions.revoke", json!({ "tx_id": tx_id }))
+                            .await;
+                    });
+                }
+                Effect::AdoptFill {
+                    from,
+                    set_id,
+                    need_id,
+                    tx_id,
+                    files,
+                    staging,
+                } => {
+                    let Some(device_id) = self.directory.device_of.get(&from).cloned() else {
+                        continue;
+                    };
+                    let client = self.client.clone();
+                    let tx = self.internal_tx.clone();
+                    tokio::spawn(async move {
+                        let failed = |tx: &mpsc::Sender<Internal>| {
+                            let set_id = set_id.clone();
+                            let tx = tx.clone();
+                            async move {
+                                let _ = tx.send(Internal::PullFailed { set_id, need_id }).await;
+                            }
+                        };
+                        let Ok(record) = client
+                            .request(
+                                "transactions.adopt",
+                                json!({ "device_id": device_id, "tx_id": tx_id }),
+                            )
+                            .await
+                        else {
+                            failed(&tx).await;
+                            return;
+                        };
+                        if std::fs::create_dir_all(&staging).is_err() {
+                            failed(&tx).await;
+                            return;
+                        }
+                        // Fill only what the offer's map names, each under
+                        // its published basename; dest paths are OURS, from
+                        // the adopted (Core-validated) record, never a
+                        // peer's claim.
+                        let mut entries = Vec::new();
+                        for row in record
+                            .get("files")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                        {
+                            let (Some(file_id), Some(path)) = (
+                                row.get("file_id").and_then(Value::as_str),
+                                row.get("path").and_then(Value::as_str),
+                            ) else {
+                                continue;
+                            };
+                            if !files.contains_key(path) {
+                                continue;
+                            }
+                            let dest = staging.join(path);
+                            entries.push(json!({
+                                "file_id": file_id,
+                                "dest_path": dest.to_string_lossy(),
+                            }));
+                        }
+                        if entries.is_empty() {
+                            failed(&tx).await;
+                            return;
+                        }
+                        let Ok(reply) = client
+                            .request(
+                                "transactions.fill",
+                                json!({ "tx_id": tx_id, "entries": entries }),
+                            )
+                            .await
+                        else {
+                            failed(&tx).await;
+                            return;
+                        };
+                        let Some(transfer_id) = reply
+                            .get("transfer_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                        else {
+                            failed(&tx).await;
+                            return;
+                        };
+                        let _ = tx
+                            .send(Internal::PullStarted {
+                                set_id,
+                                need_id,
+                                transfer_id,
+                            })
+                            .await;
+                    });
+                }
+            }
         }
     }
 }
@@ -394,6 +586,20 @@ mod tests {
         assert!(matches!(
             classify(Some(Event::Notification {
                 method: "transfer.finished".into(),
+                params: serde_json::json!({}),
+            })),
+            Action::Transfer(_, true)
+        ));
+        assert!(matches!(
+            classify(Some(Event::Notification {
+                method: "transfer.failed".into(),
+                params: serde_json::json!({}),
+            })),
+            Action::Transfer(_, false)
+        ));
+        assert!(matches!(
+            classify(Some(Event::Notification {
+                method: "clipboard.remote_updated".into(),
                 params: serde_json::json!({}),
             })),
             Action::Idle
