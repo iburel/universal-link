@@ -19,7 +19,6 @@ use serde_json::{Value, json};
 
 use crate::identity::Identity;
 use crate::index::SetIndex;
-use crate::membership::SetMembership;
 use crate::records::valid_set_id;
 
 pub struct Store {
@@ -71,12 +70,12 @@ impl Store {
         Ok(dir)
     }
 
-    /// Persists one set's state as `sets/<set_id>/meta.json`, atomically.
-    /// The membership nests under its own key; later bricks add siblings
-    /// (watermarks, the pending set, conflict records) to the same file.
-    pub fn save_set(&self, membership: &SetMembership) -> io::Result<()> {
-        let dir = self.set_dir(&membership.descriptor.set_id)?;
-        let meta = json!({ "membership": membership.to_value() });
+    /// Persists one set's meta document (`sets/<set_id>/meta.json`),
+    /// atomically. The engine composes the document (membership, root,
+    /// pending, watermarks, ...): one file, one rename, so the letter's
+    /// absorbed-state-before-watermark ordering is an atomicity property.
+    pub fn save_meta(&self, set_id: &str, meta: &Value) -> io::Result<()> {
+        let dir = self.set_dir(set_id)?;
         write_private_atomic(&dir.join("meta.json"), meta.to_string().as_bytes())
     }
 
@@ -105,14 +104,21 @@ impl Store {
         Ok(Some(SetIndex::from_value(&doc).ok_or_else(corrupt)?))
     }
 
-    /// Loads every persisted set. Corruption is an ERROR, not a shrug: a
-    /// set whose membership cannot be reloaded must fail loudly rather than
-    /// resync from a guess.
-    pub fn load_sets(&self) -> io::Result<Vec<SetMembership>> {
+    /// Loads every persisted set's meta document, keyed by set_id (the
+    /// directory name, re-validated). Corruption is an ERROR, not a shrug:
+    /// a set that cannot be reloaded must fail loudly rather than resync
+    /// from a guess.
+    pub fn load_metas(&self) -> io::Result<Vec<(String, Value)>> {
         let mut sets = Vec::new();
         for entry in std::fs::read_dir(self.root.join("sets"))? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let Some(set_id) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if !valid_set_id(&set_id) {
                 continue;
             }
             let meta_path = entry.path().join("meta.json");
@@ -125,11 +131,7 @@ impl Store {
             };
             let corrupt = || io::Error::other(format!("corrupt {}", meta_path.display()));
             let meta: Value = serde_json::from_str(&text).map_err(|_| corrupt())?;
-            let membership = meta
-                .get("membership")
-                .and_then(SetMembership::from_value)
-                .ok_or_else(corrupt)?;
-            sets.push(membership);
+            sets.push((set_id, meta));
         }
         Ok(sets)
     }
@@ -215,27 +217,25 @@ mod tests {
     }
 
     #[test]
-    fn sets_round_trip_through_the_store() {
-        use crate::records::{SetDescriptor, SetKind};
-
+    fn set_metas_round_trip_through_the_store() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path().join("sync")).expect("open");
-        let descriptor = SetDescriptor::create(
-            "AAAAAAAAAAAAAAAAAAAAAA".into(),
-            SetKind::Dir,
-            "Projects".into(),
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            1000,
-            store.identity(),
-        );
-        let membership = SetMembership::new(descriptor.clone());
-        store.save_set(&membership).expect("save");
+        let meta = json!({ "membership": { "anything": true } });
+        store
+            .save_meta("AAAAAAAAAAAAAAAAAAAAAA", &meta)
+            .expect("save");
         // Idempotent overwrite.
-        store.save_set(&membership).expect("save again");
+        store
+            .save_meta("AAAAAAAAAAAAAAAAAAAAAA", &meta)
+            .expect("save again");
+        assert!(
+            store.save_meta("../escape", &meta).is_err(),
+            "a set id is re-checked where it becomes a path"
+        );
 
-        let sets = store.load_sets().expect("load");
+        let sets = store.load_metas().expect("load");
         assert_eq!(sets.len(), 1);
-        assert_eq!(sets[0].descriptor, descriptor);
+        assert_eq!(sets[0], ("AAAAAAAAAAAAAAAAAAAAAA".to_string(), meta));
 
         // A corrupt meta fails the LOAD loudly, never silently skips.
         std::fs::write(
@@ -247,7 +247,7 @@ mod tests {
             "garbage",
         )
         .expect("corrupt");
-        assert!(store.load_sets().is_err());
+        assert!(store.load_metas().is_err());
     }
 
     /// A stale temp file (a crash between create and rename) must not stall

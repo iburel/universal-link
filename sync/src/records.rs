@@ -52,7 +52,7 @@ pub fn valid_node_id(s: &str) -> bool {
     lower_hex(s, 64)
 }
 
-fn valid_pub(s: &str) -> bool {
+pub(crate) fn valid_key(s: &str) -> bool {
     lower_hex(s, 64)
 }
 
@@ -386,7 +386,7 @@ impl MemberRecord {
         let sig = str_field(sig)?;
         if !valid_set_id(set_id)
             || !valid_node_id(node_id)
-            || !valid_pub(sync_pub)
+            || !valid_key(sync_pub)
             || !valid_sig(sig)
         {
             return None;
@@ -631,7 +631,7 @@ impl Endorsement {
         let endorsed_by = str_field(endorsed_by)?;
         let sig = str_field(sig)?;
         if !valid_node_id(node_id)
-            || !valid_pub(sync_pub)
+            || !valid_key(sync_pub)
             || !valid_node_id(endorsed_by)
             || node_id == endorsed_by
             || !valid_sig(sig)

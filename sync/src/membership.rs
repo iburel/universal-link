@@ -489,6 +489,30 @@ impl SetMembership {
         self.devices.keys().cloned().collect()
     }
 
+    /// Every verified record of the set (plus the accepted endorsements'
+    /// values ride separately): the gossip a records page carries.
+    pub fn all_records(&self) -> Vec<Value> {
+        self.devices
+            .keys()
+            .flat_map(|node| self.records_about(node))
+            .collect()
+    }
+
+    /// Forgets a device we hold NOTHING verifiable about: the answer to a
+    /// no-membership marker (the device's own channel-authenticated word
+    /// that it holds no state for this set) - the pending row drops and the
+    /// introductions stop. A device with any VERIFIED record is untouched:
+    /// records outrank the marker.
+    pub fn drop_stranger(&mut self, node_id: &str) {
+        if let Some(dev) = self.devices.get(node_id)
+            && dev.live.is_none()
+            && dev.terminal.is_none()
+            && dev.invited.is_none()
+        {
+            self.devices.remove(node_id);
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Persistence (nested under "membership" in the set's meta.json; the
     // later bricks add sibling keys).

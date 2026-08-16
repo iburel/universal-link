@@ -13,10 +13,12 @@
 
 pub mod canonical;
 pub mod clock;
+pub mod engine;
 pub mod identity;
 pub mod index;
 pub mod membership;
 pub mod orchestrator;
+pub mod protocol;
 pub mod records;
 pub mod scan;
 pub mod store;
