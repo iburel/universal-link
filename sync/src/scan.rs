@@ -79,11 +79,18 @@ pub fn rescan(
     // The tombstone pass: live entries the walk did not meet, minus what
     // the pending set expects absent and what the walk IGNORED (an ignored
     // name is frozen, not deleted: ignoring is not a delete gesture).
-    let missing: Vec<String> = index
+    let mut missing: Vec<String> = index
         .live()
         .map(|e| e.path.clone())
         .filter(|path| !seen.contains(path) && !pending.contains(path))
         .collect();
+    // Deepest first: tombstoning a folder is ordered AFTER its contents, so
+    // the children carry the lower clock and a peer's end-of-batch
+    // directory guard sees an empty directory rather than a live child.
+    missing.sort_by(|a, b| {
+        let depth = |p: &String| p.matches('/').count();
+        depth(b).cmp(&depth(a)).then_with(|| b.cmp(a))
+    });
     for path in missing {
         let entry = index.get(&path).expect("listed from the index").clone();
         let mut vv = entry.vv;
@@ -216,10 +223,17 @@ fn walk_dir(
                 name: format!("{prefix}{}", c.disk_name),
                 reason: "collides under folding",
             });
-            // Frozen, not deleted: keep any indexed entry out of the
-            // tombstone pass.
-            if let Some(e) = index.get(&wire_path(prefix, &c.wire)) {
-                seen.insert(e.path.clone());
+            // Frozen, not deleted: keep the indexed entry AND, for a
+            // directory, everything under it out of the tombstone pass. An
+            // ignored name is not a delete gesture, and a collision at one
+            // level must never wipe the subtree below it.
+            let wire = wire_path(prefix, &c.wire);
+            seen.insert(wire.clone());
+            let subtree = format!("{wire}/");
+            for entry in index.live() {
+                if entry.path.starts_with(&subtree) {
+                    seen.insert(entry.path.clone());
+                }
             }
             continue;
         }
@@ -324,8 +338,13 @@ fn reconcile_file(
         && k.kind == EntryKind::File
     {
         let same_stat = k.size == size && k.mtime == mtime;
-        let doubt = k.size == size && k.mtime.seconds_apart(mtime) <= MTIME_DOUBT_SECS;
-        if same_stat && k.exec == exec {
+        // A coarse-grained filesystem (FAT counts in 2 s steps) hands back
+        // whole seconds: an equal stamp there is no proof, so the size+mtime
+        // fast path only settles it when the stamp carries sub-second
+        // detail. "Doubt" is defined, not felt.
+        let coarse = mtime.nanos == 0;
+        let doubt = k.size == size && (coarse || k.mtime.seconds_apart(mtime) <= MTIME_DOUBT_SECS);
+        if same_stat && !coarse && k.exec == exec {
             return Ok(());
         }
         if same_stat || doubt {

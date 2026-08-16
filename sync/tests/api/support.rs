@@ -20,7 +20,12 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
-pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Generous on purpose (the menu suite's reasoning): nextest runs every
+/// test in its own process, so a whole suite of Cores can be in flight at
+/// once on a small runner. It must also exceed the Core's 10 s facade
+/// budget - a client that gave up first would read a slow-but-progressing
+/// forward as a failure.
+pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
 pub const CORE_DEVICE_NAME: &str = "PC-Core";
 
 /// Copied from `src/main.rs` rather than imported: the copy pins the
@@ -255,7 +260,13 @@ pub async fn ready(ui: &Ui) {
                         _ => tokio::time::sleep(Duration::from_millis(25)).await,
                     }
                 }
+                // The engine's hello may still be in flight, and a loaded
+                // runner can outlast one request: both are "not yet", not
+                // "broken".
                 Err(RequestError::Rpc(e)) if e.data_code.as_deref() == Some("COMPONENT_ABSENT") => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(RequestError::Timeout | RequestError::NotConnected) => {
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
                 Err(e) => panic!("unexpected error waiting for the engine: {e}"),
@@ -296,7 +307,13 @@ pub async fn status_eventually(ui: &Ui) -> Value {
         loop {
             match ui.client.request("sync.status", json!({})).await {
                 Ok(status) => break status,
+                // The engine's hello may still be in flight, and a loaded
+                // runner can outlast one request: both are "not yet", not
+                // "broken".
                 Err(RequestError::Rpc(e)) if e.data_code.as_deref() == Some("COMPONENT_ABSENT") => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(RequestError::Timeout | RequestError::NotConnected) => {
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
                 Err(e) => panic!("unexpected error waiting for the engine: {e}"),

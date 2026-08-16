@@ -80,6 +80,11 @@ platform = 'cfg(any(target_os = "macos", target_os = "windows"))'
 filter = 'package(onedevice-clipboard) & kind(test) & test(/source::/)'
 test-group = 'serial-ipc'
 
+# The sync engine's suite co-locates a real Core per test and drives routed
+# facade forwards through it: the same co-location family, scoped like its
+# siblings. (Its one Linux flake was NOT contention but a real client-crate
+# bug (a served method refused during the subscribe window), fixed at the
+# source rather than papered over here.)
 [[profile.ci.overrides]]
 platform = 'cfg(any(target_os = "macos", target_os = "windows"))'
 filter = 'package(onedevice-sync) & kind(test)'

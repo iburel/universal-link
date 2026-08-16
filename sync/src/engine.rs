@@ -117,6 +117,26 @@ const PENDING_PER_PATH: usize = 4;
 /// nothing changed: reachability flaps must not turn into message storms.
 const OPEN_INTERVAL_SECS: u64 = 5;
 
+/// Sets this engine will hold at once. A real account has a handful; the
+/// cap is what keeps an active-but-compromised sibling from minting
+/// persisted state without end.
+const SETS_MAX: usize = 64;
+
+/// Rounds one peer may have in flight here at once. A legitimate exchange
+/// uses one; the cap is what keeps a compromised sibling from parking
+/// memory in our buffers.
+const ROUNDS_IN_FLIGHT_PER_PEER: usize = 4;
+
+/// Paths the pending set may hold per set: bounds what a hostile active
+/// member can make us remember (and write to meta.json). Far above any
+/// real delta - a bigger initial sync simply arrives in several rounds.
+const PENDING_PATHS_MAX: usize = 100_000;
+
+/// Minimum seconds between full answers to one peer: an inbound head costs
+/// us a delta computation, so a flood of tiny heads must not reflect our
+/// whole index back at line rate.
+const ANSWER_INTERVAL_SECS: u64 = 1;
+
 /// A received invitation's claim, kept for the consent card.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InviteClaim {
@@ -165,6 +185,9 @@ pub struct SetState {
     announce: BTreeSet<String>,
     /// Throttle and change detection for round openers.
     last_opened: BTreeMap<String, (u64, Vv)>,
+    /// When we last answered each peer with a full leg (the amplification
+    /// throttle). Ephemeral: a restart owes everyone an answer.
+    last_answered: BTreeMap<String, u64>,
     /// Needer side: the needs in flight, by need_id. Ephemeral - a restart
     /// re-needs from the pending set; only the counter persists (the
     /// source keys its published slots by (peer, need_id)).
@@ -276,7 +299,11 @@ impl Engine {
             store,
             self_node,
             sets,
-            round_counter: 0,
+            // Seeded per boot, in the canonical integer's safe range: two
+            // incarnations must never mint the same round id, or a peer's
+            // stale buffer could complete under a fresh head and advance a
+            // watermark over entries never absorbed.
+            round_counter: boot_round_base(),
             sent_rounds: BTreeMap::new(),
             directory: DirectoryView::default(),
         })
@@ -822,9 +849,14 @@ impl Engine {
                 now,
             )),
             Message::InviteAck { set_id } => {
-                if let Some(state) = self.sets.get_mut(&set_id) {
-                    state.open_invites.remove(from);
-                    let _ = state.persist(&self.store, &set_id);
+                if let Some(state) = self.sets.get_mut(&set_id)
+                    && state.open_invites.remove(from).is_some()
+                    && let Err(e) = state.persist(&self.store, &set_id)
+                {
+                    // The retry was our durable promise: if the write
+                    // failed, keep retrying rather than forget silently.
+                    eprintln!("[1device-sync] cannot persist the invite ack: {e}");
+                    state.open_invites.insert(from.to_string(), RETRY_BUDGET);
                 }
                 Vec::new()
             }
@@ -1174,6 +1206,10 @@ impl Engine {
         // the set. A never-admitted sibling plants no state and gets no
         // ack.
         if !self.sets.contains_key(&set_id) {
+            if self.sets.len() >= SETS_MAX {
+                eprintln!("[1device-sync] too many sets: invitation dropped");
+                return Vec::new();
+            }
             let mut membership = SetMembership::new(descriptor);
             membership.pin_direct(from, &sync_pub);
             for record in &records {
@@ -1184,6 +1220,17 @@ impl Engine {
             }
             if membership.effective(from) != Effective::Active {
                 eprintln!("[1device-sync] invite from a non-admitted device dropped");
+                return Vec::new();
+            }
+            // The descriptor is the creator's signed word: check it against
+            // whatever binding the carried records established for the
+            // creator. Absent a binding, an introduction will confirm or
+            // refute it later; a binding that REFUTES it stops here.
+            let creator = membership.descriptor.created_by.clone();
+            if let Some(key) = membership.key_for(&creator).map(str::to_string)
+                && !membership.descriptor.verify(&key)
+            {
+                eprintln!("[1device-sync] invitation carries an unsigned descriptor: dropped");
                 return Vec::new();
             }
             let self_node = self.self_node.clone();
@@ -1275,15 +1322,15 @@ impl Engine {
         }
 
         let their_vv = position.set_vv.clone();
+        state.prune_buffers(now);
+        if !state.admit_buffer(from, round, now) {
+            eprintln!("[1device-sync] too many rounds in flight from one peer: head dropped");
+            return Vec::new();
+        }
         let buffer = state
             .inflight
-            .entry((from.to_string(), round))
-            .or_insert(RoundBuffer {
-                head: None,
-                records: BTreeMap::new(),
-                entries: BTreeMap::new(),
-                born_at: now,
-            });
+            .get_mut(&(from.to_string(), round))
+            .expect("admitted");
         buffer.head = Some((position, answers));
 
         let mut out = self.try_complete(from, set_id, round, now);
@@ -1294,7 +1341,7 @@ impl Engine {
             None => true,
             Some(theirs) => matches!(self.sent_rounds.get(&theirs), Some(false)),
         };
-        if answer_due {
+        if answer_due && self.answer_due_now(set_id, from, now) {
             out.extend(self.answer_head(from, set_id, round, &their_vv));
         }
         out
@@ -1420,15 +1467,14 @@ impl Engine {
         let Some(state) = self.sets.get_mut(set_id) else {
             return;
         };
+        state.prune_buffers(now);
+        if !state.admit_buffer(from, round, now) {
+            return;
+        }
         let buffer = state
             .inflight
-            .entry((from.to_string(), round))
-            .or_insert(RoundBuffer {
-                head: None,
-                records: BTreeMap::new(),
-                entries: BTreeMap::new(),
-                born_at: now,
-            });
+            .get_mut(&(from.to_string(), round))
+            .expect("admitted");
         if buffer.records.len() as u64 > crate::protocol::ROUND_PAGES_MAX
             || buffer.entries.len() as u64 > crate::protocol::ROUND_PAGES_MAX
         {
@@ -1446,25 +1492,36 @@ impl Engine {
             return Vec::new();
         };
         let key = (from.to_string(), round);
+        // Prune FIRST, then take: a buffer the TTL retires between the check
+        // and the take would otherwise be a peer-triggerable panic.
+        state.prune_buffers(now);
         let complete = state.inflight.get(&key).is_some_and(|b| {
             b.head.as_ref().is_some_and(|(p, _)| {
                 (b.records.len() as u64) >= p.records_pages
                     && (b.entries.len() as u64) >= p.entries_pages
             })
         });
-        state.prune_buffers(now);
         if !complete {
             return Vec::new();
         }
-        let buffer = state.inflight.remove(&key).expect("checked");
-        let (position, _) = buffer.head.expect("checked");
+        let Some(buffer) = state.inflight.remove(&key) else {
+            return Vec::new();
+        };
+        let Some((position, _)) = buffer.head else {
+            return Vec::new();
+        };
 
+        // The stub's proof is our OWN terminal seq echoed back (or a record
+        // superseding it): a stale terminal from an earlier era proves
+        // nothing about the news we are pushing now.
+        let our_terminal_seq = state.membership.terminal_seq_of(&self_node);
         let mut echoed_terminal_about_self = false;
         for (records, endorsements, conflicts) in buffer.records.values() {
             for record in records {
                 if let Record::Member(m) = record
                     && m.node_id == self_node
                     && m.status.is_terminal()
+                    && m.seq >= our_terminal_seq
                 {
                     echoed_terminal_about_self = true;
                 }
@@ -1502,10 +1559,13 @@ impl Engine {
         // device, which is what lets introductions and terminal news
         // travel.
         let sender_active = state.membership.effective(from) == Effective::Active;
+        let mut all_absorbed = true;
         if sender_active {
             for entries in buffer.entries.values() {
                 for entry in entries {
-                    state.absorb_entry(entry);
+                    if !state.absorb_entry(entry) {
+                        all_absorbed = false;
+                    }
                 }
             }
         }
@@ -1526,7 +1586,7 @@ impl Engine {
         // write - and the advertisement follows the DISK, not the memory: a
         // failed persist rolls the in-memory watermark back, so nothing is
         // ever advertised that a crash could lose.
-        if position.entries_complete && sender_active {
+        if position.entries_complete && sender_active && all_absorbed {
             let previous = state.watermarks.get(from).cloned();
             let watermark = state.watermarks.entry(from.to_string()).or_default();
             watermark.merge_max(&position.set_vv);
@@ -1547,6 +1607,23 @@ impl Engine {
         Vec::new()
     }
 
+    /// Whether we owe `peer` a full answer now: an inbound head costs a
+    /// delta computation, so a flood of tiny heads must not reflect our
+    /// whole index back at line rate. The peer loses nothing - its next
+    /// round (or our next pump) carries what this one skipped.
+    fn answer_due_now(&mut self, set_id: &str, peer: &str, now: u64) -> bool {
+        let Some(state) = self.sets.get_mut(set_id) else {
+            return false;
+        };
+        match state.last_answered.get(peer) {
+            Some(at) if now.saturating_sub(*at) < ANSWER_INTERVAL_SECS => false,
+            _ => {
+                state.last_answered.insert(peer.to_string(), now);
+                true
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // The wire, outbound: rounds, invitations, introductions, stubs.
     // -----------------------------------------------------------------------
@@ -1558,17 +1635,42 @@ impl Engine {
     pub fn pump(&mut self, reachable: &[String], now: u64, force: bool) -> Vec<Effect> {
         let mut out = Vec::new();
         let self_node = self.self_node.clone();
-        let sync_pub = self.store.identity().public_hex();
         let set_ids = self.set_ids();
         for set_id in set_ids {
-            // Invitations first: they are the door for everything else.
+            // Invitations first: they are the door for everything else. The
+            // letter's stop condition, whole: an ack OR any invitee-signed
+            // record for the set - a device that accepted (or declined)
+            // through some other path needs no more invitations. And the
+            // budget re-arms when a target becomes reachable again: a new
+            // route is new information, not another wasted attempt.
             let invites: Vec<String> = {
-                let state = self.sets.get(&set_id).expect("listed");
-                state
+                let state = self.sets.get_mut(&set_id).expect("listed");
+                let heard: Vec<String> = state
                     .open_invites
                     .keys()
-                    .filter(|n| reachable.contains(n))
+                    .filter(|n| {
+                        !matches!(
+                            state.membership.effective(n),
+                            Effective::Invited | Effective::Unknown
+                        )
+                    })
                     .cloned()
+                    .collect();
+                for node in heard {
+                    state.open_invites.remove(&node);
+                }
+                for node in reachable {
+                    if let Some(budget) = state.open_invites.get_mut(node)
+                        && *budget == 0
+                    {
+                        *budget = RETRY_BUDGET;
+                    }
+                }
+                state
+                    .open_invites
+                    .iter()
+                    .filter(|(n, budget)| reachable.contains(n) && **budget > 0)
+                    .map(|(n, _)| n.clone())
                     .collect()
             };
             for invitee in invites {
@@ -1578,10 +1680,10 @@ impl Engine {
                         payload: message,
                     }));
                     let state = self.sets.get_mut(&set_id).expect("listed");
-                    let budget = state.open_invites.get_mut(&invitee).expect("listed");
-                    *budget = budget.saturating_sub(1);
-                    if *budget == 0 {
-                        state.open_invites.remove(&invitee);
+                    // The budget bounds one reachable stretch, never the
+                    // invitation: it re-arms when the target reappears.
+                    if let Some(budget) = state.open_invites.get_mut(&invitee) {
+                        *budget = budget.saturating_sub(1);
                     }
                 }
             }
@@ -1602,25 +1704,7 @@ impl Engine {
                 targets
             };
             for target in announce_targets {
-                let round = self.next_round(false);
-                let state = self.sets.get(&set_id).expect("listed");
-                let head = Message::Head {
-                    set_id: set_id.clone(),
-                    round,
-                    answers: None,
-                    position: Some(HeadPosition {
-                        descriptor_hash: descriptor_hash(&state.membership.descriptor),
-                        set_vv: state.advertised(&state.clock.self_component(&self_node)),
-                        records_pages: 0,
-                        entries_pages: 0,
-                        entries_complete: false,
-                    }),
-                    sync_pub: sync_pub.clone(),
-                };
-                out.push(Effect::Send(Outgoing {
-                    to: target,
-                    payload: head.to_value(),
-                }));
+                out.extend(self.opener(&set_id, &target));
             }
 
             let state = self.sets.get(&set_id).expect("listed");
@@ -1652,25 +1736,7 @@ impl Engine {
                     state
                         .last_opened
                         .insert(peer.clone(), (now, advertised.clone()));
-                    let round = self.next_round(false);
-                    let state = self.sets.get(&set_id).expect("listed");
-                    let head = Message::Head {
-                        set_id: set_id.clone(),
-                        round,
-                        answers: None,
-                        position: Some(HeadPosition {
-                            descriptor_hash: descriptor_hash(&state.membership.descriptor),
-                            set_vv: advertised.clone(),
-                            records_pages: 0,
-                            entries_pages: 0,
-                            entries_complete: false,
-                        }),
-                        sync_pub: sync_pub.clone(),
-                    };
-                    out.push(Effect::Send(Outgoing {
-                        to: peer,
-                        payload: head.to_value(),
-                    }));
+                    out.extend(self.opener(&set_id, &peer));
                 }
             }
 
@@ -1700,25 +1766,7 @@ impl Engine {
                     continue;
                 }
                 *budget -= 1;
-                let round = self.next_round(false);
-                let state = self.sets.get(&set_id).expect("listed");
-                let head = Message::Head {
-                    set_id: set_id.clone(),
-                    round,
-                    answers: None,
-                    position: Some(HeadPosition {
-                        descriptor_hash: descriptor_hash(&state.membership.descriptor),
-                        set_vv: state.advertised(&state.clock.self_component(&self_node)),
-                        records_pages: 0,
-                        entries_pages: 0,
-                        entries_complete: false,
-                    }),
-                    sync_pub: sync_pub.clone(),
-                };
-                out.push(Effect::Send(Outgoing {
-                    to: target,
-                    payload: head.to_value(),
-                }));
+                out.extend(self.opener(&set_id, &target));
             }
 
             // Stub proofs: records-only openers until each member echoed our
@@ -1742,25 +1790,7 @@ impl Engine {
                 }
             };
             for target in stub_targets {
-                let round = self.next_round(false);
-                let state = self.sets.get(&set_id).expect("listed");
-                let head = Message::Head {
-                    set_id: set_id.clone(),
-                    round,
-                    answers: None,
-                    position: Some(HeadPosition {
-                        descriptor_hash: descriptor_hash(&state.membership.descriptor),
-                        set_vv: state.advertised(&state.clock.self_component(&self_node)),
-                        records_pages: 0,
-                        entries_pages: 0,
-                        entries_complete: false,
-                    }),
-                    sync_pub: sync_pub.clone(),
-                };
-                out.push(Effect::Send(Outgoing {
-                    to: target,
-                    payload: head.to_value(),
-                }));
+                out.extend(self.opener(&set_id, &target));
             }
         }
         out
@@ -1861,6 +1891,67 @@ impl Engine {
         out
     }
 
+    /// A round opener toward `peer`: the declaring head plus our records
+    /// pages. A "records-only head" that carried no records proved nothing:
+    /// the stub's terminal news, a pause, a resume all ride these pages, so
+    /// one exchange suffices for the answer to echo them back.
+    fn opener(&mut self, set_id: &str, peer: &str) -> Vec<Effect> {
+        let self_node = self.self_node.clone();
+        let sync_pub = self.store.identity().public_hex();
+        let round = self.next_round(false);
+        let Some(state) = self.sets.get(set_id) else {
+            return Vec::new();
+        };
+        let records: Vec<Value> = state.membership.all_records();
+        let endorsements: Vec<Value> = state
+            .membership
+            .endorsements()
+            .into_iter()
+            .map(Endorsement::to_value)
+            .collect();
+        let conflicts: Vec<Value> = state
+            .conflicts
+            .values()
+            .map(ConflictRecord::to_value)
+            .collect();
+        let mut pages = paginate(&records).unwrap_or_default();
+        if pages.is_empty() && (!endorsements.is_empty() || !conflicts.is_empty()) {
+            pages.push(Vec::new());
+        }
+        let head = Message::Head {
+            set_id: set_id.to_string(),
+            round,
+            answers: None,
+            position: Some(HeadPosition {
+                descriptor_hash: descriptor_hash(&state.membership.descriptor),
+                set_vv: state.advertised(&state.clock.self_component(&self_node)),
+                records_pages: pages.len() as u64,
+                entries_pages: 0,
+                // An opener computes no delta: only the answering leg can
+                // advance a watermark.
+                entries_complete: false,
+            }),
+            sync_pub,
+        };
+        let mut out = vec![Effect::send(peer, &head)];
+        for (page, chunk) in pages.into_iter().enumerate() {
+            out.push(Effect::Send(Outgoing {
+                to: peer.to_string(),
+                payload: json!({
+                    "dialect": DIALECT,
+                    "type": "records",
+                    "set_id": set_id,
+                    "round": round,
+                    "page": page as u64,
+                    "records": chunk,
+                    "endorsements": if page == 0 { endorsements.clone() } else { Vec::new() },
+                    "conflicts": if page == 0 { conflicts.clone() } else { Vec::new() },
+                }),
+            }));
+        }
+        out
+    }
+
     fn build_invite(&self, set_id: &str, _invitee: &str) -> Option<Value> {
         let state = self.sets.get(set_id)?;
         let entries = state.index.live().count() as u64;
@@ -1916,6 +2007,7 @@ impl SetState {
             stub: None,
             announce: BTreeSet::new(),
             last_opened: BTreeMap::new(),
+            last_answered: BTreeMap::new(),
             needs: BTreeMap::new(),
             need_counter: 0,
             published: BTreeMap::new(),
@@ -1944,22 +2036,31 @@ impl SetState {
     }
 
     /// Parks one absorbed entry: dominance-pruned against the index and the
-    /// versions already parked for its path.
-    fn absorb_entry(&mut self, entry: &Entry) {
+    /// versions already parked for its path, bounded per path and per set.
+    /// Beyond the bounds the entry is REFUSED rather than displacing a
+    /// version already parked - a watermark covers what we absorbed, so a
+    /// dropped version would never be offered again.
+    fn absorb_entry(&mut self, entry: &Entry) -> bool {
         if let Some(ours) = self.index.get(&entry.path)
             && ours.vv.covers(&entry.vv)
         {
-            return;
+            return true;
+        }
+        if !self.pending.contains_key(&entry.path) && self.pending.len() >= PENDING_PATHS_MAX {
+            eprintln!("[1device-sync] pending set full: entry refused, the round stays open");
+            return false;
         }
         let parked = self.pending.entry(entry.path.clone()).or_default();
         parked.retain(|held| !entry.vv.covers(&held.vv));
         if parked.iter().any(|held| held.vv.covers(&entry.vv)) {
-            return;
+            return true;
         }
         if parked.len() >= PENDING_PER_PATH {
-            parked.remove(0);
+            eprintln!("[1device-sync] too many concurrent versions parked: entry refused");
+            return false;
         }
         parked.push(entry.clone());
+        true
     }
 
     /// The consent guard (the letter, section 2): the inviter's size claim,
@@ -2480,6 +2581,40 @@ impl SetState {
             .retain(|_, b| now.saturating_sub(b.born_at) <= ROUND_TTL_SECS);
     }
 
+    /// Makes room for a round buffer, bounded per peer: a compromised
+    /// sibling must not be able to park arbitrarily many. Beyond the cap
+    /// its OWN oldest round is retired (never another member's), and
+    /// `false` means even that failed.
+    fn admit_buffer(&mut self, from: &str, round: u64, now: u64) -> bool {
+        let key = (from.to_string(), round);
+        if self.inflight.contains_key(&key) {
+            return true;
+        }
+        let mine: Vec<(String, u64)> = self
+            .inflight
+            .keys()
+            .filter(|(peer, _)| peer == from)
+            .cloned()
+            .collect();
+        if mine.len() >= ROUNDS_IN_FLIGHT_PER_PEER {
+            let oldest = mine
+                .into_iter()
+                .min_by_key(|k| self.inflight.get(k).map(|b| b.born_at).unwrap_or(0))
+                .expect("non-empty");
+            self.inflight.remove(&oldest);
+        }
+        self.inflight.insert(
+            key,
+            RoundBuffer {
+                head: None,
+                records: BTreeMap::new(),
+                entries: BTreeMap::new(),
+                born_at: now,
+            },
+        );
+        true
+    }
+
     fn persist(&self, store: &Store, set_id: &str) -> io::Result<()> {
         let pending: Value = Value::Object(
             self.pending
@@ -2644,6 +2779,7 @@ impl SetState {
             stub,
             announce: BTreeSet::new(),
             last_opened: BTreeMap::new(),
+            last_answered: BTreeMap::new(),
             needs: BTreeMap::new(),
             need_counter: meta
                 .get("need_counter")
@@ -2744,6 +2880,14 @@ impl SetState {
 
 fn wrap(out: Vec<Outgoing>) -> Vec<Effect> {
     out.into_iter().map(Effect::Send).collect()
+}
+
+/// A per-boot base for round ids: 40 random bits, leaving room for 2^12
+/// rounds per incarnation under the canonical integer bound.
+fn boot_round_base() -> u64 {
+    let mut bytes = [0u8; 8];
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut bytes);
+    (u64::from_be_bytes(bytes) % (1 << 40)) << 12
 }
 
 fn kind_str(kind: SetKind) -> &'static str {

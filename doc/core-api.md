@@ -844,6 +844,13 @@ shapes, caches nothing, interprets nothing.
 - Answering the facade requires the `sync-backend` role AND the `sync.serve`
   scope: a connection missing either is not the engine, whatever its name.
 
+A component that serves a forwarded method is routable from the moment its
+`hello` is accepted, which is BEFORE it has finished subscribing to its
+topics: a facade call can therefore land during that window. The Rust IPC
+client holds such a request and delivers it once established (it refuses
+only methods the component does not serve) - without that, a served method
+would be intermittently missing, answered `-32601` by the client itself.
+
 Notifications (topic `sync`, scope `sync.read`, subscription-based): they are
 published BY the backend through `sync.emit { method, params }` - the one
 component-originated topic. The Core checks the shape (`method` a `sync.*`

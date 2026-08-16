@@ -749,8 +749,13 @@ impl Loop {
         }
         self.pump(true);
         self.sync_watchers();
-        self.request_directory();
         self.emit_changes();
+        // The directory refreshes itself on `device.*` events; the tick only
+        // retries when it is missing entirely (a Core that has joined
+        // nothing yet), so a resolved engine never polls.
+        if self.directory.self_node.is_none() {
+            self.request_directory();
+        }
     }
 
     fn pump(&mut self, force: bool) {

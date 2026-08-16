@@ -455,6 +455,15 @@ impl SetMembership {
         Effective::Unknown
     }
 
+    /// The highest TERMINAL seq known for a device (record or surviving
+    /// floor): what a stub's proof must reach to count.
+    pub fn terminal_seq_of(&self, node_id: &str) -> u64 {
+        self.devices.get(node_id).map_or(0, |dev| {
+            dev.terminal_seq_floor
+                .max(dev.terminal.as_ref().map_or(0, |r| r.seq))
+        })
+    }
+
     /// The seq one's own NEXT record must carry: `1 + max(seq over every
     /// record about self ever seen)`, invitations' supersedes_seq included -
     /// never a local counter restarted. Saturates at the wire's seq cap so
