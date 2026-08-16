@@ -1438,7 +1438,7 @@ impl Conn {
             files,
             sensitive: false,
             producer: crate::clipboard::Producer::Published {
-                owner: self.conn_id,
+                owners: vec![self.conn_id],
             },
             origin: crate::clipboard::Origin::Local {
                 announcer: self.conn_id,
@@ -1571,9 +1571,14 @@ impl Conn {
         let entries = parse_fill_entries(params)?;
         let plan = {
             let cb = self.state.clipboard.lock().expect("lock clipboard");
-            let needed = cb
-                .consume_scope_of(&tx_id)
-                .ok_or_else(|| RpcErr::app("TX_STALE"))?;
+            // Same precedence as `transactions.open`: unknown OR superseded is
+            // `TX_STALE` first, the wrong scope second - one state, one answer,
+            // whichever verb asks (and a scope-less probe learns nothing a
+            // superseded clip's existence included).
+            if !cb.is_openable(&tx_id) {
+                return Err(RpcErr::app("TX_STALE"));
+            }
+            let needed = cb.consume_scope_of(&tx_id).expect("openable transaction");
             if !has(needed) {
                 return Err(RpcErr::app("SCOPE_DENIED"));
             }
@@ -1657,6 +1662,10 @@ impl Conn {
         let issued = {
             let mut reg = self.state.registry.lock().expect("lock registry");
             reg.conn_for_role_scope("sync-backend", "sync.serve")
+                // Never oneself: a backend calling the facade would enqueue a
+                // request its own blocked dispatch could never answer, and
+                // burn the whole budget for a guaranteed timeout.
+                .filter(|target| *target != self.conn_id)
                 .and_then(|target| {
                     reg.issue_request(target, method, params.clone())
                         .map(|(id, rx)| (target, id, rx))

@@ -136,10 +136,12 @@ pub enum Producer {
     /// Published by `transactions.publish` (or installed by
     /// `transactions.adopt` on a destination): OUTSIDE the election - never the
     /// current clip, never superseded, no automatic expiry. It ends by
-    /// `transactions.revoke`, by `owner`'s connection closing (a grant dies
-    /// with its holder), or with every other transaction at logout/Core stop.
-    /// Consumed under `transactions.publish`.
-    Published { owner: ConnId },
+    /// `transactions.revoke`, by the LAST of `owners`' connections closing (a
+    /// grant dies with its holder - and an entry several components adopted is
+    /// co-owned, so no adopter's grant hangs on another's connection), or with
+    /// every other transaction at logout/Core stop. Consumed under
+    /// `transactions.publish`.
+    Published { owners: Vec<ConnId> },
 }
 
 /// How a paste session on a transaction is served — the routing decision the
@@ -515,16 +517,34 @@ impl ClipboardState {
     }
 
     /// Installs a published transaction ADOPTED from a peer (its `tx_id` is the
-    /// source's, so a collision is meaningful): if the id is already installed
-    /// as a published entry, answers its record - an idempotent re-adopt; if it
-    /// collides with a clipboard transaction, refuses (`TX_STALE`, disclosing
-    /// nothing). Returns the installed record.
+    /// source's, so a collision is meaningful): an id already installed as an
+    /// adopted entry makes the caller a CO-OWNER and answers the record - the
+    /// idempotent re-adopt, without ever binding one adopter's grant to
+    /// another's connection; an id this Core itself published answers the
+    /// record untouched; a collision with a clipboard transaction refuses
+    /// (`TX_STALE`, disclosing nothing). Returns the installed record.
     pub fn install_adopted(&mut self, tx: Transaction) -> Result<Value, RpcErr> {
-        if let Some(existing) = self.transactions.get(&tx.tx_id) {
-            return match existing.producer {
-                Producer::Published { .. } => Ok(existing.record()),
-                Producer::Clipboard => Err(RpcErr::app("TX_STALE")),
-            };
+        if let Some(existing) = self.transactions.get_mut(&tx.tx_id) {
+            match (&mut existing.producer, &existing.origin) {
+                // Already adopted here: the caller JOINS the owners, so its
+                // grant lives with its own connection, never with the first
+                // adopter's - the entry stays until its LAST owner leaves.
+                (Producer::Published { owners }, Origin::Remote { .. }) => {
+                    if let Producer::Published { owners: joining } = &tx.producer {
+                        for owner in joining {
+                            if !owners.contains(owner) {
+                                owners.push(*owner);
+                            }
+                        }
+                    }
+                }
+                // The id names a transaction THIS Core published (adopting
+                // one's own device makes no one an owner): the publisher's
+                // lifetime rules stand, the record is simply answered.
+                (Producer::Published { .. }, Origin::Local { .. }) => {}
+                (Producer::Clipboard, _) => return Err(RpcErr::app("TX_STALE")),
+            }
+            return Ok(self.transactions[&tx.tx_id].record());
         }
         let record = tx.record();
         self.transactions.insert(tx.tx_id.clone(), tx);
@@ -576,14 +596,19 @@ impl ClipboardState {
         }
     }
 
-    /// Revokes every published transaction owned by `conn_id` - its publisher
-    /// (or adopter) is gone, and a grant dies with its holder. Returns whether
-    /// anything was removed (the caller then wakes the reset `Notify`).
+    /// Withdraws `conn_id` from every published transaction it co-owns - its
+    /// publisher, or one adopter among several, is gone, and a grant dies with
+    /// its holder. An entry is removed once its LAST owner leaves. Returns
+    /// whether anything was removed (the caller then wakes the reset `Notify`).
     pub fn revoke_owned_by(&mut self, conn_id: ConnId) -> bool {
         let before = self.transactions.len();
-        self.transactions.retain(
-            |_, t| !matches!(t.producer, Producer::Published { owner } if owner == conn_id),
-        );
+        self.transactions.retain(|_, t| match &mut t.producer {
+            Producer::Clipboard => true,
+            Producer::Published { owners } => {
+                owners.retain(|o| *o != conn_id);
+                !owners.is_empty()
+            }
+        });
         self.transactions.len() != before
     }
 

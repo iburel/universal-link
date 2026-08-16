@@ -245,3 +245,26 @@ async fn the_wire_ack_reports_delivery_and_refuses_malformed_frames() {
     assert_eq!(ack["delivered"], json!(false));
     mb.assert_silent().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_wire_payload_is_refused_on_arrival() {
+    let server = TestServer::start().await;
+    let switchboard = onedevice_test_support::memory_transport::MemorySwitchboard::new();
+    let code = onedevice_core::account_key::generate_recovery_code();
+    let b = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
+    let mut mb = messenger(&b, "engine", "custom").await;
+    wait_server_connected(&mut mb, true).await;
+    let raw = RawPeer::attested(&server, &switchboard, &code).await;
+    wait_attested(&mut mb, &raw.device_id).await;
+
+    // A compliant sender's Core caps at 64 KiB; a hostile one can push up to
+    // the frame limit. The receiver's own cap refuses it: nothing delivered.
+    let ack = raw_exchange(
+        &raw,
+        &b,
+        json!({ "type": "peer_msg", "role": "custom", "payload": "x".repeat(70 * 1024) }),
+    )
+    .await;
+    assert_eq!(ack["delivered"], json!(false));
+    mb.assert_silent().await;
+}

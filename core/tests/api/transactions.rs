@@ -678,3 +678,131 @@ async fn an_adopted_entry_dies_with_its_adopter() {
         .await
         .expect("re-adopting after a reconnect");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_destination_side_revoke_cuts_the_relaying_pipe_and_spares_siblings() {
+    let server = TestServer::start().await;
+    let (a, mut ea, b, mut eb) = adopted_pair(&server).await;
+
+    // Two adopted transactions, each with an open relaying channel.
+    let (tx1, f1) = publish_file(&a, &mut ea, "one.bin", b"first body").await;
+    let (tx2, f2) = publish_file(&a, &mut ea, "two.bin", b"second body").await;
+    for tx in [&tx1, &tx2] {
+        eb.request(
+            "transactions.adopt",
+            json!({ "device_id": a.device_id(), "tx_id": tx }),
+        )
+        .await
+        .unwrap();
+    }
+    let t1 = open_token(&mut eb, &tx1).await;
+    let mut ch1 = b.open_channel(&t1).await;
+    assert_eq!(ch1.read(&f1, 0, 5).await.unwrap(), b"first");
+    let t2 = open_token(&mut eb, &tx2).await;
+    let mut ch2 = b.open_channel(&t2).await;
+    assert_eq!(ch2.read(&f2, 0, 6).await.unwrap(), b"second");
+
+    // The DESTINATION revokes one adopted entry (possession authorizes): its
+    // own reset arm must cut that relay NOW, and only that one.
+    eb.request("transactions.revoke", json!({ "tx_id": tx1 }))
+        .await
+        .unwrap();
+    assert_eq!(ch1.next_response().await.unwrap_err(), "TX_STALE");
+    assert_eq!(ch2.read(&f2, 7, 4).await.unwrap(), b"body");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fill_that_hears_the_sources_revoke_fails_and_evicts_the_adoption() {
+    let server = TestServer::start().await;
+    let (a, mut ea, _b, mut eb) = adopted_pair(&server).await;
+
+    let (tx_id, file_id) = publish_file(&a, &mut ea, "filled.bin", b"fill me").await;
+    eb.request(
+        "transactions.adopt",
+        json!({ "device_id": a.device_id(), "tx_id": tx_id }),
+    )
+    .await
+    .unwrap();
+    // The source revokes while NO channel is open on B: only a later gesture
+    // can discover the staleness.
+    ea.request("transactions.revoke", json!({ "tx_id": tx_id }))
+        .await
+        .unwrap();
+
+    eb.request("events.subscribe", json!({ "topics": ["transfers"] }))
+        .await
+        .unwrap();
+    let dest = _b.config_dir().join("never.bin");
+    eb.request(
+        "transactions.fill",
+        json!({ "tx_id": tx_id, "entries": [
+            { "file_id": file_id, "dest_path": dest.to_string_lossy() },
+        ] }),
+    )
+    .await
+    .expect("the fill starts; staleness surfaces as its outcome");
+    let failed = eb.wait_notification("transfer.failed").await;
+    assert_eq!(failed["error"], json!("TX_STALE"));
+
+    // And the discovery evicted the adopted entry: the next open refuses at
+    // the control plane instead of re-dialing a promise nobody backs.
+    eventually(
+        async || {
+            eb.request("transactions.open", json!({ "tx_id": &tx_id }))
+                .await
+                .err()
+                .is_some_and(|e| e.app_code() == "TX_STALE")
+        },
+        "the adopted entry is evicted after the fill's TX_STALE",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn co_adopters_survive_each_others_teardown() {
+    let server = TestServer::start().await;
+    let (a, mut ea, b, mut eb) = adopted_pair(&server).await;
+    let mut other = net_producer(&b).await;
+
+    let (tx_id, file_id) = publish_file(&a, &mut ea, "shared.bin", b"co-owned").await;
+    // `other` adopts FIRST, `eb` joins: the entry is co-owned, and neither
+    // grant hangs on the other's connection.
+    other
+        .request(
+            "transactions.adopt",
+            json!({ "device_id": a.device_id(), "tx_id": tx_id }),
+        )
+        .await
+        .unwrap();
+    eb.request(
+        "transactions.adopt",
+        json!({ "device_id": a.device_id(), "tx_id": tx_id }),
+    )
+    .await
+    .unwrap();
+
+    let token = open_token(&mut eb, &tx_id).await;
+    let mut ch = b.open_channel(&token).await;
+    assert_eq!(ch.read(&file_id, 0, 8).await.unwrap(), b"co-owned");
+
+    // The FIRST adopter leaves: the second's open session and future opens
+    // survive - its grant lives with its own connection.
+    drop(other);
+    assert_eq!(ch.read(&file_id, 3, 5).await.unwrap(), b"owned");
+    open_token(&mut eb, &tx_id).await;
+
+    // The LAST owner leaving is what removes the entry.
+    drop(eb);
+    let mut fresh = net_producer(&b).await;
+    eventually(
+        async || {
+            fresh
+                .request("transactions.open", json!({ "tx_id": &tx_id }))
+                .await
+                .err()
+                .is_some_and(|e| e.app_code() == "TX_STALE")
+        },
+        "the entry dies with its last owner",
+    )
+    .await;
+}

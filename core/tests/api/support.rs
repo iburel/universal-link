@@ -397,9 +397,13 @@
 //!   (`tx_fetch` → `tx_manifest` | `tx_error` on the data plane), re-validates
 //!   the manifest fail-closed (`validate_remote_manifest` - a hostile record
 //!   installs nothing, `TX_STALE`), and returns the record. Idempotent while
-//!   installed. A clipboard transaction is not adoptable (`TX_STALE`,
-//!   indistinguishable from unknown). A source-side revoke reaches remote
-//!   consumers as a relayed `TX_STALE` and EVICTS the adopted entry.
+//!   installed - a re-adopt JOINS the entry's owners, so an entry several
+//!   components adopted is co-owned and dies with the LAST of them, never
+//!   with somebody else's connection. A clipboard transaction is not
+//!   adoptable (`TX_STALE`, indistinguishable from unknown). A source-side
+//!   revoke reaches remote consumers as a relayed `TX_STALE` and EVICTS the
+//!   adopted entry - and an adopt that hears the source's own `TX_STALE`
+//!   evicts what it holds too.
 //!
 //! Peer messages between same-role components (#83, `peers.rs`):
 //! - `peers.send { device_id, payload }`, scope `peers.message`, any role.
@@ -1420,12 +1424,24 @@ impl TestComponent {
     /// Sends a JSON-RPC request and waits for its response. The notifications
     /// received in the meantime are buffered.
     pub async fn request(&mut self, method: &str, params: Value) -> Result<Value, RpcError> {
+        self.request_within(method, params, RESPONSE_TIMEOUT).await
+    }
+
+    /// Like `request`, with a caller-chosen response budget - for the rare
+    /// test whose legitimate answer only arrives after a Core-side timeout
+    /// (the sync facade's 10 s forward budget).
+    pub async fn request_within(
+        &mut self,
+        method: &str,
+        params: Value,
+        budget: Duration,
+    ) -> Result<Value, RpcError> {
         self.next_id += 1;
         let id = self.next_id;
         let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         self.send_frame(&msg.to_string()).await;
 
-        timeout(RESPONSE_TIMEOUT, async {
+        timeout(budget, async {
             loop {
                 let v = self.recv_json().await;
                 if v.get("method").is_some() {

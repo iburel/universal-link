@@ -657,10 +657,12 @@ is never the current clip, is superseded by nothing, and is invisible to
 
 What "long-lived" means, exactly: no automatic expiry and no supersession -
 not immortality. A published transaction ends with `transactions.revoke`,
-with its OWNER's connection (the publisher on the source, the adopter on a
-destination: a grant dies with its holder, and re-publishing or re-adopting
-after a reconnect is cheap), and with everything else at logout or Core
-stop. Nothing survives a Core restart; the producer republishes.
+with its owners' connections (the publisher on the source; on a destination
+the adopters, and an entry several components adopted is co-owned - each
+grant dies with ITS holder, the entry with the last of them; re-publishing
+or re-adopting after a reconnect is cheap), and with everything else at
+logout or Core stop. Nothing survives a Core restart; the producer
+republishes.
 
 Consumption is the untouched machinery: `transactions.open`,
 `transactions.fill`, the data channel and its range reads, `FILE_CHANGED`

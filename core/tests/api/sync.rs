@@ -198,3 +198,79 @@ async fn sync_emit_is_the_backends_privilege_and_checks_its_shape() {
         assert_eq!(err.code, -32602);
     }
 }
+
+#[tokio::test]
+async fn an_approve_of_a_second_sync_backend_keeps_the_request_pending() {
+    let core = TestCore::start().await;
+    let _official = backend(&core).await;
+    let mut g = gui(&core).await;
+    let mut third = pending_component(&core, "third-engine", "sync-backend", &["sync.serve"]).await;
+    let p = g.expect_notification("component.pending").await;
+    let request_id = p["request_id"].as_str().expect("request_id");
+
+    let err = g
+        .request(
+            "components.approve",
+            json!({ "request_id": request_id, "scopes": ["sync.serve"] }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.app_code(), "ROLE_CONFLICT");
+
+    // The request survives the conflict, approvable once the slot frees.
+    let list = g
+        .request("components.pending", json!({}))
+        .await
+        .expect("components.pending");
+    assert_eq!(list.as_array().expect("list").len(), 1);
+    third.assert_silent().await;
+}
+
+#[tokio::test]
+async fn the_backend_calling_the_facade_is_answered_absent_at_once() {
+    let core = TestCore::start().await;
+    // A backend that also holds a facade scope: forwarding to ONESELF would
+    // enqueue a request its own blocked dispatch could never answer, so the
+    // Core refuses immediately rather than burning the whole forward budget.
+    let mut engine = spawn_component(
+        &core,
+        "sync-engine",
+        "sync-backend",
+        &["sync.serve", "sync.read"],
+    )
+    .await;
+    let err = engine.request("sync.status", json!({})).await.unwrap_err();
+    assert_eq!(err.app_code(), "COMPONENT_ABSENT");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_backend_reads_as_absent_and_its_late_reply_is_dropped() {
+    let core = TestCore::start().await;
+    let mut engine = backend(&core).await;
+    let mut ui = interface(&core).await;
+
+    // The backend reads the forward but never answers: the caller gets
+    // COMPONENT_ABSENT once the Core's forward budget (10 s) runs out.
+    let ask = ui.request_within(
+        "sync.pause",
+        json!({ "set": "s1" }),
+        std::time::Duration::from_secs(20),
+    );
+    let serve = async {
+        let (id, _) = engine.expect_request("sync.pause").await;
+        id
+    };
+    let (reply, id) = tokio::join!(ask, serve);
+    assert_eq!(reply.unwrap_err().app_code(), "COMPONENT_ABSENT");
+
+    // A very late reply is a stray, dropped by the reclaimed waiter; the
+    // facade still round-trips cleanly afterwards.
+    engine.respond(id, json!({ "too": "late" })).await;
+    let ask = ui.request("sync.status", json!({}));
+    let serve = async {
+        let (id, _) = engine.expect_request("sync.status").await;
+        engine.respond(id, json!({ "sets": [] })).await;
+    };
+    let (reply, ()) = tokio::join!(ask, serve);
+    assert_eq!(reply.expect("clean round-trip"), json!({ "sets": [] }));
+}

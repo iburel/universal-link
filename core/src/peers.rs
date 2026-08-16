@@ -116,7 +116,9 @@ pub(crate) async fn recv(
     let delivered = deliver(&state, &peer_node_id, &first);
     let ack = serde_json::to_vec(&json!({ "type": "peer_ack", "delivered": delivered }))
         .expect("serialize peer_ack");
-    let _ = dataplane::write_frame(&mut stream, &ack).await;
+    // No-progress bound on the reply, like every responder: a peer that never
+    // grants credit must not pin this handler's slot.
+    let _ = crate::datachannel::bounded(dataplane::write_frame(&mut stream, &ack)).await;
     let _ = stream.shutdown().await;
     let _ = timeout(LINGER, dataplane::drain(&mut stream)).await;
 }

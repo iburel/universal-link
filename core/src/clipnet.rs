@@ -603,21 +603,44 @@ pub(crate) async fn pipe_consumer<R, W>(
     // Downstream: the source's frames → the consumer, plus the terminal
     // conditions. The sole writer of consumer-facing errors.
     let down = async {
+        // The reset `Notify` wakes EVERY session (Core stop, logout, or a
+        // targeted `transactions.revoke`); only the sessions whose entry is
+        // gone are cut. `notify_waiters` stores no permit, so the waiter must
+        // be LATCHED across every await in this loop (the relay write to the
+        // consumer included): pinned, enabled before the first liveness
+        // check, and re-armed BEFORE each re-check - a wake landing in any
+        // gap is then seen either by the check or by the fresh waiter.
+        let mut reset = std::pin::pin!(state.clipboard_reset.notified());
+        reset.as_mut().enable();
+        if !state
+            .clipboard
+            .lock()
+            .expect("lock clipboard")
+            .is_live(tx_id)
+        {
+            let _ = datachannel::write_error(&mut consumer_write, "TX_STALE").await;
+            return;
+        }
         loop {
-            let msg = tokio::select! {
-                biased;
-                // The reset `Notify` wakes EVERY session (Core stop, logout, or
-                // a targeted `transactions.revoke`): re-check whether OUR
-                // destination-side entry is the one that is gone - a wake for
-                // someone else's revocation re-arms and keeps relaying.
-                _ = state.clipboard_reset.notified() => {
-                    if state.clipboard.lock().expect("lock clipboard").is_live(tx_id) {
-                        continue;
+            // One frame from the source, KEPT IN FLIGHT across wakes for
+            // someone else's revocation: `read_msg` is not cancel-safe, and
+            // dropping it mid-frame would desynchronize the relay.
+            let mut read =
+                std::pin::pin!(datachannel::bounded(datachannel::read_msg(&mut net_read)));
+            let msg = loop {
+                tokio::select! {
+                    biased;
+                    _ = reset.as_mut() => {
+                        reset.set(state.clipboard_reset.notified());
+                        reset.as_mut().enable();
+                        if state.clipboard.lock().expect("lock clipboard").is_live(tx_id) {
+                            continue;
+                        }
+                        let _ = datachannel::write_error(&mut consumer_write, "TX_STALE").await;
+                        return;
                     }
-                    let _ = datachannel::write_error(&mut consumer_write, "TX_STALE").await;
-                    return;
+                    m = read.as_mut() => break m,
                 }
-                m = datachannel::bounded(datachannel::read_msg(&mut net_read)) => m,
             };
             match msg {
                 Ok(Some((tag, payload))) => {
@@ -709,11 +732,34 @@ pub(crate) async fn run_fill(
         return;
     };
 
+    // A fill is a session: a revocation must cut it too, not only the consumer
+    // channels. The watcher latches the reset wake (pinned + enabled, liveness
+    // checked before each park so a wake in the re-arm gap is never lost) and
+    // resolves only when OUR transaction is gone - a wake for someone else's
+    // revocation parks again.
+    let revoked = async {
+        let mut reset = std::pin::pin!(state.clipboard_reset.notified());
+        reset.as_mut().enable();
+        loop {
+            if !state
+                .clipboard
+                .lock()
+                .expect("lock clipboard")
+                .is_live(&tx_id)
+            {
+                return;
+            }
+            reset.as_mut().await;
+            reset.set(state.clipboard_reset.notified());
+            reset.as_mut().enable();
+        }
+    };
     // `biased` + fill FIRST: on a tie, a completed fill is not reported
-    // cancelled.
+    // cancelled (nor cut by a revocation that lost the race).
     let outcome = tokio::select! {
         biased;
         r = fill_entries(&state, &tx_id, &mode, &plan, &transfer_id) => r,
+        _ = revoked => Err("TX_STALE".to_string()),
         _ = cancel.notified() => Err("cancelled".to_string()),
     };
     state
@@ -1011,7 +1057,13 @@ pub(crate) async fn serve_tx_fetch(
         bytes = serde_json::to_vec(&json!({ "type": "tx_error", "code": "MANIFEST_TOO_LARGE" }))
             .expect("serialize tx_error");
     }
-    if dataplane::write_frame(&mut stream, &bytes).await.is_err() {
+    // The reply can be a whole manifest: a peer that never grants stream
+    // credit must not pin this handler's slot forever (the accept loop's
+    // budget) - the house no-progress bound, as every responder applies.
+    if datachannel::bounded(dataplane::write_frame(&mut stream, &bytes))
+        .await
+        .is_err()
+    {
         return;
     }
     // QUIC lifecycle: hold the reply until the initiator closes.
@@ -1053,6 +1105,13 @@ pub(crate) async fn adopt(
                 Some("MANIFEST_TOO_LARGE") => "MANIFEST_TOO_LARGE",
                 _ => "TX_STALE",
             };
+            // The source's own word that it no longer backs the id: a record
+            // this Core already installed (a re-adopt probing after a
+            // reconnect) is a promise nobody backs - evict it, exactly as a
+            // relayed TX_STALE would.
+            if code == "TX_STALE" {
+                evict_stale_published(state, tx_id);
+            }
             return Err(RpcErr::app(code));
         }
         _ => return Err(RpcErr::app("TX_STALE")),
@@ -1074,7 +1133,9 @@ pub(crate) async fn adopt(
         formats: Vec::new(),
         files,
         sensitive: false,
-        producer: Producer::Published { owner },
+        producer: Producer::Published {
+            owners: vec![owner],
+        },
         origin: Origin::Remote {
             node_id: peer.node_id.clone(),
             device_id: device_id.to_string(),
