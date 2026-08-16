@@ -12,11 +12,16 @@
 //! (the sync keypair that signs membership records) and the persistent store.
 
 pub mod canonical;
+pub mod clock;
 pub mod identity;
+pub mod index;
 pub mod membership;
 pub mod orchestrator;
 pub mod records;
+pub mod scan;
 pub mod store;
+pub mod vv;
+pub mod wirepath;
 
 pub use orchestrator::{Outcome, SERVED_METHODS, run};
 pub use store::Store;

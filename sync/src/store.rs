@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use crate::identity::Identity;
+use crate::index::SetIndex;
 use crate::membership::SetMembership;
 use crate::records::valid_set_id;
 
@@ -58,21 +59,50 @@ impl Store {
         &self.root
     }
 
-    /// Persists one set's state as `sets/<set_id>/meta.json`, atomically.
-    /// The membership nests under its own key; later bricks add siblings
-    /// (watermarks, the pending set, conflict records) to the same file.
-    pub fn save_set(&self, membership: &SetMembership) -> io::Result<()> {
-        let set_id = &membership.descriptor.set_id;
-        // The descriptor came through the strict parse, but this string is
-        // about to name a directory: the invariant is re-checked where it
-        // becomes a path.
+    /// The directory one set's files live under, created on first use. The
+    /// set_id is re-checked where it becomes a path, whatever parse it
+    /// already survived.
+    pub fn set_dir(&self, set_id: &str) -> io::Result<PathBuf> {
         if !valid_set_id(set_id) {
             return Err(io::Error::other("invalid set id"));
         }
         let dir = self.root.join("sets").join(set_id);
         std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    /// Persists one set's state as `sets/<set_id>/meta.json`, atomically.
+    /// The membership nests under its own key; later bricks add siblings
+    /// (watermarks, the pending set, conflict records) to the same file.
+    pub fn save_set(&self, membership: &SetMembership) -> io::Result<()> {
+        let dir = self.set_dir(&membership.descriptor.set_id)?;
         let meta = json!({ "membership": membership.to_value() });
         write_private_atomic(&dir.join("meta.json"), meta.to_string().as_bytes())
+    }
+
+    /// Persists one set's index as `sets/<set_id>/index.json`.
+    pub fn save_index(&self, set_id: &str, index: &SetIndex) -> io::Result<()> {
+        let dir = self.set_dir(set_id)?;
+        write_private_atomic(
+            &dir.join("index.json"),
+            index.to_value().to_string().as_bytes(),
+        )
+    }
+
+    /// Loads a set's index. `None` for an ABSENT file (loud-but-safe: the
+    /// lease keeps the clock monotonic and the rescan re-derives the tree);
+    /// a present-but-garbled index is an error, never a guess.
+    pub fn load_index(&self, set_id: &str) -> io::Result<Option<SetIndex>> {
+        let dir = self.set_dir(set_id)?;
+        let path = dir.join("index.json");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let corrupt = || io::Error::other(format!("corrupt {}", path.display()));
+        let doc: Value = serde_json::from_str(&text).map_err(|_| corrupt())?;
+        Ok(Some(SetIndex::from_value(&doc).ok_or_else(corrupt)?))
     }
 
     /// Loads every persisted set. Corruption is an ERROR, not a shrug: a
