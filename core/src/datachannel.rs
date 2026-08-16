@@ -203,9 +203,14 @@ where
 {
     loop {
         let (tag, payload) = tokio::select! {
-            // A clipboard-wide reset (Core stop, logout): the transaction is
-            // gone — cut the session with `TX_STALE`.
+            // The reset `Notify` wakes EVERY session (Core stop, logout, or a
+            // targeted `transactions.revoke`): re-check whether OUR transaction
+            // is the one that is gone - only then is this session cut. A wake
+            // for someone else's revocation re-arms and keeps serving.
             _ = state.clipboard_reset.notified() => {
+                if state.clipboard.lock().expect("lock clipboard").is_live(tx_id) {
+                    continue;
+                }
                 let _ = write_error(&mut write, "TX_STALE").await;
                 break;
             }

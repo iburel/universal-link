@@ -41,7 +41,7 @@ const ROLES: [&str; 5] = ["gui", "clipboard-backend", "menu-backend", "tray", "c
 /// A single clipboard backend active at a time (doc/core-api.md, "Roles").
 const EXCLUSIVE_ROLE: &str = "clipboard-backend";
 
-const SCOPES: [&str; 10] = [
+const SCOPES: [&str; 11] = [
     "session.read",
     "session.manage",
     "devices.read",
@@ -50,6 +50,7 @@ const SCOPES: [&str; 10] = [
     "transfers.read",
     "clipboard.read",
     "clipboard.write",
+    "transactions.publish",
     "components.approve",
     "system.shutdown",
 ];
@@ -365,6 +366,9 @@ impl Conn {
             "clipboard.current" => self.clipboard_current(),
             "transactions.open" => self.transactions_open(params),
             "transactions.fill" => self.transactions_fill(params),
+            "transactions.publish" => self.transactions_publish(params),
+            "transactions.revoke" => self.transactions_revoke(params),
+            "transactions.adopt" => self.transactions_adopt(params).await,
             "system.shutdown" => self.system_shutdown(),
             _ => {
                 // Phase first: an unenrolled component learns nothing about
@@ -1308,6 +1312,7 @@ impl Conn {
             formats,
             files,
             sensitive,
+            producer: crate::clipboard::Producer::Clipboard,
             origin: crate::clipboard::Origin::Local {
                 announcer: self.conn_id,
             },
@@ -1366,17 +1371,117 @@ impl Conn {
             .current_record())
     }
 
+    /// Publishes a LONG-LIVED transaction over `paths` (doc/core-api.md,
+    /// "Transactions"): the very manifest freeze and guards of a clipboard
+    /// announce, but OUTSIDE the election - the current clip is untouched,
+    /// nothing supersedes the published transaction, and it serves any number
+    /// of sessions until `transactions.revoke`, until this connection closes (a
+    /// grant dies with its holder), or until the account's grants die with the
+    /// session (logout / Core stop). Guarded by the producer scope alone, no
+    /// role: any component may be a producer.
+    fn transactions_publish(&self, params: &Value) -> Result<Value, RpcErr> {
+        self.require_scope("transactions.publish")?;
+        let paths = rpc::required_str_array(params, "paths")?;
+        if paths.is_empty() {
+            return Err(RpcErr::invalid_params("paths"));
+        }
+        let files = crate::clipboard::freeze_manifest(&paths)?;
+        let device_id = self
+            .state
+            .session
+            .lock()
+            .expect("lock session")
+            .own_device_id
+            .clone();
+        let tx = crate::clipboard::Transaction {
+            tx_id: format!("tx_{}", random_hex(16)),
+            device_id,
+            seq: 0, // outside the election: never compared
+            // Files-only by construction: a `FETCH` answers `FORMAT_UNKNOWN`,
+            // and no inline pull ever reaches the publisher (which is not a
+            // clipboard backend and answers no `clipboard.get_data`).
+            formats: Vec::new(),
+            files,
+            sensitive: false,
+            producer: crate::clipboard::Producer::Published {
+                owner: self.conn_id,
+            },
+            origin: crate::clipboard::Origin::Local {
+                announcer: self.conn_id,
+            },
+            superseded: false,
+            sessions: 0,
+            materialized: std::collections::HashMap::new(),
+        };
+        // The publisher gets the full frozen record back - relative wire paths
+        // and Core-assigned `file_id`s, never the source paths: the manifest it
+        // will speak to its peers about, exactly what an adopter installs.
+        let record = {
+            let mut cb = self.state.clipboard.lock().expect("lock clipboard");
+            let tx_id = cb.publish(tx);
+            cb.published_record(&tx_id).expect("just published")
+        };
+        Ok(record)
+    }
+
+    /// Revokes a published transaction: the right to read ends NOW - open
+    /// channels are cut with `TX_STALE` (the same cutting path a logout takes)
+    /// and new opens refuse. Idempotent on an unknown `tx_id` (a revoke retried
+    /// after a timeout, or racing the publisher's own teardown, is not an
+    /// error); a CLIPBOARD transaction is `-32602` - its lifecycle belongs to
+    /// the election, not to a revoker.
+    fn transactions_revoke(&self, params: &Value) -> Result<Value, RpcErr> {
+        self.require_scope("transactions.publish")?;
+        let tx_id = rpc::required_str(params, "tx_id")?;
+        let removed = self
+            .state
+            .clipboard
+            .lock()
+            .expect("lock clipboard")
+            .revoke(&tx_id)?;
+        if removed {
+            self.state.clipboard_reset.notify_waiters();
+        }
+        Ok(json!({}))
+    }
+
+    /// Installs a transaction PUBLISHED on another device of the account, so
+    /// the untouched consumer machinery (`transactions.open`, `transactions.fill`,
+    /// the data channel) can then reach it: fetches the frozen manifest from
+    /// the source (`tx_fetch` on the data plane), re-validates it fail-closed
+    /// (exactly like a remote clip announce), and returns the installed record.
+    /// The entry dies with this connection, like a published one - re-adopting
+    /// after a reconnect is cheap and idempotent.
+    async fn transactions_adopt(&self, params: &Value) -> Result<Value, RpcErr> {
+        self.require_scope("transactions.publish")?;
+        let device_id = rpc::required_str(params, "device_id")?;
+        let tx_id = rpc::required_str(params, "tx_id")?;
+        crate::clipnet::adopt(&self.state, self.conn_id, &device_id, &tx_id).await
+    }
+
     /// Opens a consumer channel for `tx_id`: mints an unguessable `channel_token`
     /// bound to this component (peer credentials). The transaction must be
     /// openable — a superseded clip accepts no NEW session (`TX_STALE`). The
     /// session itself begins when the data channel attaches with the token.
+    /// Consuming requires the scope of the transaction's PRODUCER
+    /// (doc/core-api.md, "Transactions"): `clipboard.read` for a clipboard
+    /// transaction, `transactions.publish` for a published one. A caller
+    /// holding neither learns nothing (`SCOPE_DENIED` before any lookup).
     fn transactions_open(&self, params: &Value) -> Result<Value, RpcErr> {
-        self.require_scope("clipboard.read")?;
+        let scopes = self.require_enrolled()?;
+        let has = |s: &str| scopes.iter().any(|x| x == s);
+        if !has("clipboard.read") && !has("transactions.publish") {
+            return Err(RpcErr::app("SCOPE_DENIED"));
+        }
         let tx_id = rpc::required_str(params, "tx_id")?;
         let (origin, materialized) = {
             let cb = self.state.clipboard.lock().expect("lock clipboard");
             if !cb.is_openable(&tx_id) {
                 return Err(RpcErr::app("TX_STALE"));
+            }
+            let needed = cb.consume_scope_of(&tx_id).expect("openable transaction");
+            if !has(needed) {
+                return Err(RpcErr::app("SCOPE_DENIED"));
             }
             (cb.origin_of(&tx_id), cb.is_materialized(&tx_id))
         };
@@ -1422,15 +1527,24 @@ impl Conn {
     /// parents and writes them directly (an OS-watched skeleton admits no
     /// temp+rename). The `file_id`s must be non-`dir` manifest entries.
     fn transactions_fill(&self, params: &Value) -> Result<Value, RpcErr> {
-        self.require_scope("clipboard.read")?;
+        // Same per-producer consuming scope as `transactions.open`.
+        let scopes = self.require_enrolled()?;
+        let has = |s: &str| scopes.iter().any(|x| x == s);
+        if !has("clipboard.read") && !has("transactions.publish") {
+            return Err(RpcErr::app("SCOPE_DENIED"));
+        }
         let tx_id = rpc::required_str(params, "tx_id")?;
         let entries = parse_fill_entries(params)?;
-        let plan = self
-            .state
-            .clipboard
-            .lock()
-            .expect("lock clipboard")
-            .fill_plan(&tx_id, &entries)?;
+        let plan = {
+            let cb = self.state.clipboard.lock().expect("lock clipboard");
+            let needed = cb
+                .consume_scope_of(&tx_id)
+                .ok_or_else(|| RpcErr::app("TX_STALE"))?;
+            if !has(needed) {
+                return Err(RpcErr::app("SCOPE_DENIED"));
+            }
+            cb.fill_plan(&tx_id, &entries)?
+        };
         let (transfer_id, cancel) = self
             .state
             .transfers
@@ -1500,14 +1614,30 @@ impl Conn {
     /// Removes the connection from the registry, and its pending enrollment
     /// request if any (a requester that has left has nothing left to approve).
     fn teardown(&mut self) {
-        let mut reg = self.state.registry.lock().expect("lock registry");
-        if let Some(entry) = reg.conns.remove(&self.conn_id)
-            && let Phase::Pending(request_id) = entry.phase
         {
-            reg.pending.remove(&request_id);
+            let mut reg = self.state.registry.lock().expect("lock registry");
+            if let Some(entry) = reg.conns.remove(&self.conn_id)
+                && let Phase::Pending(request_id) = entry.phase
+            {
+                reg.pending.remove(&request_id);
+            }
+            // Reclaim any data-channel token this connection minted but that
+            // never attached (an abandoned paste): otherwise the grant would
+            // linger.
+            reg.drop_channel_tokens_of(self.conn_id);
         }
-        // Reclaim any data-channel token this connection minted but that never
-        // attached (an abandoned paste): otherwise the grant would linger.
-        reg.drop_channel_tokens_of(self.conn_id);
+        // A published transaction dies with its publisher, an adopted one with
+        // its adopter (a grant dies with its holder - and without this, a Core
+        // that never restarts would accumulate orphans no supersession sweeps).
+        // Leaf lock, taken alone, after the registry's is released.
+        let removed = self
+            .state
+            .clipboard
+            .lock()
+            .expect("lock clipboard")
+            .revoke_owned_by(self.conn_id);
+        if removed {
+            self.state.clipboard_reset.notify_waiters();
+        }
     }
 }

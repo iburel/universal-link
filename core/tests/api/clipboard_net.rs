@@ -936,14 +936,18 @@ async fn core_with_raw_peer(server: &TestServer) -> (TestCore, TestComponent, Ra
     (b, cb, raw)
 }
 
-struct RawPeer {
-    device_id: String,
-    transport: Arc<MemoryTransport>,
+pub(crate) struct RawPeer {
+    pub(crate) device_id: String,
+    pub(crate) transport: Arc<MemoryTransport>,
     _conn: TestConn,
 }
 
 impl RawPeer {
-    async fn attested(server: &TestServer, switchboard: &MemorySwitchboard, code: &str) -> RawPeer {
+    pub(crate) async fn attested(
+        server: &TestServer,
+        switchboard: &MemorySwitchboard,
+        code: &str,
+    ) -> RawPeer {
         let key = DeviceKey::generate();
         let mut conn = server.connect_direct().await;
         let device_id = enroll_key(
@@ -981,7 +985,10 @@ impl RawPeer {
     /// real Core would answer it, and a peer that goes quiet instead is exactly
     /// what dirsync tolerates by design — rather than mistaken for the stream
     /// the test is staging.
-    async fn next_stream_of(&self, wanted: &str) -> Option<Box<dyn onedevice_core::IoStream>> {
+    pub(crate) async fn next_stream_of(
+        &self,
+        wanted: &str,
+    ) -> Option<Box<dyn onedevice_core::IoStream>> {
         loop {
             let Ok((_peer, mut stream)) = self.transport.accept().await else {
                 return None;

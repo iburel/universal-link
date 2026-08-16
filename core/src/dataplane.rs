@@ -1196,6 +1196,7 @@ async fn serve_incoming(
         Some("clip_announce") => crate::clipnet::recv_announce(state, peer, first, stream).await,
         Some("clip_push") => crate::clipnet::recv_push(state, peer, first, stream).await,
         Some("clip_session") => crate::clipnet::serve_session(state, first, stream).await,
+        Some("tx_fetch") => crate::clipnet::serve_tx_fetch(state, first, stream).await,
         Some("dir_sync") => crate::dirsync::recv_sync(state, peer, first, stream).await,
         other => {
             tracing::debug!(peer = %peer, kind = ?other, "unknown incoming frame type: abandoned");

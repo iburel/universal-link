@@ -368,6 +368,38 @@
 //!   sponsors over the local network; the joiner joins the ACCOUNT, not the
 //!   deployment. `pairing.offer` on that device still goes through the server —
 //!   the `1D1` path is what also enrolls the newcomer on the deployment.
+//!
+//! Published transactions - the generic long-lived producer (#83,
+//! `transactions.rs`):
+//! - `transactions.publish { paths[] }` → the frozen record (`tx_id`, `files`
+//!   with Core-assigned `file_id`s and relative wire paths - never the source
+//!   paths). Guarded by the `transactions.publish` scope ALONE, any role
+//!   (unlike announcing, the exclusive backend's privilege). Empty `paths` →
+//!   `-32602`; the walk's guards (caps, wire-safe names, whole-publish
+//!   refusal) are the clipboard announce's, unchanged.
+//! - A published transaction lives OUTSIDE the election: never the current
+//!   clip, never superseded, absent from `clipboard.current` and from
+//!   `clip_announce`. Its ends: `transactions.revoke`, its OWNER connection
+//!   closing (publisher or adopter - a grant dies with its holder), and the
+//!   logout/stop cut with everything else. It does NOT survive a Core restart
+//!   (nothing does; the producer republishes).
+//! - Consuming requires the scope of the PRODUCER: `clipboard.read` for a
+//!   clipboard transaction, `transactions.publish` for a published one - a
+//!   holder of neither gets `SCOPE_DENIED` before any lookup; the wrong one of
+//!   the two gets `SCOPE_DENIED` after it (and `TX_STALE` on an unknown id).
+//! - `transactions.revoke { tx_id }` cuts open channels NOW (`TX_STALE`
+//!   pushed, the logout path - the reset `Notify` wakes every session and each
+//!   re-checks its OWN transaction, so a targeted revoke spares the others).
+//!   Idempotent on an unknown id; `-32602` on a clipboard transaction.
+//! - `transactions.adopt { device_id, tx_id }` installs a transaction
+//!   published on another device: dials the resolved, attested source
+//!   (`DEVICE_UNKNOWN` / `DEVICE_OFFLINE` as `files.send`), fetches the record
+//!   (`tx_fetch` → `tx_manifest` | `tx_error` on the data plane), re-validates
+//!   the manifest fail-closed (`validate_remote_manifest` - a hostile record
+//!   installs nothing, `TX_STALE`), and returns the record. Idempotent while
+//!   installed. A clipboard transaction is not adoptable (`TX_STALE`,
+//!   indistinguishable from unknown). A source-side revoke reaches remote
+//!   consumers as a relayed `TX_STALE` and EVICTS the adopted entry.
 
 #![allow(dead_code)]
 
