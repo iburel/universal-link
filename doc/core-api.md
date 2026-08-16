@@ -663,13 +663,19 @@ Constraints keep it a narrow, safe extension:
 Because the source may vanish the instant the push completes, it has to know
 *when* that is. The announce therefore answers `pushed_to` — how many of the
 account's other devices the fan-out targets — and, when that is non-zero, the
-Core sends exactly one `clipboard.pushed { tx_id, delivered, failed }` on the
-announcing connection once every push has settled. That is the completion
-signal an ephemeral source waits on before exiting, and it is deliberately
-*reporting*, not a guarantee: `pushed_to: 0` means nothing was shared at all,
-`delivered: 0` means no device could be reached, and a device that was offline
-at copy time never learns the clip. A source that does not care may ignore both
-— the local transaction is unaffected.
+Core sends exactly one `clipboard.pushed { tx_id, delivered, failed,
+no_direct_path }` on the announcing connection once every push has settled.
+That is the completion signal an ephemeral source waits on before exiting,
+and it is deliberately *reporting*, not a guarantee: `pushed_to: 0` means
+nothing was shared at all, `delivered: 0` means no device could be reached,
+and a device that was offline at copy time never learns the clip.
+`no_direct_path` is the subset of `failed` refused by the deployment's
+announced relay role (#88): those devices are online and were told the clip
+exists through a fallback metadata announce (their paste then speaks the
+policy's code, or rides a direct path if one forms); only the pushed bytes
+needed a direct path, and an interface words that remedy apart from "could
+not be reached". A source that does not care may ignore the report, the
+local transaction being unaffected.
 
 Supersession and the Core-stop/logout cut drop the cached bytes with the
 transaction, like any other: a materialized clip is deleted (and its bytes
@@ -778,14 +784,16 @@ implementation time):
     request; the channel stays usable)
   - Core → component: `DATA { offset, bytes }`, `EOF`, `ERROR { code }`
     (`TX_STALE`, `CLIP_STALE`, `FILE_CHANGED`, `FILE_UNKNOWN`,
-    `FORMAT_UNKNOWN`, `PEER_GONE`, `TIMEOUT`)
+    `FORMAT_UNKNOWN`, `PEER_GONE`, `NO_DIRECT_PATH`, `TIMEOUT`)
   - Every request is answered by `DATA*` then `EOF` — `EOF` terminates the
     *response*, not the file: a `READ` crossing the end of the file returns
     the intersection (possibly zero bytes) then `EOF`. `DATA` arrives in
     order; `offset` is absolute (file-relative for `READ`, 0-based for
     `FETCH`). An `ERROR` ends only the request — the channel stays usable —
-    except `TX_STALE` and `PEER_GONE`, which end the session: the Core closes
-    the channel. `READ` on a `dir` entry → `FILE_UNKNOWN` (a directory conveys
+    except `TX_STALE`, `PEER_GONE` and `NO_DIRECT_PATH` (#88: the sized open
+    to the source was refused by the announced relay role, before any
+    request could be served), which end the session: the Core closes the
+    channel. `READ` on a `dir` entry → `FILE_UNKNOWN` (a directory conveys
     the tree; it has no bytes).
 - **Provider channel** (source side, token carried by `clipboard.get_data`) —
   the backend writes the requested blob: `DATA*` then `EOF`, or `ERROR { code }`

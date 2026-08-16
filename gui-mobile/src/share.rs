@@ -571,6 +571,10 @@ async fn share_text(
                     "phase": "done",
                     "delivered": report["delivered"].as_u64().unwrap_or(0),
                     "failed": report["failed"].as_u64().unwrap_or(targets),
+                    // Subset of `failed` refused by the announced relay role
+                    // (#88): worded apart, its remedy is the pair's network,
+                    // not the device's liveness. Absent on an older Core.
+                    "no_direct_path": report["no_direct_path"].as_u64().unwrap_or(0),
                 }),
             );
         }

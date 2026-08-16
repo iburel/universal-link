@@ -67,6 +67,12 @@ pub enum ErrorCode {
     FormatUnknown,
     /// The remote source vanished mid-stream — **terminal**.
     PeerGone,
+    /// The deployment's relays are rendezvous-only above a cap (#88) and no
+    /// direct path to the source formed. **Terminal**: the Core refused to
+    /// open the relay-borne session at all, so the channel closes right
+    /// after this frame. The remedy is the pair's (a shared network, a
+    /// VPN), not a retry on the same route.
+    NoDirectPath,
     /// The Core's stall budget elapsed — request scoped.
     Timeout,
     /// An unrecognized (or absent) code — forward-compatible.
@@ -85,6 +91,7 @@ impl ErrorCode {
             Some("FILE_UNKNOWN") => ErrorCode::FileUnknown,
             Some("FORMAT_UNKNOWN") => ErrorCode::FormatUnknown,
             Some("PEER_GONE") => ErrorCode::PeerGone,
+            Some("NO_DIRECT_PATH") => ErrorCode::NoDirectPath,
             Some("TIMEOUT") => ErrorCode::Timeout,
             Some(other) => ErrorCode::Other(other.to_string()),
             None => ErrorCode::Other(String::new()),
@@ -92,10 +99,15 @@ impl ErrorCode {
     }
 
     /// Whether this code ends the whole session (the Core closes the channel):
-    /// `TX_STALE` and `PEER_GONE`. Everything else is request-scoped — the
-    /// channel stays usable. Mirror of the Core's `error_ends_session`.
+    /// `TX_STALE`, `PEER_GONE` and `NO_DIRECT_PATH`. Everything else is
+    /// request-scoped, the channel stays usable. Mirror of the Core's
+    /// `error_ends_session`, plus the sized-open refusal (#88), which the
+    /// destination Core writes as its one and only frame before hanging up.
     pub fn is_terminal(&self) -> bool {
-        matches!(self, ErrorCode::TxStale | ErrorCode::PeerGone)
+        matches!(
+            self,
+            ErrorCode::TxStale | ErrorCode::PeerGone | ErrorCode::NoDirectPath
+        )
     }
 }
 

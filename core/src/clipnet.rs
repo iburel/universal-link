@@ -235,6 +235,15 @@ pub(crate) fn propagate_materialized(
     let blobs = Arc::new(blobs);
     let state = state.clone();
     tokio::spawn(async move {
+        /// How one peer's push ended. Ordered by what the report says about
+        /// it: a policy refusal is a failure WITH its own remedy, so it is
+        /// counted apart (`no_direct_path` in the report) instead of blending
+        /// into "could not reach", whose remedy points the wrong way.
+        enum Push {
+            Delivered,
+            Failed,
+            NoDirectPath,
+        }
         let mut pushes = tokio::task::JoinSet::new();
         for peer in peers {
             let state = state.clone();
@@ -242,30 +251,56 @@ pub(crate) fn propagate_materialized(
             let blobs = blobs.clone();
             pushes.spawn(async move {
                 match send_push(&state, &peer, &announce, &blobs).await {
-                    Ok(()) => true,
+                    Ok(()) => Push::Delivered,
+                    Err(e) if dataplane::failure_code(&e) == crate::dataplane::NO_DIRECT_PATH => {
+                        // The relays may not carry the bytes, but introducing
+                        // is exactly what they are for: fall back to a
+                        // metadata-only announce, so the destination learns
+                        // the clip exists and its paste speaks the policy's
+                        // own code (or rides a direct path if one forms)
+                        // instead of silently serving the previous clip.
+                        if let Err(e) = send_announce(&state, &peer, &announce).await {
+                            tracing::debug!(peer = %peer.node_id, error = %e,
+                                "fallback announce after a rendezvous-only refusal not delivered");
+                        }
+                        Push::NoDirectPath
+                    }
                     Err(e) => {
                         tracing::debug!(peer = %peer.node_id, error = %e, "materialized clip not pushed");
-                        false
+                        Push::Failed
                     }
                 }
             });
         }
         let mut delivered = 0usize;
         let mut failed = 0usize;
+        let mut no_direct_path = 0usize;
         while let Some(outcome) = pushes.join_next().await {
             // A push task that panicked counts as a failure, never a delivery:
             // the report must never over-promise.
             match outcome {
-                Ok(true) => delivered += 1,
-                Ok(false) | Err(_) => failed += 1,
+                Ok(Push::Delivered) => delivered += 1,
+                Ok(Push::NoDirectPath) => {
+                    failed += 1;
+                    no_direct_path += 1;
+                }
+                Ok(Push::Failed) | Err(_) => failed += 1,
             }
         }
         // The announcer may already be gone (that is the whole point of
-        // push-at-copy) — `notify_conn` is then a no-op.
+        // push-at-copy), `notify_conn` is then a no-op. `no_direct_path`
+        // counts the subset of `failed` the announced relay role refused
+        // (#88): those devices are online and introduced, only the bytes
+        // need a direct path, and the share sheet words that remedy.
         state.registry.lock().expect("lock registry").notify_conn(
             announcer,
             "clipboard.pushed",
-            &json!({ "tx_id": tx_id, "delivered": delivered, "failed": failed }),
+            &json!({
+                "tx_id": tx_id,
+                "delivered": delivered,
+                "failed": failed,
+                "no_direct_path": no_direct_path,
+            }),
         );
     });
     launched

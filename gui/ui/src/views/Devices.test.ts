@@ -365,6 +365,21 @@ test("a failed or cancelled send says so on the card", () => {
   );
 });
 
+// A fill relays the SOURCE device's error strings verbatim, and only the
+// local Core's own transfer codes own a sentence: a peer answering a READ
+// with an account-shaped code must not make this row assert account facts
+// ("struck from the account for good...") the peer never had authority on.
+test("a peer-shaped code renders verbatim, never as an account sentence", () => {
+  store.devices = [WIN, SELF];
+  store.transfers = [
+    transferTo("d_win", { status: "failed", error: "DEVICE_REVOKED" }),
+  ];
+  const view = render(Devices, { store, now: NOW });
+  const text = view.querySelector('[data-device-id="d_win"]')?.textContent ?? "";
+  expect(text).toContain("Send failed: DEVICE_REVOKED");
+  expect(text).not.toContain("struck from the account");
+});
+
 // A bare Core code in `transfer.failed` gets its sentence (#88): the phrase
 // blames the PAIR and names the remedies, instead of printing the code.
 test("a rendezvous-only refusal is worded, not printed as a code", () => {

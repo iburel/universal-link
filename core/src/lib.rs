@@ -396,20 +396,24 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
         }
     }
 
-    if let Some(info) = session_info {
-        start_session_task(&state, info);
-    }
-
     // The deployment's cached relay announcement (#105), handed to the
     // transport BEFORE anything can bind it: a Core that boots with the
     // server down still binds with the operator's relays - and keeps
     // honoring their announced role (#88). An empty cache announces nothing,
-    // which is exactly what an off default should hear.
+    // which is exactly what an off default should hear. Deliberately ABOVE
+    // the session task's spawn: the session is the one boot-time actor that
+    // can reach the bind (and refresh this very word), and the spawn is the
+    // happens-before edge that makes "before" structural rather than a race
+    // the boot thread usually wins.
     let cached = relays::load(&state.config_dir);
     if !cached.relays.is_empty() {
         state
             .transport
             .announce_relays(&cached.relays, cached.relay_max_payload);
+    }
+
+    if let Some(info) = session_info {
+        start_session_task(&state, info);
     }
 
     let accept_state = state.clone();

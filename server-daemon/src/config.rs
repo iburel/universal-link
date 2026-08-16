@@ -162,7 +162,10 @@ fn relay_max_payload(
 ) -> Option<u64> {
     const KEY: &str = "ONEDEVICE_RELAY_MAX_PAYLOAD";
     let raw = non_empty(env, KEY)?;
-    let cap = parse::<u64>(KEY, &raw, errors)?;
+    // No early return between the two checks: the orphan check depends only
+    // on the variable's presence, so a malformed value must not hide it
+    // until the next restart ("all errors at once", the module contract).
+    let cap = parse::<u64>(KEY, &raw, errors);
     if relays.is_empty() {
         errors.push(format!(
             "{KEY} needs ONEDEVICE_RELAYS: the cap states the role of the \
@@ -170,7 +173,7 @@ fn relay_max_payload(
         ));
         return None;
     }
-    Some(cap)
+    cap
 }
 
 /// Required variable: present and non-empty. A variable SET BUT EMPTY
@@ -470,6 +473,14 @@ mod tests {
         bad.push(("ONEDEVICE_RELAY_MAX_PAYLOAD", "a lot"));
         let err = load_from(&env_of(&bad)).expect_err("must fail");
         assert!(err.contains("ONEDEVICE_RELAY_MAX_PAYLOAD"), "{err}");
+
+        // Malformed AND orphaned: BOTH reported at the first restart, per
+        // the module contract (all errors at once, never one per restart).
+        let mut both = REQUIRED.to_vec();
+        both.push(("ONEDEVICE_RELAY_MAX_PAYLOAD", "a lot"));
+        let err = load_from(&env_of(&both)).expect_err("must fail");
+        assert!(err.contains("invalid"), "{err}");
+        assert!(err.contains("needs ONEDEVICE_RELAYS"), "{err}");
     }
 
     #[test]

@@ -131,15 +131,27 @@ export function pairingFailure(reason: string): string {
 }
 
 /**
+ * The codes the LOCAL Core mints on the transfer channel, and only those: a
+ * fill relays the source device's error strings verbatim, so consulting all
+ * of `APP_MESSAGES` here would let a hostile same-account source inject any
+ * of its sentences ("struck from the account for good...") into the
+ * victim's device row by answering a READ with that code. A peer-authored
+ * string falls through to the verbatim lead instead.
+ */
+const TRANSFER_MESSAGES: Record<string, string> = {
+  NO_DIRECT_PATH: APP_MESSAGES.NO_DIRECT_PATH,
+};
+
+/**
  * The sentence for a failed transfer's row. Mid-transfer failures arrive as
- * `transfer.failed { error }` - a bare code when the Core minted one (today
- * `NO_DIRECT_PATH`, #88), otherwise the error's own words; codes get their
- * `APP_MESSAGES` sentence, words are carried verbatim under the usual
- * "Send failed:" lead. (`cancelled` never reaches here - the row words a
- * cancellation itself, it is an outcome, not a failure.)
+ * `transfer.failed { error }` - a bare code when the local Core minted one
+ * (today `NO_DIRECT_PATH`, #88), otherwise the error's own words; local
+ * codes get their sentence, everything else is carried verbatim under the
+ * usual "Send failed:" lead. (`cancelled` never reaches here - the row
+ * words a cancellation itself, it is an outcome, not a failure.)
  */
 export function transferFailure(error: string): string {
-  return APP_MESSAGES[error] ?? `Send failed: ${error}`;
+  return TRANSFER_MESSAGES[error] ?? `Send failed: ${error}`;
 }
 
 /**

@@ -232,9 +232,14 @@ role - the meeting point for hole punching, a few KB per device per day -
 always stays; payloads up to the cap may still ride it, so clipboard-sized
 things keep working everywhere; anything larger requires the punched direct
 path, and when two devices genuinely cannot reach each other directly
-(symmetric NAT on both ends, double CGNAT) the operation fails with a clean
-sentence naming the remedies rather than silently riding your bandwidth.
-`0` is the strict form; unset keeps the historical fallback. Two notes:
+(symmetric NAT on both ends, double CGNAT) the operation fails cleanly
+rather than silently riding your bandwidth: file sends, fills and phone
+shares word the remedies on screen, and a refused remote paste stays empty
+with the code in the clipboard component's log. A clip that CONCEALS its
+size (a sensitive copy, whose length is deliberately never advertised)
+counts as over-cap: the strict form would otherwise police every sized clip
+while the secrets ride. `0` is the strict form; unset keeps the historical
+fallback. Two notes:
 
 - The cap is enforced by every device of the fleet, at the source. It is a
   policy, not a wall: pair it with the per-client rate limit shown in

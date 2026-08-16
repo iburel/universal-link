@@ -239,9 +239,11 @@ pub const ALPN: &[u8] = b"1device/data/1";
 
 /// Error vocabulary of [`PeerTransport::open_for_payload`] (#88): the message
 /// of the refusal STARTS with this marker (detail may follow after a colon).
-/// The Core surfaces the marker alone to the interfaces - as the
-/// `transfer.failed` error and as the `RpcErr` application code - and the GUI
-/// owns the sentence, like every code (doc/core-api.md).
+/// The Core surfaces the marker alone to the interfaces - as the bare
+/// `transfer.failed` error (sends and fills) and as the data-channel `ERROR`
+/// code (paste pipe); never in an RPC reply, the sized open happens after
+/// the call returned - and the GUI owns the sentence, like every code
+/// (doc/core-api.md).
 pub const NO_DIRECT_PATH: &str = "NO_DIRECT_PATH";
 
 /// Maximum size of a framed CONTROL frame (offer, acknowledgment, clip

@@ -105,10 +105,13 @@ async fn the_core_transfer_protocol_survives_real_quic() {
 /// waits for the punched direct path and then proceeds - on localhost the
 /// punch always lands, so this pins that the enforcement never
 /// false-refuses a pair that can meet directly, over the real QUIC
-/// lifecycle. (The refusal itself needs a pair that genuinely cannot
-/// hole-punch, which no offline test can stage: the surfacing of the code
-/// is proven against the in-memory double in the Core suite, and the real
-/// refusal belongs to live validation.)
+/// lifecycle. The `relay_cap` assertion pins the other half a green
+/// transfer cannot: the cap actually reached the enforcement (a bind that
+/// dropped it would make this very test pass by never gating at all). The
+/// refusal arm itself needs a pair that genuinely cannot hole-punch, which
+/// no offline test can stage: the surfacing of the code is proven against
+/// the in-memory double in the Core suite, and the real refusal belongs to
+/// live validation.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_over_cap_open_proceeds_once_the_punch_lands() {
     let (_relay_map, relay_url, _guard) = run_relay_server().await.expect("local relay");
@@ -122,6 +125,11 @@ async fn an_over_cap_open_proceeds_once_the_punch_lands() {
     let b = IrohTransport::bind_test_announced(seed_b, announced, Some(1024), false)
         .await
         .expect("endpoint B");
+    assert_eq!(
+        b.relay_cap(),
+        Some(1024),
+        "the announced cap must reach the enforcement"
+    );
 
     timeout(Duration::from_secs(15), async {
         tokio::join!(a.endpoint().online(), b.endpoint().online());

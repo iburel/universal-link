@@ -493,6 +493,16 @@ impl IrohTransport {
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
     }
+
+    /// The payload cap this endpoint enforces on its sized opens (#88), as
+    /// `resolve_relay` derived it at the bind. Test observability only: a
+    /// regression that stops plumbing the announced cap to the enforcement
+    /// would otherwise ship green, since the enforcing arm itself needs a
+    /// pair that cannot hole-punch, which no offline test can stage.
+    #[cfg(feature = "test-utils")]
+    pub fn relay_cap(&self) -> Option<u64> {
+        self.relay_max_payload
+    }
 }
 
 /// The mDNS lookup when `lan_discovery` is on, built ahead of the endpoint
@@ -1062,6 +1072,11 @@ impl PeerTransport for IrohTransport {
             };
             if let Some(cap) = over_cap {
                 require_direct(&conn, payload, cap).await?;
+                let (send, recv) = conn.open_bi().await.map_err(|e| wrap("open_bi", e))?;
+                // The policy stays armed for the stream's life: iroh would
+                // otherwise migrate a long transfer onto the surviving relay
+                // path if the direct one dies (see `bidi_policed`).
+                return Ok(bidi_policed(conn, send, recv, payload, cap));
             }
             let (send, recv) = conn.open_bi().await.map_err(|e| wrap("open_bi", e))?;
             Ok(bidi(conn, send, recv))
@@ -1148,12 +1163,140 @@ fn bidi(conn: Connection, send: SendStream, recv: RecvStream) -> Box<dyn IoStrea
     Box::new(BiStream {
         _conn: conn,
         io: tokio::io::join(recv, send),
+        policed: None,
+        watcher: None,
     })
+}
+
+/// `bidi` for an OVER-CAP stream (#88): the policy stays armed for the
+/// stream's whole life. iroh keeps the relay path open as a backup and
+/// migrates onto it if the direct path dies (roaming off Wi-Fi is the
+/// textbook case), which would put the remainder of a long transfer on the
+/// operator's relay with the open-time check long passed. A watcher task
+/// follows the connection's path events and, when no direct path is selected
+/// after a re-punch grace, closes the connection with the policy's own code;
+/// the flag it sets is what lets the stream's next error speak
+/// `NO_DIRECT_PATH` instead of a bare "connection lost".
+fn bidi_policed(
+    conn: Connection,
+    send: SendStream,
+    recv: RecvStream,
+    payload: u64,
+    cap: u64,
+) -> Box<dyn IoStream> {
+    let policed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher = tokio::spawn(watch_direct(conn.clone(), payload, cap, policed.clone()));
+    Box::new(BiStream {
+        _conn: conn,
+        io: tokio::io::join(recv, send),
+        policed: Some(policed),
+        watcher: Some(watcher.abort_handle()),
+    })
+}
+
+/// Whether the connection currently carries its application data over a
+/// direct IP path - the predicate `require_direct` waits on, re-checked live
+/// by the mid-stream watcher.
+fn direct_selected(conn: &Connection) -> bool {
+    conn.paths()
+        .iter()
+        .any(|path| path.is_ip() && path.is_selected())
+}
+
+/// The mid-stream half of the announced role (#88): follows the connection's
+/// path events and closes it (setting `policed` first, so the stream's error
+/// carries the code) when the selected path stops being direct and no direct
+/// path re-forms within the grace. Ends on its own when the connection
+/// closes; aborted by `BiStream::drop` so a finished stream leaves nothing
+/// behind. Every wake re-reads `paths()` rather than trusting the event's
+/// payload, so a `Lagged` event costs one re-check, never a missed
+/// migration.
+async fn watch_direct(
+    conn: Connection,
+    payload: u64,
+    cap: u64,
+    policed: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let mut events = conn.path_events();
+    loop {
+        // Wait for any path change; the event stream ends with the
+        // connection.
+        if events.next().await.is_none() {
+            return;
+        }
+        if direct_selected(&conn) {
+            continue;
+        }
+        // The direct path is gone: the same grace as the open-time check for
+        // a re-punch, still listening (a re-formed path breaks the wait),
+        // then the close the policy owes.
+        let deadline = tokio::time::sleep(DIRECT_PATH_GRACE);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                () = &mut deadline => {
+                    if direct_selected(&conn) {
+                        break;
+                    }
+                    tracing::warn!(
+                        payload, cap,
+                        "over-cap stream lost its direct path and none re-formed: closed"
+                    );
+                    policed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    conn.close(0u32.into(), onedevice_core::NO_DIRECT_PATH.as_bytes());
+                    return;
+                }
+                event = events.next() => {
+                    if event.is_none() {
+                        return;
+                    }
+                    if direct_selected(&conn) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 struct BiStream {
     _conn: Connection,
     io: tokio::io::Join<RecvStream, SendStream>,
+    /// Set by the watcher when IT closed the connection for the announced
+    /// role (#88): the next poll error is then reworded to carry the code.
+    policed: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The watcher's abort handle: a stream that ends normally must not
+    /// leave a task holding a `Connection` clone alive behind it.
+    watcher: Option<tokio::task::AbortHandle>,
+}
+
+impl Drop for BiStream {
+    fn drop(&mut self) {
+        if let Some(watcher) = &self.watcher {
+            watcher.abort();
+        }
+    }
+}
+
+impl BiStream {
+    /// Rewords a poll error when the policy watcher is what killed the
+    /// stream: the caller then reports `NO_DIRECT_PATH` (the code the GUI
+    /// owns a sentence for) instead of a bare "connection lost".
+    fn police(&self, e: io::Error) -> io::Error {
+        let policed = self
+            .policed
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst));
+        if policed {
+            io::Error::other(format!(
+                "{}: the stream lost its direct path mid-transfer and the \
+                 deployment's relays are rendezvous-only",
+                onedevice_core::NO_DIRECT_PATH
+            ))
+        } else {
+            e
+        }
+    }
 }
 
 impl AsyncRead for BiStream {
@@ -1162,7 +1305,11 @@ impl AsyncRead for BiStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.io).poll_read(cx, buf)
+        let this = &mut *self;
+        match Pin::new(&mut this.io).poll_read(cx, buf) {
+            Poll::Ready(Err(e)) => Poll::Ready(Err(this.police(e))),
+            other => other,
+        }
     }
 }
 
@@ -1172,15 +1319,27 @@ impl AsyncWrite for BiStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.io).poll_write(cx, buf)
+        let this = &mut *self;
+        match Pin::new(&mut this.io).poll_write(cx, buf) {
+            Poll::Ready(Err(e)) => Poll::Ready(Err(this.police(e))),
+            other => other,
+        }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.io).poll_flush(cx)
+        let this = &mut *self;
+        match Pin::new(&mut this.io).poll_flush(cx) {
+            Poll::Ready(Err(e)) => Poll::Ready(Err(this.police(e))),
+            other => other,
+        }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.io).poll_shutdown(cx)
+        let this = &mut *self;
+        match Pin::new(&mut this.io).poll_shutdown(cx) {
+            Poll::Ready(Err(e)) => Poll::Ready(Err(this.police(e))),
+            other => other,
+        }
     }
 }
 

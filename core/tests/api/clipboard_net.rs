@@ -519,6 +519,47 @@ async fn fill_writes_remote_files_to_disk() {
     assert_eq!(std::fs::read(&dest2).unwrap(), b"the second file!!");
 }
 
+/// A clip that CONCEALS its size counts as over-cap (#88): a sensitive
+/// copy's size hints are stripped by design, so counting it as zero would
+/// exempt exactly the secrets from a rendezvous-only cap. Under the cap,
+/// the paste pipe to its source must refuse the relay route with the
+/// policy's own terminal code.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clip_concealing_its_size_counts_as_over_cap() {
+    let server = TestServer::start().await;
+    let switchboard = MemorySwitchboard::new();
+    let code = onedevice_core::account_key::generate_recovery_code();
+    let a = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
+    let b = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
+    let mut ca = backend(&a).await;
+    let mut cb = backend(&b).await;
+    subscribe(&mut ca).await;
+    subscribe(&mut cb).await;
+    wait_server_connected(&mut ca, true).await;
+    wait_server_connected(&mut cb, true).await;
+    wait_reachable(&mut ca, b.device_id()).await;
+    wait_reachable(&mut cb, a.device_id()).await;
+
+    // A generous cap: a sized 6-byte clip would ride, an unsized one must
+    // not, whatever its actual size.
+    switchboard.set_payload_cap(&b.node_id(), Some(1024 * 1024));
+
+    // A sensitive copy: no size hint ever travels for it (the backends
+    // strip them), and pull-at-paste is its only remote path.
+    ca.request(
+        "clipboard.updated",
+        json!({ "formats": [{ "format": "text" }], "sensitive": true }),
+    )
+    .await
+    .expect("clipboard.updated");
+    let note = cb.wait_notification("clipboard.remote_updated").await;
+    let tx = note["tx_id"].as_str().expect("tx_id").to_string();
+
+    let token = open_channel_token(&mut cb, &tx).await;
+    let mut ch = b.open_channel(&token).await;
+    assert_eq!(ch.fetch("text").await.unwrap_err(), "NO_DIRECT_PATH");
+}
+
 /// The announced relay role on the paste path (#88): a fill whose payload
 /// exceeds the cap, with the relay as the only route, fails with its OWN
 /// bare code - not `PEER_GONE`, whose remedy (the source is gone) would
@@ -780,6 +821,49 @@ async fn a_materialized_copy_reports_its_delivery() {
     assert_eq!(report["tx_id"], json!(tx));
     assert_eq!(report["delivered"], json!(1));
     assert_eq!(report["failed"], json!(0));
+    assert_eq!(report["no_direct_path"], json!(0));
+}
+
+/// A push refused by the announced relay role (#88) is not "could not
+/// reach": the report counts it apart (`no_direct_path`, the share sheet's
+/// remedy), and the destination still LEARNS the clip through the fallback
+/// metadata announce, so its paste speaks the policy's code instead of
+/// silently serving the previous clip.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_push_refused_by_the_relay_role_reports_it_and_falls_back_to_metadata() {
+    let server = TestServer::start().await;
+    let switchboard = MemorySwitchboard::new();
+    let code = onedevice_core::account_key::generate_recovery_code();
+    let a = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
+    let b = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
+    let mut ca = backend(&a).await;
+    let mut cb = backend(&b).await;
+    subscribe(&mut ca).await;
+    subscribe(&mut cb).await;
+    wait_server_connected(&mut ca, true).await;
+    wait_server_connected(&mut cb, true).await;
+    wait_reachable(&mut ca, b.device_id()).await;
+    wait_reachable(&mut cb, a.device_id()).await;
+
+    // The SOURCE pushes, so the source's transport enforces the role. Any
+    // materialized blob is over a zero cap.
+    switchboard.set_payload_cap(&a.node_id(), Some(0));
+
+    let result = announce_materialized(&mut ca, "the bytes may not ride").await;
+    let tx = result["tx_id"].as_str().expect("tx_id").to_string();
+    assert_eq!(result["pushed_to"], json!(1));
+
+    // The destination learned the clip anyway: the fallback announce rode
+    // the relay as metadata, which is exactly what a rendezvous is for.
+    let note = cb.wait_notification("clipboard.remote_updated").await;
+    assert_eq!(note["tx_id"], json!(tx));
+
+    // And the report names the refusal apart from a plain failure.
+    let report = ca.wait_notification("clipboard.pushed").await;
+    assert_eq!(report["tx_id"], json!(tx));
+    assert_eq!(report["delivered"], json!(0));
+    assert_eq!(report["failed"], json!(1));
+    assert_eq!(report["no_direct_path"], json!(1));
 }
 
 #[tokio::test(flavor = "multi_thread")]
