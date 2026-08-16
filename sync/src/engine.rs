@@ -2637,13 +2637,7 @@ impl SetState {
         // Windows: a read-only destination refuses the replace; clearing
         // the attribute is deliberate (the incoming version supersedes it).
         #[cfg(windows)]
-        if let Ok(meta) = std::fs::metadata(&dest) {
-            let mut perms = meta.permissions();
-            if perms.readonly() {
-                perms.set_readonly(false);
-                let _ = std::fs::set_permissions(&dest, perms);
-            }
-        }
+        clear_readonly(&dest);
         // A mount point inside the root makes the staging rename cross a
         // filesystem: copy beside the target and rename from there, which is
         // still atomic where it matters (the final replace).
@@ -3522,6 +3516,22 @@ fn boot_round_base() -> u64 {
 /// Whether the Core's words on a failed fill name a full disk. The Core
 /// relays the failure's own words, so this reads them rather than guessing:
 /// a wrong guess would stop a set for nothing (a resume gesture undoes it).
+/// Windows only: clears FILE_ATTRIBUTE_READONLY so a replace can proceed.
+/// The clippy lint on `set_readonly(false)` warns about a UNIX hazard (it
+/// means world-writable there), which cannot apply in a windows-only
+/// function: here it clears exactly that one attribute and nothing else.
+#[cfg(windows)]
+#[allow(clippy::permissions_set_readonly_false)]
+fn clear_readonly(dest: &Path) {
+    if let Ok(meta) = std::fs::metadata(dest) {
+        let mut perms = meta.permissions();
+        if perms.readonly() {
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(dest, perms);
+        }
+    }
+}
+
 /// Whether an I/O error is the cross-device one (`EXDEV`, and Windows's
 /// own refusal to rename across volumes). `raw_os_error` rather than a
 /// string: the message is localized, the number is not.

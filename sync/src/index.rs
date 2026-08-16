@@ -299,10 +299,21 @@ mod tests {
         assert!(SetIndex::from_value(&json!({ "entries": [{}] })).is_none());
     }
 
+    /// Sub-second precision is the PLATFORM's, not ours: Windows counts in
+    /// 100-nanosecond units, so a stamp is asserted at a precision every
+    /// filesystem can actually hold (which is the whole reason the index
+    /// records the value read BACK from the disk rather than the one we
+    /// asked for).
     #[test]
     fn mtimes_capture_the_filesystem_report() {
-        let m = Mtime::of(SystemTime::UNIX_EPOCH + std::time::Duration::new(10, 7));
-        assert_eq!(m, Mtime { secs: 10, nanos: 7 });
+        let m = Mtime::of(SystemTime::UNIX_EPOCH + std::time::Duration::new(10, 500_000_000));
+        assert_eq!(
+            m,
+            Mtime {
+                secs: 10,
+                nanos: 500_000_000
+            }
+        );
         let before = Mtime::of(SystemTime::UNIX_EPOCH - std::time::Duration::new(5, 0));
         assert_eq!(before.secs, -5);
         assert_eq!(m.seconds_apart(before), 15);

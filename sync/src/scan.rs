@@ -636,18 +636,30 @@ mod tests {
     /// What the user did wrong is reported with a reason; what is OURS is
     /// simply not there. The engine's own staging directory must never show
     /// up in a card's ignored list.
+    ///
+    /// The gate-failing names are exercised on unix only, and not for lack
+    /// of care: Windows cannot CREATE what the gate refuses (a colon opens
+    /// an alternate data stream, a reserved device name is rejected outright,
+    /// a trailing dot is stripped), which is the very reason the gate refuses
+    /// them - they are the names a Windows member could not receive.
     #[test]
     fn exclusions_are_reported_but_our_own_staging_is_silent() {
         let mut f = Fixture::new();
         f.write("ok.txt", "x");
         f.write(".1device.tmp/staged", "x");
         f.write(".partial.1dtmp", "x");
-        f.write("bad:name.txt", "x");
         #[cfg(unix)]
-        std::os::unix::fs::symlink(f.root.path().join("ok.txt"), f.root.path().join("link.txt"))
+        {
+            f.write("bad:name.txt", "x");
+            std::os::unix::fs::symlink(
+                f.root.path().join("ok.txt"),
+                f.root.path().join("link.txt"),
+            )
             .expect("symlink");
+        }
         let report = f.scan();
         let reasons: Vec<&str> = report.ignored.iter().map(|i| i.reason).collect();
+        #[cfg(unix)]
         assert!(reasons.contains(&"separator character"), "{reasons:?}");
         #[cfg(unix)]
         assert!(reasons.contains(&"symlink"), "{reasons:?}");
@@ -666,7 +678,12 @@ mod tests {
         assert!(f.index.get(".partial.1dtmp").is_none());
     }
 
-    #[cfg(unix)]
+    /// Linux only, and not by preference: the scenario needs a filesystem
+    /// that can HOLD two names differing by case. On macOS and Windows the
+    /// second write lands on the same file, so there is no collision to
+    /// detect - which is exactly why the rule exists for the devices that
+    /// receive such a pair from a Linux member.
+    #[cfg(target_os = "linux")]
     #[test]
     fn fold_collisions_ignore_both_and_freeze_the_indexed_one() {
         let mut f = Fixture::new();
