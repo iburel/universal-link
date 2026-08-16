@@ -8,6 +8,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Folders now stay identical across your computers, by themselves** (the
+  sync engine). A new official component, `1device-sync`, keeps chosen
+  folders in step over the generic primitives the Core already had: control
+  messages ride `peers.send`, bytes ride published transactions, and the
+  Core reads and writes both disks - nothing crosses the IPC. It is
+  replaceable by construction (the exclusive `sync-backend` role, one
+  dialect marker on every message) and owns all of its own state.
+  What the interfaces get is the frozen `sync.*` vocabulary: create a set
+  from a folder (or a single file) and invite your other computers, accept
+  with a local folder of your choosing, pause, resume, leave, and resolve a
+  conflict; plus one authoritative snapshot, `sync.status`, carrying per
+  device whether it is up to date, behind (by how many files) or offline,
+  the open conflicts with both versions, and the names the engine refused
+  with the reason - so a window opening late can render everything and act
+  from that snapshot alone. Membership is each device's own signed word (no
+  central list): an invitation is the door both ways, `left` and `declined`
+  bind until someone re-invites, and a device the account revoked is gone
+  here too. Concurrent edits keep BOTH versions, deterministically: the same
+  winner and the same
+  "name (DeviceName, 2026-08-16 14h02 UTC).ext" copy on every computer, one
+  gesture to keep the one you want. A deletion loses to a concurrent edit,
+  everywhere and up the tree, so nothing is lost to a race. Design and
+  protocol: [doc/sync-engine.md](doc/sync-engine.md).
+
 - **The Core grew the generic primitives pluggable cross-device components
   build on** (the sync epic's foundation). Transactions gained a second
   producer: any component holding the new `transactions.publish` scope can
