@@ -23,8 +23,11 @@ use tokio::time::timeout;
 pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const CORE_DEVICE_NAME: &str = "PC-Core";
 
-/// Copied from `src/main.rs` rather than imported: the suite proves the
-/// shipping binary's values still connect, so a drift there must break here.
+/// Copied from `src/main.rs` rather than imported: the copy pins the
+/// profile the shipping binary is MEANT to ask for, independently of what
+/// its own constants say. (The suite drives the lib, so it cannot detect a
+/// drift in the binary's copy; what it proves is that this profile, the
+/// documented one, enrolls and serves.)
 pub const ROLE: &str = "sync-backend";
 pub const SCOPES: [&str; 6] = [
     "sync.serve",

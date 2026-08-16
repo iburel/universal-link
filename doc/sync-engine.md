@@ -60,7 +60,10 @@ device's word. The pinning rules, exactly:
   the pin (the engine was reinstalled) and retires the records the OLD key
   signed, untrusted pending re-receipt; the device's invitation survives
   (it is the inviter's signature), so a reinstalled member shows as
-  invited rather than vanishing.
+  invited rather than vanishing. The highest TERMINAL seq the old key had
+  signed survives the rotation as a floor the door keeps measuring
+  against: wiping one's engine does not void a binding `left` or
+  `declined`, re-invitation does.
 - Gossiped records about a device with NO pin are held as **unverified**:
   shown as pending at most, never counted `active`, never sent data, never
   allowed to supersede anything. But unverified is a state the protocol
@@ -83,8 +86,10 @@ device's word. The pinning rules, exactly:
   and verified `active`: one explicit, signed hop of witness, never a
   chain of hearsay (an endorsement is not transitive). An accepted
   endorsement only ever FILLS ABSENCE: it never replaces an existing
-  binding, direct or endorsed, and first direct contact upgrades it in
-  place. Since
+  binding, direct or endorsed; it is accepted only for a device the
+  set's records already name (a compromised active sibling must not be
+  able to grow state for fabricated nodes); and direct contact retires
+  the stored witness, the device's own word superseding it. Since
   introductions eventually pin every reachable pair directly,
   endorsements only need to cover the departed; the residual case (an
   inviter gone before anyone it met can endorse it) is remedied by a
@@ -105,7 +110,10 @@ within 2^53 - 1 only, floats refused (beyond that bound JCS's IEEE-754
 number serialization stops round-tripping). Parsing is strict: an
 unknown extra field is a malformed record, not an extension point, and
 formats are bounded (set_id = 22 base64url chars, ids and keys lowercase
-hex), so a signature is never ambiguous about what it covered.
+hex, seq-like integers within 2^32, with seq seeding saturating AT that
+cap so a hostile `supersedes_seq` can never drive a device's own records
+past what peers absorb), so a signature is never ambiguous about what it
+covered.
 
 **The set descriptor.** Created once, signed by the creator's sync key:
 
@@ -142,7 +150,15 @@ its own history.
   after `left(5)` carries `supersedes_seq: 5` and reopens the membership; a
   REPLAYED old invitation carries a stale `supersedes_seq` and loses to
   every later self-signed record. Replay is thereby ordered out, without
-  breaking re-invitation.
+  breaking re-invitation. And an `invited` record is ABSORBED only while
+  its inviter itself stands admitted (active or paused; the creator
+  through its own first-join record): one signed by a device the set
+  never admitted parks like an unverified record and is re-evaluated as
+  records land, so out-of-order pages lose nothing, admission chains stay
+  well-founded (rooted at the creator), and two never-admitted account
+  devices cannot mint each other into a set by exchanging invitations.
+  Absorption is the gate: an invitation that landed while its inviter was
+  admitted keeps its effect if the inviter later leaves.
 - All other statuses are signed by the device they describe; higher `seq`
   wins, ties by `at` then lexicographic sig. **Seq seeding:** a device
   never restarts a per-set seq from a local counter; every self-signed
@@ -491,9 +507,11 @@ fraction of a lock: while behind-count > 0 the card says "catching up, N
 files on the way", and the race window is real but handled, not denied.
 
 **Persistence discipline** (all engine state, section 9 files): write
-temp, fsync the temp, rename, fsync the directory (FlushFileBuffers before
-ReplaceFile on Windows). Rename-alone orders the namespace, not the data;
-a power cut must not hand back a zero-length index.
+temp, fsync the temp, rename, fsync the directory (on Windows:
+FlushFileBuffers before the replacing rename; the directory flush has no
+std equivalent there and the rename itself is the ordering). Rename-alone
+orders the namespace, not the data; a power cut must not hand back a
+zero-length index.
 
 ## 7. Conflicts
 
@@ -635,7 +653,7 @@ full fsync discipline (section 6):
 The Core stores nothing; `sync.status` is answered entirely from this
 state.
 
-## 10. The `sync.*` vocabulary (freeze proposal)
+## 10. The `sync.*` vocabulary (frozen)
 
 Methods, all routed through the facade (verbatim relay; `sync.status`
 under `sync.read`, the rest under `sync.manage`). The facade's proxy

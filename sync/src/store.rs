@@ -29,9 +29,16 @@ pub struct Store {
 impl Store {
     /// Opens (creating if needed) the engine state under `root`, and loads or
     /// mints the identity. An unreadable identity is an error, not a mint:
-    /// see the identity module's header.
+    /// see the identity module's header. The root is owner-only on unix:
+    /// set ids are unguessable capabilities, and a world-listable state
+    /// directory would hand them to every local user.
     pub fn open(root: PathBuf) -> io::Result<Store> {
         std::fs::create_dir_all(root.join("sets"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+        }
         let identity = Identity::load_or_generate(&root)?;
         Ok(Store { root, identity })
     }

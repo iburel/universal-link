@@ -41,6 +41,10 @@ pub enum Outcome {
 enum Action {
     /// A forwarded `sync.status`: answer the snapshot from the store.
     Status(RequestId),
+    /// A request in `served_methods` that this dispatch does not handle:
+    /// impossible while the two lists agree, refused honestly if they ever
+    /// drift (a dropped reply would burn the caller's whole facade budget).
+    Unsupported(RequestId),
     /// A connected-but-uninteresting event: nothing to do yet. Connection
     /// establishment lands here too - the engine's snapshot lives in its own
     /// store, so there is nothing to resynchronize from the Core until the
@@ -54,8 +58,8 @@ fn classify(event: Option<Event>) -> Action {
     match event {
         Some(Event::Request { id, method, .. }) if method == "sync.status" => Action::Status(id),
         // The client only delivers requests whose method is in
-        // [`SERVED_METHODS`]; anything else is auto-refused there.
-        Some(Event::Request { .. }) => Action::Idle,
+        // [`SERVED_METHODS`]: reaching this arm means the two lists drifted.
+        Some(Event::Request { id, .. }) => Action::Unsupported(id),
         Some(Event::Connected { .. }) | Some(Event::Notification { .. }) => Action::Idle,
         Some(Event::Disconnected) => Action::Exit(Outcome::ConnectionLost),
         Some(Event::Incompatible { .. }) => Action::Exit(Outcome::Incompatible),
@@ -78,7 +82,20 @@ pub async fn run(
             biased;
             () = &mut stdin_closed => break Outcome::StdinClosed,
             event = events.recv() => match classify(event) {
-                Action::Status(id) => respond_status(&client, id, &store).await,
+                // Replies ride their own task: `Client::respond` awaits the
+                // actual socket write, and a Core that stopped draining must
+                // not hold the stop signal past the supervisor's grace.
+                Action::Status(id) => {
+                    let client = client.clone();
+                    let snapshot = store.status();
+                    tokio::spawn(async move { respond(client, id, snapshot).await });
+                }
+                Action::Unsupported(id) => {
+                    let client = client.clone();
+                    tokio::spawn(async move {
+                        swallow_stale(client.respond_error(id, "SYNC_UNSUPPORTED").await);
+                    });
+                }
                 Action::Idle => {}
                 Action::Exit(outcome) => break outcome,
             },
@@ -86,15 +103,19 @@ pub async fn run(
     }
 }
 
-/// Answers `sync.status` inline: the snapshot is assembled from local state
-/// alone (no round-trip to the Core), so serving it cannot stall the loop.
-async fn respond_status(client: &Client, id: RequestId, store: &Store) {
-    if let Err(e) = client.respond(id, store.status()).await {
-        // A stale request id (its connection dropped mid-flight) is expected
-        // around a reconnect; anything else deserves a trace.
-        if !matches!(e, RequestError::Disconnected) {
-            eprintln!("[1device-sync] status reply failed: {e}");
-        }
+/// Answers `sync.status` with the snapshot, assembled from local state
+/// alone before the task was spawned.
+async fn respond(client: Client, id: RequestId, snapshot: serde_json::Value) {
+    swallow_stale(client.respond(id, snapshot).await);
+}
+
+/// A stale request id (its connection dropped mid-flight) is expected
+/// around a reconnect; anything else deserves a trace.
+fn swallow_stale(result: Result<(), RequestError>) {
+    if let Err(e) = result
+        && !matches!(e, RequestError::Disconnected)
+    {
+        eprintln!("[1device-sync] reply failed: {e}");
     }
 }
 

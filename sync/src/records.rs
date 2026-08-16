@@ -102,6 +102,19 @@ fn int_field(v: &Value) -> Option<u64> {
     v.as_u64().filter(|n| *n < (1 << 53))
 }
 
+/// Bound on seq-like fields (`seq`, `supersedes_seq`): far beyond any
+/// legitimate membership history, and low enough that seq arithmetic
+/// (`1 + max` seeding, however records compose) can never climb toward the
+/// canonical integer bound - a hostile supersedes_seq must not be able to
+/// drive the LOCAL signer to a value canonicalization refuses. Seeding
+/// saturates AT the cap (`SetMembership::next_seq`), so one's own records
+/// always stay absorbable by peers.
+pub(crate) const SEQ_MAX: u64 = 1 << 32;
+
+fn seq_field(v: &Value) -> Option<u64> {
+    v.as_u64().filter(|n| *n <= SEQ_MAX)
+}
+
 // ---------------------------------------------------------------------------
 // The set descriptor.
 // ---------------------------------------------------------------------------
@@ -142,7 +155,10 @@ pub struct SetDescriptor {
 }
 
 impl SetDescriptor {
-    /// Builds and signs a fresh descriptor (the `sync.create` path).
+    /// Builds and signs a fresh descriptor (the `sync.create` path). `name`
+    /// is clamped to what the strict parser accepts (a root's basename can
+    /// exceed the page bound, or be empty for an exotic root): what this
+    /// constructor signs, `from_value` must reload.
     pub fn create(
         set_id: String,
         kind: SetKind,
@@ -151,6 +167,13 @@ impl SetDescriptor {
         created_at: u64,
         identity: &Identity,
     ) -> SetDescriptor {
+        let mut name = name;
+        while name.len() > NAME_MAX_BYTES {
+            name.pop();
+        }
+        if name.is_empty() {
+            name = "set".to_string();
+        }
         let mut descriptor = SetDescriptor {
             set_id,
             kind,
@@ -372,7 +395,7 @@ impl MemberRecord {
             set_id: set_id.to_string(),
             node_id: node_id.to_string(),
             status: MemberStatus::parse(str_field(status)?)?,
-            seq: int_field(seq)?,
+            seq: seq_field(seq)?,
             generation: int_field(generation)?,
             sync_pub: sync_pub.to_string(),
             at: int_field(at)?,
@@ -494,7 +517,7 @@ impl InvitedRecord {
             set_id: set_id.to_string(),
             node_id: node_id.to_string(),
             invited_by: invited_by.to_string(),
-            supersedes_seq: int_field(supersedes_seq)?,
+            supersedes_seq: seq_field(supersedes_seq)?,
             at: int_field(at)?,
             sig: sig.to_string(),
         })
@@ -733,6 +756,7 @@ mod tests {
             ("set_id", json!("AAAAAAAAAAAAAAAAAAAAA")),
             ("node_id", json!(NODE_A.to_uppercase())),
             ("node_id", json!("ab")),
+            ("seq", json!(SEQ_MAX + 1)),
             ("seq", json!(9007199254740992_u64)),
             ("seq", json!(-1)),
             ("status", json!("gone")),
@@ -785,6 +809,47 @@ mod tests {
         let mut relabelled = member.to_value();
         relabelled["status"] = json!("invited");
         assert!(Record::from_value(&relabelled).is_none());
+    }
+
+    /// The cap is a WIRE bound: a record beyond it stops being absorbable,
+    /// and seeding saturates at the cap so one's own records never cross
+    /// it (the membership tests pin the saturation).
+    #[test]
+    fn seq_values_at_the_cap_reload_and_beyond_it_refuse() {
+        let (_dir, identity) = test_identity();
+        let sign = |seq| {
+            MemberRecord::sign_own(
+                SET.into(),
+                NODE_A.into(),
+                MemberStatus::Active,
+                seq,
+                1,
+                1000,
+                &identity,
+            )
+        };
+        assert!(Record::from_value(&sign(SEQ_MAX).to_value()).is_some());
+        assert!(Record::from_value(&sign(SEQ_MAX + 1).to_value()).is_none());
+    }
+
+    /// What `create` signs, `from_value` must reload: the constructor
+    /// clamps a name the strict parser would refuse.
+    #[test]
+    fn a_descriptor_created_from_an_unruly_name_still_reloads() {
+        let (_dir, creator) = test_identity();
+        for name in [String::new(), "n".repeat(300), "\u{00E9}".repeat(200)] {
+            let descriptor = SetDescriptor::create(
+                SET.into(),
+                SetKind::Dir,
+                name,
+                NODE_A.into(),
+                1000,
+                &creator,
+            );
+            let parsed = SetDescriptor::from_value(&descriptor.to_value())
+                .expect("a created descriptor must reload");
+            assert!(parsed.verify(&creator.public_hex()));
+        }
     }
 
     #[test]

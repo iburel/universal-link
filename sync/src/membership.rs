@@ -18,7 +18,8 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value, json};
 
 use crate::records::{
-    Endorsement, InvitedRecord, MemberRecord, MemberStatus, Record, SetDescriptor, valid_node_id,
+    Endorsement, InvitedRecord, MemberRecord, MemberStatus, Record, SEQ_MAX, SetDescriptor,
+    valid_node_id,
 };
 
 /// Cap on records stashed for a device whose key we cannot check yet: enough
@@ -85,6 +86,11 @@ struct DeviceState {
     terminal: Option<MemberRecord>,
     /// Newest verified invitation.
     invited: Option<InvitedRecord>,
+    /// The highest terminal seq the device is KNOWN to have signed, kept
+    /// even after a key rotation retires the record itself: the door keeps
+    /// measuring against it, so rotating one's key never voids a binding
+    /// `left` or `declined`.
+    terminal_seq_floor: u64,
     /// The highest seq-like value seen about this device (self-signed seqs
     /// and invitations' supersedes_seq): what one's own next record must
     /// exceed (seq seeding, and the invite payload counts).
@@ -99,6 +105,10 @@ impl DeviceState {
             && self.terminal.is_none()
             && self.invited.is_none()
             && self.unverified.is_empty()
+            // A floor is knowledge (the device once signed a terminal): a
+            // state holding one is not empty, or a rotation could launder
+            // it away through the cleanup.
+            && self.terminal_seq_floor == 0
     }
 }
 
@@ -132,6 +142,9 @@ impl SetMembership {
     /// verified under the old key - untrusted pending re-receipt, at which
     /// point they park as unverified against the new key.
     pub fn pin_direct(&mut self, node_id: &str, key: &str) {
+        // Direct contact retires the stored endorsement either way: the
+        // witness has been superseded by the device's own word.
+        self.endorsements.remove(node_id);
         match self.pins.get(node_id) {
             Some(pin) if pin.key == key => {
                 // Same key: at most an upgrade from endorsed to direct.
@@ -148,8 +161,13 @@ impl SetMembership {
                 // Only what the OLD key signed is retired: the device's own
                 // records. Its invitation is the INVITER's signature and
                 // survives the reinstall - which is what lets the reinstalled
-                // device show as invited rather than vanish.
+                // device show as invited rather than vanish. The terminal seq
+                // survives as a floor: a rotation must not void a binding
+                // `left` or `declined`.
                 if let Some(dev) = self.devices.get_mut(node_id) {
+                    dev.terminal_seq_floor = dev
+                        .terminal_seq_floor
+                        .max(dev.terminal.as_ref().map_or(0, |r| r.seq));
                     dev.live = None;
                     dev.terminal = None;
                 }
@@ -176,8 +194,19 @@ impl SetMembership {
             .collect()
     }
 
-    /// Absorbs one record: verify, then keep-newest. See [`Absorb`].
+    /// Absorbs one record: verify, then keep-newest. See [`Absorb`]. A
+    /// record that lands can admit an inviter whose parked invitations were
+    /// waiting on it (pages arrive in any order), so every successful
+    /// absorption settles the parked pool to its fixpoint.
     pub fn absorb(&mut self, record: &Record) -> Absorb {
+        let outcome = self.absorb_inner(record);
+        if outcome == Absorb::Absorbed {
+            self.reverify();
+        }
+        outcome
+    }
+
+    fn absorb_inner(&mut self, record: &Record) -> Absorb {
         if record.set_id() != self.descriptor.set_id {
             return Absorb::Dropped("foreign set");
         }
@@ -204,10 +233,29 @@ impl SetMembership {
                 if !invited.verify(&inviter_key) {
                     return Absorb::Dropped("bad signature");
                 }
+                // The inviter must itself stand admitted (active or paused;
+                // the creator's first join qualifies through its own
+                // record). An invitation signed by a device the set never
+                // admitted PARKS rather than counts: admission chains stay
+                // well-founded, rooted at the creator, and two never-admitted
+                // account devices cannot mint each other into the set.
+                // Absorption is the gate, so an invitation that landed while
+                // its inviter was admitted keeps its effect if the inviter
+                // later leaves.
+                if !self.is_admitted(&invited.invited_by) {
+                    return self.stash_unverified(record);
+                }
                 self.absorb_invited_verified(invited.clone());
                 Absorb::Absorbed
             }
         }
+    }
+
+    fn is_admitted(&self, node_id: &str) -> bool {
+        matches!(
+            self.effective(node_id),
+            Effective::Active | Effective::Paused
+        )
     }
 
     fn absorb_member_verified(&mut self, member: MemberRecord) {
@@ -268,6 +316,13 @@ impl SetMembership {
         if !endorsement.verify(&endorser_key) {
             return Absorb::Dropped("bad signature");
         }
+        // A binding is only useful for a device the set's records already
+        // name: refusing the rest bounds what one compromised active
+        // sibling can grow (pins and endorsements stay within DEVICE_CAP,
+        // like the strangers they would otherwise mint).
+        if !self.devices.contains_key(&endorsement.node_id) {
+            return Absorb::Dropped("device unknown to the set");
+        }
         if self.pins.contains_key(&endorsement.node_id) {
             // Already bound (either way): the endorsement adds nothing and
             // must never replace.
@@ -303,32 +358,46 @@ impl SetMembership {
         self.endorsements.values().collect()
     }
 
-    /// Re-runs every parked record against the current bindings: called
-    /// after any pin or endorsement change. Cheap (the pool is capped), and
-    /// what verifies leaves the pool.
+    /// Re-runs every parked record against the current bindings and
+    /// admissions, to the FIXPOINT: called after any pin or endorsement
+    /// change and after any absorbed record. One landed record can admit an
+    /// inviter, whose parked invitation then admits its invitee, and so on
+    /// down a chain; each pass either absorbs something (and the pools are
+    /// capped, so passes are few) or the state is stable.
     fn reverify(&mut self) {
-        let parked: Vec<(String, Vec<Value>)> = self
-            .devices
-            .iter_mut()
-            .filter(|(_, dev)| !dev.unverified.is_empty())
-            .map(|(node, dev)| (node.clone(), std::mem::take(&mut dev.unverified)))
-            .collect();
-        for (node, blobs) in parked {
-            for blob in blobs {
-                // A blob that still cannot verify re-parks itself; one whose
-                // signature now provably FAILS drops here, at the first
-                // moment failure is provable.
-                let Some(record) = Record::from_value(&blob) else {
-                    continue;
-                };
-                let _ = self.absorb(&record);
+        loop {
+            let mut progress = false;
+            let parked: Vec<(String, Vec<Value>)> = self
+                .devices
+                .iter_mut()
+                .filter(|(_, dev)| !dev.unverified.is_empty())
+                .map(|(node, dev)| (node.clone(), std::mem::take(&mut dev.unverified)))
+                .collect();
+            if parked.is_empty() {
+                return;
             }
-            // A device whose last blob evaporated without leaving records
-            // must not linger as an introduction target.
-            if let Some(dev) = self.devices.get(&node)
-                && dev.is_empty()
-            {
-                self.devices.remove(&node);
+            for (node, blobs) in parked {
+                for blob in blobs {
+                    // A blob that still cannot verify re-parks itself; one
+                    // whose signature now provably FAILS drops here, at the
+                    // first moment failure is provable.
+                    let Some(record) = Record::from_value(&blob) else {
+                        continue;
+                    };
+                    if self.absorb_inner(&record) == Absorb::Absorbed {
+                        progress = true;
+                    }
+                }
+                // A device whose last blob evaporated without leaving
+                // records must not linger as an introduction target.
+                if let Some(dev) = self.devices.get(&node)
+                    && dev.is_empty()
+                {
+                    self.devices.remove(&node);
+                }
+            }
+            if !progress {
+                return;
             }
         }
     }
@@ -340,7 +409,12 @@ impl SetMembership {
         let Some(dev) = self.devices.get(node_id) else {
             return Effective::Unknown;
         };
-        let terminal_seq = dev.terminal.as_ref().map_or(0, |r| r.seq);
+        // The floor keeps counting a terminal whose RECORD a key rotation
+        // retired: the door measures against everything the device is known
+        // to have signed.
+        let terminal_seq = dev
+            .terminal_seq_floor
+            .max(dev.terminal.as_ref().map_or(0, |r| r.seq));
         let door_open = (node_id == self.descriptor.created_by && terminal_seq == 0)
             || dev
                 .invited
@@ -365,7 +439,7 @@ impl SetMembership {
             let reopened = dev
                 .invited
                 .as_ref()
-                .is_some_and(|i| i.supersedes_seq >= terminal.seq);
+                .is_some_and(|i| i.supersedes_seq >= terminal_seq);
             if reopened {
                 return Effective::Invited;
             }
@@ -383,9 +457,11 @@ impl SetMembership {
 
     /// The seq one's own NEXT record must carry: `1 + max(seq over every
     /// record about self ever seen)`, invitations' supersedes_seq included -
-    /// never a local counter restarted.
+    /// never a local counter restarted. Saturates at the wire's seq cap so
+    /// a hostile supersedes_seq at the cap cannot drive one's own records
+    /// past what peers absorb (ties break by `at` then `sig` up there).
     pub fn next_seq(&self, node_id: &str) -> u64 {
-        1 + self.devices.get(node_id).map_or(0, |dev| dev.max_seq_seen)
+        (1 + self.devices.get(node_id).map_or(0, |dev| dev.max_seq_seen)).min(SEQ_MAX)
     }
 
     /// The verified records held ABOUT `node_id` - what every answer to a
@@ -429,6 +505,7 @@ impl SetMembership {
                         "live": dev.live.as_ref().map(MemberRecord::to_value),
                         "terminal": dev.terminal.as_ref().map(MemberRecord::to_value),
                         "invited": dev.invited.as_ref().map(InvitedRecord::to_value),
+                        "terminal_seq_floor": dev.terminal_seq_floor,
                         "max_seq_seen": dev.max_seq_seen,
                         "unverified": dev.unverified,
                     }),
@@ -490,6 +567,7 @@ impl SetMembership {
                 return None;
             }
             let mut state = DeviceState {
+                terminal_seq_floor: dev.get("terminal_seq_floor")?.as_u64()?,
                 max_seq_seen: dev.get("max_seq_seen")?.as_u64()?,
                 ..DeviceState::default()
             };
@@ -678,6 +756,76 @@ mod tests {
         assert_eq!(m.effective(&a.node_id), Effective::Active);
     }
 
+    /// The well-foundedness of admission: invitations only count when their
+    /// inviter stands admitted, chains root at the creator, and the parked
+    /// pool settles to its fixpoint when the missing link lands.
+    #[test]
+    fn two_never_admitted_devices_cannot_mint_each_other() {
+        let (mut m, a, _b) = fixture();
+        let e = device(&node('e'));
+        let f = device(&node('f'));
+        m.pin_direct(&e.node_id, &e.identity.public_hex());
+        m.pin_direct(&f.node_id, &f.identity.public_hex());
+
+        // E and F exchange invitations and sign themselves active: every
+        // signature is genuine, every key is pinned - and none of it counts,
+        // because neither inviter was ever admitted.
+        assert_eq!(m.absorb(&invite(&e, &f, 0, 1100)), Absorb::Unverified);
+        assert_eq!(m.absorb(&invite(&f, &e, 0, 1100)), Absorb::Unverified);
+        assert_eq!(
+            m.absorb(&own(&e, MemberStatus::Active, 1, 1150)),
+            Absorb::Absorbed
+        );
+        assert_eq!(
+            m.absorb(&own(&f, MemberStatus::Active, 1, 1150)),
+            Absorb::Absorbed
+        );
+        assert_eq!(m.effective(&e.node_id), Effective::Unknown);
+        assert_eq!(m.effective(&f.node_id), Effective::Unknown);
+
+        // A real member invites E: the chain roots, and the fixpoint
+        // cascades - E becomes active, which admits E's invitation of F.
+        assert_eq!(m.absorb(&invite(&a, &e, 0, 1200)), Absorb::Absorbed);
+        assert_eq!(m.effective(&e.node_id), Effective::Active);
+        assert_eq!(m.effective(&f.node_id), Effective::Active);
+    }
+
+    /// Wiping one's engine (a fresh key, then direct contact) must not
+    /// launder a binding `left`: the terminal seq survives as a floor.
+    #[test]
+    fn key_rotation_does_not_void_a_binding_terminal() {
+        let (mut m, a, b) = fixture();
+        m.absorb(&invite(&a, &b, 0, 1050));
+        m.absorb(&own(&b, MemberStatus::Active, 1, 1100));
+        m.absorb(&own(&b, MemberStatus::Left, 2, 1200));
+        assert_eq!(m.effective(&b.node_id), Effective::Left);
+
+        // B wipes its engine and makes direct contact under a new key.
+        let b_new = device(&b.node_id);
+        m.pin_direct(&b.node_id, &b_new.identity.public_hex());
+        // The old invitation (supersedes 0) does not cover the floor (2):
+        // a fresh active under the new key parks at the closed door.
+        m.absorb(&own(&b_new, MemberStatus::Active, 3, 1300));
+        assert_ne!(m.effective(&b.node_id), Effective::Active);
+
+        // The floor survives persistence too.
+        let reloaded = SetMembership::from_value(&m.to_value()).expect("reload");
+        assert_ne!(reloaded.effective(&b.node_id), Effective::Active);
+
+        // A REAL re-invite covers the floor: the door opens again.
+        m.absorb(&invite(&a, &b, 2, 1400));
+        assert_eq!(m.effective(&b.node_id), Effective::Active);
+    }
+
+    /// A hostile supersedes_seq at the wire cap cannot drive one's own next
+    /// seq past what peers absorb: seeding saturates.
+    #[test]
+    fn next_seq_saturates_at_the_wire_cap() {
+        let (mut m, a, b) = fixture();
+        m.absorb(&invite(&a, &b, crate::records::SEQ_MAX, 1050));
+        assert_eq!(m.next_seq(&b.node_id), crate::records::SEQ_MAX);
+    }
+
     #[test]
     fn records_for_an_unpinned_device_wait_for_the_pin() {
         let a = device(&node('a'));
@@ -781,6 +929,20 @@ mod tests {
             Absorb::Dropped("unpinned endorser")
         );
 
+        // An endorsement for a device NO record of the set names is refused:
+        // it could only grow state for fabricated nodes.
+        let ghost = device(&node('9'));
+        let for_ghost = Endorsement::issue(
+            ghost.node_id.clone(),
+            ghost.identity.public_hex(),
+            b.node_id.clone(),
+            &b.identity,
+        );
+        assert_eq!(
+            m.absorb_endorsement(&for_ghost),
+            Absorb::Dropped("device unknown to the set")
+        );
+
         // From B, directly pinned and active: accepted, C's record verifies.
         let from_b = Endorsement::issue(
             c.node_id.clone(),
@@ -790,10 +952,13 @@ mod tests {
         );
         assert_eq!(m.absorb_endorsement(&from_b), Absorb::Absorbed);
         assert_eq!(m.effective(&c.node_id), Effective::Active);
+        assert_eq!(m.endorsements().len(), 1);
 
         // One hop only: an endorsement whose endorser is himself only
-        // ENDORSED is refused (C vouching for D).
+        // ENDORSED is refused (C, endorsed above, vouching for D - whom a
+        // record names, so the refusal is the hop, not the ghost gate).
         let d = device(&node('d'));
+        m.absorb(&invite(&b, &d, 0, 1200));
         let from_c = Endorsement::issue(
             d.node_id.clone(),
             d.identity.public_hex(),
@@ -804,6 +969,12 @@ mod tests {
             m.absorb_endorsement(&from_c),
             Absorb::Dropped("endorsement is one hop only")
         );
+
+        // Direct contact with C retires the stored witness: the device's
+        // own word supersedes it.
+        m.pin_direct(&c.node_id, &c.identity.public_hex());
+        assert!(m.endorsements().is_empty());
+        assert_eq!(m.effective(&c.node_id), Effective::Active);
     }
 
     #[test]
