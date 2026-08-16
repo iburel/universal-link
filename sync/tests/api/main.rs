@@ -5,5 +5,6 @@
 //! through the routed `sync.*` facade.
 
 mod facade;
+mod gestures;
 mod resolve;
 mod support;

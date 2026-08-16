@@ -341,9 +341,9 @@ Message types (all carry `dialect` and `set_id`):
 
 | Type | Content | Meaning |
 |---|---|---|
-| `head` | descriptor hash, sender's `set_vv`, `records_pages` and `entries_pages` counts for the pages that FOLLOW it, sender's sync_pub; or a no-membership marker | "here is where I stand"; every batch of pages is preceded by a head declaring it, on BOTH legs (an empty delta is distinguishable from a lost one, on both sides) |
-| `records` | page of membership + conflict records, `round`/`page`/`of` | the gossip, paged |
-| `entries` | page of index entries, `round`/`page`/`of` | the delta the peer's head showed it lacks |
+| `head` | descriptor hash, sender's `set_vv`, `records_pages` and `entries_pages` counts for the pages that FOLLOW it, `entries_complete`, sender's sync_pub, the `answers` round when it is an answer; or a no-membership marker | "here is where I stand"; every batch of pages is preceded by a head declaring it, on BOTH legs. The counts make a page batch complete-or-discarded (so no per-page `of` is needed), and `entries_complete` says whether the delta was COMPUTED at all: an empty delta and an uncomputed one are the difference between advancing a watermark and advancing nothing |
+| `records` | page of membership + conflict records and endorsements, `round`/`page` | the gossip, paged |
+| `entries` | page of index entries, `round`/`page` | the delta the peer's head showed it lacks |
 | `need` | list of wire paths, `need_id` | "publish these for me" |
 | `offer` | `need_id`, `tx_id`, `files: [{ wire_path, set_path }]` | "adopt this and pull" |
 | `done` | `need_id`, `tx_id` | "I have landed everything; you may revoke" |
@@ -618,7 +618,10 @@ Excluded and refused:
 - The exec bit on filesystems that lack one (NTFS, FAT) is write-only
   passthrough: the index preserves the last received value, apply ignores
   it, the rescan never diffs on it, local edits carry it forward. A
-  Windows member must not strip `+x` from every script it touches.
+  Windows member must not strip `+x` from every script it touches. v1
+  keys this on the OS rather than the filesystem, so a FAT or NTFS volume
+  mounted on unix reports whatever mode the mount options invent; lifting
+  it means asking the filesystem, which is additive.
 - The set-of-one-file case (`kind: "file"`) watches the parent directory
   filtered to the one name (editors replace-by-rename on save).
 
@@ -678,10 +681,18 @@ on the same root is `SYNC_ROOT_OVERLAP`.
 | `sync.leave { set_id }` | → `{}`. Local files stay in place (and the interface says so) |
 | `sync.resolve { set_id, path, keep }` | → `{}`. `keep`: a `version_id`, or `"all"` |
 
-Errors (engine's own, relayed verbatim): `SYNC_UNKNOWN_SET`,
-`SYNC_ROOT_OVERLAP`, `SYNC_ROOT_NOT_EMPTY`, `SYNC_NOT_INVITED`,
+Errors (engine's own, relayed verbatim): `SYNC_UNKNOWN_SET` (including a
+`set_id` of the wrong shape: not one this engine could hold),
+`SYNC_ROOT_OVERLAP`, `SYNC_ROOT_NOT_EMPTY`, `SYNC_ROOT_UNKNOWN` (the path
+is not there, or cannot be made), `SYNC_ROOT_RESERVED` (a pre-existing
+entry named like the staging directory), `SYNC_NOT_INVITED`,
 `SYNC_NO_CONFLICT`, `SYNC_DEVICE_INELIGIBLE` (mobile, unknown, or already
-a member), plus `-32602` for shape.
+a member), `SYNC_NOT_READY` (the engine has not resolved the account's
+directory yet: a Core that joined nothing has no sets to manage either),
+`SYNC_INTERNAL` (a local failure the caller can only retry), plus a
+genuine JSON-RPC `-32602` for shape - a malformed request is not an
+application state, and the engine emits the real code rather than
+dressing one as an app code.
 
 Notifications (topic `sync`, published via `sync.emit`):
 
@@ -731,7 +742,7 @@ section 7.
 ## 11. v1 limits (all deliberate, all additive to lift)
 
 Computers only (mobiles never in a list); bidirectional only; no move
-detection; no selective sub-folder sync; no filters/ignore patterns beyond
+detection; the exec bit keyed on the OS rather than the filesystem; no selective sub-folder sync; no filters/ignore patterns beyond
 the built-in exclusions; symlinks ignored; tombstones and conflict records
 never compacted; index snapshot not paged; accept target must be empty; no
 set rename; no cross-device eviction (`devices.revoke` is the

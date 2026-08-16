@@ -183,6 +183,15 @@ pub struct SetState {
     /// The conflict records, keyed (path, conflict_id): first-class
     /// gossiped state, `resolved` a kept tombstone.
     conflicts: BTreeMap<(String, String), ConflictRecord>,
+    /// Bytes landed while the invitation's claim still stands: the consent
+    /// guard measures against it. Persisted.
+    landed_bytes: u64,
+    /// The last rescan's exclusions (the card's ignored list). In-memory:
+    /// the next rescan recomputes it.
+    ignored: Vec<crate::scan::Ignored>,
+    /// The watcher could not be installed: degraded to periodic scanning,
+    /// said on the card. Pushed by the orchestrator.
+    watch_degraded: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -230,10 +239,27 @@ pub struct Engine {
     /// The rounds WE sent, by id: `true` when the round was itself an
     /// answer (its own answer closes the exchange). Bounded.
     sent_rounds: BTreeMap<u64, bool>,
-    /// Device display names from the directory (the conflict-copy
-    /// filenames' one use of them). Refreshed by the orchestrator;
-    /// fallback is the node id's prefix.
-    names: BTreeMap<String, String>,
+    /// The directory as the orchestrator last saw it: translations, names,
+    /// reachability, platforms. The engine core never asks the Core - the
+    /// view is pushed in.
+    directory: DirectoryView,
+}
+
+/// What the engine knows of the device directory, pushed by the
+/// orchestrator from every `devices.list` snapshot.
+#[derive(Clone, Debug, Default)]
+pub struct DirectoryView {
+    /// node_id -> the Core's device_id (what the facade and `peers.send`
+    /// speak).
+    pub device_of: BTreeMap<String, String>,
+    /// node_id -> display name.
+    pub names: BTreeMap<String, String>,
+    /// Nodes with a route right now.
+    pub reachable: BTreeSet<String>,
+    /// node_id -> platform (the computers-only rule needs it).
+    pub platforms: BTreeMap<String, String>,
+    /// node_id -> last_seen, relayed verbatim into the cards.
+    pub last_seen: BTreeMap<String, Value>,
 }
 
 impl Engine {
@@ -252,13 +278,21 @@ impl Engine {
             sets,
             round_counter: 0,
             sent_rounds: BTreeMap::new(),
-            names: BTreeMap::new(),
+            directory: DirectoryView::default(),
         })
     }
 
-    /// The directory's display names, for the conflict-copy filenames.
-    pub fn set_device_names(&mut self, names: BTreeMap<String, String>) {
-        self.names = names;
+    /// The orchestrator's directory push.
+    pub fn set_directory(&mut self, directory: DirectoryView) {
+        self.directory = directory;
+    }
+
+    /// The orchestrator's word on whether this set's watcher could be
+    /// installed: a set reduced to periodic scanning says so on its card.
+    pub fn set_watch_degraded(&mut self, set_id: &str, degraded: bool) {
+        if let Some(state) = self.sets.get_mut(set_id) {
+            state.set_watch_degraded(degraded);
+        }
     }
 
     pub fn self_node(&self) -> &str {
@@ -283,11 +317,193 @@ impl Engine {
         self.sets.keys().cloned().collect()
     }
 
-    /// The `sync.status` snapshot. Honest and empty of cards until the
-    /// facade brick teaches it to describe the sets; the engine still owns
-    /// the answer, so the shape has one home.
+    /// The `sync.status` snapshot (doc/sync-engine.md, section 10): the
+    /// AUTHORITATIVE state the notifications merely echo. A GUI starting
+    /// after the fact must be able to render everything - conflicts,
+    /// ignored, blocked - from this alone.
     pub fn status(&self) -> Value {
-        json!({ "sets": [], "invitations": [] })
+        let mut sets = Vec::new();
+        let mut invitations = Vec::new();
+        for (set_id, state) in &self.sets {
+            match state.membership.effective(&self.self_node) {
+                Effective::Invited => {
+                    let claim = state.invite_claim.clone().unwrap_or(InviteClaim {
+                        inviter: String::new(),
+                        entries: 0,
+                        total_size: 0,
+                    });
+                    invitations.push(json!({
+                        "set_id": set_id,
+                        "name": state.membership.descriptor.name,
+                        "kind": kind_str(state.membership.descriptor.kind),
+                        "device_id": self.device_id_of(&claim.inviter),
+                        "entries": claim.entries,
+                        "total_size": claim.total_size,
+                        "default_path": format!("~/1Device/{}", state.membership.descriptor.name),
+                    }));
+                }
+                Effective::Active | Effective::Paused => {
+                    sets.push(self.card(set_id, state));
+                }
+                // Declined, left, or nothing verifiable: no card - the set
+                // left this device.
+                _ => {}
+            }
+        }
+        json!({ "sets": sets, "invitations": invitations })
+    }
+
+    fn device_id_of(&self, node: &str) -> String {
+        self.directory
+            .device_of
+            .get(node)
+            .cloned()
+            .unwrap_or_else(|| node.to_string())
+    }
+
+    fn card(&self, set_id: &str, state: &SetState) -> Value {
+        let effective_self = state.membership.effective(&self.self_node);
+        let open_conflicts: Vec<&ConflictRecord> =
+            state.conflicts.values().filter(|r| !r.resolved).collect();
+
+        let mut devices = Vec::new();
+        let mut any_other_active = false;
+        for node in state.membership.device_ids() {
+            let membership = match state.membership.effective(&node) {
+                Effective::Active => "active",
+                Effective::Paused => "paused",
+                Effective::Invited => "invited",
+                Effective::Declined => "declined",
+                Effective::Left => "left",
+                Effective::Unknown => continue,
+            };
+            if node != self.self_node && membership == "active" {
+                any_other_active = true;
+            }
+            let behind = match state.watermarks.get(&node) {
+                _ if node == self.self_node => 0,
+                Some(watermark) => state
+                    .index
+                    .iter()
+                    .filter(|e| !watermark.covers(&e.vv))
+                    .count(),
+                None => state.index.len(),
+            };
+            let sync = if node == self.self_node {
+                "up_to_date"
+            } else if !self.directory.reachable.contains(&node) {
+                "offline"
+            } else if behind > 0 {
+                "behind"
+            } else {
+                "up_to_date"
+            };
+            devices.push(json!({
+                "device_id": self.device_id_of(&node),
+                "membership": membership,
+                "sync": sync,
+                "behind": behind,
+                "last_seen": self.directory.last_seen.get(&node).cloned().unwrap_or(Value::Null),
+            }));
+        }
+
+        let conflicts: Vec<Value> = open_conflicts
+            .iter()
+            .map(|record| {
+                let mut versions = Vec::new();
+                for path in [record.path.as_str(), record.path_on_disk.as_str()] {
+                    if let Some(entry) = state.index.get(path).filter(|e| !e.deleted) {
+                        versions.push(json!({
+                            "version_id": version_id(entry),
+                            "device_id": self.device_id_of(
+                                &author_of(&entry.vv).unwrap_or_default(),
+                            ),
+                            "mtime": { "secs": entry.mtime.secs, "nanos": entry.mtime.nanos },
+                            "size": entry.size,
+                            "path_on_disk": path,
+                        }));
+                    }
+                }
+                json!({
+                    "path": record.path,
+                    "conflict_id": record.conflict_id,
+                    "versions": versions,
+                })
+            })
+            .collect();
+
+        let state_str = if !open_conflicts.is_empty() {
+            "conflicts"
+        } else if effective_self == Effective::Paused {
+            "paused"
+        } else if !state.pending.is_empty() || !state.needs.is_empty() || !state.parked.is_empty() {
+            "catching_up"
+        } else if !any_other_active {
+            "waiting"
+        } else {
+            "in_order"
+        };
+        let problem = if state.size_guard_tripped() {
+            json!("size_exceeds_invitation")
+        } else if state.watch_degraded {
+            json!("watch_degraded")
+        } else {
+            Value::Null
+        };
+
+        json!({
+            "set_id": set_id,
+            "kind": kind_str(state.membership.descriptor.kind),
+            "name": state.membership.descriptor.name,
+            "path": state.root.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            "state": state_str,
+            "problem": problem,
+            "behind": state.pending.len(),
+            "devices": devices,
+            "conflicts": conflicts,
+            "ignored": state
+                .ignored
+                .iter()
+                .map(|i| json!({ "path": i.name, "reason": i.reason }))
+                .collect::<Vec<_>>(),
+            "blocked": state
+                .parked
+                .values()
+                .map(|p| json!({ "path": p.entry.path, "reason": p.reason }))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// Does `path` equal, contain, or live inside any set root? One file,
+    /// one set (SYNC_ROOT_OVERLAP).
+    pub fn overlaps(&self, path: &Path) -> bool {
+        self.sets.values().any(|state| {
+            state.root.as_deref().is_some_and(|root| {
+                root == path || root.starts_with(path) || path.starts_with(root)
+            })
+        })
+    }
+
+    /// Whether `node` may be invited at all: a computer of the account,
+    /// not us. The mobile exclusion is the v1 rule, not a judgement.
+    pub fn invite_eligible(&self, node: &str) -> Result<(), &'static str> {
+        if node == self.self_node {
+            return Err("oneself");
+        }
+        if !self.directory.device_of.contains_key(node) {
+            return Err("unknown device");
+        }
+        if self.directory.platforms.get(node).map(String::as_str) == Some("android") {
+            return Err("mobile");
+        }
+        Ok(())
+    }
+
+    /// The invitation state, for the facade's refusals.
+    pub fn is_invited(&self, set_id: &str) -> bool {
+        self.sets
+            .get(set_id)
+            .is_some_and(|state| state.membership.effective(&self.self_node) == Effective::Invited)
     }
 
     fn next_round(&mut self, answer: bool) -> u64 {
@@ -405,6 +621,10 @@ impl Engine {
             .sets
             .remove(set_id)
             .ok_or_else(|| io::Error::other("unknown set"))?;
+        if status == MemberStatus::Active {
+            // Resuming is the user gesture that lifts the consent guard.
+            state.invite_claim = None;
+        }
         let absorbed = self.sign_own(&mut state, status, now);
         debug_assert!(matches!(absorbed, Absorb::Absorbed));
         if status.is_terminal() {
@@ -562,6 +782,7 @@ impl Engine {
             &key,
         )?;
         let _ = state.drain_pending(&key);
+        state.ignored = report.ignored.clone();
         state.persist(&self.store, set_id)?;
         Ok(report)
     }
@@ -882,7 +1103,7 @@ impl Engine {
                         // record.
                         if materialize_conflict(
                             state,
-                            &self.names,
+                            &self.directory.names,
                             self.store.identity(),
                             &self_node,
                             &staged,
@@ -895,6 +1116,11 @@ impl Engine {
                 }
             }
             let _ = state.drain_pending(&key);
+            if state.pending.is_empty() && state.needs.is_empty() {
+                // The initial sync delivered everything: the claim served
+                // its purpose.
+                state.invite_claim = None;
+            }
             // The staging dir has served: verified files were moved out,
             // failures are re-pulled whole.
             let _ = std::fs::remove_dir_all(&pull.staging);
@@ -1550,7 +1776,10 @@ impl Engine {
         let Some(state) = self.sets.get_mut(set_id) else {
             return out;
         };
-        if state.root.is_none() || state.membership.effective(&self_node) != Effective::Active {
+        if state.root.is_none()
+            || state.membership.effective(&self_node) != Effective::Active
+            || state.size_guard_tripped()
+        {
             return out;
         }
         let mut claimed: BTreeSet<String> = state
@@ -1693,6 +1922,9 @@ impl SetState {
             publishing: BTreeMap::new(),
             parked: BTreeMap::new(),
             conflicts: BTreeMap::new(),
+            landed_bytes: 0,
+            ignored: Vec::new(),
+            watch_degraded: false,
         })
     }
 
@@ -1728,6 +1960,23 @@ impl SetState {
             parked.remove(0);
         }
         parked.push(entry.clone());
+    }
+
+    /// The consent guard (the letter, section 2): the inviter's size claim,
+    /// honestly enforced with a stated margin. Tripped = the set stops
+    /// pulling and the card says why; resuming is a user gesture.
+    fn size_guard_tripped(&self) -> bool {
+        self.invite_claim.as_ref().is_some_and(|claim| {
+            self.landed_bytes
+                > claim
+                    .total_size
+                    .saturating_mul(2)
+                    .saturating_add(100 * 1024 * 1024)
+        })
+    }
+
+    fn set_watch_degraded(&mut self, degraded: bool) {
+        self.watch_degraded = degraded;
     }
 
     #[cfg(test)]
@@ -1861,6 +2110,10 @@ impl SetState {
         let size = std::fs::metadata(&dest)
             .map(|m| m.len())
             .unwrap_or(entry.size);
+        if self.invite_claim.is_some() {
+            // The consent guard measures what the initial sync lands.
+            self.landed_bytes = self.landed_bytes.saturating_add(size);
+        }
         let mut vv = entry.vv.clone();
         if resurrects {
             // The survivor dominates the tombstone it beat: merged, then
@@ -2266,6 +2519,7 @@ impl SetState {
                     .collect(),
             ),
             "need_counter": self.need_counter,
+            "landed_bytes": self.landed_bytes,
             "conflicts": Value::Array(
                 self.conflicts.values().map(ConflictRecord::to_value).collect(),
             ),
@@ -2397,6 +2651,12 @@ impl SetState {
                 .ok_or_else(corrupt)?,
             published: BTreeMap::new(),
             publishing: BTreeMap::new(),
+            landed_bytes: meta
+                .get("landed_bytes")
+                .and_then(Value::as_u64)
+                .ok_or_else(corrupt)?,
+            ignored: Vec::new(),
+            watch_degraded: false,
             conflicts: {
                 let mut conflicts = BTreeMap::new();
                 for record in meta
@@ -2484,6 +2744,21 @@ impl SetState {
 
 fn wrap(out: Vec<Outgoing>) -> Vec<Effect> {
     out.into_iter().map(Effect::Send).collect()
+}
+
+fn kind_str(kind: SetKind) -> &'static str {
+    match kind {
+        SetKind::Dir => "dir",
+        SetKind::File => "file",
+    }
+}
+
+/// The version's author for the card: the node holding the greatest
+/// (value, key) component - a deterministic attribution, not a judgement.
+fn author_of(vv: &Vv) -> Option<String> {
+    vv.components()
+        .max_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)))
+        .map(|(key, _)| key.split('@').next().unwrap_or(key).to_string())
 }
 
 /// Keep both, deterministically (the letter, section 7): the winner of the
@@ -3556,7 +3831,10 @@ mod tests {
                 (node('b'), "Beta:Box".to_string()),
             ]
             .into();
-            rig.of(letter).set_device_names(names);
+            rig.of(letter).set_directory(DirectoryView {
+                names,
+                ..DirectoryView::default()
+            });
         }
         let a_root = root_of(&mut rig, 'a', &set_id);
         let b_root = root_of(&mut rig, 'b', &set_id);

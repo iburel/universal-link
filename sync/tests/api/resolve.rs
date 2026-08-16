@@ -12,21 +12,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::support::{Engine, RESPONSE_TIMEOUT, TestCore, status_eventually, ui};
-
-/// A serverless Core that joined an account: device key + account root
-/// seeded on disk, exactly what `account.setup` would have written.
-async fn core_in_account() -> TestCore {
-    TestCore::start_with(|dir| {
-        let key = onedevice_test_support::DeviceKey::generate();
-        std::fs::write(dir.join("device.key"), key.seed_hex()).expect("seed the device key");
-        let code = onedevice_core::account_key::generate_recovery_code();
-        let ak = onedevice_core::account_key::account_key_from_code(&code).expect("account key");
-        let root = onedevice_core::account_key::root_for(&ak, &key.node_id());
-        onedevice_core::account_key::save(dir, &root).expect("save the account root");
-    })
-    .await
-}
+use crate::support::{Engine, RESPONSE_TIMEOUT, core_in_account, status_eventually, ui};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_engine_resolves_itself_and_keeps_serving() {

@@ -217,6 +217,77 @@ pub async fn ui(core: &TestCore) -> Ui {
     Ui { client, events }
 }
 
+/// A serverless Core that joined an account: device key + account root
+/// seeded on disk, exactly what `account.setup` would have written. The
+/// engine resolves its own node_id from such a Core's directory.
+pub async fn core_in_account() -> TestCore {
+    TestCore::start_with(|dir| {
+        let key = onedevice_test_support::DeviceKey::generate();
+        std::fs::write(dir.join("device.key"), key.seed_hex()).expect("seed the device key");
+        let code = onedevice_core::account_key::generate_recovery_code();
+        let ak = onedevice_core::account_key::account_key_from_code(&code).expect("account key");
+        let root = onedevice_core::account_key::root_for(&ak, &key.node_id());
+        onedevice_core::account_key::save(dir, &root).expect("save the account root");
+    })
+    .await
+}
+
+/// Calls a gesture until the engine has resolved its directory: the very
+/// first calls answer `SYNC_NOT_READY` while the resolution is in flight,
+/// and the suite never sleeps a fixed amount.
+pub async fn ready(ui: &Ui) {
+    timeout(RESPONSE_TIMEOUT, async {
+        loop {
+            match ui.client.request("sync.status", json!({})).await {
+                Ok(_) => {
+                    // Status answers even unresolved; probe a gesture that
+                    // needs the engine.
+                    match ui
+                        .client
+                        .request("sync.pause", json!({ "set_id": "AAAAAAAAAAAAAAAAAAAAAA" }))
+                        .await
+                    {
+                        Err(RequestError::Rpc(e))
+                            if e.data_code.as_deref() == Some("SYNC_UNKNOWN_SET") =>
+                        {
+                            return;
+                        }
+                        _ => tokio::time::sleep(Duration::from_millis(25)).await,
+                    }
+                }
+                Err(RequestError::Rpc(e)) if e.data_code.as_deref() == Some("COMPONENT_ABSENT") => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(e) => panic!("unexpected error waiting for the engine: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for the engine to resolve its directory")
+}
+
+/// The application code of a refused gesture.
+pub async fn app_code(ui: &Ui, method: &str, params: Value) -> String {
+    match ui.client.request(method, params).await {
+        Err(RequestError::Rpc(e)) => e.data_code.unwrap_or_else(|| format!("code {}", e.code)),
+        other => panic!("expected a refusal from {method}, got {other:?}"),
+    }
+}
+
+/// Waits for one `sync.*` notification of the given method.
+pub async fn wait_notification(ui: &mut Ui, method: &str) -> Value {
+    timeout(RESPONSE_TIMEOUT, async {
+        loop {
+            match ui.events.recv().await.expect("event channel closed") {
+                Event::Notification { method: m, params } if m == method => return params,
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timeout waiting for {method}"))
+}
+
 /// Calls `sync.status` until the engine is actually serving: the facade
 /// answers `COMPONENT_ABSENT` while the engine's own hello is still in
 /// flight, and the suite never sleeps a fixed amount.

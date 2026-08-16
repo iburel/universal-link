@@ -25,7 +25,7 @@ async fn the_engine_serves_the_empty_snapshot_through_the_facade() {
     assert_eq!(engine.stop().await, Outcome::StdinClosed);
 }
 
-/// A vocabulary name the engine does not serve yet is refused with `-32601`
+/// A `sync.*` name outside the frozen vocabulary is refused with `-32601`
 /// by the engine's OWN client (the served-methods gate), and the Core relays
 /// that refusal verbatim - not `COMPONENT_ABSENT`: the engine is there, the
 /// method is not.
@@ -41,7 +41,7 @@ async fn a_gesture_outside_the_served_list_relays_method_not_found() {
 
     match ui
         .client
-        .request("sync.pause", json!({ "set_id": "s" }))
+        .request("sync.imagine", json!({ "set_id": "s" }))
         .await
     {
         Err(RequestError::Rpc(e)) => {

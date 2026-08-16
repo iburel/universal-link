@@ -58,6 +58,12 @@ enum RespondPayload {
     Ok(Value),
     /// An application error code (`error.data.code`, e.g. `CLIP_STALE`).
     Err(String),
+    /// A malformed request: the JSON-RPC `-32602`, worded exactly as the
+    /// Core words its own (`invalid params: <what>`). A component serving
+    /// a routed facade needs it: a shape refusal is not an application
+    /// state, and dressing one as an app code would make every interface
+    /// special-case it.
+    InvalidParams(String),
 }
 
 /// Request handle to the Core — clonable, shareable across tasks.
@@ -107,6 +113,17 @@ impl Client {
     /// the Core as `error.data.code`, e.g. `CLIP_STALE`).
     pub async fn respond_error(&self, id: RequestId, code: &str) -> Result<(), RequestError> {
         self.send_response(id, RespondPayload::Err(code.to_string()))
+            .await
+    }
+
+    /// Refuses a served request as malformed: the JSON-RPC `-32602`, worded
+    /// like the Core's own. `what` names the offending field.
+    pub async fn respond_invalid_params(
+        &self,
+        id: RequestId,
+        what: &str,
+    ) -> Result<(), RequestError> {
+        self.send_response(id, RespondPayload::InvalidParams(what.to_string()))
             .await
     }
 
@@ -504,6 +521,14 @@ async fn serve(
                             "jsonrpc": "2.0",
                             "id": id,
                             "error": { "code": -32000, "message": code, "data": { "code": code } },
+                        }),
+                        RespondPayload::InvalidParams(what) => json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": -32602,
+                                "message": format!("invalid params: {what}"),
+                            },
                         }),
                     };
                     match write_frame(&mut writer, &msg.to_string()).await {
