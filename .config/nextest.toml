@@ -80,6 +80,11 @@ platform = 'cfg(any(target_os = "macos", target_os = "windows"))'
 filter = 'package(onedevice-clipboard) & kind(test) & test(/source::/)'
 test-group = 'serial-ipc'
 
+[[profile.ci.overrides]]
+platform = 'cfg(any(target_os = "macos", target_os = "windows"))'
+filter = 'package(onedevice-sync) & kind(test)'
+test-group = 'serial-ipc'
+
 # --- serial-os-clipboard: shared per-session OS resources -------------------
 # No platform scope needed: each of these binaries is `#![cfg(target_os = ...)]`
 # and simply does not exist off its own OS. Anchored regexes so the `linux`

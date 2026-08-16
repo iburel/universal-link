@@ -4481,6 +4481,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "onedevice-sync"
+version = "0.6.0"
+dependencies = [
+ "ed25519-dalek 3.0.0",
+ "hex",
+ "onedevice-core",
+ "onedevice-ipc-client",
+ "onedevice-paths",
+ "onedevice-test-support",
+ "rand 0.10.2",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "onedevice-test-support"
 version = "0.6.0"
 dependencies = [

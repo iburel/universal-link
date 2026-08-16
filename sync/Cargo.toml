@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[package]
+name = "onedevice-sync"
+version = "0.6.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+# The official sync engine (doc/sync-engine.md): the exclusive `sync-backend`
+# component behind the Core's routed `sync.*` facade. It speaks ONLY the public
+# Core API - control messages ride `peers.send`, bytes ride published
+# transactions - and owns all of its persistence under the platform data dir.
+# The OS-agnostic logic lives in the lib, frozen by tests/api/; the binary is
+# wiring.
+
+[[bin]]
+name = "1device-sync"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+# Hand-picked features, like the sibling components: the runtime, stdin (the
+# supervisor's stop signal), and the sync primitives the orchestrator uses.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-std",
+    "io-util",
+    "sync",
+] }
+onedevice-ipc-client = { path = "../client" }
+# Resolves the platform data directory the engine persists under.
+onedevice-paths = { path = "../paths" }
+# Aligned with core/Cargo.toml, which explains why this is an ordinary
+# requirement rather than an exact pin. The same stability concern applies
+# here: the engine's seed is PERSISTED (identity.json) and its public half is
+# what peers pin, so a change in `to_bytes`/`from_bytes` semantics would unpin
+# this device from every set it belongs to.
+ed25519-dalek = { version = "3", features = ["rand_core"] }
+rand = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+onedevice-core = { path = "../core" }
+onedevice-test-support = { path = "../test-support" }
