@@ -37,6 +37,9 @@ services:
       # URLs, see .env.example). Empty = the deployment runs no relay, which
       # is a valid shape: devices then fall back to their own relay setting.
       ONEDEVICE_RELAYS: ${ONEDEVICE_RELAYS:-}
+      # The role those relays play (#88, see .env.example): empty = they also
+      # carry payload; a byte count = rendezvous-only above it.
+      ONEDEVICE_RELAY_MAX_PAYLOAD: ${ONEDEVICE_RELAY_MAX_PAYLOAD:-}
       # Optional (defaults baked into the binary) — uncomment as needed:
       # ONEDEVICE_MAX_REQUESTS_PER_MINUTE: "120"
       # ONEDEVICE_LOG: "info"

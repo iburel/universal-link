@@ -365,6 +365,35 @@ test("a failed or cancelled send says so on the card", () => {
   );
 });
 
+// A fill relays the SOURCE device's error strings verbatim, and only the
+// local Core's own transfer codes own a sentence: a peer answering a READ
+// with an account-shaped code must not make this row assert account facts
+// ("struck from the account for good...") the peer never had authority on.
+test("a peer-shaped code renders verbatim, never as an account sentence", () => {
+  store.devices = [WIN, SELF];
+  store.transfers = [
+    transferTo("d_win", { status: "failed", error: "DEVICE_REVOKED" }),
+  ];
+  const view = render(Devices, { store, now: NOW });
+  const text = view.querySelector('[data-device-id="d_win"]')?.textContent ?? "";
+  expect(text).toContain("Send failed: DEVICE_REVOKED");
+  expect(text).not.toContain("struck from the account");
+});
+
+// A bare Core code in `transfer.failed` gets its sentence (#88): the phrase
+// blames the PAIR and names the remedies, instead of printing the code.
+test("a rendezvous-only refusal is worded, not printed as a code", () => {
+  store.devices = [WIN, SELF];
+  store.transfers = [
+    transferTo("d_win", { status: "failed", error: "NO_DIRECT_PATH" }),
+  ];
+  const view = render(Devices, { store, now: NOW });
+  const text = view.querySelector('[data-device-id="d_win"]')?.textContent ?? "";
+  expect(text).toContain("could not reach each other directly");
+  expect(text).toContain("relay introduces devices without carrying their files");
+  expect(text).not.toContain("NO_DIRECT_PATH");
+});
+
 // -- Android share sheet: the destination picker ------------------------------
 //
 // A file shared into the app turns this list into a picker: one tap sends it.

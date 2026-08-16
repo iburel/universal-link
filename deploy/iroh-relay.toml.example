@@ -7,3 +7,22 @@
 # no `[tls]` section the relay serves everything over this one socket.
 
 http_bind_addr = "[::]:3340"
+
+# The physical half of a rendezvous-only deployment (#88): a per-client
+# receive rate limit, in the relay itself. The announced cap
+# (ONEDEVICE_RELAY_MAX_PAYLOAD in .env) is enforced by every device of the
+# fleet - this token bucket is what protects your bandwidth from a client
+# that ignores it (an old build, a third-party endpoint).
+#
+# Sizing rule: the bucket throttles, it never refuses, so an authorized
+# at-cap payload must clear at burst speed or the fleet's own timeouts eat
+# it (a pushed clip waits 10 s for its ack, a paste read 30 s). Set
+# max_burst_bytes to a small multiple of the announced cap (2x below, for
+# the recommended 1 MiB cap) so capped payloads ride instantly, and keep
+# bytes_per_second low: it is what a policy-ignoring client gets squeezed
+# to. With the values below, one authorized payload clears at once and
+# sustained bulk crawls at 256 KiB/s.
+#
+# [limits.client.rx]
+# bytes_per_second = 262144
+# max_burst_bytes = 2097152

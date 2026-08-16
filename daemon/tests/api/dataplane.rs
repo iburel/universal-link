@@ -99,6 +99,94 @@ async fn the_core_transfer_protocol_survives_real_quic() {
     b.close().await;
 }
 
+/// The announced role (#88) against REAL iroh endpoints: both bound in the
+/// production announced shape (`resolve_relay`: off default filled by the
+/// deployment's word, rendezvous-only above a cap), an OVER-CAP sized open
+/// waits for the punched direct path and then proceeds - on localhost the
+/// punch always lands, so this pins that the enforcement never
+/// false-refuses a pair that can meet directly, over the real QUIC
+/// lifecycle. The `relay_cap` assertion pins the other half a green
+/// transfer cannot: the cap actually reached the enforcement (a bind that
+/// dropped it would make this very test pass by never gating at all). The
+/// refusal arm itself needs a pair that genuinely cannot hole-punch, which
+/// no offline test can stage: the surfacing of the code is proven against
+/// the in-memory double in the Core suite, and the real refusal belongs to
+/// live validation.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_over_cap_open_proceeds_once_the_punch_lands() {
+    let (_relay_map, relay_url, _guard) = run_relay_server().await.expect("local relay");
+
+    let seed_a = [11u8; 32];
+    let seed_b = [12u8; 32];
+    let announced = vec![relay_url.clone()];
+    let a = IrohTransport::bind_test_announced(seed_a, announced.clone(), Some(1024), false)
+        .await
+        .expect("endpoint A");
+    let b = IrohTransport::bind_test_announced(seed_b, announced, Some(1024), false)
+        .await
+        .expect("endpoint B");
+    assert_eq!(
+        b.relay_cap(),
+        Some(1024),
+        "the announced cap must reach the enforcement"
+    );
+
+    timeout(Duration::from_secs(15), async {
+        tokio::join!(a.endpoint().online(), b.endpoint().online());
+    })
+    .await
+    .expect("endpoints online via the relay");
+
+    let peer = PeerAddr {
+        node_id: node_id(&seed_a),
+        relay_url: Some(relay_url.to_string()),
+        addrs: Vec::new(),
+    };
+
+    // Well over the cap: the sized open must hold the stream back until the
+    // direct path is the selected one, then let the whole transfer through.
+    let contents = vec![7u8; 200_000];
+    let src_dir = tempfile::tempdir().expect("tempdir source");
+    let src = src_dir.path().join("payload.bin");
+    std::fs::write(&src, &contents).expect("write the source");
+    let dest_dir = tempfile::tempdir().expect("tempdir dest");
+
+    let written = timeout(Duration::from_secs(20), async {
+        let respond = async {
+            let (peer_id, mut stream) = a.accept().await.expect("accept A");
+            assert_eq!(peer_id, node_id(&seed_b), "incoming peer's identity");
+            let manifest = read_offer(&mut stream).await.expect("offer");
+            receive_bodies(&mut stream, dest_dir.path(), &manifest, &mut |_, _| {})
+                .await
+                .expect("receive")
+        };
+        let ask = async {
+            let files = vec![OutgoingFile {
+                name: "payload.bin".into(),
+                source: Some(src.clone()),
+                size: contents.len() as u64,
+                is_dir: false,
+            }];
+            let mut stream = b
+                .open_for_payload(&peer, contents.len() as u64)
+                .await
+                .expect("sized open B->A over the cap");
+            send_transfer(&mut stream, &files, &mut |_, _| {})
+                .await
+                .expect("send");
+        };
+        let (written, ()) = tokio::join!(respond, ask);
+        written
+    })
+    .await
+    .expect("transfer within the deadline");
+
+    assert_eq!(written.len(), 1);
+    assert_eq!(std::fs::read(&written[0]).expect("received file"), contents);
+    a.close().await;
+    b.close().await;
+}
+
 /// Two endpoints in OFF mode (`RelayMode::Disabled`, the production default,
 /// #104): mDNS is the only possible route, so a successful transfer proves
 /// the LAN discovery end to end (announcement on one side, resolution on the

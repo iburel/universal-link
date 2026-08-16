@@ -300,6 +300,7 @@ transfer (deleted automatically on failure).
 | `access_denied` (browser) | Consent screen in "Testing" and the account not added as a test user. |
 | `DEVICE_UNKNOWN` | C7 attestation absent/invalid (one side has not done *setup*/*join*), or no directory snapshot yet. |
 | `DEVICE_OFFLINE` | Peer known but **with no route**: no relay (its iroh has not joined one, or the server has not registered its `relay_url`), not heard on the LAN, and its record carries no signed reach hints ([beyond-the-lan.md](beyond-the-lan.md)). |
+| `NO_DIRECT_PATH` | The deployment's relays are **rendezvous-only** above a size cap ([server-deployment.md](server-deployment.md)) and hole punching found no direct path between the two devices. The pair is what fails, not one device; the same network or a VPN between them restores the path. |
 
 Sources: [`core/src/login.rs`](../core/src/login.rs),
 [`server/src/oidc.rs`](../server/src/oidc.rs),
@@ -311,10 +312,17 @@ This is the most likely friction point, and the reason is worth knowing: the iro
 data plane is in a **minimal** preset — **automatic discovery is disabled** (no
 DNS; mDNS covers the local network only), and the relay is **off by default**, so
 off the LAN two peers only meet through a route somebody set up: a VPN between
-them, their signed address hints, or a relay opted into with the `relay` setting
-(a URL, or `"n0"` for the public relays). With a relay, the peers **meet through
-it** (rendezvous); NAT traversal (hole-punching) stays active and a **direct
-route** can form after the rendezvous, the relay remaining the fallback channel.
+them, their signed address hints, a relay opted into with the `relay` setting
+(a URL, or `"n0"` for the public relays), or, for a device that belongs to a
+server account and left `relay` off, the relays its deployment announces
+([server-deployment.md](server-deployment.md)). With a relay, the peers
+**meet through it** (rendezvous); NAT traversal (hole-punching) stays active
+and a **direct route** can form after the rendezvous, the relay remaining
+the fallback channel. One exception, on the announced route only: a
+deployment may announce its relays rendezvous-only above a size cap, and an
+over-cap operation with no punched direct path then fails with
+`NO_DIRECT_PATH` instead of riding the relay. The cap never governs a relay
+you configured locally with `relay`.
 Practical consequence: to establish the initial connection through a relay,
 **both machines must have a UDP egress to a common relay** (corporate firewall,
 restricted network → failure). Lead: host your own relay and set it as `relay`

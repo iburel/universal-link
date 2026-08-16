@@ -3,6 +3,7 @@
 
 <script lang="ts">
   import type { Device } from "../lib/api";
+  import { transferFailure } from "../lib/errors";
   import {
     platformLabel,
     relativeTime,
@@ -254,7 +255,9 @@
                   {:else if transfer.error === "cancelled"}
                     Send cancelled
                   {:else}
-                    Send failed: {transfer.error}
+                    <!-- A bare Core code (NO_DIRECT_PATH, #88) gets its
+                         sentence; anything else is the error's own words. -->
+                    {transferFailure(transfer.error ?? "")}
                   {/if}
                 </span>
                 <button

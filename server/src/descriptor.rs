@@ -67,6 +67,12 @@ fn body(config: &Config) -> Value {
         // Location, not command: the client's own explicit setting wins
         // (#104), and the server's OWN address is still never dictated here.
         "relays": config.relays,
+        // The role those relays play (#88): null = they also carry payload
+        // bytes as the fallback, a number = rendezvous-only above that many
+        // bytes per operation. Rides next to `relays` because location and
+        // role travel together - the word is about the relays named above,
+        // never about a relay the device chose itself.
+        "relay_max_payload": config.relay_max_payload,
     })
 }
 
@@ -104,6 +110,7 @@ mod tests {
             pairing_ttl: Duration::from_secs(120),
             max_requests_per_minute: None,
             relays: relays.iter().map(|r| r.to_string()).collect(),
+            relay_max_payload: None,
         }
     }
 
@@ -166,6 +173,7 @@ mod tests {
                 "oidc_client_id",
                 "oidc_client_secret",
                 "oidc_issuer",
+                "relay_max_payload",
                 "relays",
             ],
             "unexpected descriptor shape"
@@ -189,5 +197,26 @@ mod tests {
             v["relays"],
             serde_json::json!(["https://relay-eu.example", "https://relay-us.example"])
         );
+    }
+
+    /// The relays' role (#88): PRESENT and null when the deployment lets its
+    /// relays carry payload (the historical behavior), the cap in bytes when
+    /// they are rendezvous-only above it. Same shape argument as the secret
+    /// and the relay list: curl the endpoint and the shape answers, rather
+    /// than leaving you to wonder whether the server predates the field.
+    #[test]
+    fn it_states_the_relays_role_next_to_their_location() {
+        let v = body(&config(None, &["https://relay.example"]));
+        assert_eq!(v["relay_max_payload"], Value::Null);
+        assert!(
+            v.as_object()
+                .expect("an object")
+                .contains_key("relay_max_payload"),
+            "the key must be there even when unset: {v}"
+        );
+
+        let mut with_cap = config(None, &["https://relay.example"]);
+        with_cap.relay_max_payload = Some(1_048_576);
+        assert_eq!(body(&with_cap)["relay_max_payload"], 1_048_576);
     }
 }

@@ -56,7 +56,8 @@ client reads it before it is able to log in.
   "oidc_issuer": "https://accounts.google.com",
   "oidc_client_id": "1234.apps.googleusercontent.com",
   "oidc_client_secret": "GOCSPX-…",
-  "relays": ["https://relay-eu.example", "https://relay-us.example"]
+  "relays": ["https://relay-eu.example", "https://relay-us.example"],
+  "relay_max_payload": 1048576
 }
 ```
 
@@ -93,6 +94,16 @@ into its `config.json`.
   Core re-reads this at every session establishment and keeps its own copy
   (`announced-relays.json`), so a boot with the server down still binds with
   the operator's relays.
+- `relay_max_payload` is the role those relays play (#88): `null` (or, from
+  a server that predates the field, absent) = they also carry payload bytes
+  when no direct path exists, the historical behavior; a number = they are
+  **rendezvous-only above that many bytes per operation** (`0`: strictly
+  rendezvous). Announced next to `relays` because location and role travel
+  together: the word is about the relays named above and binds a device
+  exactly when they are its effective relay source - never when its own
+  explicit setting won. The Core enforces it at the source (an over-cap
+  operation with no punched direct path fails with `NO_DIRECT_PATH`,
+  doc/core-api.md) and caches it in the same `announced-relays.json`.
 - `api_version` is the number `auth.enroll` also answers: a client can tell,
   before enrolling, whether this server speaks its protocol.
 - `Cache-Control: no-store`: read when a device is set up, and re-read at each

@@ -559,7 +559,7 @@ Notifications (topic `transfers`):
 | `transfer.incoming { transfer_id, device_id, files }` | a device sends us files (`files` = manifest `[{name, size}]`) |
 | `transfer.started { transfer_id, device_id, files, total }` | the actual start of a send (will include `transactions.fill` fills) |
 | `transfer.progress { transfer_id, done, total }` | throttled by the Core (~2/s; the first and last point are always emitted) |
-| `transfer.finished { transfer_id, paths? }` / `transfer.failed { transfer_id, error }` | end (`paths` = files written, on the receiving side; `error: "cancelled"` on cancellation) |
+| `transfer.finished { transfer_id, paths? }` / `transfer.failed { transfer_id, error }` | end (`paths` = files written, on the receiving side). `error` is a bare code when the Core minted one - `"cancelled"` on cancellation, `"NO_DIRECT_PATH"` when the deployment's rendezvous-only relays refused an over-cap payload with no direct path (#88) - otherwise the failure's own words |
 
 ## Transactions
 
@@ -663,13 +663,19 @@ Constraints keep it a narrow, safe extension:
 Because the source may vanish the instant the push completes, it has to know
 *when* that is. The announce therefore answers `pushed_to` — how many of the
 account's other devices the fan-out targets — and, when that is non-zero, the
-Core sends exactly one `clipboard.pushed { tx_id, delivered, failed }` on the
-announcing connection once every push has settled. That is the completion
-signal an ephemeral source waits on before exiting, and it is deliberately
-*reporting*, not a guarantee: `pushed_to: 0` means nothing was shared at all,
-`delivered: 0` means no device could be reached, and a device that was offline
-at copy time never learns the clip. A source that does not care may ignore both
-— the local transaction is unaffected.
+Core sends exactly one `clipboard.pushed { tx_id, delivered, failed,
+no_direct_path }` on the announcing connection once every push has settled.
+That is the completion signal an ephemeral source waits on before exiting,
+and it is deliberately *reporting*, not a guarantee: `pushed_to: 0` means
+nothing was shared at all, `delivered: 0` means no device could be reached,
+and a device that was offline at copy time never learns the clip.
+`no_direct_path` is the subset of `failed` refused by the deployment's
+announced relay role (#88): those devices are online and were told the clip
+exists through a fallback metadata announce (their paste then speaks the
+policy's code, or rides a direct path if one forms); only the pushed bytes
+needed a direct path, and an interface words that remedy apart from "could
+not be reached". A source that does not care may ignore the report, the
+local transaction being unaffected.
 
 Supersession and the Core-stop/logout cut drop the cached bytes with the
 transaction, like any other: a materialized clip is deleted (and its bytes
@@ -778,14 +784,16 @@ implementation time):
     request; the channel stays usable)
   - Core → component: `DATA { offset, bytes }`, `EOF`, `ERROR { code }`
     (`TX_STALE`, `CLIP_STALE`, `FILE_CHANGED`, `FILE_UNKNOWN`,
-    `FORMAT_UNKNOWN`, `PEER_GONE`, `TIMEOUT`)
+    `FORMAT_UNKNOWN`, `PEER_GONE`, `NO_DIRECT_PATH`, `TIMEOUT`)
   - Every request is answered by `DATA*` then `EOF` — `EOF` terminates the
     *response*, not the file: a `READ` crossing the end of the file returns
     the intersection (possibly zero bytes) then `EOF`. `DATA` arrives in
     order; `offset` is absolute (file-relative for `READ`, 0-based for
     `FETCH`). An `ERROR` ends only the request — the channel stays usable —
-    except `TX_STALE` and `PEER_GONE`, which end the session: the Core closes
-    the channel. `READ` on a `dir` entry → `FILE_UNKNOWN` (a directory conveys
+    except `TX_STALE`, `PEER_GONE` and `NO_DIRECT_PATH` (#88: the sized open
+    to the source was refused by the announced relay role, before any
+    request could be served), which end the session: the Core closes the
+    channel. `READ` on a `dir` entry → `FILE_UNKNOWN` (a directory conveys
     the tree; it has no bytes).
 - **Provider channel** (source side, token carried by `clipboard.get_data`) —
   the backend writes the requested blob: `DATA*` then `EOF`, or `ERROR { code }`
@@ -840,6 +848,7 @@ Standard JSON-RPC codes + application codes in `error.data.code`:
 | `FILE_CHANGED` | the file behind a manifest entry is no longer the frozen one (size, identity, or mtime): the read is refused rather than serving different bytes |
 | `MANIFEST_TOO_LARGE` | announce refused: the copy exceeds the v1 manifest cap |
 | `PEER_GONE` | data channel: the source device vanished mid-stream (`DEVICE_OFFLINE` is its control-plane twin, at `transactions.open`) |
+| `NO_DIRECT_PATH` | the deployment's relays are rendezvous-only above a cap (#88, announced with the relay list) and hole punching produced no direct path for an over-cap payload. Carried in `transfer.failed.error` (sends and fills) and as a data-channel error code (paste pipe). The PAIR fails, not one device: the same network or a VPN between the two restores the path |
 | `TIMEOUT` | data channel: stall timeout on the Core side |
 
 ## Versioning

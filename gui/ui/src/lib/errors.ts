@@ -48,6 +48,11 @@ const APP_MESSAGES: Record<string, string> = {
   // cannot be withdrawn, so the Core refuses to let a device bar itself.
   CANNOT_REVOKE_SELF:
     "This device cannot revoke itself — do it from another device on the account.",
+  // A rendezvous-only deployment (#88): the relay introduced the devices but
+  // will not carry the payload, and hole punching found no direct path. The
+  // PAIR is what fails, never one device - and the remedies are the pair's.
+  NO_DIRECT_PATH:
+    "These two devices could not reach each other directly, and this deployment's relay introduces devices without carrying their files. The same network, or a VPN between them, would give them a direct path.",
   // Deliberately absent: `session.discover`'s NO_DESCRIPTOR, which the setup
   // screen acts on rather than reports (it reveals the fields to fill in), and
   // INVALID_DESCRIPTOR, whose own message names the field at fault — more use to
@@ -123,6 +128,30 @@ const PAIRING_REASONS: Record<string, string> = {
 
 export function pairingFailure(reason: string): string {
   return PAIRING_REASONS[reason] ?? `The link failed (${reason}).`;
+}
+
+/**
+ * The codes the LOCAL Core mints on the transfer channel, and only those: a
+ * fill relays the source device's error strings verbatim, so consulting all
+ * of `APP_MESSAGES` here would let a hostile same-account source inject any
+ * of its sentences ("struck from the account for good...") into the
+ * victim's device row by answering a READ with that code. A peer-authored
+ * string falls through to the verbatim lead instead.
+ */
+const TRANSFER_MESSAGES: Record<string, string> = {
+  NO_DIRECT_PATH: APP_MESSAGES.NO_DIRECT_PATH,
+};
+
+/**
+ * The sentence for a failed transfer's row. Mid-transfer failures arrive as
+ * `transfer.failed { error }` - a bare code when the local Core minted one
+ * (today `NO_DIRECT_PATH`, #88), otherwise the error's own words; local
+ * codes get their sentence, everything else is carried verbatim under the
+ * usual "Send failed:" lead. (`cancelled` never reaches here - the row
+ * words a cancellation itself, it is an outcome, not a failure.)
+ */
+export function transferFailure(error: string): string {
+  return TRANSFER_MESSAGES[error] ?? `Send failed: ${error}`;
 }
 
 /**

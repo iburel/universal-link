@@ -138,6 +138,18 @@ function shareText(status: ShareBanner): Notice {
       };
     case "done": {
       const { delivered, failed } = status;
+      const refused = status.no_direct_path ?? 0;
+      // Every failure the announced relay role refused (#88): the devices
+      // are online and were told about the clip; saying "could not reach"
+      // would send the user to check liveness when the remedy is the pair's
+      // network. Mixed outcomes keep the counts and add the reason.
+      if (delivered === 0 && failed > 0 && refused === failed) {
+        return {
+          kind: "error",
+          text:
+            "Your devices are reachable, but this deployment's relay does not carry a share this large. The same network, or a VPN between your devices, would let it through.",
+        };
+      }
       if (delivered === 0) {
         return {
           kind: "error",
@@ -149,7 +161,9 @@ function shareText(status: ShareBanner): Notice {
         text:
           failed === 0
             ? `Shared with ${devices(delivered)}.`
-            : `Shared with ${delivered} of ${devices(delivered + failed)}.`,
+            : refused > 0
+              ? `Shared with ${delivered} of ${devices(delivered + failed)}. The deployment's relay does not carry a share this large to the rest; the same network or a VPN would.`
+              : `Shared with ${delivered} of ${devices(delivered + failed)}.`,
       };
     }
     case "error":

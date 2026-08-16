@@ -75,27 +75,39 @@ pub enum RelayChoice {
     Url(RelayUrl),
 }
 
-/// Mode, signed hint and the `home_relay` short-circuit, derived in one
-/// place from the local choice and the deployment's announcement, so the
-/// signed word can never disagree with how the endpoint runs. The decided
+/// Mode, signed hint, the `home_relay` short-circuit and the enforced
+/// payload cap, derived in one place from the local choice and the
+/// deployment's announcement, so the signed word (and the enforced role,
+/// #88) can never disagree with how the endpoint runs. The decided
 /// precedence (#104/#105): an explicit local relay beats the announcement,
 /// which beats off: the announcement only ever fills the off default. Off
 /// with no announcement signs nothing and skips the relay probe; a URL
 /// signs itself; n0 signs whatever home relay the endpoint elects, and so
 /// does an announced list (the user chose the server, the operator chose
 /// the relays: the election is chosen all the way down).
-fn resolve_relay(relay: RelayChoice, announced: &[RelayUrl]) -> (RelayMode, HintSource, bool) {
+///
+/// `announced_cap` is the role the operator announced for THEIR relays
+/// (#88), so it binds exactly the arm where those relays are the effective
+/// source. A local n0 or URL choice rides infrastructure the user picked,
+/// which the operator's word does not govern - and off with no announcement
+/// has no relay for any byte to ride, so there is nothing to cap.
+fn resolve_relay(
+    relay: RelayChoice,
+    announced: &[RelayUrl],
+    announced_cap: Option<u64>,
+) -> (RelayMode, HintSource, bool, Option<u64>) {
     match relay {
         RelayChoice::Off if !announced.is_empty() => (
             RelayMode::custom(announced.iter().cloned()),
             HintSource::Elected,
             false,
+            announced_cap,
         ),
-        RelayChoice::Off => (RelayMode::Disabled, HintSource::Fixed(None), true),
-        RelayChoice::N0 => (RelayMode::Default, HintSource::Elected, false),
+        RelayChoice::Off => (RelayMode::Disabled, HintSource::Fixed(None), true, None),
+        RelayChoice::N0 => (RelayMode::Default, HintSource::Elected, false, None),
         RelayChoice::Url(url) => {
             let hint = HintSource::Fixed(Some(url.to_string()));
-            (RelayMode::custom([url]), hint, false)
+            (RelayMode::custom([url]), hint, false, None)
         }
     }
 }
@@ -134,6 +146,24 @@ const READY_QUEUE: usize = 8;
 /// no timeout on their side). Beyond that, we leave anyway.
 const CLOSE_BUDGET: Duration = Duration::from_secs(3);
 
+/// How long an over-cap open waits for hole punching to produce a direct
+/// path (#88). `Endpoint::connect` returns as soon as ANY path completes the
+/// handshake - usually the relay path - and the direct one arrives
+/// asynchronously when the punch succeeds, typically within a couple of
+/// seconds.
+const DIRECT_PATH_GRACE: Duration = Duration::from_secs(5);
+
+/// Bound on the CONNECT half of an over-cap open (#88). The Core wraps the
+/// whole sized open in its 15-second connection budget; an unbounded
+/// connect that lands late would leave the grace less than its five seconds
+/// and, worse, let the caller's outer timeout fire MID-grace - the refusal
+/// would then surface as a generic timeout instead of `NO_DIRECT_PATH`,
+/// hiding from the user exactly the sentence this policy owes them. Ten
+/// seconds = that budget minus the full grace, so the refusal always gets
+/// to speak first. (The plain `open` keeps its unbounded connect: with no
+/// policy to name, the caller's timeout says everything there is to say.)
+const OVER_CAP_CONNECT_BOUND: Duration = Duration::from_secs(10);
+
 pub struct IrohTransport {
     endpoint: Endpoint,
     /// Incoming streams whose handshake is done, served by `accept`.
@@ -167,6 +197,12 @@ pub struct IrohTransport {
     /// (the opt-in is the choice, the election is its current shape); `None`
     /// in off mode, always.
     relay_hint: Arc<Mutex<Option<String>>>,
+    /// The announced payload cap this endpoint enforces (#88): `Some(cap)`
+    /// exactly when the announced relays are the effective relay source AND
+    /// the deployment announced a role for them (`resolve_relay`). An
+    /// over-cap `open_for_payload` then requires a direct path. Fixed at the
+    /// bind, like the relay map the role is about.
+    relay_max_payload: Option<u64>,
     /// Off mode: `home_relay` answers `None` immediately instead of waiting
     /// out `HOME_RELAY_WAIT` on an `online()` that can never resolve (iroh
     /// pends forever with no relay configured).
@@ -210,11 +246,21 @@ impl IrohTransport {
         seed: [u8; 32],
         relay: RelayChoice,
         announced: Vec<RelayUrl>,
+        announced_cap: Option<u64>,
         lan_discovery: bool,
     ) -> anyhow::Result<IrohTransport> {
         let (lan_gen, _) = tokio::sync::watch::channel(0);
         let (reach_gen, _) = tokio::sync::watch::channel(0);
-        Self::bind_with_gen(seed, relay, announced, lan_discovery, lan_gen, reach_gen).await
+        Self::bind_with_gen(
+            seed,
+            relay,
+            announced,
+            announced_cap,
+            lan_discovery,
+            lan_gen,
+            reach_gen,
+        )
+        .await
     }
 
     /// `bind`, with the LAN and reach generation channels supplied by the
@@ -225,13 +271,15 @@ impl IrohTransport {
         seed: [u8; 32],
         relay: RelayChoice,
         announced: Vec<RelayUrl>,
+        announced_cap: Option<u64>,
         lan_discovery: bool,
         lan_gen: tokio::sync::watch::Sender<u64>,
         reach_gen: tokio::sync::watch::Sender<u64>,
     ) -> anyhow::Result<IrohTransport> {
         let secret = SecretKey::from_bytes(&seed);
         let mdns = lan_lookup(&secret, lan_discovery);
-        let (relay_mode, hint, relay_off) = resolve_relay(relay, &announced);
+        let (relay_mode, hint, relay_off, relay_max_payload) =
+            resolve_relay(relay, &announced, announced_cap);
         let mut builder = Endpoint::builder(presets::Minimal)
             .secret_key(secret)
             .alpns(vec![ALPN.to_vec()])
@@ -239,7 +287,16 @@ impl IrohTransport {
         if let Some(mdns) = &mdns {
             builder = builder.address_lookup(mdns.clone());
         }
-        Self::finish(builder, mdns, lan_gen, hint, reach_gen, relay_off).await
+        Self::finish(
+            builder,
+            mdns,
+            lan_gen,
+            hint,
+            reach_gen,
+            relay_off,
+            relay_max_payload,
+        )
+        .await
     }
 
     /// Test endpoint: a LOCAL relay (self-signed certificate) whose
@@ -265,6 +322,7 @@ impl IrohTransport {
             RelayMode::Custom(relay_map),
             hint,
             false,
+            None,
             lan_discovery,
         )
         .await
@@ -285,6 +343,32 @@ impl IrohTransport {
             RelayMode::Custom(relay_map),
             HintSource::Elected,
             false,
+            None,
+            lan_discovery,
+        )
+        .await
+    }
+
+    /// Test endpoint in ANNOUNCED mode (#105/#88): the off default filled by
+    /// a deployment's announcement, THROUGH the production mapping
+    /// (`resolve_relay`), against a LOCAL relay - the shape a fleet is in
+    /// when its operator announced the relays, and, when `announced_cap` is
+    /// set, announced their rendezvous-only role with them.
+    #[cfg(feature = "test-utils")]
+    pub async fn bind_test_announced(
+        seed: [u8; 32],
+        announced: Vec<RelayUrl>,
+        announced_cap: Option<u64>,
+        lan_discovery: bool,
+    ) -> anyhow::Result<IrohTransport> {
+        let (relay_mode, hint, relay_off, relay_max_payload) =
+            resolve_relay(RelayChoice::Off, &announced, announced_cap);
+        Self::bind_test_with(
+            seed,
+            relay_mode,
+            hint,
+            relay_off,
+            relay_max_payload,
             lan_discovery,
         )
         .await
@@ -299,8 +383,17 @@ impl IrohTransport {
         seed: [u8; 32],
         lan_discovery: bool,
     ) -> anyhow::Result<IrohTransport> {
-        let (relay_mode, hint, relay_off) = resolve_relay(RelayChoice::Off, &[]);
-        Self::bind_test_with(seed, relay_mode, hint, relay_off, lan_discovery).await
+        let (relay_mode, hint, relay_off, relay_max_payload) =
+            resolve_relay(RelayChoice::Off, &[], None);
+        Self::bind_test_with(
+            seed,
+            relay_mode,
+            hint,
+            relay_off,
+            relay_max_payload,
+            lan_discovery,
+        )
+        .await
     }
 
     #[cfg(feature = "test-utils")]
@@ -309,6 +402,7 @@ impl IrohTransport {
         relay_mode: RelayMode,
         hint: HintSource,
         relay_off: bool,
+        relay_max_payload: Option<u64>,
         lan_discovery: bool,
     ) -> anyhow::Result<IrohTransport> {
         let secret = SecretKey::from_bytes(&seed);
@@ -324,9 +418,19 @@ impl IrohTransport {
         }
         let (lan_gen, _) = tokio::sync::watch::channel(0);
         let (reach_gen, _) = tokio::sync::watch::channel(0);
-        Self::finish(builder, mdns, lan_gen, hint, reach_gen, relay_off).await
+        Self::finish(
+            builder,
+            mdns,
+            lan_gen,
+            hint,
+            reach_gen,
+            relay_off,
+            relay_max_payload,
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn finish(
         builder: iroh::endpoint::Builder,
         mdns: Option<MdnsAddressLookup>,
@@ -334,6 +438,7 @@ impl IrohTransport {
         hint: HintSource,
         reach_gen: tokio::sync::watch::Sender<u64>,
         relay_off: bool,
+        relay_max_payload: Option<u64>,
     ) -> anyhow::Result<IrohTransport> {
         // Subscribed BEFORE the endpoint binds: the discovery actor is already
         // running (it starts with the lookup), so waiting until after `bind`
@@ -378,6 +483,7 @@ impl IrohTransport {
             addrs,
             relay_hint,
             relay_off,
+            relay_max_payload,
             reach_gen,
             reach_task,
         })
@@ -386,6 +492,16 @@ impl IrohTransport {
     /// The underlying endpoint (local address, `online()`, for tests).
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
+    }
+
+    /// The payload cap this endpoint enforces on its sized opens (#88), as
+    /// `resolve_relay` derived it at the bind. Test observability only: a
+    /// regression that stops plumbing the announced cap to the enforcement
+    /// would otherwise ship green, since the enforcing arm itself needs a
+    /// pair that cannot hole-punch, which no offline test can stage.
+    #[cfg(feature = "test-utils")]
+    pub fn relay_cap(&self) -> Option<u64> {
+        self.relay_max_payload
     }
 }
 
@@ -868,15 +984,100 @@ fn peer_to_addr(peer: &PeerAddr) -> io::Result<EndpointAddr> {
     Ok(addr)
 }
 
+impl IrohTransport {
+    /// The connection half of `open`: dial hints in, established QUIC
+    /// connection out. `connect` returns as soon as ANY path completed the
+    /// handshake - with a relay in the map that is usually the relay path,
+    /// and hole punching keeps working the direct one in the background.
+    async fn connect_to(&self, peer: &PeerAddr) -> io::Result<Connection> {
+        let addr = peer_to_addr(peer)?;
+        self.endpoint
+            .connect(addr, ALPN)
+            .await
+            .map_err(|e| wrap("iroh connection", e))
+    }
+}
+
+/// Bounded wait for the connection to carry its application data over a
+/// DIRECT path (#88): resolved as soon as the selected path is an IP one,
+/// refused (and the connection closed) when the grace runs out. Selected,
+/// not merely open: iroh prefers a punched direct path as soon as it
+/// exists, so "still selecting the relay" after the grace means the punch
+/// failed - and bytes written then would ride the relay, which is exactly
+/// what the announced role forbids.
+///
+/// A connection that closes UNDER the wait (the stream ends: the peer shut
+/// down cleanly mid-grace) is not a policy refusal - the peer is gone, the
+/// punch never got its chance - so that arm mints a plain connection error,
+/// exactly what the under-cap path would report from `open_bi` in the same
+/// state, and the interfaces say "peer gone" rather than prescribing a VPN
+/// to reach a machine that is off.
+async fn require_direct(conn: &Connection, payload: u64, cap: u64) -> io::Result<()> {
+    let punched = tokio::time::timeout(DIRECT_PATH_GRACE, async {
+        let mut snapshots = conn.paths_stream();
+        while let Some(paths) = snapshots.next().await {
+            if paths.iter().any(|path| path.is_ip() && path.is_selected()) {
+                return true;
+            }
+        }
+        false // The stream ended: the connection closed under us.
+    })
+    .await;
+    match punched {
+        Ok(true) => Ok(()),
+        // Already dead: nothing to close, and nothing to blame on the relay
+        // role. `close_reason` names what ended it when iroh knows.
+        Ok(false) => Err(io::Error::other(match conn.close_reason() {
+            Some(reason) => format!("connection closed during hole punching: {reason}"),
+            None => "connection closed during hole punching".to_string(),
+        })),
+        Err(_) => {
+            conn.close(0u32.into(), onedevice_core::NO_DIRECT_PATH.as_bytes());
+            Err(io::Error::other(format!(
+                "{}: the deployment's relays are rendezvous-only above {cap} bytes \
+                 (payload: {payload}) and hole punching produced no direct path",
+                onedevice_core::NO_DIRECT_PATH
+            )))
+        }
+    }
+}
+
 impl PeerTransport for IrohTransport {
     fn open<'a>(&'a self, peer: &'a PeerAddr) -> Opening<'a> {
         Box::pin(async move {
-            let addr = peer_to_addr(peer)?;
-            let conn = self
-                .endpoint
-                .connect(addr, ALPN)
-                .await
-                .map_err(|e| wrap("iroh connection", e))?;
+            let conn = self.connect_to(peer).await?;
+            let (send, recv) = conn.open_bi().await.map_err(|e| wrap("open_bi", e))?;
+            Ok(bidi(conn, send, recv))
+        })
+    }
+
+    fn open_for_payload<'a>(&'a self, peer: &'a PeerAddr, payload: u64) -> Opening<'a> {
+        Box::pin(async move {
+            // The announced role (#88), enforced where the bytes are about
+            // to flow: an over-cap payload needs the punched path before the
+            // stream opens. At-or-under-cap payloads ride whatever path the
+            // connection has - the relay included, that is what the cap
+            // allows.
+            let over_cap = self.relay_max_payload.filter(|cap| payload > *cap);
+            let conn = match over_cap {
+                // Connect bounded (OVER_CAP_CONNECT_BOUND) so the grace
+                // always fits under the caller's budget and a punch failure
+                // speaks as NO_DIRECT_PATH, never as the outer timeout.
+                Some(_) => tokio::time::timeout(OVER_CAP_CONNECT_BOUND, self.connect_to(peer))
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "iroh connection: timed out")
+                    })??,
+                None => self.connect_to(peer).await?,
+            };
+            if let Some(cap) = over_cap {
+                require_direct(&conn, payload, cap).await?;
+                let (send, recv) = conn.open_bi().await.map_err(|e| wrap("open_bi", e))?;
+                // The policy stays armed for the stream's life: iroh would
+                // otherwise migrate a long transfer onto the surviving relay
+                // path if the direct one dies (see `bidi_policed`).
+                return Ok(bidi_policed(conn, send, recv, payload, cap));
+            }
             let (send, recv) = conn.open_bi().await.map_err(|e| wrap("open_bi", e))?;
             Ok(bidi(conn, send, recv))
         })
@@ -962,12 +1163,140 @@ fn bidi(conn: Connection, send: SendStream, recv: RecvStream) -> Box<dyn IoStrea
     Box::new(BiStream {
         _conn: conn,
         io: tokio::io::join(recv, send),
+        policed: None,
+        watcher: None,
     })
+}
+
+/// `bidi` for an OVER-CAP stream (#88): the policy stays armed for the
+/// stream's whole life. iroh keeps the relay path open as a backup and
+/// migrates onto it if the direct path dies (roaming off Wi-Fi is the
+/// textbook case), which would put the remainder of a long transfer on the
+/// operator's relay with the open-time check long passed. A watcher task
+/// follows the connection's path events and, when no direct path is selected
+/// after a re-punch grace, closes the connection with the policy's own code;
+/// the flag it sets is what lets the stream's next error speak
+/// `NO_DIRECT_PATH` instead of a bare "connection lost".
+fn bidi_policed(
+    conn: Connection,
+    send: SendStream,
+    recv: RecvStream,
+    payload: u64,
+    cap: u64,
+) -> Box<dyn IoStream> {
+    let policed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher = tokio::spawn(watch_direct(conn.clone(), payload, cap, policed.clone()));
+    Box::new(BiStream {
+        _conn: conn,
+        io: tokio::io::join(recv, send),
+        policed: Some(policed),
+        watcher: Some(watcher.abort_handle()),
+    })
+}
+
+/// Whether the connection currently carries its application data over a
+/// direct IP path - the predicate `require_direct` waits on, re-checked live
+/// by the mid-stream watcher.
+fn direct_selected(conn: &Connection) -> bool {
+    conn.paths()
+        .iter()
+        .any(|path| path.is_ip() && path.is_selected())
+}
+
+/// The mid-stream half of the announced role (#88): follows the connection's
+/// path events and closes it (setting `policed` first, so the stream's error
+/// carries the code) when the selected path stops being direct and no direct
+/// path re-forms within the grace. Ends on its own when the connection
+/// closes; aborted by `BiStream::drop` so a finished stream leaves nothing
+/// behind. Every wake re-reads `paths()` rather than trusting the event's
+/// payload, so a `Lagged` event costs one re-check, never a missed
+/// migration.
+async fn watch_direct(
+    conn: Connection,
+    payload: u64,
+    cap: u64,
+    policed: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let mut events = conn.path_events();
+    loop {
+        // Wait for any path change; the event stream ends with the
+        // connection.
+        if events.next().await.is_none() {
+            return;
+        }
+        if direct_selected(&conn) {
+            continue;
+        }
+        // The direct path is gone: the same grace as the open-time check for
+        // a re-punch, still listening (a re-formed path breaks the wait),
+        // then the close the policy owes.
+        let deadline = tokio::time::sleep(DIRECT_PATH_GRACE);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                () = &mut deadline => {
+                    if direct_selected(&conn) {
+                        break;
+                    }
+                    tracing::warn!(
+                        payload, cap,
+                        "over-cap stream lost its direct path and none re-formed: closed"
+                    );
+                    policed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    conn.close(0u32.into(), onedevice_core::NO_DIRECT_PATH.as_bytes());
+                    return;
+                }
+                event = events.next() => {
+                    if event.is_none() {
+                        return;
+                    }
+                    if direct_selected(&conn) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 struct BiStream {
     _conn: Connection,
     io: tokio::io::Join<RecvStream, SendStream>,
+    /// Set by the watcher when IT closed the connection for the announced
+    /// role (#88): the next poll error is then reworded to carry the code.
+    policed: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The watcher's abort handle: a stream that ends normally must not
+    /// leave a task holding a `Connection` clone alive behind it.
+    watcher: Option<tokio::task::AbortHandle>,
+}
+
+impl Drop for BiStream {
+    fn drop(&mut self) {
+        if let Some(watcher) = &self.watcher {
+            watcher.abort();
+        }
+    }
+}
+
+impl BiStream {
+    /// Rewords a poll error when the policy watcher is what killed the
+    /// stream: the caller then reports `NO_DIRECT_PATH` (the code the GUI
+    /// owns a sentence for) instead of a bare "connection lost".
+    fn police(&self, e: io::Error) -> io::Error {
+        let policed = self
+            .policed
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst));
+        if policed {
+            io::Error::other(format!(
+                "{}: the stream lost its direct path mid-transfer and the \
+                 deployment's relays are rendezvous-only",
+                onedevice_core::NO_DIRECT_PATH
+            ))
+        } else {
+            e
+        }
+    }
 }
 
 impl AsyncRead for BiStream {
@@ -976,7 +1305,11 @@ impl AsyncRead for BiStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.io).poll_read(cx, buf)
+        let this = &mut *self;
+        match Pin::new(&mut this.io).poll_read(cx, buf) {
+            Poll::Ready(Err(e)) => Poll::Ready(Err(this.police(e))),
+            other => other,
+        }
     }
 }
 
@@ -986,15 +1319,27 @@ impl AsyncWrite for BiStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.io).poll_write(cx, buf)
+        let this = &mut *self;
+        match Pin::new(&mut this.io).poll_write(cx, buf) {
+            Poll::Ready(Err(e)) => Poll::Ready(Err(this.police(e))),
+            other => other,
+        }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.io).poll_flush(cx)
+        let this = &mut *self;
+        match Pin::new(&mut this.io).poll_flush(cx) {
+            Poll::Ready(Err(e)) => Poll::Ready(Err(this.police(e))),
+            other => other,
+        }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.io).poll_shutdown(cx)
+        let this = &mut *self;
+        match Pin::new(&mut this.io).poll_shutdown(cx) {
+            Poll::Ready(Err(e)) => Poll::Ready(Err(this.police(e))),
+            other => other,
+        }
     }
 }
 
@@ -1014,16 +1359,19 @@ pub struct LazyIrohTransport {
     /// Read once, at the bind — like `relay`, a change requires a Core
     /// restart.
     lan_discovery: bool,
-    /// The deployment's announced relays (#105), parsed and deduplicated:
-    /// handed over by the Core (`announce_relays`) from its disk cache at
-    /// startup and from the descriptor at each session establishment. Read
-    /// at the bind, where `resolve_relay` folds it in under the local
-    /// choice; a change that lands after the bind applies at the next
-    /// start, and says so.
-    announced: Mutex<Vec<RelayUrl>>,
+    /// The deployment's announced word (#105): the relays, parsed and
+    /// deduplicated, and the payload cap that rides with them (#88, `None`
+    /// = no announced role). Handed over by the Core (`announce_relays`)
+    /// from its disk cache at startup and from the descriptor at each
+    /// session establishment. Read at the bind, where `resolve_relay` folds
+    /// it in under the local choice; a change that lands after the bind
+    /// applies at the next start, and says so. One mutex for the pair: the
+    /// list and its role are one word, and a bind must never consume half
+    /// of each.
+    announced: Mutex<(Vec<RelayUrl>, Option<u64>)>,
     /// What the bind actually consumed, so a post-bind announcement change
-    /// is told apart from a repeat of the same list.
-    bound_announced: Mutex<Option<Vec<RelayUrl>>>,
+    /// is told apart from a repeat of the same word.
+    bound_announced: Mutex<Option<(Vec<RelayUrl>, Option<u64>)>>,
     /// The LAN generation channel, created HERE so `lan_changes` can hand out
     /// receivers before the endpoint exists: the sender is given to the inner
     /// transport at the (lazy) bind, and a receiver taken while still unbound
@@ -1042,7 +1390,7 @@ impl LazyIrohTransport {
             config_dir,
             relay,
             lan_discovery,
-            announced: Mutex::new(Vec::new()),
+            announced: Mutex::new((Vec::new(), None)),
             bound_announced: Mutex::new(None),
             lan_gen: tokio::sync::watch::channel(0).0,
             reach_gen: tokio::sync::watch::channel(0).0,
@@ -1068,7 +1416,8 @@ impl LazyIrohTransport {
                 let transport = IrohTransport::bind_with_gen(
                     seed,
                     self.relay.clone(),
-                    announced.clone(),
+                    announced.0.clone(),
+                    announced.1,
                     self.lan_discovery,
                     self.lan_gen.clone(),
                     self.reach_gen.clone(),
@@ -1138,6 +1487,10 @@ impl PeerTransport for LazyIrohTransport {
         Box::pin(async move { self.ensure().await?.open(peer).await })
     }
 
+    fn open_for_payload<'a>(&'a self, peer: &'a PeerAddr, payload: u64) -> Opening<'a> {
+        Box::pin(async move { self.ensure().await?.open_for_payload(peer, payload).await })
+    }
+
     fn accept(&self) -> Incoming<'_> {
         Box::pin(async move { self.wait_bound().await.accept().await })
     }
@@ -1203,7 +1556,7 @@ impl PeerTransport for LazyIrohTransport {
         self.reach_gen.subscribe()
     }
 
-    fn announce_relays(&self, relays: &[String]) {
+    fn announce_relays(&self, relays: &[String], relay_max_payload: Option<u64>) {
         // Parsed here, at the seam where strings become routes, with the
         // same tolerance as `peer_to_addr`: a garbled entry is skipped, not
         // fatal, so one bad URL in an announcement cannot mask the good
@@ -1220,9 +1573,10 @@ impl PeerTransport for LazyIrohTransport {
             })
             .filter(|url| seen.insert(url.to_string()))
             .collect();
-        *self.announced.lock().expect("lock announced") = parsed.clone();
+        let word = (parsed, relay_max_payload);
+        *self.announced.lock().expect("lock announced") = word.clone();
         let bound = self.bound_announced.lock().expect("lock bound announced");
-        if announcement_outran_by_the_bind(&self.relay, bound.as_deref(), &parsed) {
+        if announcement_outran_by_the_bind(&self.relay, bound.as_ref(), &word) {
             tracing::info!(
                 "the deployment's relay announcement changed: applied at the next Core start"
             );
@@ -1233,12 +1587,14 @@ impl PeerTransport for LazyIrohTransport {
 /// Whether a fresh announcement arrived too late for the running endpoint:
 /// only the off default consumes the announcement (precedence: the local
 /// word wins), so only there is a post-bind change worth a line, and only
-/// when the bind consumed something else. `bound` is what the bind actually
-/// used (`None`: not bound yet, the fresh word will be consumed normally).
+/// when the bind consumed something else - the relay list or the payload
+/// cap riding with it (#88), since the endpoint fixed both at its bind.
+/// `bound` is what the bind actually used (`None`: not bound yet, the fresh
+/// word will be consumed normally).
 fn announcement_outran_by_the_bind(
     relay: &RelayChoice,
-    bound: Option<&[RelayUrl]>,
-    fresh: &[RelayUrl],
+    bound: Option<&(Vec<RelayUrl>, Option<u64>)>,
+    fresh: &(Vec<RelayUrl>, Option<u64>),
 ) -> bool {
     matches!(relay, RelayChoice::Off) && bound.is_some_and(|used| used != fresh)
 }
@@ -1266,26 +1622,29 @@ mod tests {
         // signed, and the home_relay probe short-circuited. This is the
         // production arm the daemon and the phone actually run; a regression
         // here silently puts fresh installs back on relays nobody chose.
-        let (mode, hint, off) = resolve_relay(RelayChoice::Off, &[]);
+        let (mode, hint, off, cap) = resolve_relay(RelayChoice::Off, &[], None);
         assert!(matches!(mode, RelayMode::Disabled));
         assert!(matches!(hint, HintSource::Fixed(None)));
         assert!(off, "off must skip the home_relay wait");
+        assert_eq!(cap, None);
 
         // n0: the stock map, and the ELECTION as the signed word.
-        let (mode, hint, off) = resolve_relay(RelayChoice::N0, &[]);
+        let (mode, hint, off, cap) = resolve_relay(RelayChoice::N0, &[], None);
         assert!(matches!(mode, RelayMode::Default));
         assert!(
             matches!(hint, HintSource::Elected),
             "the opt-in signs its election"
         );
         assert!(!off);
+        assert_eq!(cap, None);
 
         // A URL: a one-relay map, the URL itself as the signed word.
         let url: RelayUrl = "https://relay.example".parse().expect("relay url");
-        let (mode, hint, off) = resolve_relay(RelayChoice::Url(url.clone()), &[]);
+        let (mode, hint, off, cap) = resolve_relay(RelayChoice::Url(url.clone()), &[], None);
         assert_eq!(custom_urls(mode), vec![url.to_string()]);
         assert!(matches!(hint, HintSource::Fixed(Some(u)) if u == url.to_string()));
         assert!(!off);
+        assert_eq!(cap, None);
     }
 
     #[test]
@@ -1296,21 +1655,33 @@ mod tests {
 
         // Off + an announcement: the whole list becomes the map, the
         // election becomes the signed word (chosen all the way down: the
-        // user chose the server, the operator chose the relays), and the
-        // home_relay probe runs.
-        let (mode, hint, off) = resolve_relay(RelayChoice::Off, &announced);
+        // user chose the server, the operator chose the relays), the
+        // home_relay probe runs, and the announced role (#88) binds - it is
+        // a word about exactly these relays.
+        let (mode, hint, off, cap) = resolve_relay(RelayChoice::Off, &announced, Some(65536));
         assert_eq!(custom_urls(mode), vec![eu.to_string(), us.to_string()]);
         assert!(matches!(hint, HintSource::Elected));
         assert!(!off);
+        assert_eq!(cap, Some(65536), "the role rides with the announced list");
 
         // The precedence (#104): an explicit local relay beats the
-        // announcement.
+        // announcement - and sheds the announced role with it (#88): the
+        // operator's word governs the operator's relays, not one the user
+        // picked.
         let local: RelayUrl = "https://relay.mine.example".parse().expect("relay url");
-        let (mode, hint, _) = resolve_relay(RelayChoice::Url(local.clone()), &announced);
+        let (mode, hint, _, cap) =
+            resolve_relay(RelayChoice::Url(local.clone()), &announced, Some(65536));
         assert_eq!(custom_urls(mode), vec![local.to_string()]);
         assert!(matches!(hint, HintSource::Fixed(Some(u)) if u == local.to_string()));
-        let (mode, _, _) = resolve_relay(RelayChoice::N0, &announced);
+        assert_eq!(cap, None, "a local relay is not governed by the operator");
+        let (mode, _, _, cap) = resolve_relay(RelayChoice::N0, &announced, Some(65536));
         assert!(matches!(mode, RelayMode::Default));
+        assert_eq!(cap, None);
+
+        // A role with nothing to govern (off, no announcement): no relay for
+        // any byte to ride, nothing to cap.
+        let (_, _, _, cap) = resolve_relay(RelayChoice::Off, &[], Some(65536));
+        assert_eq!(cap, None);
     }
 
     #[test]
@@ -1324,15 +1695,17 @@ mod tests {
                 "not a url".to_string(),
                 "https://relay-eu.example".to_string(),
             ],
+            Some(65536),
         );
-        let held: Vec<String> = lazy
-            .announced
-            .lock()
-            .expect("lock announced")
-            .iter()
-            .map(ToString::to_string)
-            .collect();
+        let (held, cap) = {
+            let word = lazy.announced.lock().expect("lock announced");
+            (
+                word.0.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                word.1,
+            )
+        };
         assert_eq!(held, vec!["https://relay-eu.example/".to_string()]);
+        assert_eq!(cap, Some(65536), "the announced role is held for the bind");
         // Hearing an announcement is not a use: nothing may bind for it.
         assert!(
             !dir.path().join("device.key").exists(),
@@ -1345,29 +1718,39 @@ mod tests {
         let eu: RelayUrl = "https://relay-eu.example".parse().expect("relay url");
         let us: RelayUrl = "https://relay-us.example".parse().expect("relay url");
 
+        let word_eu = (vec![eu.clone()], None);
+        let word_us = (vec![us.clone()], None);
+
         // Not bound yet: the fresh word will be consumed normally, no line.
         assert!(!announcement_outran_by_the_bind(
             &RelayChoice::Off,
             None,
-            std::slice::from_ref(&eu)
+            &word_eu
         ));
-        // Bound with the same list: a repeat, no line.
+        // Bound with the same word: a repeat, no line.
         assert!(!announcement_outran_by_the_bind(
             &RelayChoice::Off,
-            Some(std::slice::from_ref(&eu)),
-            std::slice::from_ref(&eu)
+            Some(&word_eu),
+            &word_eu
         ));
         // Bound with another list: the word arrived too late, say so.
         assert!(announcement_outran_by_the_bind(
             &RelayChoice::Off,
-            Some(std::slice::from_ref(&eu)),
-            std::slice::from_ref(&us)
+            Some(&word_eu),
+            &word_us
+        ));
+        // The role alone changing is a late word too (#88): the endpoint
+        // fixed the enforced cap at its bind, like the map.
+        assert!(announcement_outran_by_the_bind(
+            &RelayChoice::Off,
+            Some(&word_eu),
+            &(vec![eu.clone()], Some(65536))
         ));
         // A local choice never consumes the announcement: never a line.
         assert!(!announcement_outran_by_the_bind(
             &RelayChoice::N0,
-            Some(std::slice::from_ref(&eu)),
-            std::slice::from_ref(&us)
+            Some(&word_eu),
+            &word_us
         ));
     }
 

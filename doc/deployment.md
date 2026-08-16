@@ -110,8 +110,12 @@ URL or `"n0"`) wins over it; `"off"` IS the default, written out or not, so
 it is exactly what the announcement fills. Never a relay nobody chose: with
 no announcement, a device whose relay is off signs none and none of your
 devices is dialed through one; under an announcement, the elected relay is
-one your operator chose and you accepted by joining their server. What off
-costs, honestly: two
+one your operator chose and you accepted by joining their server - including
+the role the operator gave it: relays announced rendezvous-only above a size
+cap introduce your devices but refuse to carry over-cap payloads
+(`NO_DIRECT_PATH`; sends, fills and shares word the remedies on screen, a
+refused remote paste stays empty with the code in the clipboard component's
+log). What off costs, honestly: two
 devices behind two distinct NATs, off the LAN, with no VPN between them, need
 a relay to meet (hole punching needs the rendezvous). The whole off-LAN story,
 VPN recipes included, is [beyond-the-lan.md](beyond-the-lan.md).

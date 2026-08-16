@@ -88,7 +88,10 @@ export interface SharedFile {
  */
 export type ShareStatus =
   | { phase: "sending"; targets?: number }
-  | { phase: "done"; delivered: number; failed: number }
+  // `no_direct_path` (absent on an older shell): the subset of `failed` the
+  // deployment's rendezvous-only relays refused (#88): those devices are
+  // online, only the bytes need a direct path.
+  | { phase: "done"; delivered: number; failed: number; no_direct_path?: number }
   | { phase: "preparing"; files: number }
   | { phase: "pick"; id: string; files: SharedFile[] }
   | {

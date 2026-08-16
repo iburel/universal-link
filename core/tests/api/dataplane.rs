@@ -108,6 +108,92 @@ async fn two_cores_transfer_a_file_through_the_directory() {
     assert_eq!(sent["transfer_id"], json!(transfer_id));
 }
 
+/// The announced relay role, on the production send path (#88): with the
+/// double's cap armed, an over-cap send whose only route is the relay fails
+/// with the BARE `NO_DIRECT_PATH` code in `transfer.failed` (the GUI owns
+/// the sentence, like `cancelled`); an under-cap send still rides the relay
+/// (clipboard-sized payloads keep working everywhere); and the same over-cap
+/// send passes once a direct route exists (here, the shared LAN).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_over_cap_send_needs_a_direct_path() {
+    let server = TestServer::start().await;
+    let switchboard = MemorySwitchboard::new();
+    let code = onedevice_core::account_key::generate_recovery_code();
+    let a = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
+    let b = TestCore::start_enrolled_on_with_code(&server, &switchboard, Some(&code)).await;
+
+    let mut sender = spawn_component(
+        &a,
+        "sender",
+        "menu-backend",
+        &[
+            "files.send",
+            "devices.read",
+            "session.read",
+            "transfers.read",
+        ],
+    )
+    .await;
+    let mut watcher = spawn_component(
+        &b,
+        "watcher",
+        "tray",
+        &["transfers.read", "devices.read", "session.read"],
+    )
+    .await;
+    subscribe_transfers(&mut sender).await;
+    wait_server_connected(&mut sender, true).await;
+    wait_server_connected(&mut watcher, true).await;
+    wait_reachable(&mut sender, b.device_id()).await;
+    wait_attested(&mut watcher, a.device_id()).await;
+
+    // The role in effect on the sending device: rendezvous-only above 16
+    // bytes (the daemon derives this from the announced word; the double is
+    // armed directly - that derivation has its own tests).
+    switchboard.set_payload_cap(&a.node_id(), Some(16));
+
+    // Over the cap, relay-only: refused, and refused by its OWN code - the
+    // remedy (a shared network, a VPN) is not "the device is offline".
+    let big = a.write_source("big.bin", &[7u8; 64]);
+    let r = sender
+        .request(
+            "files.send",
+            json!({ "device_id": b.device_id(), "paths": [big.to_str().unwrap()] }),
+        )
+        .await
+        .expect("files.send");
+    let transfer_id = r["transfer_id"].as_str().expect("transfer_id");
+    let failed = sender.wait_notification("transfer.failed").await;
+    assert_eq!(failed["transfer_id"], json!(transfer_id));
+    assert_eq!(failed["error"], json!("NO_DIRECT_PATH"));
+
+    // Under the cap: the relay may carry it - that is what the cap allows.
+    let small = a.write_source("small.txt", b"tiny");
+    sender
+        .request(
+            "files.send",
+            json!({ "device_id": b.device_id(), "paths": [small.to_str().unwrap()] }),
+        )
+        .await
+        .expect("files.send under the cap");
+    let finished = sender.wait_notification("transfer.finished").await;
+    assert!(finished["transfer_id"].is_string());
+
+    // A direct route appears (the shared LAN): the same over-cap send
+    // passes - the policy never blocks bytes that do not ride the relay.
+    switchboard.join_lan(&a.node_id());
+    switchboard.join_lan(&b.node_id());
+    sender
+        .request(
+            "files.send",
+            json!({ "device_id": b.device_id(), "paths": [big.to_str().unwrap()] }),
+        )
+        .await
+        .expect("files.send over a direct route");
+    let finished = sender.wait_notification("transfer.finished").await;
+    assert!(finished["transfer_id"].is_string());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_transfer_of_several_files_lands_intact() {
     let server = TestServer::start().await;

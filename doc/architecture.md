@@ -233,7 +233,9 @@ provides:
   (NodeId = public key).
 - NAT traversal / hole punching for direct connections.
 - Automatic fallback to a relay when a direct connection is impossible — a relay
-  that only sees encrypted traffic.
+  that only sees encrypted traffic. (A deployment may announce its relays
+  rendezvous-only above a size cap, #88: the Core then refuses to ride them
+  with an over-cap payload, `NO_DIRECT_PATH`, instead of falling back.)
 - **Local discovery** (mDNS, on by default, `lan_discovery` in `config.json`):
   devices announce themselves on the local network and resolve each other by
   NodeId alone, so two machines that share a network connect directly — without

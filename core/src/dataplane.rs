@@ -120,6 +120,22 @@ pub trait PeerTransport: Send + Sync + std::fmt::Debug {
     /// bidirectional stream).
     fn open<'a>(&'a self, peer: &'a PeerAddr) -> Opening<'a>;
 
+    /// Opens a stream that is about to carry `payload` data-plane bytes to
+    /// `peer`. Every byte-heavy flow (file send, clipboard push, fill, paste
+    /// pipe) opens through this and states its size; the control-plane flows
+    /// (dirsync, pairing, announces) keep [`Self::open`] - introductions are
+    /// what a relay is for. Default: [`Self::open`], because a transport with
+    /// no notion of paths carries any size anywhere. The iroh transport
+    /// enforces the announced relay role here (#88): when the announced
+    /// relays are the effective relay source and `payload` exceeds the
+    /// announced cap, the stream must ride a direct path, and the open fails
+    /// with an error whose message starts with [`NO_DIRECT_PATH`] when none
+    /// forms after the hole-punching attempt.
+    fn open_for_payload<'a>(&'a self, peer: &'a PeerAddr, payload: u64) -> Opening<'a> {
+        let _ = payload;
+        self.open(peer)
+    }
+
     /// Waits for the next incoming stream, whatever the peer. Called in a loop
     /// by the data plane task. An error = transport closed.
     fn accept(&self) -> Incoming<'_>;
@@ -153,16 +169,20 @@ pub trait PeerTransport: Send + Sync + std::fmt::Debug {
         tokio::sync::watch::channel(0).1
     }
 
-    /// Hands the transport the relay list the deployment announced (#105):
-    /// the descriptor's word, cached on disk between sessions
-    /// (`crate::relays`). The transport folds it into its relay resolution
+    /// Hands the transport the deployment's word about its relays (#105):
+    /// the list from the descriptor, cached on disk between sessions
+    /// (`crate::relays`), and, since #88, the role those relays play -
+    /// `relay_max_payload` is the announced byte cap above which they are
+    /// rendezvous-only (`None` = they also carry payload, the historical
+    /// behavior). The transport folds the list into its relay resolution
     /// UNDER the local choice (an explicit local relay or opt-in wins; the
-    /// announcement only fills the off default), applied at its next bind.
-    /// Called at startup with the cached list and again whenever a session
+    /// announcement only fills the off default), applied at its next bind;
+    /// the cap binds [`Self::open_for_payload`] exactly when the list won.
+    /// Called at startup with the cached word and again whenever a session
     /// learns a fresh one. Default: nothing (a transport with no relay
-    /// notion has nothing to fold.
-    fn announce_relays(&self, relays: &[String]) {
-        let _ = relays;
+    /// notion has nothing to fold).
+    fn announce_relays(&self, relays: &[String], relay_max_payload: Option<u64>) {
+        let _ = (relays, relay_max_payload);
     }
 
     /// The endpoints currently visible on the local network (mDNS), as
@@ -216,6 +236,15 @@ pub trait PeerTransport: Send + Sync + std::fmt::Debug {
 /// (at the handshake). Source of truth for the daemon's iroh impl. Versioned
 /// like the rest — an incompatible change will bump it.
 pub const ALPN: &[u8] = b"1device/data/1";
+
+/// Error vocabulary of [`PeerTransport::open_for_payload`] (#88): the message
+/// of the refusal STARTS with this marker (detail may follow after a colon).
+/// The Core surfaces the marker alone to the interfaces - as the bare
+/// `transfer.failed` error (sends and fills) and as the data-channel `ERROR`
+/// code (paste pipe); never in an RPC reply, the sized open happens after
+/// the call returned - and the GUI owns the sentence, like every code
+/// (doc/core-api.md).
+pub const NO_DIRECT_PATH: &str = "NO_DIRECT_PATH";
 
 /// Maximum size of a framed CONTROL frame (offer, acknowledgment, clip
 /// announce). Bounds the memory a peer can make us allocate at once. The file
@@ -1358,9 +1387,12 @@ async fn run_send(
     let outcome = tokio::select! {
         biased;
         r = async {
-            let mut stream = bounded(CONNECT_TIMEOUT, state.transport.open(&peer), "peer connection").await?;
+            // Sized open (#88): under a rendezvous-only announcement, a
+            // transfer larger than the announced cap needs a direct path.
+            let opening = state.transport.open_for_payload(&peer, total);
+            let mut stream = bounded(CONNECT_TIMEOUT, opening, "peer connection").await?;
             send_transfer(&mut stream, &files, &mut progress).await
-        } => r.map_err(|e| e.to_string()),
+        } => r.map_err(|e| failure_code(&e)),
         _ = cancel.notified() => Err("cancelled".to_string()),
     };
 
@@ -1399,6 +1431,20 @@ pub(crate) fn cancel(state: &AppState, transfer_id: &str) -> bool {
         }
         None => false,
     }
+}
+
+/// The `transfer.failed` error for a transport failure: the codes the
+/// interfaces translate arrive bare, the rest arrives as the error's own
+/// words. Today one code travels this path: a refusal by the announced relay
+/// role ([`NO_DIRECT_PATH`], #88) - the transport's message carries the cap
+/// and the payload for the log, but the event carries the code alone, like
+/// `"cancelled"`, so the GUI can own the sentence.
+pub(crate) fn failure_code(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    if text.starts_with(NO_DIRECT_PATH) {
+        return NO_DIRECT_PATH.to_string();
+    }
+    text
 }
 
 /// Pushes a notification on the `transfers` topic (scope `transfers.read`,

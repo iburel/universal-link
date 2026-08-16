@@ -864,6 +864,7 @@ mod tests {
                 pairing_ttl: Duration::from_secs(120),
                 max_requests_per_minute: None,
                 relays: Vec::new(),
+                relay_max_payload: None,
             },
             Arc::new(MemoryStore::default()),
             DurableState::default(),

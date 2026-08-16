@@ -92,6 +92,47 @@ async fn the_announcement_is_learned_cached_rebound_and_forgotten() {
     );
 }
 
+/// The relays' ROLE rides the same word (#88): announced next to the list
+/// in the descriptor, cached with it on disk, handed to the transport with
+/// it - and, like the list, surviving a boot with the server down.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_announced_role_rides_with_the_list() {
+    let server = TestServer::start_with(|c| {
+        announcing(c);
+        c.relay_max_payload = Some(4096);
+    })
+    .await;
+    let switchboard = MemorySwitchboard::new();
+    let core = TestCore::start_enrolled_on(&server, &switchboard).await;
+    let node_id = core.node_id();
+    let mut c = manager(&core).await;
+    wait_server_connected(&mut c, true).await;
+
+    let announced: Vec<String> = ANNOUNCED.iter().map(|r| r.to_string()).collect();
+    let expected = (announced.clone(), Some(4096));
+    eventually(
+        async || switchboard.announced_words(&node_id).last() == Some(&expected),
+        "the role reaching the transport with the list",
+    )
+    .await;
+    let cache = std::fs::read_to_string(core.config_dir().join("announced-relays.json"))
+        .expect("the word is cached");
+    assert!(cache.contains("\"relay_max_payload\":4096"), "{cache}");
+
+    // A restart with the server cut: the boot re-announces the WHOLE word
+    // from the cache - a fleet whose server is down keeps not only its
+    // operator's relays but the role the operator gave them.
+    server.cut();
+    drop(c);
+    let _core = core.restart().await;
+    eventually(
+        async || switchboard.announced_words(&node_id).len() == 2,
+        "the cached word re-applied at boot",
+    )
+    .await;
+    assert_eq!(switchboard.announced_words(&node_id)[1], expected);
+}
+
 /// A server REVOKING the device ends the standing word exactly like a
 /// logout: the struck device does not keep riding, or caching, the
 /// operator's relays.

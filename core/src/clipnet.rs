@@ -235,6 +235,15 @@ pub(crate) fn propagate_materialized(
     let blobs = Arc::new(blobs);
     let state = state.clone();
     tokio::spawn(async move {
+        /// How one peer's push ended. Ordered by what the report says about
+        /// it: a policy refusal is a failure WITH its own remedy, so it is
+        /// counted apart (`no_direct_path` in the report) instead of blending
+        /// into "could not reach", whose remedy points the wrong way.
+        enum Push {
+            Delivered,
+            Failed,
+            NoDirectPath,
+        }
         let mut pushes = tokio::task::JoinSet::new();
         for peer in peers {
             let state = state.clone();
@@ -242,30 +251,56 @@ pub(crate) fn propagate_materialized(
             let blobs = blobs.clone();
             pushes.spawn(async move {
                 match send_push(&state, &peer, &announce, &blobs).await {
-                    Ok(()) => true,
+                    Ok(()) => Push::Delivered,
+                    Err(e) if dataplane::failure_code(&e) == crate::dataplane::NO_DIRECT_PATH => {
+                        // The relays may not carry the bytes, but introducing
+                        // is exactly what they are for: fall back to a
+                        // metadata-only announce, so the destination learns
+                        // the clip exists and its paste speaks the policy's
+                        // own code (or rides a direct path if one forms)
+                        // instead of silently serving the previous clip.
+                        if let Err(e) = send_announce(&state, &peer, &announce).await {
+                            tracing::debug!(peer = %peer.node_id, error = %e,
+                                "fallback announce after a rendezvous-only refusal not delivered");
+                        }
+                        Push::NoDirectPath
+                    }
                     Err(e) => {
                         tracing::debug!(peer = %peer.node_id, error = %e, "materialized clip not pushed");
-                        false
+                        Push::Failed
                     }
                 }
             });
         }
         let mut delivered = 0usize;
         let mut failed = 0usize;
+        let mut no_direct_path = 0usize;
         while let Some(outcome) = pushes.join_next().await {
             // A push task that panicked counts as a failure, never a delivery:
             // the report must never over-promise.
             match outcome {
-                Ok(true) => delivered += 1,
-                Ok(false) | Err(_) => failed += 1,
+                Ok(Push::Delivered) => delivered += 1,
+                Ok(Push::NoDirectPath) => {
+                    failed += 1;
+                    no_direct_path += 1;
+                }
+                Ok(Push::Failed) | Err(_) => failed += 1,
             }
         }
         // The announcer may already be gone (that is the whole point of
-        // push-at-copy) — `notify_conn` is then a no-op.
+        // push-at-copy), `notify_conn` is then a no-op. `no_direct_path`
+        // counts the subset of `failed` the announced relay role refused
+        // (#88): those devices are online and introduced, only the bytes
+        // need a direct path, and the share sheet words that remedy.
         state.registry.lock().expect("lock registry").notify_conn(
             announcer,
             "clipboard.pushed",
-            &json!({ "tx_id": tx_id, "delivered": delivered, "failed": failed }),
+            &json!({
+                "tx_id": tx_id,
+                "delivered": delivered,
+                "failed": failed,
+                "no_direct_path": no_direct_path,
+            }),
         );
     });
     launched
@@ -288,9 +323,18 @@ async fn send_push(
     announce: &Value,
     blobs: &[(String, Arc<Vec<u8>>)],
 ) -> std::io::Result<()> {
-    let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, state.transport.open(peer))
-        .await
-        .map_err(|_| timed_out("connect"))??;
+    // Sized open (#88): the blobs about to be streamed are the payload, and
+    // under a rendezvous-only announcement an over-cap push needs a direct
+    // path (a failure is one counter in the push report, like any other).
+    let payload = blobs
+        .iter()
+        .fold(0u64, |a, (_, bytes)| a.saturating_add(bytes.len() as u64));
+    let mut stream = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        state.transport.open_for_payload(peer, payload),
+    )
+    .await
+    .map_err(|_| timed_out("connect"))??;
     let mut frame = announce.clone();
     frame["type"] = json!("clip_push");
     dataplane::write_frame(&mut stream, &serde_json::to_vec(&frame)?).await?;
@@ -486,10 +530,32 @@ pub(crate) async fn pipe_consumer<R, W>(
             return;
         }
     };
-    let net = tokio::time::timeout(CONNECT_TIMEOUT, state.transport.open(&peer)).await;
+    // Sized open (#88): the bound of what this pipe can relay. A refusal by
+    // the announced relay role is its own code - "no route" would send the
+    // user chasing the wrong remedy.
+    let payload = state
+        .clipboard
+        .lock()
+        .expect("lock clipboard")
+        .payload_bound(tx_id);
+    let net = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        state.transport.open_for_payload(&peer, payload),
+    )
+    .await;
     let mut net = match net {
         Ok(Ok(s)) => s,
-        _ => {
+        Ok(Err(e)) => {
+            let code = dataplane::failure_code(&e);
+            let code = if code == crate::dataplane::NO_DIRECT_PATH {
+                code
+            } else {
+                "PEER_GONE".to_string()
+            };
+            let _ = datachannel::write_error(&mut consumer_write, &code).await;
+            return;
+        }
+        Err(_) => {
             let _ = datachannel::write_error(&mut consumer_write, "PEER_GONE").await;
             return;
         }
@@ -697,7 +763,7 @@ async fn fill_entries(
                 Some(p) if p.node_id == *node_id && dataplane::peer_reachable(state, &p) => p,
                 _ => return Err("PEER_GONE".to_string()),
             };
-            Some(RemoteSession::open(state, &peer, tx_id).await?)
+            Some(RemoteSession::open(state, &peer, tx_id, plan.total).await?)
         }
         ServeMode::Local => None,
     };
@@ -792,11 +858,25 @@ impl RemoteSession {
         state: &Arc<AppState>,
         peer: &PeerAddr,
         tx_id: &str,
+        payload: u64,
     ) -> Result<RemoteSession, String> {
-        let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, state.transport.open(peer))
-            .await
-            .map_err(|_| "PEER_GONE".to_string())?
-            .map_err(|_| "PEER_GONE".to_string())?;
+        // Sized open (#88): the fill's total is the payload. A refusal by the
+        // announced relay role keeps its own code through the fill's string
+        // errors - it has a remedy of its own, unlike "the peer is gone".
+        let mut stream = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            state.transport.open_for_payload(peer, payload),
+        )
+        .await
+        .map_err(|_| "PEER_GONE".to_string())?
+        .map_err(|e| {
+            let code = dataplane::failure_code(&e);
+            if code == crate::dataplane::NO_DIRECT_PATH {
+                code
+            } else {
+                "PEER_GONE".to_string()
+            }
+        })?;
         let frame = serde_json::to_vec(&json!({ "type": "clip_session", "tx_id": tx_id }))
             .expect("serialize clip_session");
         dataplane::write_frame(&mut stream, &frame)

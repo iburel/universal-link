@@ -394,6 +394,44 @@ impl ClipboardState {
         })
     }
 
+    /// Upper bound, in bytes, of what a paste session on `tx_id` can pull
+    /// from its source: every inline format's advisory size plus the file
+    /// manifest. What a sized open (#88) states for the consumer pipe - a
+    /// bound, not a measurement: the consumer usually reads one format.
+    ///
+    /// Fail-closed on a clip that CONCEALS its size: a sensitive clip's
+    /// size hints are stripped by design (the backends redact them so a
+    /// secret's length never travels in metadata), and any other inline
+    /// format may simply not advertise one. Counting those as zero would
+    /// exempt exactly them from a rendezvous-only cap - the strict form
+    /// (`0`) would police every sized clip while the secrets ride the
+    /// operator's relay. An unknowable bound is therefore the maximal one:
+    /// under a cap the paste requires the direct path, and with no cap
+    /// armed (every deployment without the #88 option) the bound is inert.
+    /// The `files` format itself is exempt from that rule: its bytes ARE
+    /// the manifest's, already summed below.
+    pub fn payload_bound(&self, tx_id: &str) -> u64 {
+        let Some(t) = self.transactions.get(tx_id) else {
+            return 0;
+        };
+        let concealed = t.sensitive
+            || t.formats
+                .iter()
+                .any(|f| f.format != "files" && f.size.is_none());
+        if concealed {
+            return u64::MAX;
+        }
+        let formats = t
+            .formats
+            .iter()
+            .filter_map(|f| f.size)
+            .fold(0u64, u64::saturating_add);
+        t.files
+            .iter()
+            .map(|f| f.size)
+            .fold(formats, u64::saturating_add)
+    }
+
     /// Whether `tx_id` is a materialized clip (its inline bytes are cached
     /// here). A materialized clip is served locally and stays openable even when
     /// its source is offline (`transactions.open` skips the reachability check).
@@ -958,6 +996,68 @@ fn rpc_random() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The consumer pipe's bound (#88): sized clips sum, a clip that
+    /// conceals its size (sensitive, or any inline format with no advisory
+    /// size) is the maximal bound - never zero, which would exempt exactly
+    /// the secrets from a rendezvous-only cap. The `files` format itself is
+    /// exempt: its bytes are the manifest's, summed separately.
+    #[test]
+    fn payload_bound_fails_closed_on_a_concealed_size() {
+        fn tx(sensitive: bool, formats: Vec<Format>, files: Vec<FileEntry>) -> Transaction {
+            Transaction {
+                tx_id: "tx".into(),
+                device_id: None,
+                seq: 1,
+                formats,
+                files,
+                sensitive,
+                origin: Origin::Remote {
+                    node_id: "n".into(),
+                    device_id: "d".into(),
+                },
+                superseded: false,
+                sessions: 0,
+                materialized: HashMap::new(),
+            }
+        }
+        fn bound(t: Transaction) -> u64 {
+            let mut cb = ClipboardState::new();
+            let id = cb.announce_local(t, 1);
+            cb.payload_bound(&id)
+        }
+        let sized = |name: &str, size: Option<u64>| Format {
+            format: name.into(),
+            size,
+        };
+        let file = FileEntry {
+            file_id: "f0".into(),
+            rel_path: "a.bin".into(),
+            size: 100,
+            is_dir: false,
+            backing: None,
+        };
+
+        // Sized inline + manifest: the honest sum.
+        let t = tx(false, vec![sized("text", Some(7))], vec![file.clone()]);
+        assert_eq!(bound(t), 107);
+        // The `files` format entry itself carries no size and triggers
+        // nothing: the manifest already counts its bytes.
+        let t = tx(
+            false,
+            vec![sized("files", None), sized("text", Some(7))],
+            vec![file.clone()],
+        );
+        assert_eq!(bound(t), 107);
+        // An unsized inline format conceals the payload: maximal bound.
+        let t = tx(false, vec![sized("text", None)], vec![]);
+        assert_eq!(bound(t), u64::MAX);
+        // Sensitive conceals BY DESIGN, sizes present or not.
+        let t = tx(true, vec![sized("text", Some(7))], vec![]);
+        assert_eq!(bound(t), u64::MAX);
+        // Unknown transaction: nothing to pull.
+        assert_eq!(ClipboardState::new().payload_bound("nope"), 0);
+    }
 
     #[test]
     fn parse_formats_validates_the_normalized_set() {
