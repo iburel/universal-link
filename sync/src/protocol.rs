@@ -13,7 +13,7 @@
 use serde_json::{Value, json};
 
 use crate::index::Entry;
-use crate::records::{Endorsement, Record, SetDescriptor, valid_set_id};
+use crate::records::{ConflictRecord, Endorsement, Record, SetDescriptor, valid_set_id};
 use crate::vv::Vv;
 
 pub const DIALECT: &str = "1device-sync/1";
@@ -54,6 +54,7 @@ pub enum Message {
         page: u64,
         records: Vec<Record>,
         endorsements: Vec<Endorsement>,
+        conflicts: Vec<ConflictRecord>,
     },
     /// A page of index entries: the delta the peer's head showed it lacks.
     Entries {
@@ -169,6 +170,7 @@ impl Message {
                 page,
                 records,
                 endorsements,
+                conflicts,
             } => json!({
                 "dialect": DIALECT,
                 "type": "records",
@@ -177,6 +179,7 @@ impl Message {
                 "page": page,
                 "records": records.iter().map(Record::to_value).collect::<Vec<_>>(),
                 "endorsements": endorsements.iter().map(Endorsement::to_value).collect::<Vec<_>>(),
+                "conflicts": conflicts.iter().map(ConflictRecord::to_value).collect::<Vec<_>>(),
             }),
             Message::Entries {
                 set_id,
@@ -311,6 +314,7 @@ impl Message {
                 page: int("page")?,
                 records: parse_all(value.get("records")?, Record::from_value)?,
                 endorsements: parse_all(value.get("endorsements")?, Endorsement::from_value)?,
+                conflicts: parse_all(value.get("conflicts")?, ConflictRecord::from_value)?,
             }),
             "entries" => Some(Message::Entries {
                 set_id,
@@ -508,6 +512,7 @@ mod tests {
                 page: 0,
                 records: vec![record],
                 endorsements: vec![],
+                conflicts: vec![],
             },
             Message::Invite {
                 set_id: SET.into(),
@@ -560,6 +565,7 @@ mod tests {
             "page": 0,
             "records": [good, { "garbage": true }],
             "endorsements": [],
+            "conflicts": [],
         });
         assert_eq!(Message::from_value(&value), None);
     }

@@ -581,7 +581,11 @@ entry's.
      resolves everywhere, a peer that missed the resolution cannot
      resurrect the conflict from a stale open record, and the fold cannot
      ping-pong. Only a NEW incomparable pair (fresh version_ids) opens a
-     new record.
+     new record. (v1 defers the PHYSICAL fold: the divergence needs two
+     detectors holding different directory names at the same instant, and
+     what it leaves is a same-content, synced, harmless duplicate; the
+     winning record's `path_on_disk` remains the authority the fold will
+     use when it lands.)
   5. `sync.resolve { set_id, path, keep }`: `keep: version_id` puts that
      content at the plain path and deletes the other copy (ordinary
      synced operations, they propagate by themselves); `keep: "all"`

@@ -28,8 +28,8 @@ use crate::index::{Entry, SetIndex};
 use crate::membership::{Absorb, Effective, SetMembership};
 use crate::protocol::{DIALECT, HeadPosition, Message, descriptor_hash, paginate};
 use crate::records::{
-    Endorsement, InvitedRecord, MemberRecord, MemberStatus, Record, SetDescriptor, SetKind,
-    valid_node_id, valid_set_id,
+    ConflictRecord, Endorsement, InvitedRecord, MemberRecord, MemberStatus, Record, SetDescriptor,
+    SetKind, valid_node_id, valid_set_id,
 };
 use crate::scan::ScanReport;
 use crate::store::Store;
@@ -125,9 +125,13 @@ pub struct InviteClaim {
     pub total_size: u64,
 }
 
+/// One buffered records page: membership records, endorsements, conflict
+/// records.
+type RecordsPage = (Vec<Record>, Vec<Endorsement>, Vec<ConflictRecord>);
+
 struct RoundBuffer {
     head: Option<(HeadPosition, Option<u64>)>,
-    records: BTreeMap<u64, (Vec<Record>, Vec<Endorsement>)>,
+    records: BTreeMap<u64, RecordsPage>,
     entries: BTreeMap<u64, Vec<Entry>>,
     born_at: u64,
 }
@@ -176,6 +180,9 @@ pub struct SetState {
     /// Verified staged bytes whose final rename keeps failing (the Office
     /// case): kept, persisted, retried - never re-transferred.
     parked: BTreeMap<String, ParkedEntry>,
+    /// The conflict records, keyed (path, conflict_id): first-class
+    /// gossiped state, `resolved` a kept tombstone.
+    conflicts: BTreeMap<(String, String), ConflictRecord>,
 }
 
 #[derive(Clone, Debug)]
@@ -183,6 +190,15 @@ struct ParkedEntry {
     staged: PathBuf,
     entry: Entry,
     reason: String,
+}
+
+/// What one staged file's apply did.
+enum Apply {
+    Landed,
+    /// Concurrent with a local LIVE version: the keep-both machinery's
+    /// case.
+    Conflict,
+    Failed,
 }
 
 struct NeedState {
@@ -214,6 +230,10 @@ pub struct Engine {
     /// The rounds WE sent, by id: `true` when the round was itself an
     /// answer (its own answer closes the exchange). Bounded.
     sent_rounds: BTreeMap<u64, bool>,
+    /// Device display names from the directory (the conflict-copy
+    /// filenames' one use of them). Refreshed by the orchestrator;
+    /// fallback is the node id's prefix.
+    names: BTreeMap<String, String>,
 }
 
 impl Engine {
@@ -232,7 +252,13 @@ impl Engine {
             sets,
             round_counter: 0,
             sent_rounds: BTreeMap::new(),
+            names: BTreeMap::new(),
         })
+    }
+
+    /// The directory's display names, for the conflict-copy filenames.
+    pub fn set_device_names(&mut self, names: BTreeMap<String, String>) {
+        self.names = names;
     }
 
     pub fn self_node(&self) -> &str {
@@ -407,6 +433,93 @@ impl Engine {
         Ok(())
     }
 
+    /// `sync.resolve { set_id, path, keep }`: `keep` is a version_id (that
+    /// content takes the plain path, the other copy is deleted) or "all"
+    /// (both files stay). The record flips to resolved either way and the
+    /// gesture's effects propagate as ordinary synced operations - nothing
+    /// else ever deletes.
+    pub fn resolve(&mut self, set_id: &str, path: &str, keep: &str) -> io::Result<()> {
+        let self_node = self.self_node.clone();
+        let state = self
+            .sets
+            .get_mut(set_id)
+            .ok_or_else(|| io::Error::other("unknown set"))?;
+        let record = state
+            .conflicts
+            .values()
+            .find(|r| !r.resolved && r.path == path)
+            .cloned()
+            .ok_or_else(|| io::Error::other("no open conflict at this path"))?;
+        let key = state.clock.self_component(&self_node);
+        if keep != "all" {
+            let root = state
+                .root
+                .clone()
+                .ok_or_else(|| io::Error::other("no root"))?;
+            let join = |wire: &str| {
+                let mut p = root.clone();
+                for c in wire.split('/') {
+                    p.push(c);
+                }
+                p
+            };
+            let plain = state.index.get(path).cloned();
+            let copy = state.index.get(&record.path_on_disk).cloned();
+            let plain_vid = plain.as_ref().filter(|e| !e.deleted).map(version_id);
+            let copy_vid = copy.as_ref().filter(|e| !e.deleted).map(version_id);
+            let tombstone = |state: &mut SetState, entry: &Entry, key: &str| {
+                let mut tomb = entry.clone();
+                tomb.deleted = true;
+                tomb.hash = String::new();
+                tomb.size = 0;
+                if let Ok(tick) = state.clock.tick() {
+                    tomb.vv.set(key, tick);
+                }
+                state.index.upsert(tomb);
+            };
+            if plain_vid.as_deref() == Some(keep) {
+                // Keep the plain path's occupant: the copy goes.
+                if let Some(copy) = &copy {
+                    let _ = std::fs::remove_file(join(&copy.path));
+                    tombstone(state, copy, &key);
+                }
+            } else if copy_vid.as_deref() == Some(keep) {
+                // The copy's content takes the plain path.
+                let (Some(plain), Some(copy)) = (&plain, &copy) else {
+                    return Err(io::Error::other("no such version"));
+                };
+                let _ = std::fs::remove_file(join(path));
+                if std::fs::rename(join(&copy.path), join(path)).is_err() {
+                    return Err(io::Error::other("cannot move the kept version"));
+                }
+                let mut kept = copy.clone();
+                kept.path = path.to_string();
+                kept.vv = plain.vv.clone();
+                kept.vv.merge_max(&copy.vv);
+                if let Ok(tick) = state.clock.tick() {
+                    kept.vv.set(&key, tick);
+                }
+                state.index.upsert(kept);
+                tombstone(state, copy, &key);
+            } else {
+                return Err(io::Error::other("no such version"));
+            }
+        }
+        let resolved = ConflictRecord::sign(
+            record.set_id.clone(),
+            record.path.clone(),
+            record.conflict_id.clone(),
+            record.path_on_disk.clone(),
+            Some(self_node.clone()),
+            self_node,
+            self.store.identity(),
+        );
+        state.absorb_conflict(&resolved);
+        state.announce_to_members(&self.self_node.clone());
+        state.persist(&self.store, set_id)?;
+        Ok(())
+    }
+
     fn sign_own(&mut self, state: &mut SetState, status: MemberStatus, now: u64) -> Absorb {
         // One's own key is one's own direct contact: a shadow state born
         // from an invitation has pinned only the inviter so far.
@@ -507,9 +620,12 @@ impl Engine {
                 page,
                 records,
                 endorsements,
+                conflicts,
             } => {
                 self.buffer_page(from, &set_id, round, now, |buffer| {
-                    buffer.records.insert(page, (records, endorsements));
+                    buffer
+                        .records
+                        .insert(page, (records, endorsements, conflicts));
                 });
                 wrap(self.try_complete(from, &set_id, round, now))
             }
@@ -757,8 +873,25 @@ impl Engine {
             let mut landed = 0usize;
             for (wire, set_path) in &pull.files {
                 let staged = pull.staging.join(wire);
-                if state.apply_staged_file(&staged, set_path, &key) {
-                    landed += 1;
+                match state.apply_staged(&staged, set_path, &key) {
+                    Apply::Landed => landed += 1,
+                    Apply::Failed => {}
+                    Apply::Conflict => {
+                        // Both contents are local now: keep both,
+                        // deterministically, and say so with a signed
+                        // record.
+                        if materialize_conflict(
+                            state,
+                            &self.names,
+                            self.store.identity(),
+                            &self_node,
+                            &staged,
+                            set_path,
+                            &key,
+                        ) {
+                            landed += 1;
+                        }
+                    }
                 }
             }
             let _ = state.drain_pending(&key);
@@ -966,7 +1099,15 @@ impl Engine {
             .into_iter()
             .map(Endorsement::to_value)
             .collect();
-        let record_pages = paginate(&records).unwrap_or_default();
+        let conflict_values: Vec<Value> = state
+            .conflicts
+            .values()
+            .map(ConflictRecord::to_value)
+            .collect();
+        let mut record_pages = paginate(&records).unwrap_or_default();
+        if record_pages.is_empty() && (!endorsements.is_empty() || !conflict_values.is_empty()) {
+            record_pages.push(Vec::new());
+        }
 
         let serving = state.root.is_some()
             && state.membership.effective(&self_node) == Effective::Active
@@ -1022,6 +1163,7 @@ impl Engine {
                     "page": page as u64,
                     "records": chunk,
                     "endorsements": if page == 0 { endorsements.clone() } else { Vec::new() },
+                    "conflicts": if page == 0 { conflict_values.clone() } else { Vec::new() },
                 }),
             });
         }
@@ -1092,7 +1234,7 @@ impl Engine {
         let (position, _) = buffer.head.expect("checked");
 
         let mut echoed_terminal_about_self = false;
-        for (records, endorsements) in buffer.records.values() {
+        for (records, endorsements, conflicts) in buffer.records.values() {
             for record in records {
                 if let Record::Member(m) = record
                     && m.node_id == self_node
@@ -1104,6 +1246,9 @@ impl Engine {
             }
             for endorsement in endorsements {
                 let _ = state.membership.absorb_endorsement(endorsement);
+            }
+            for conflict in conflicts {
+                state.absorb_conflict(conflict);
             }
         }
 
@@ -1547,6 +1692,7 @@ impl SetState {
             published: BTreeMap::new(),
             publishing: BTreeMap::new(),
             parked: BTreeMap::new(),
+            conflicts: BTreeMap::new(),
         })
     }
 
@@ -1589,21 +1735,27 @@ impl SetState {
         self.stub.is_some()
     }
 
-    /// The fast apply path (the letter, section 6, minus the conflict and
-    /// tombstone machinery the next brick brings): a staged file whose
-    /// pending entry cleanly DOMINATES the local one (or has none) is
-    /// verified by hash, moved into place filesystem-first, and only then
-    /// indexed. Anything else stays pending. Returns whether the path no
-    /// longer needs bytes.
+    /// The fast apply path (the letter, section 6): a staged file whose
+    /// pending entry cleanly DOMINATES the local one (or has none, or
+    /// beats a tombstone) is verified by hash, moved into place
+    /// filesystem-first, and only then indexed. A concurrent LIVE pair
+    /// reports [`Apply::Conflict`] for the keep-both machinery.
     fn apply_staged_file(&mut self, staged: &Path, set_path: &str, self_component: &str) -> bool {
+        match self.apply_staged(staged, set_path, self_component) {
+            Apply::Landed => true,
+            Apply::Conflict | Apply::Failed => false,
+        }
+    }
+
+    fn apply_staged(&mut self, staged: &Path, set_path: &str, self_component: &str) -> Apply {
         use crate::vv::Relation;
 
         let Some(root) = self.root.clone() else {
-            return false;
+            return Apply::Failed;
         };
         let Some(versions) = self.pending.get(set_path) else {
             // Nothing pending anymore (superseded mid-pull): nothing owed.
-            return true;
+            return Apply::Landed;
         };
         // The version this pull was FOR: the newest pending file version.
         let Some(entry) = versions
@@ -1611,7 +1763,7 @@ impl SetState {
             .rfind(|e| !e.deleted && e.kind == crate::index::EntryKind::File)
             .cloned()
         else {
-            return true;
+            return Apply::Landed;
         };
         let (dominates, resurrects) = match self.index.get(set_path) {
             None => (true, false),
@@ -1621,20 +1773,20 @@ impl SetState {
                 // wins (the lossless doctrine), and the survivor will
                 // dominate the tombstone.
                 Relation::Concurrent if ours.deleted => (true, true),
-                Relation::Concurrent | Relation::Precedes => (false, false),
+                // Concurrent with a local LIVE version: keep both.
+                Relation::Concurrent => return Apply::Conflict,
+                Relation::Precedes => (false, false),
             },
         };
         if !dominates {
-            // Concurrent with a local live version: the conflict
-            // machinery's work.
-            return false;
+            return Apply::Failed;
         }
         let Ok(hash) = crate::scan::hash_file(staged) else {
-            return false;
+            return Apply::Failed;
         };
         if hash != entry.hash {
             eprintln!("[1device-sync] staged bytes do not match their entry: re-needed");
-            return false;
+            return Apply::Failed;
         }
         // Filesystem first, index after (load-bearing, the letter).
         let mut dest = root.clone();
@@ -1644,13 +1796,13 @@ impl SetState {
         if let Some(parent) = dest.parent()
             && std::fs::create_dir_all(parent).is_err()
         {
-            return false;
+            return Apply::Failed;
         }
         // A kind change applies as remove-old-kind-then-create: a directory
         // in the way goes only if empty (its children's tombstones come in
         // the same batch and land first).
         if dest.is_dir() && std::fs::remove_dir(&dest).is_err() {
-            return false;
+            return Apply::Failed;
         }
         // Windows: a read-only destination refuses the replace; clearing
         // the attribute is deliberate (the incoming version supersedes it).
@@ -1685,7 +1837,7 @@ impl SetState {
                     );
                 }
             }
-            return false;
+            return Apply::Failed;
         }
         #[cfg(unix)]
         if entry.exec {
@@ -1737,7 +1889,7 @@ impl SetState {
                 self.pending.remove(set_path);
             }
         }
-        true
+        Apply::Landed
     }
 
     /// Drains everything the pending set can settle WITHOUT pulling bytes
@@ -1953,6 +2105,37 @@ impl SetState {
         self.settle_pending(&tomb.path, &tomb.vv);
     }
 
+    /// Absorbs one gossiped conflict record: verified under its signer's
+    /// binding, keep-best per key (`resolved` beats `open`, then the
+    /// deterministic signer/sig order), and the winning record's
+    /// path_on_disk is authoritative - a live same-content copy of ours
+    /// under another name FOLDS onto it, never overwriting.
+    fn absorb_conflict(&mut self, record: &ConflictRecord) {
+        if record.set_id != self.membership.descriptor.set_id {
+            return;
+        }
+        let Some(signer_key) = self.membership.key_for(&record.signed_by) else {
+            return;
+        };
+        if !record.verify(signer_key) {
+            return;
+        }
+        let key = (record.path.clone(), record.conflict_id.clone());
+        let superseded = match self.conflicts.get(&key) {
+            Some(held) => record.beats(held),
+            None => true,
+        };
+        if !superseded {
+            return;
+        }
+        self.conflicts.insert(key, record.clone());
+        // The physical FOLD of a transiently divergent copy name onto the
+        // winning record's path is deferred (a v1 note in the letter): the
+        // divergence needs two detectors holding different directory names
+        // at the same instant, and the duplicate it leaves is same-content,
+        // synced, and harmless.
+    }
+
     /// Removes the pending versions `vv` covers, and the path when none
     /// remain.
     fn settle_pending(&mut self, path: &str, vv: &Vv) {
@@ -2083,6 +2266,9 @@ impl SetState {
                     .collect(),
             ),
             "need_counter": self.need_counter,
+            "conflicts": Value::Array(
+                self.conflicts.values().map(ConflictRecord::to_value).collect(),
+            ),
             "parked": Value::Object(
                 self.parked
                     .iter()
@@ -2211,6 +2397,18 @@ impl SetState {
                 .ok_or_else(corrupt)?,
             published: BTreeMap::new(),
             publishing: BTreeMap::new(),
+            conflicts: {
+                let mut conflicts = BTreeMap::new();
+                for record in meta
+                    .get("conflicts")
+                    .and_then(Value::as_array)
+                    .ok_or_else(corrupt)?
+                {
+                    let record = ConflictRecord::from_value(record).ok_or_else(corrupt)?;
+                    conflicts.insert((record.path.clone(), record.conflict_id.clone()), record);
+                }
+                conflicts
+            },
             parked: {
                 let mut parked = BTreeMap::new();
                 for (path, p) in meta
@@ -2286,6 +2484,304 @@ impl SetState {
 
 fn wrap(out: Vec<Outgoing>) -> Vec<Effect> {
     out.into_iter().map(Effect::Send).collect()
+}
+
+/// Keep both, deterministically (the letter, section 7): the winner of the
+/// plain path is the lower version_id - symmetric, arbitrary, identical
+/// everywhere - with vv = max of both plus the detector's bump; the loser
+/// is materialized beside it under its honest name. Placement never
+/// overwrites: an occupied candidate with different content bumps the
+/// deterministic counter, a same-content occupant merges silently. Returns
+/// whether the staged bytes were consumed.
+#[allow(clippy::too_many_arguments)]
+fn materialize_conflict(
+    state: &mut SetState,
+    names: &BTreeMap<String, String>,
+    identity: &crate::identity::Identity,
+    self_node: &str,
+    staged: &Path,
+    set_path: &str,
+    self_component: &str,
+) -> bool {
+    let Some(root) = state.root.clone() else {
+        return false;
+    };
+    let Some(local) = state.index.get(set_path).cloned() else {
+        return false;
+    };
+    let Some(incoming) = state.pending.get(set_path).and_then(|v| {
+        v.iter()
+            .rfind(|e| !e.deleted && e.kind == crate::index::EntryKind::File)
+            .cloned()
+    }) else {
+        return false;
+    };
+    let Ok(staged_hash) = crate::scan::hash_file(staged) else {
+        return false;
+    };
+    if staged_hash != incoming.hash {
+        return false;
+    }
+    let lvid = version_id(&local);
+    let rvid = version_id(&incoming);
+    let conflict_id = conflict_id_of(&lvid, &rvid);
+    let local_wins = lvid < rvid;
+    let (loser, winner) = if local_wins {
+        (incoming.clone(), local.clone())
+    } else {
+        (local.clone(), incoming.clone())
+    };
+
+    let author = loser_author(&loser.vv, &winner.vv).unwrap_or_else(|| self_node.to_string());
+    let mut device = names
+        .get(&author)
+        .map(|n| sanitize_device_name(n))
+        .unwrap_or_default();
+    if device.is_empty() {
+        device = author.chars().take(8).collect();
+    }
+    let base = crate::protocol::basename(set_path);
+    let dir_prefix = &set_path[..set_path.len() - base.len()];
+    let mut counter = 1u32;
+    let loser_path = loop {
+        let name = conflict_copy_name(base, &device, loser.mtime, counter);
+        let candidate = format!("{dir_prefix}{name}");
+        match state.index.get(&candidate) {
+            Some(e) if !e.deleted && e.hash != loser.hash => {
+                counter += 1;
+                if counter > 32 {
+                    return false;
+                }
+            }
+            _ => break candidate,
+        }
+    };
+    let occupied_same = state
+        .index
+        .get(&loser_path)
+        .is_some_and(|e| !e.deleted && e.hash == loser.hash);
+
+    let join = |wire: &str| {
+        let mut p = root.clone();
+        for c in wire.split('/') {
+            p.push(c);
+        }
+        p
+    };
+    let plain_fs = join(set_path);
+    let loser_fs = join(&loser_path);
+
+    if local_wins {
+        // The staged remote version becomes the copy; the plain path keeps
+        // our content, dominating both histories.
+        if !occupied_same {
+            let Some((mtime, size)) = install_file(staged, &loser_fs, incoming.mtime) else {
+                return false;
+            };
+            let mut vv = Vv::new();
+            if let Ok(tick) = state.clock.tick() {
+                vv.set(self_component, tick);
+            }
+            state.index.upsert(Entry {
+                path: loser_path.clone(),
+                kind: crate::index::EntryKind::File,
+                size,
+                mtime,
+                exec: incoming.exec,
+                hash: incoming.hash.clone(),
+                vv,
+                deleted: false,
+            });
+        }
+        let mut plain = local;
+        plain.vv.merge_max(&incoming.vv);
+        if let Ok(tick) = state.clock.tick() {
+            plain.vv.set(self_component, tick);
+        }
+        state.index.upsert(plain);
+    } else {
+        // Our content moves aside under its honest name; the staged remote
+        // version takes the plain path.
+        if occupied_same {
+            let _ = std::fs::remove_file(&plain_fs);
+        } else {
+            if std::fs::rename(&plain_fs, &loser_fs).is_err() {
+                return false;
+            }
+            let mut vv = Vv::new();
+            if let Ok(tick) = state.clock.tick() {
+                vv.set(self_component, tick);
+            }
+            state.index.upsert(Entry {
+                path: loser_path.clone(),
+                kind: crate::index::EntryKind::File,
+                size: loser.size,
+                mtime: loser.mtime,
+                exec: loser.exec,
+                hash: loser.hash.clone(),
+                vv,
+                deleted: false,
+            });
+        }
+        let Some((mtime, size)) = install_file(staged, &plain_fs, incoming.mtime) else {
+            return false;
+        };
+        let mut vv = incoming.vv.clone();
+        vv.merge_max(&winner.vv);
+        vv.merge_max(&loser.vv);
+        if let Ok(tick) = state.clock.tick() {
+            vv.set(self_component, tick);
+        }
+        state.index.upsert(Entry {
+            path: set_path.to_string(),
+            kind: crate::index::EntryKind::File,
+            size,
+            mtime,
+            exec: incoming.exec,
+            hash: incoming.hash.clone(),
+            vv,
+            deleted: false,
+        });
+    }
+    state.settle_pending(set_path, &incoming.vv);
+
+    let record = ConflictRecord::sign(
+        state.membership.descriptor.set_id.clone(),
+        set_path.to_string(),
+        conflict_id,
+        loser_path,
+        None,
+        self_node.to_string(),
+        identity,
+    );
+    state.absorb_conflict(&record);
+    true
+}
+
+/// Moves a verified staged file into place, stamps the wanted mtime and
+/// reads BACK what the filesystem kept.
+fn install_file(
+    staged: &Path,
+    dest: &Path,
+    want: crate::index::Mtime,
+) -> Option<(crate::index::Mtime, u64)> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    std::fs::rename(staged, dest).ok()?;
+    let mtime = (|| {
+        let file = std::fs::File::options().write(true).open(dest).ok()?;
+        let secs = u64::try_from(want.secs).ok()?;
+        let stamp = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::new(secs, want.nanos);
+        file.set_times(std::fs::FileTimes::new().set_modified(stamp))
+            .ok()?;
+        Some(crate::index::Mtime::of(
+            std::fs::metadata(dest).ok()?.modified().ok()?,
+        ))
+    })()
+    .unwrap_or(want);
+    let size = std::fs::metadata(dest).map(|m| m.len()).ok()?;
+    Some((mtime, size))
+}
+
+/// The deterministic identity of one version: BLAKE3 over the canonical vv
+/// and the content hash. Every device computes the same ids, so the fold
+/// needs no negotiation.
+pub fn version_id(entry: &Entry) -> String {
+    let canonical = crate::canonical::to_canonical_json(&entry.vv.to_value())
+        .expect("a vv is canonicalizable by construction");
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(canonical.as_bytes());
+    hasher.update(b"|");
+    hasher.update(entry.hash.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn conflict_id_of(a: &str, b: &str) -> String {
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(lo.as_bytes());
+    hasher.update(hi.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+/// The losing version's author, deterministically: the greatest component
+/// key the loser's vv holds ABOVE the winner's - identical on every
+/// detector, whatever their directories say.
+fn loser_author(loser: &Vv, winner: &Vv) -> Option<String> {
+    loser
+        .components()
+        .filter(|(key, value)| *value > winner.get(key))
+        .map(|(key, _)| key.split('@').next().unwrap_or(key).to_string())
+        .max()
+}
+
+/// "name (DeviceName, 2026-08-16 14h02 UTC).ext", sanitized against the
+/// full gate, deterministically truncated to the component budget, with a
+/// deterministic counter from the second collision on.
+fn conflict_copy_name(
+    base: &str,
+    device: &str,
+    mtime: crate::index::Mtime,
+    counter: u32,
+) -> String {
+    let (stem, ext) = match base.rfind('.') {
+        Some(i) if i > 0 => base.split_at(i),
+        _ => (base, ""),
+    };
+    let tag = if counter <= 1 {
+        format!(" ({device}, {})", utc_stamp(mtime.secs))
+    } else {
+        format!(" ({device}, {}) {counter}", utc_stamp(mtime.secs))
+    };
+    let mut stem = stem.to_string();
+    loop {
+        let name = format!("{stem}{tag}{ext}");
+        if crate::wirepath::check_component(&name).is_ok() {
+            return name;
+        }
+        if stem.pop().is_none() {
+            // Nothing sane left: an ungainly but valid fallback.
+            return format!("conflict{tag}").trim().to_string();
+        }
+    }
+}
+
+/// A directory display name fit for a filename: the separators, colon and
+/// control characters go, leading dots go, 32 chars at most, no trailing
+/// dot or space. Empty falls back to the node prefix at the caller.
+fn sanitize_device_name(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+
+    let cleaned: String = name
+        .nfc()
+        .filter(|c| !matches!(c, '/' | '\\' | ':') && !c.is_control())
+        .collect();
+    let cleaned = cleaned.trim_start_matches('.');
+    let capped: String = cleaned.chars().take(32).collect();
+    capped.trim_end_matches([' ', '.']).to_string()
+}
+
+/// Civil date from unix seconds (Howard Hinnant's civil_from_days),
+/// "YYYY-MM-DD HHhMM UTC". No date crate: the algorithm is twelve lines.
+fn utc_stamp(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}h{:02} UTC",
+        rem / 3600,
+        (rem % 3600) / 60
+    )
 }
 
 /// A fresh unguessable set id: 22 chars of the base64url alphabet, 132
@@ -3045,6 +3541,137 @@ mod tests {
         let state = a.set(&set_id).expect("state");
         assert!(state.pending.is_empty(), "no entry from a non-member");
         assert!(!state.watermarks.contains_key(&node('b')));
+    }
+
+    /// Edit vs edit: both sides keep BOTH, the plain path converges on the
+    /// same winner everywhere, the loser sits beside it under the same
+    /// honest name, and one open conflict record is shared.
+    #[test]
+    fn concurrent_edits_keep_both_deterministically() {
+        let mut rig = Rig::new(&['a', 'b']);
+        let (set_id, _a_root) = synced_pair(&mut rig);
+        for letter in ['a', 'b'] {
+            let names: BTreeMap<String, String> = [
+                (node('a'), "Alpha PC".to_string()),
+                (node('b'), "Beta:Box".to_string()),
+            ]
+            .into();
+            rig.of(letter).set_device_names(names);
+        }
+        let a_root = root_of(&mut rig, 'a', &set_id);
+        let b_root = root_of(&mut rig, 'b', &set_id);
+
+        std::fs::write(a_root.join("a.txt"), "the a version").expect("edit");
+        std::fs::write(b_root.join("a.txt"), "the b version").expect("edit");
+        rig.of('a').rescan_set(&set_id).expect("rescan");
+        rig.of('b').rescan_set(&set_id).expect("rescan");
+        for i in 0..6 {
+            rig.settle(NOW + 400 + i * 10);
+        }
+
+        let plain_a = std::fs::read_to_string(a_root.join("a.txt")).expect("plain at a");
+        let plain_b = std::fs::read_to_string(b_root.join("a.txt")).expect("plain at b");
+        assert_eq!(plain_a, plain_b, "the plain path converges on one winner");
+
+        let copies = |root: &PathBuf| -> Vec<String> {
+            let mut out: Vec<String> = std::fs::read_dir(root)
+                .expect("dir")
+                .flatten()
+                .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                .filter(|n| n.starts_with("a (") && n.ends_with(".txt"))
+                .collect();
+            out.sort();
+            out
+        };
+        let copies_a = copies(&a_root);
+        let copies_b = copies(&b_root);
+        assert_eq!(copies_a.len(), 1, "one loser copy at a: {copies_a:?}");
+        assert_eq!(copies_a, copies_b, "the copy name is deterministic");
+        let copy_a = std::fs::read_to_string(a_root.join(&copies_a[0])).expect("copy");
+        let copy_b = std::fs::read_to_string(b_root.join(&copies_b[0])).expect("copy");
+        assert_eq!(copy_a, copy_b);
+        assert_ne!(copy_a, plain_a, "the copy holds the OTHER content");
+        let both: BTreeSet<String> = [plain_a, copy_a].into();
+        assert_eq!(
+            both,
+            ["the a version".to_string(), "the b version".to_string()].into(),
+            "nothing was lost"
+        );
+
+        // One shared open record; nothing left pending.
+        for letter in ['a', 'b'] {
+            let state = rig.of(letter).set(&set_id).expect("state");
+            let open: Vec<_> = state.conflicts.values().filter(|r| !r.resolved).collect();
+            assert_eq!(open.len(), 1, "one open conflict at {letter}");
+            assert_eq!(open[0].path, "a.txt");
+            assert!(
+                state.pending.is_empty(),
+                "at {letter}: {:?}",
+                state.pending.keys()
+            );
+        }
+    }
+
+    /// Resolving anywhere resolves everywhere: the kept version takes the
+    /// plain path, the other copy is deleted, the record travels resolved.
+    #[test]
+    fn resolving_a_conflict_travels() {
+        let mut rig = Rig::new(&['a', 'b']);
+        let (set_id, _a_root) = synced_pair(&mut rig);
+        let a_root = root_of(&mut rig, 'a', &set_id);
+        let b_root = root_of(&mut rig, 'b', &set_id);
+        std::fs::write(a_root.join("a.txt"), "the a version").expect("edit");
+        std::fs::write(b_root.join("a.txt"), "the b version").expect("edit");
+        rig.of('a').rescan_set(&set_id).expect("rescan");
+        rig.of('b').rescan_set(&set_id).expect("rescan");
+        for i in 0..6 {
+            rig.settle(NOW + 500 + i * 10);
+        }
+
+        // Keep the version currently sitting AT THE COPY, from A.
+        let record = rig
+            .of('a')
+            .set(&set_id)
+            .expect("state")
+            .conflicts
+            .values()
+            .find(|r| !r.resolved)
+            .cloned()
+            .expect("open conflict");
+        let copy_entry = rig
+            .of('a')
+            .set(&set_id)
+            .expect("state")
+            .index
+            .get(&record.path_on_disk)
+            .cloned()
+            .expect("copy indexed");
+        let keep = version_id(&copy_entry);
+        let kept_content =
+            std::fs::read_to_string(a_root.join(&record.path_on_disk)).expect("copy");
+        rig.of('a')
+            .resolve(&set_id, "a.txt", &keep)
+            .expect("resolve");
+        for i in 0..6 {
+            rig.settle(NOW + 600 + i * 10);
+        }
+
+        for (letter, root) in [('a', &a_root), ('b', &b_root)] {
+            assert_eq!(
+                std::fs::read_to_string(root.join("a.txt")).expect("plain"),
+                kept_content,
+                "the kept version rules the plain path at {letter}"
+            );
+            assert!(
+                !root.join(&record.path_on_disk).exists(),
+                "the other copy is gone at {letter}"
+            );
+            let state = rig.of(letter).set(&set_id).expect("state");
+            assert!(
+                state.conflicts.values().all(|r| r.resolved),
+                "the record travels resolved to {letter}"
+            );
+        }
     }
 
     /// The self-component guard: an active member inflating OUR component
