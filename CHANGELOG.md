@@ -8,6 +8,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The Core grew the generic primitives pluggable cross-device components
+  build on** (the sync epic's foundation). Transactions gained a second
+  producer: any component holding the new `transactions.publish` scope can
+  freeze a manifest into a LONG-LIVED transaction - outside the clipboard's
+  last-copier-wins election, revoked explicitly (`transactions.revoke` cuts
+  open channels at once, the path a logout already took) or dying with its
+  publisher's connection - and a peer device installs it with
+  `transactions.adopt`, after the same fail-closed re-validation a remote
+  clipboard manifest gets; the untouched consumer machinery (range reads,
+  fills, `FILE_CHANGED`) then serves it as it always served a remote clip.
+  Components of the same role can now talk to each other across the
+  account's devices: `peers.send` carries an opaque, capped payload to an
+  attested device over the encrypted data plane and lands as a
+  `peer.message` push on the components holding the sender's role there -
+  role-to-same-role, the role stamped by the Core, delivery best-effort but
+  the refusals honest (`DEVICE_OFFLINE`, `COMPONENT_ABSENT`,
+  `PAYLOAD_TOO_LARGE`). And the `sync.*` namespace is now a routed facade:
+  forwarded whole to the exclusive `sync-backend` component (a second
+  exclusive role beside the clipboard's), scope-checked by the Core
+  (`sync.read` for the snapshot, `sync.manage` for gestures, `sync.serve`
+  to answer), with the backend publishing the `sync` topic through
+  `sync.emit`. None of it shows in the interfaces yet: it is the contract
+  the official sync engine, and any third-party replacement, will speak.
+
 - **A deployment can now make its relays rendezvous-only.** A relay plays
   two roles: the meeting point for hole punching (tiny, a few KB per device
   per day) and the fallback that carries the bytes when no direct path can
