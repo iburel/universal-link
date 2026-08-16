@@ -67,7 +67,7 @@ serial-os-clipboard = { max-threads = 1 }
 # flake rate to ~0 so retries almost never fire.
 [[profile.ci.overrides]]
 platform = 'cfg(any(target_os = "macos", target_os = "windows"))'
-filter = 'package(onedevice-core) & kind(test) & test(/clipboard|dataplane|transactions|peers/)'
+filter = 'package(onedevice-core) & kind(test) & test(/clipboard|dataplane|transactions|peers|sync::/)'
 test-group = 'serial-ipc'
 
 [[profile.ci.overrides]]

@@ -985,6 +985,16 @@ impl Registry {
             .any(|c| matches!(&c.phase, Phase::Active(a) if a.role == role))
     }
 
+    /// The active connection holding `role` with `scope` - the `sync.*`
+    /// facade's routing lookup. For an exclusive role there is at most one;
+    /// were there several (a non-exclusive role someday), any one serves.
+    pub fn conn_for_role_scope(&self, role: &str, scope: &str) -> Option<ConnId> {
+        self.conns.iter().find_map(|(id, e)| match &e.phase {
+            Phase::Active(a) if a.role == role && a.has_scope(scope) => Some(*id),
+            _ => None,
+        })
+    }
+
     /// Pushes a notification to all active connections carrying `scope` — with
     /// no subscription: it is the duty attached to the scope
     /// (`component.pending` → `components.approve`).

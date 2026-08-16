@@ -29,5 +29,6 @@ mod revocation;
 mod serverless;
 mod session;
 mod startup;
+mod sync;
 mod system;
 mod transactions;

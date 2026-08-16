@@ -420,6 +420,26 @@
 //!   does not distinguish "role not held" from "held without the scope" or a
 //!   malformed frame. Delivery stays best-effort: the ack means "queued to at
 //!   least one matching component", nothing more.
+//!
+//! The routed `sync.*` facade (#83, `sync.rs`):
+//! - Role `sync-backend` joins `clipboard-backend` as an EXCLUSIVE role: two
+//!   slots, one holder each, `ROLE_CONFLICT` at activation as before (the
+//!   refused token not consumed, the pending request surviving an occupied
+//!   approve).
+//! - Every `sync.*` method except `sync.emit` is FORWARDED to the active
+//!   `sync-backend` connection holding `sync.serve`, and the reply (result or
+//!   error) relays verbatim - the vocabulary's semantics live in the
+//!   component. No such connection, one that tears down mid-flight, or one
+//!   that does not answer within the 10 s proxy budget: `COMPONENT_ABSENT`.
+//! - The read/manage split is the Core's: `sync.status` (the `sync` topic's
+//!   snapshot method) requires `sync.read`; every other name requires
+//!   `sync.manage`. The split is per-scope, not cumulative - an interface
+//!   that wants both holds both. Phase before everything, as everywhere.
+//! - Topic `sync`, gated on `sync.read`, subscription-based. The backend
+//!   publishes it through `sync.emit { method, params }`, gated on its role
+//!   AND `sync.serve` (the announce pattern): `method` must be a `sync.*`
+//!   name other than `sync.emit`, `params` must be an object; the Core
+//!   relays verbatim and interprets nothing.
 
 #![allow(dead_code)]
 

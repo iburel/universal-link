@@ -32,16 +32,34 @@ use crate::{API_VERSION, framing};
 const OUT_QUEUE_DEPTH: usize = 256;
 /// Beyond this, a write that makes no progress counts as a dead connection.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Budget for a `sync.*` facade forward (the proxy norm, like the server
+/// proxies): a backend that does not answer within it reads as absent.
+const SYNC_FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Bounds for fields that are stored and later rebroadcast.
 const NAME_MAX: usize = 128;
 const VERSION_MAX: usize = 64;
 
-const ROLES: [&str; 5] = ["gui", "clipboard-backend", "menu-backend", "tray", "custom"];
-/// A single clipboard backend active at a time (doc/core-api.md, "Roles").
-const EXCLUSIVE_ROLE: &str = "clipboard-backend";
+const ROLES: [&str; 6] = [
+    "gui",
+    "clipboard-backend",
+    "menu-backend",
+    "sync-backend",
+    "tray",
+    "custom",
+];
+/// One active holder at a time for these roles (doc/core-api.md, "Roles"):
+/// a second `hello` (or approve) naming one already taken is `ROLE_CONFLICT`.
+/// Replacing an official backend with a third-party one is a configuration
+/// choice, which is exactly what exclusivity protects.
+const EXCLUSIVE_ROLES: [&str; 2] = ["clipboard-backend", "sync-backend"];
 
-const SCOPES: [&str; 12] = [
+/// Is `role` taken by an active connection, where that matters (exclusivity)?
+fn exclusive_role_taken(reg: &crate::state::Registry, role: &str) -> bool {
+    EXCLUSIVE_ROLES.contains(&role) && reg.role_taken(role)
+}
+
+const SCOPES: [&str; 15] = [
     "session.read",
     "session.manage",
     "devices.read",
@@ -52,9 +70,18 @@ const SCOPES: [&str; 12] = [
     "clipboard.write",
     "transactions.publish",
     "peers.message",
+    "sync.serve",
+    "sync.read",
+    "sync.manage",
     "components.approve",
     "system.shutdown",
 ];
+
+/// The `sync.*` facade methods a `sync.read` holder may call: the topic's
+/// snapshot method (the resync rule: snapshot, then subscribe). Everything
+/// else in the namespace is a gesture, under `sync.manage`. Additive: the
+/// vocabulary freeze (#84) extends this list, never shrinks it.
+const SYNC_READ_METHODS: [&str; 1] = ["sync.status"];
 
 /// Never grantable through the approval prompt — only by the bootstrap trust
 /// roots (otherwise: self-escalation).
@@ -70,6 +97,7 @@ fn topic_scope(topic: &str) -> Option<&'static str> {
         // events drive a confirmation screen and carry the device asking to
         // join. Whoever watches one is whoever may answer it.
         "pairing" => Some("session.manage"),
+        "sync" => Some("sync.read"),
         _ => None,
     }
 }
@@ -372,6 +400,10 @@ impl Conn {
             "transactions.adopt" => self.transactions_adopt(params).await,
             "peers.send" => self.peers_send(params).await,
             "system.shutdown" => self.system_shutdown(),
+            // The backend's own method first; every other `sync.*` name is the
+            // routed facade, forwarded to the exclusive sync backend.
+            "sync.emit" => self.sync_emit(params),
+            m if m.starts_with("sync.") => self.sync_forward(m, params).await,
             _ => {
                 // Phase first: an unenrolled component learns nothing about
                 // the surface, not even which methods exist.
@@ -454,7 +486,7 @@ impl Conn {
             return Err(RpcErr::app("INVALID_TOKEN"));
         }
 
-        if role == EXCLUSIVE_ROLE && reg.role_taken(EXCLUSIVE_ROLE) {
+        if exclusive_role_taken(&reg, &role) {
             return Err(RpcErr::app("ROLE_CONFLICT"));
         }
         // Hello accepted: it is now that a spawn token is consumed — a refused
@@ -1179,7 +1211,7 @@ impl Conn {
         if scopes.iter().any(|s| !request.scopes.contains(s)) {
             return Err(RpcErr::invalid_params("scopes"));
         }
-        if request.role == EXCLUSIVE_ROLE && reg.role_taken(EXCLUSIVE_ROLE) {
+        if exclusive_role_taken(&reg, &request.role) {
             // The request survives: approvable once the incumbent has left.
             return Err(RpcErr::app("ROLE_CONFLICT"));
         }
@@ -1601,6 +1633,79 @@ impl Conn {
         crate::peers::send(&self.state, &role, &device_id, payload).await
     }
 
+    // -- The sync facade ----------------------------------------------------
+
+    /// Forwards a `sync.*` method to the connected exclusive `sync-backend`
+    /// (the `clipboard.get_data` pattern, in the other direction) and relays
+    /// its reply verbatim - errors included: the vocabulary's semantics live
+    /// in the component, the Core checks scopes and caches nothing. No backend
+    /// connected (or holding `sync.serve`), a backend that dies mid-flight, or
+    /// one that does not answer in time: `COMPONENT_ABSENT`, an honest state
+    /// the interface can phrase.
+    async fn sync_forward(&self, method: &str, params: &Value) -> Result<Value, RpcErr> {
+        // Phase first (through `require_scope`), then the read/manage split:
+        // the snapshot methods under `sync.read`, every gesture under
+        // `sync.manage`.
+        let scope = if SYNC_READ_METHODS.contains(&method) {
+            "sync.read"
+        } else {
+            "sync.manage"
+        };
+        self.require_scope(scope)?;
+        // Find the backend and enqueue under ONE registry lock; the await
+        // happens strictly after its release (the write invariant).
+        let issued = {
+            let mut reg = self.state.registry.lock().expect("lock registry");
+            reg.conn_for_role_scope("sync-backend", "sync.serve")
+                .and_then(|target| {
+                    reg.issue_request(target, method, params.clone())
+                        .map(|(id, rx)| (target, id, rx))
+                })
+        };
+        let Some((target, req_id, reply_rx)) = issued else {
+            return Err(RpcErr::app("COMPONENT_ABSENT"));
+        };
+        match tokio::time::timeout(SYNC_FORWARD_TIMEOUT, reply_rx).await {
+            // The backend's reply, result or error, relayed as-is.
+            Ok(Ok(outcome)) => outcome,
+            // Waiter dropped: the backend's connection tore down mid-flight.
+            Ok(Err(_)) => Err(RpcErr::app("COMPONENT_ABSENT")),
+            Err(_) => {
+                // Reclaim the abandoned waiter; a very late reply is dropped
+                // by `deliver_response` as a stray.
+                self.state
+                    .registry
+                    .lock()
+                    .expect("lock registry")
+                    .cancel_request(target, req_id);
+                Err(RpcErr::app("COMPONENT_ABSENT"))
+            }
+        }
+    }
+
+    /// The backend publishes a `sync` topic notification through the Core -
+    /// the one component-originated topic, gated exactly like announcing is
+    /// for the clipboard: the exclusive role AND its serving scope. The Core
+    /// checks the shape (a `sync.*` name, an object for params) and relays;
+    /// it interprets nothing.
+    fn sync_emit(&self, params: &Value) -> Result<Value, RpcErr> {
+        self.require_sync_backend()?;
+        let method = rpc::required_str(params, "method")?;
+        if !method.starts_with("sync.") || method == "sync.emit" {
+            return Err(RpcErr::invalid_params("method"));
+        }
+        let payload = params
+            .get("params")
+            .filter(|v| v.is_object())
+            .ok_or_else(|| RpcErr::invalid_params("params"))?;
+        self.state
+            .registry
+            .lock()
+            .expect("lock registry")
+            .notify_topic("sync", &method, payload);
+        Ok(json!({}))
+    }
+
     // -- Lifecycle ----------------------------------------------------------
 
     /// Stops the whole Core — the tray's Quit. The library only SIGNALS; the
@@ -1635,6 +1740,19 @@ impl Conn {
         }
     }
 
+    /// Publishing on the `sync` topic is bound to the exclusive `sync-backend`
+    /// role AND the `sync.serve` scope, the `require_clipboard_backend`
+    /// pattern. Phase before scope (an unenrolled connection learns nothing).
+    fn require_sync_backend(&self) -> Result<(), RpcErr> {
+        let reg = self.state.registry.lock().expect("lock registry");
+        match &reg.conns.get(&self.conn_id).expect("live connection").phase {
+            Phase::Fresh => Err(RpcErr::app("NOT_ENROLLED")),
+            Phase::Pending(_) => Err(RpcErr::app("PENDING_APPROVAL")),
+            Phase::Active(a) if a.role == "sync-backend" && a.has_scope("sync.serve") => Ok(()),
+            Phase::Active(_) => Err(RpcErr::app("SCOPE_DENIED")),
+        }
+    }
+
     /// Announcing (and answering `clipboard.get_data`) is bound to the exclusive
     /// `clipboard-backend` role AND the `clipboard.write` scope: a component
     /// with the scope but another role cannot mint clipboard transactions.
@@ -1644,7 +1762,7 @@ impl Conn {
         match &reg.conns.get(&self.conn_id).expect("live connection").phase {
             Phase::Fresh => Err(RpcErr::app("NOT_ENROLLED")),
             Phase::Pending(_) => Err(RpcErr::app("PENDING_APPROVAL")),
-            Phase::Active(a) if a.role == EXCLUSIVE_ROLE && a.has_scope("clipboard.write") => {
+            Phase::Active(a) if a.role == "clipboard-backend" && a.has_scope("clipboard.write") => {
                 Ok(())
             }
             Phase::Active(_) => Err(RpcErr::app("SCOPE_DENIED")),
