@@ -408,7 +408,12 @@ fn stage_core_copy(src: &Path, data_home: &Path) -> std::io::Result<PathBuf> {
 /// components are added; nothing cross-checks it against `official_components`, and
 /// a sidecar missing from it is simply never launched on a real Linux install.
 #[cfg(target_os = "linux")]
-const STAGED_SIDECARS: &[&str] = &["1device-tray", "1device-clipboard", "1device-menu"];
+const STAGED_SIDECARS: &[&str] = &[
+    "1device-tray",
+    "1device-clipboard",
+    "1device-menu",
+    "1device-sync",
+];
 
 /// Copies each sidecar next to the durable Core (best-effort). A sidecar absent
 /// from this build is skipped; a copy failure is logged but not fatal — a Core

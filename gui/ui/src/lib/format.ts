@@ -30,6 +30,7 @@ const ROLES: Record<string, string> = {
   tray: "notification area",
   "clipboard-backend": "clipboard",
   "menu-backend": "context menu",
+  "sync-backend": "folder sync",
   custom: "third-party component",
 };
 
@@ -50,6 +51,19 @@ const SCOPES: Record<string, string> = {
   "transfers.read": "Track transfers",
   "clipboard.read": "Read the shared clipboard",
   "clipboard.write": "Write to the shared clipboard",
+  // The generic cross-device primitives. `transactions.publish` mints a
+  // capability to READ files this device holds, and `peers.message` speaks
+  // to the same component on the other devices: both are worth spelling out,
+  // since the prompt is the only place the user is ever told.
+  "transactions.publish": "Offer files of this device to your other devices",
+  "peers.message": "Exchange messages with itself on your other devices",
+  // The sync engine's own three. `sync.serve` is what makes a component THE
+  // engine (it answers every interface's sync gesture); `sync.manage` can
+  // create sets, invite devices and resolve conflicts, which moves files.
+  "sync.serve": "Act as the folder-sync engine",
+  "sync.read": "Read the synced folders and their state",
+  "sync.manage": "Create synced folders, invite devices, resolve conflicts",
+  "system.shutdown": "Stop 1Device",
   "components.approve": "Approve other components",
 };
 

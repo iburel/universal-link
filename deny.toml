@@ -34,6 +34,10 @@ allow = [
   # no obligation. Pulled in by pharos/ws_stream_wasm/async_io_stream
   # (iroh closure, wasm target).
   "Unlicense",
+  # CC0-1.0: the Creative Commons public-domain dedication, same family as
+  # the Unlicense above, no obligation. Pulled in by `notify` (the sync
+  # engine's filesystem watcher); also one branch of blake3's dual license.
+  "CC0-1.0",
   # Apache-2.0 with the LLVM exception, which merely LIFTS the
   # §4 requirements for binary redistribution: strictly more
   # permissive than Apache-2.0 alone. Pulled in by target-lexicon (wasmtime).

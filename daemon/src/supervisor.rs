@@ -206,7 +206,8 @@ async fn run_once(
 /// The deployment's official components, looked up next to the Core binary — or,
 /// for the tray, in the helper bundle described by `helper_bundle_program`.
 /// The tray is registered on every platform; the clipboard backend is registered
-/// on Linux (X11), Windows, and macOS, and so is the contextual menu.
+/// on Linux (X11), Windows, and macOS, and so are the contextual menu and the
+/// sync engine.
 /// A missing executable is ignored (with a word in the log) — a Core without a
 /// tray is still a working Core.
 ///
@@ -277,6 +278,22 @@ pub fn official_components() -> Vec<ChildSpec> {
         "1device-menu",
         "menu-backend",
         &["session.read", "devices.read", "files.send"],
+    ));
+    // The sync engine: the exclusive `sync-backend` behind the routed `sync.*`
+    // facade (doc/sync-engine.md). Computers only (the v1 limits), with the
+    // documented profile everywhere - one push for the three desktops.
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+    official.push((
+        "1device-sync",
+        "sync-backend",
+        &[
+            "sync.serve",
+            "transactions.publish",
+            "peers.message",
+            "devices.read",
+            "session.read",
+            "transfers.read",
+        ],
     ));
 
     let Some(dir) = std::env::current_exe()

@@ -68,6 +68,18 @@ pub fn log_dir() -> Option<PathBuf> {
     log_dir_from(&|key| std::env::var(key).ok())
 }
 
+/// Where a component stores durable per-user data (the sync engine's state:
+/// identity, indexes, membership records). Separate from the config directory
+/// (this is data, not settings) and DEVICE-LOCAL by construction: on Windows
+/// it lives under `LOCALAPPDATA`, never the roaming profile, because a
+/// sync-engine identity that roamed between two machines would present two
+/// devices under one pinned key, exactly what the membership model forbids.
+/// `None`:
+/// unusable environment, a startup error for the component.
+pub fn data_dir() -> Option<PathBuf> {
+    data_dir_from(&|key| std::env::var(key).ok())
+}
+
 #[cfg(target_os = "linux")]
 fn log_dir_from(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
     let xdg = |key: &str| env(key).filter(|v| v.starts_with('/'));
@@ -102,6 +114,45 @@ fn log_dir_from(_env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
     // Android: the Core is embedded in the app, not launched from a session
     // whose environment tells it where to write. The app supplies its own
     // private data dir directly; this discovery path is never taken.
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn data_dir_from(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let xdg = |key: &str| env(key).filter(|v| v.starts_with('/'));
+    // XDG: user data lives under XDG_DATA_HOME (default ~/.local/share).
+    let data = xdg("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| xdg("HOME").map(|home| PathBuf::from(home).join(".local").join("share")))?;
+    Some(data.join("1device"))
+}
+
+#[cfg(target_os = "macos")]
+fn data_dir_from(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    // Application Support is macOS's home for both settings and data, so this
+    // resolves to the same directory as the endpoint's `config_dir`;
+    // components namespace under their own subdirectory.
+    let home = env("HOME").filter(|v| v.starts_with('/'))?;
+    Some(
+        PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("1Device"),
+    )
+}
+
+#[cfg(windows)]
+fn data_dir_from(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    // LOCALAPPDATA and not APPDATA: see `data_dir`, this data must stay on
+    // this machine.
+    let local = env("LOCALAPPDATA").filter(|v| !v.is_empty())?;
+    Some(PathBuf::from(local).join("1Device"))
+}
+
+#[cfg(target_os = "android")]
+fn data_dir_from(_env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    // Android: the app supplies its own private data dir directly; this
+    // discovery path is never taken (and the sync engine is computers-only).
     None
 }
 
@@ -210,6 +261,39 @@ mod tests {
             PathBuf::from(r"C:\Users\iwan\AppData\Local\1Device\logs")
         );
         assert!(log_dir_from(&env_of(&[("APPDATA", r"C:\x")])).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_data_goes_under_xdg_data_home() {
+        let dir = data_dir_from(&env_of(&[("HOME", "/home/u")])).expect("data directory");
+        assert_eq!(dir, PathBuf::from("/home/u/.local/share/1device"));
+        let dir = data_dir_from(&env_of(&[("XDG_DATA_HOME", "/data"), ("HOME", "/home/u")]))
+            .expect("data directory");
+        assert_eq!(dir, PathBuf::from("/data/1device"));
+        assert!(data_dir_from(&env_of(&[])).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_data_shares_application_support() {
+        let dir = data_dir_from(&env_of(&[("HOME", "/Users/u")])).expect("data directory");
+        assert_eq!(
+            dir,
+            PathBuf::from("/Users/u/Library/Application Support/1Device")
+        );
+        assert!(data_dir_from(&env_of(&[])).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_data_stays_local() {
+        // LOCALAPPDATA: this data must not follow the user to another machine
+        // (a roamed engine identity would alias two devices under one key).
+        let dir = data_dir_from(&env_of(&[("LOCALAPPDATA", r"C:\Users\iwan\AppData\Local")]))
+            .expect("data directory");
+        assert_eq!(dir, PathBuf::from(r"C:\Users\iwan\AppData\Local\1Device"));
+        assert!(data_dir_from(&env_of(&[("APPDATA", r"C:\x")])).is_none());
     }
 
     #[cfg(target_os = "linux")]

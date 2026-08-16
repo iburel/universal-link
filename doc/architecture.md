@@ -262,8 +262,8 @@ Central daemon, launched automatically at session login.
 - Establishes **transfers** via iroh (direct, else relay).
 - Exposes the **local IPC server** to components.
 - Is the **supervisor** of the official background components: it spawns (and
-  restarts on crash) the clipboard manager, the contextual menu manager, and the
-  tray/notifier.
+  restarts on crash) the clipboard manager, the contextual menu manager, the
+  sync engine, and the tray/notifier.
 
 ### Official components
 
@@ -272,6 +272,7 @@ Central daemon, launched automatically at session login.
 | **Tray / notifier** | spawned by the Core | Minimal always-present surface: status icon, native notifications (session expired, pending approval…), "open the GUI" / "open the browser" actions. It is the Core's doorbell. |
 | **Clipboard manager** | spawned by the Core | Per-OS backends to read/write the clipboard and be notified of changes (X11 with ICCCM INCR on Linux, the Win32 clipboard and OLE `IDataObject` on Windows, `NSPasteboard` with an `NSFilePresenter` on macOS). Handles the "blocking paste" for the duration of the download, and honors the OS's confidentiality markers in both directions. Protocol specified in [core-api.md](core-api.md) (`clipboard.*`, transactions). |
 | **Contextual menu manager** | spawned by the Core | Per-contextual-menu-surface backends. See the dedicated section. |
+| **Sync engine** | spawned by the Core | The exclusive `sync-backend` behind the routed `sync.*` facade: keeps chosen folders identical across the account's computers, over the generic primitives (published transactions, `peers.send`). Design and protocol in [sync-engine.md](sync-engine.md). |
 | **GUI** | launched by the user (or via the tray) | Displays the PCs and their states, drag and drop, list of transfers, settings, approval of third-party components. Never required for nominal operation. |
 
 The Core finds them next to itself, and launches whichever ones the build shipped

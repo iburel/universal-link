@@ -192,3 +192,84 @@ async fn invalid_frame_causes_reconnect() {
     conn2.handle_hello(1).await;
     expect_connected(&mut events, &["session.read"]).await;
 }
+
+/// A served request can land the instant the hello is accepted - the Core
+/// routes to a connection from that moment, while the client is still
+/// subscribing. It must be HELD and delivered, not refused: a facade method
+/// that vanished during the subscribe window would be intermittently
+/// missing (observed as a flaky `-32601` from the sync engine's suite).
+#[tokio::test]
+async fn a_served_request_during_establishment_is_held_not_refused() {
+    let mut scripted = ScriptedCore::start().await;
+    let mut cfg = client_config_at(scripted.path());
+    cfg.served_methods = vec!["sync.pause".into()];
+    cfg.topics = vec!["session".into()];
+    let (client, mut events) = onedevice_ipc_client::spawn(cfg);
+    let mut conn = scripted.accept().await;
+    conn.handle_hello(1).await;
+
+    // The subscribe leg is in flight: the Core forwards anyway.
+    let subscribe = conn.recv().await;
+    assert_eq!(subscribe["method"], "events.subscribe");
+    conn.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 77,
+        "method": "sync.pause",
+        "params": { "set_id": "s" },
+    }))
+    .await;
+    // A method it does NOT serve is still refused in the same window.
+    conn.send(&json!({ "jsonrpc": "2.0", "id": 78, "method": "other.method", "params": {} }))
+        .await;
+    let refusal = conn.recv().await;
+    assert_eq!(refusal["id"], 78);
+    assert_eq!(refusal["error"]["code"], -32601);
+    conn.send(&json!({ "jsonrpc": "2.0", "id": subscribe["id"], "result": {} }))
+        .await;
+
+    expect_connected(&mut events, &["session.read"]).await;
+    let id = match next_event(&mut events).await {
+        Event::Request { id, method, .. } => {
+            assert_eq!(method, "sync.pause");
+            id
+        }
+        other => panic!("expected the held request, got {other:?}"),
+    };
+    client.respond(id, json!({})).await.expect("respond");
+    let resp = conn.recv().await;
+    assert_eq!(resp["id"], 77);
+    assert_eq!(resp["result"], json!({}));
+}
+
+/// `respond_invalid_params` is a GENUINE `-32602`, worded like the Core's
+/// own: a component serving a routed facade refuses a malformed request as
+/// a protocol error, not as an application state.
+#[tokio::test]
+async fn respond_invalid_params_is_a_real_protocol_error() {
+    let mut scripted = ScriptedCore::start().await;
+    let mut cfg = client_config_at(scripted.path());
+    cfg.served_methods = vec!["sync.create".into()];
+    let (client, mut events) = onedevice_ipc_client::spawn(cfg);
+    let mut conn = scripted.accept().await;
+    conn.handle_hello(1).await;
+    expect_connected(&mut events, &["session.read"]).await;
+
+    conn.send(&json!({ "jsonrpc": "2.0", "id": 9, "method": "sync.create", "params": {} }))
+        .await;
+    let id = match next_event(&mut events).await {
+        Event::Request { id, .. } => id,
+        other => panic!("expected an incoming request, got {other:?}"),
+    };
+    client
+        .respond_invalid_params(id, "path")
+        .await
+        .expect("respond");
+    let resp = conn.recv().await;
+    assert_eq!(resp["id"], 9);
+    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(resp["error"]["message"], "invalid params: path");
+    assert!(
+        resp["error"]["data"].is_null(),
+        "a shape refusal carries no application code"
+    );
+}

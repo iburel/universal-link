@@ -58,6 +58,12 @@ enum RespondPayload {
     Ok(Value),
     /// An application error code (`error.data.code`, e.g. `CLIP_STALE`).
     Err(String),
+    /// A malformed request: the JSON-RPC `-32602`, worded exactly as the
+    /// Core words its own (`invalid params: <what>`). A component serving
+    /// a routed facade needs it: a shape refusal is not an application
+    /// state, and dressing one as an app code would make every interface
+    /// special-case it.
+    InvalidParams(String),
 }
 
 /// Request handle to the Core — clonable, shareable across tasks.
@@ -107,6 +113,17 @@ impl Client {
     /// the Core as `error.data.code`, e.g. `CLIP_STALE`).
     pub async fn respond_error(&self, id: RequestId, code: &str) -> Result<(), RequestError> {
         self.send_response(id, RespondPayload::Err(code.to_string()))
+            .await
+    }
+
+    /// Refuses a served request as malformed: the JSON-RPC `-32602`, worded
+    /// like the Core's own. `what` names the offending field.
+    pub async fn respond_invalid_params(
+        &self,
+        id: RequestId,
+        what: &str,
+    ) -> Result<(), RequestError> {
+        self.send_response(id, RespondPayload::InvalidParams(what.to_string()))
             .await
     }
 
@@ -200,6 +217,20 @@ async fn run(config: ClientConfig, mut cmd_rx: mpsc::Receiver<Cmd>, event_tx: mp
                         })
                         .await;
                 }
+                // Served requests that arrived in the same window: the
+                // caller answers them like any other, on this generation.
+                for (id, method, params) in &link.pending_requests {
+                    let _ = event_tx
+                        .send(Event::Request {
+                            id: RequestId {
+                                generation,
+                                id: id.clone(),
+                            },
+                            method: method.clone(),
+                            params: params.clone(),
+                        })
+                        .await;
+                }
                 let served = serve(
                     link,
                     &mut cmd_rx,
@@ -277,6 +308,12 @@ struct Link {
     /// soon as the hello is accepted — `component.pending` does not wait for
     /// a subscription).
     pending_notifications: Vec<(String, Value)>,
+    /// Core→component REQUESTS received before establishment completes, for
+    /// methods this component serves. The Core routes to a connection from
+    /// the moment its hello is accepted, so a routed facade call (or a
+    /// `clipboard.get_data`) can land during the subscribe leg: refusing it
+    /// `-32601` there would make a served method intermittently missing.
+    pending_requests: Vec<(Value, String, Value)>,
 }
 
 enum EstablishError {
@@ -306,6 +343,7 @@ async fn establish(config: &ClientConfig, next_id: &mut u64) -> Result<Link, Est
         granted_scopes: Vec::new(),
         api_version: 0,
         pending_notifications: Vec::new(),
+        pending_requests: Vec::new(),
     };
 
     *next_id += 1;
@@ -325,7 +363,7 @@ async fn establish(config: &ClientConfig, next_id: &mut u64) -> Result<Link, Est
     write_frame(&mut link.writer, &hello.to_string())
         .await
         .map_err(|_| EstablishError::Failed)?;
-    let result = wait_response(&mut link, hello_id).await?;
+    let result = wait_response(&mut link, hello_id, &config.served_methods).await?;
 
     // `pending` (interactive third-party enrollment): not supported in v1 —
     // for an official component it means a missing token, hence a failure.
@@ -359,11 +397,15 @@ async fn establish(config: &ClientConfig, next_id: &mut u64) -> Result<Link, Est
         .copied()
         .chain(config.optional_topics.iter().map(String::as_str))
         .collect();
-    if !wanted.is_empty() && subscribe(&mut link, next_id, &wanted).await.is_err() {
+    if !wanted.is_empty()
+        && subscribe(&mut link, next_id, &wanted, &config.served_methods)
+            .await
+            .is_err()
+    {
         if config.optional_topics.is_empty() {
             return Err(EstablishError::Failed);
         }
-        subscribe(&mut link, next_id, &required).await?;
+        subscribe(&mut link, next_id, &required, &config.served_methods).await?;
     }
 
     Ok(link)
@@ -373,6 +415,7 @@ async fn subscribe(
     link: &mut Link,
     next_id: &mut u64,
     topics: &[&str],
+    served: &[String],
 ) -> Result<(), EstablishError> {
     *next_id += 1;
     let sub_id = *next_id;
@@ -385,12 +428,16 @@ async fn subscribe(
     write_frame(&mut link.writer, &request.to_string())
         .await
         .map_err(|_| EstablishError::Failed)?;
-    wait_response(link, sub_id).await.map(|_| ())
+    wait_response(link, sub_id, served).await.map(|_| ())
 }
 
-/// Awaits response `id` during establishment, buffering notifications
-/// and turning away incoming requests.
-async fn wait_response(link: &mut Link, id: u64) -> Result<Value, EstablishError> {
+/// Awaits response `id` during establishment, buffering notifications and
+/// the requests this component serves (turning away only the rest).
+async fn wait_response(
+    link: &mut Link,
+    id: u64,
+    served: &[String],
+) -> Result<Value, EstablishError> {
     loop {
         let text = framing::read_frame(&mut link.reader)
             .await
@@ -405,6 +452,19 @@ async fn wait_response(link: &mut Link, id: u64) -> Result<Value, EstablishError
                     .to_string();
                 let params = v.get("params").cloned().unwrap_or(Value::Null);
                 link.pending_notifications.push((method, params));
+            } else if served
+                .iter()
+                .any(|m| Some(m.as_str()) == v["method"].as_str())
+            {
+                // Held, not refused: delivered as an `Event::Request` right
+                // after `Connected`, with the same id.
+                let method = v["method"]
+                    .as_str()
+                    .ok_or(EstablishError::Failed)?
+                    .to_string();
+                let params = v.get("params").cloned().unwrap_or(Value::Null);
+                link.pending_requests
+                    .push((v["id"].clone(), method, params));
             } else {
                 write_frame(&mut link.writer, &method_not_found(&v))
                     .await
@@ -504,6 +564,14 @@ async fn serve(
                             "jsonrpc": "2.0",
                             "id": id,
                             "error": { "code": -32000, "message": code, "data": { "code": code } },
+                        }),
+                        RespondPayload::InvalidParams(what) => json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": -32602,
+                                "message": format!("invalid params: {what}"),
+                            },
                         }),
                     };
                     match write_frame(&mut writer, &msg.to_string()).await {
