@@ -91,6 +91,22 @@ fn windows_reserved(name: &str) -> bool {
             && stem.as_bytes()[3] != b'0')
 }
 
+/// Windows only: the extended-length form of an absolute path
+/// (`\\?\C:\...`), which lifts the 260-character MAX_PATH limit for every
+/// call that takes it. A deep tree under a long root must not wedge, and
+/// the prefix is invisible to the rest of the code (elsewhere, and for a
+/// path that already carries it, this is the identity).
+pub fn long_path(path: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if path.is_absolute() && !text.starts_with(r"\\") {
+            return std::path::PathBuf::from(format!(r"\\?\{text}"));
+        }
+    }
+    path.to_path_buf()
+}
+
 /// The NFC form of a local name, when mapping is this platform's job: on
 /// macOS the disk hands back NFD and the filesystem opens either spelling,
 /// so the wire form is the NFC mapping. Elsewhere the disk name IS the

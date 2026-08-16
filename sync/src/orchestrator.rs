@@ -136,6 +136,8 @@ enum Internal {
         set_id: String,
         observation: crate::scan::Observation,
     },
+    /// A walk could not read the root at all.
+    WalkFailed { set_id: String },
 }
 
 /// The directory's translation tables, rebuilt from every snapshot.
@@ -270,15 +272,18 @@ pub async fn run(
                 Action::Exit(outcome) => break outcome,
             },
             Some(internal) = internal_rx.recv() => match internal {
-                Internal::Directory(snapshot) => state.on_directory(snapshot),
+                Internal::Directory(snapshot) => {
+                    state.on_directory(snapshot);
+                    // The per-device truth on every card comes from the
+                    // directory: a device going offline changes what the
+                    // cards say, so the topic must hear about it.
+                    state.emit_changes();
+                }
                 Internal::Published { to, set_id, need_id, tx_id } => {
                     let effects = match &mut state.engine {
                         Some(engine) => match tx_id {
                             Some(tx_id) => engine.on_published(&to, &set_id, need_id, &tx_id),
-                            None => {
-                                engine.on_publish_failed(&to, &set_id, need_id);
-                                Vec::new()
-                            }
+                            None => engine.on_publish_failed(&to, &set_id, need_id),
                         },
                         None => Vec::new(),
                     };
@@ -300,8 +305,23 @@ pub async fn run(
                     }
                 }
                 Internal::Scan { set_id } => state.start_scan(&set_id),
+                Internal::WalkFailed { set_id } => {
+                    state.scanning.remove(&set_id);
+                    // Drop the watch: a watcher on a root that is gone never
+                    // fires again, and `sync_watchers` only installs what is
+                    // missing. Dropping it here is what re-arms the set if
+                    // the folder returns.
+                    state.watchers.remove(&set_id);
+                    if let Some(engine) = &mut state.engine {
+                        engine.set_root_unreadable(&set_id, true);
+                    }
+                    state.emit_changes();
+                }
                 Internal::Scanned { set_id, observation } => {
                     state.scanning.remove(&set_id);
+                    if let Some(engine) = &mut state.engine {
+                        engine.set_root_unreadable(&set_id, false);
+                    }
                     if let Some(engine) = &mut state.engine
                         && let Err(e) = engine.fold_scan(&set_id, observation)
                     {
@@ -518,9 +538,10 @@ impl Loop {
                 // A gesture the state does not offer (pausing a set one was
                 // only invited to) is not an internal failure: it is a
                 // refusal the interface can phrase.
-                engine
+                let effects = engine
                     .sign_status(&set_id, status, now)
                     .map_err(|_| "SYNC_NOT_A_MEMBER")?;
+                self.execute(effects);
                 if method == "sync.resume" {
                     self.start_scan(&set_id);
                 }
@@ -764,11 +785,12 @@ impl Loop {
                     });
                 }
                 Err(e) => {
+                    // A root that vanished (unmounted, renamed, deleted) is
+                    // not a difference to fold: reported so the watcher is
+                    // dropped and re-armed if the folder comes back, and so
+                    // the card can say what is wrong instead of going quiet.
                     eprintln!("[1device-sync] walk of {set_id} failed: {e}");
-                    let _ = tx.blocking_send(Internal::Scanned {
-                        set_id,
-                        observation: crate::scan::Observation::default(),
-                    });
+                    let _ = tx.blocking_send(Internal::WalkFailed { set_id });
                 }
             }
         });

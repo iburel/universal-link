@@ -356,6 +356,7 @@ Message types (all carry `dialect` and `set_id`):
 | `need` | list of wire paths, `need_id` | "publish these for me" |
 | `offer` | `need_id`, `tx_id`, `files: [{ wire_path, set_path }]` | "adopt this and pull" |
 | `done` | `need_id`, `tx_id` | "I have landed everything; you may revoke" |
+| `cannot` | `need_id` | "not from me": the source cannot serve that need (a path it does not hold LIVE - the ordinary case for a relay carrying an entry whose bytes it has not pulled). Without it the needer would wait out its timeout and then ask the same peer again; with it, it asks another member |
 | `invite` / `invite_ack` | section 2 | the one confirmed one-shot |
 
 **The wire-path gate.** Every path arriving in ANY dialect message
@@ -496,13 +497,18 @@ fleet-wide silent loss. Order is load-bearing.)
 
 Windows realities, specified: all staging and apply I/O uses `\\?\`
 extended-length paths (a deep tree under a long root must not wedge);
-rename-over-existing uses the platform replace primitive;
+rename-over-existing uses the platform replace primitive (std's `rename`,
+which is `MoveFileEx` with replacement there);
 FILE_ATTRIBUTE_READONLY is cleared deliberately before replacing; a
 destination locked by an open application (the Office case) keeps its
-verified staged copy (persisted as a parked entry) and retries the RENAME
-alone with backoff, no re-transfer, and after N failures parks as
-"blocked: file in use" in the card's details (fail-visible, like every
-ignored entry). A kind change (file to dir or back) applies as
+verified staged copy (persisted as a parked entry, with its own attempt
+count) and retries the RENAME alone, no re-transfer - on every drain up to
+a cap, and after that once per walk, so a permanently locked file costs a
+rename per safety tick rather than per round - showing as "blocked: file
+in use" in the card's details (fail-visible, like every ignored entry).
+The staging directory is NOT given the hidden attribute in v1: it is one
+dotted name in the root, and the call would cost the crate a Windows-only
+dependency it otherwise does not need. A kind change (file to dir or back) applies as
 remove-old-kind-then-create.
 
 **Tombstone apply guards.** Before removing for a tombstone: no LIVE index
@@ -584,9 +590,10 @@ entry's.
   4. The conflict record is a FIRST-CLASS gossiped object (it rides the
      `records` pages): signed by the detecting device, keyed
      `(set_id, path, conflict_id)`, carrying the authoritative
-     `path_on_disk`, with a lifecycle
-     `open -> resolved { resolved_by, seq }` where `resolved` is a kept
-     tombstone that wins absorption. Two parallel detectors may sign the
+     `path_on_disk`, with a lifecycle `open -> resolved { resolved_by }`
+     where `resolved` is a kept tombstone that wins absorption (it needs no
+     seq of its own: `resolved` beats `open` for one key, and among equals
+     the deterministic signer/signature order decides). Two parallel detectors may sign the
      same key (names can transiently differ): the deterministic winner
      among same-key open records is the lower signing node_id, then
      lexicographic sig; only the winning record's `path_on_disk` is
@@ -596,11 +603,16 @@ entry's.
      resolves everywhere, a peer that missed the resolution cannot
      resurrect the conflict from a stale open record, and the fold cannot
      ping-pong. Only a NEW incomparable pair (fresh version_ids) opens a
-     new record. (v1 defers the PHYSICAL fold: the divergence needs two
-     detectors holding different directory names at the same instant, and
-     what it leaves is a same-content, synced, harmless duplicate; the
-     winning record's `path_on_disk` remains the authority the fold will
-     use when it lands.)
+     new record. (v1 defers the PHYSICAL fold, and only the fold: the
+     copy's NAME is already deterministic everywhere - the losing version's
+     own id is what distinguishes a collision, never a local counter - so
+     two detectors diverge on it only if their directories disagree on a
+     device's display name at that instant. What that leaves is a
+     same-content, synced duplicate of the losing version under a second
+     name; resolving keeps or deletes the copy the winning record NAMES, so
+     such a duplicate outlives the resolution and the user deletes it like
+     any file. The winning record's `path_on_disk` is the authority the fold
+     will use when it lands.)
   5. `sync.resolve { set_id, path, keep }`: `keep: version_id` puts that
      content at the plain path and deletes the other copy (ordinary
      synced operations, they propagate by themselves); `keep: "all"`
@@ -729,7 +741,7 @@ Shapes:
 ```json
 Card = { "set_id", "kind": "dir"|"file", "name", "path",
          "state": "in_order"|"catching_up"|"paused"|"waiting"|"conflicts",
-         "problem": null | "disk_full" | "watch_degraded"
+         "problem": null | "root_unreadable" | "disk_full" | "watch_degraded"
                   | "size_exceeds_invitation",
          "behind": <n, when catching_up>,
          "devices": [ { "device_id",
@@ -752,7 +764,10 @@ Conflict = { "path", "conflict_id",
 
 `problem` is the card-level honest sentence hook (the
 `session.status.problem` pattern): a set that cannot do its job says why,
-from the snapshot alone. The Card carries the full conflict and
+from the snapshot alone. `root_unreadable` is the loudest of them (the
+folder was unmounted, renamed or deleted): the walk that could not read it
+tombstones NOTHING on that word alone, and the watch is dropped so the set
+re-arms itself if the folder comes back. The Card carries the full conflict and
 ignored/blocked lists (a GUI that starts after a materialization must be
 able to render #82's "lists the files; each shows both versions" and call
 `sync.resolve` from the snapshot alone). Device NAMES are the GUI's job

@@ -98,6 +98,11 @@ pub enum Message {
         need_id: u64,
         tx_id: String,
     },
+    /// "Not from me": the source cannot serve that need (a path it does not
+    /// hold live - the ordinary case for a relay that has the ENTRY but not
+    /// the bytes). Without this the needer would wait out its whole TTL and
+    /// then ask the same peer again, for ever.
+    Cannot { set_id: String, need_id: u64 },
 }
 
 /// A head's declared position: descriptor hash, the advertised set_vv, and
@@ -127,7 +132,8 @@ impl Message {
             | Message::InviteAck { set_id }
             | Message::Need { set_id, .. }
             | Message::Offer { set_id, .. }
-            | Message::Done { set_id, .. } => set_id,
+            | Message::Done { set_id, .. }
+            | Message::Cannot { set_id, .. } => set_id,
         }
     }
 
@@ -254,6 +260,12 @@ impl Message {
                 "set_id": set_id,
                 "need_id": need_id,
                 "tx_id": tx_id,
+            }),
+            Message::Cannot { set_id, need_id } => json!({
+                "dialect": DIALECT,
+                "type": "cannot",
+                "set_id": set_id,
+                "need_id": need_id,
             }),
         }
     }
@@ -392,6 +404,10 @@ impl Message {
                     tx_id: tx_id.to_string(),
                 })
             }
+            "cannot" => Some(Message::Cannot {
+                set_id,
+                need_id: int("need_id")?,
+            }),
             _ => None,
         }
     }
@@ -407,7 +423,17 @@ pub fn basename(path: &str) -> &str {
 fn parse_all<T>(value: &Value, parse: impl Fn(&Value) -> Option<T>) -> Option<Vec<T>> {
     let items = value.as_array()?;
     if items.len() > 4096 {
+        eprintln!("[1device-sync] a page with {} items: dropped", items.len());
         return None;
+    }
+    for (i, item) in items.iter().enumerate() {
+        if parse(item).is_none() {
+            // One invalid item drops the whole page, LOUDLY (the letter):
+            // a page is absorbed entire or not at all, and a peer sending
+            // one is either broken or trying something.
+            eprintln!("[1device-sync] item {i} of a page did not parse: page dropped");
+            return None;
+        }
     }
     items.iter().map(parse).collect()
 }

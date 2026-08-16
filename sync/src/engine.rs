@@ -131,6 +131,16 @@ const ROUNDS_IN_FLIGHT_PER_PEER: usize = 4;
 /// conflicts, and a bound a member cannot push past.
 const CONFLICTS_MAX: usize = 10_000;
 
+/// Rename attempts a parked entry spends on the ordinary drains before it
+/// waits for a walk instead. Its bytes are kept either way.
+const PARKED_ATTEMPTS_MAX: u32 = 16;
+
+/// (peer, path) refusals remembered, and for how long: long enough that a
+/// pump does not loop on the same peer, short enough that a relay which has
+/// since pulled the bytes is asked again.
+const REFUSALS_MAX: usize = 4096;
+const REFUSAL_TTL_SECS: u64 = 300;
+
 /// Terminal outcomes remembered while their transfer id is still in
 /// flight: a handful is plenty (at most two pulls per peer).
 const EARLY_OUTCOMES_MAX: usize = 16;
@@ -207,6 +217,9 @@ pub struct SetState {
     last_answered: BTreeMap<String, u64>,
     /// When we last served each peer a need (the publish rate limit).
     last_served: BTreeMap<String, u64>,
+    /// (peer, path) pairs a peer has told us it cannot serve, and when.
+    /// Ephemeral and bounded: it steers the next need at another member.
+    refused: BTreeMap<(String, String), u64>,
     /// When a complete leg from each peer was last absorbed: the card's
     /// "offline since T" (section 4), which is OUR fact rather than the
     /// directory's. Ephemeral: after a restart the directory's word does.
@@ -238,6 +251,9 @@ pub struct SetState {
     /// The watcher could not be installed: degraded to periodic scanning,
     /// said on the card. Pushed by the orchestrator.
     watch_degraded: bool,
+    /// The root itself could not be read (unmounted, renamed, deleted):
+    /// said on the card, and nothing is tombstoned on that word alone.
+    root_unreadable: bool,
     /// The disk said no: pulling stops and the card says why, until a
     /// resume gesture. Persisted, because a full disk survives a restart.
     disk_full: bool,
@@ -255,6 +271,10 @@ struct ParkedEntry {
     staged: PathBuf,
     entry: Entry,
     reason: String,
+    /// Rename attempts spent. Past the cap the entry stops retrying on
+    /// every drain and waits for the safety tick's walk, so a permanently
+    /// locked file costs a rename per walk rather than per round.
+    attempts: u32,
 }
 
 /// What one staged file's apply did.
@@ -357,6 +377,15 @@ impl Engine {
     pub fn set_watch_degraded(&mut self, set_id: &str, degraded: bool) {
         if let Some(state) = self.sets.get_mut(set_id) {
             state.set_watch_degraded(degraded);
+        }
+    }
+
+    /// The orchestrator's word on whether the root could be read at all: an
+    /// unmounted or deleted folder is the loudest problem a set can have,
+    /// and going quiet about it would look like "in order".
+    pub fn set_root_unreadable(&mut self, set_id: &str, unreadable: bool) {
+        if let Some(state) = self.sets.get_mut(set_id) {
+            state.root_unreadable = unreadable;
         }
     }
 
@@ -544,7 +573,9 @@ impl Engine {
         } else {
             "in_order"
         };
-        let problem = if state.disk_full {
+        let problem = if state.root_unreadable {
+            json!("root_unreadable")
+        } else if state.disk_full {
             json!("disk_full")
         } else if state.size_guard_tripped() {
             json!("size_exceeds_invitation")
@@ -720,7 +751,12 @@ impl Engine {
     /// Declines the invitation (or leaves, or pauses, or resumes: the four
     /// self-signed gestures share this path). Terminal gestures grow a stub
     /// that keeps proving itself to each member until echoed.
-    pub fn sign_status(&mut self, set_id: &str, status: MemberStatus, now: u64) -> io::Result<()> {
+    pub fn sign_status(
+        &mut self,
+        set_id: &str,
+        status: MemberStatus,
+        now: u64,
+    ) -> io::Result<Vec<Effect>> {
         let self_node = self.self_node.clone();
         let mut state = self
             .sets
@@ -741,6 +777,7 @@ impl Engine {
             self.sets.insert(set_id.to_string(), state);
             return Err(io::Error::other("gesture not available in this state"));
         }
+        let mut out = Vec::new();
         if status == MemberStatus::Active {
             // Resuming is the user gesture that lifts both guards: the
             // consent claim and the disk-full stop.
@@ -768,6 +805,13 @@ impl Engine {
                     attempts: RETRY_BUDGET,
                 });
             }
+            // Nothing we published may outlive the gesture: a transaction
+            // already handed out would keep serving the bytes of a folder
+            // this device has left.
+            for tx_id in std::mem::take(&mut state.published).into_values() {
+                out.push(Effect::Revoke { tx_id });
+            }
+            state.publishing.clear();
             // The set left this device: the local files stay exactly where
             // they are (the letter, and the interface says so), and we stop
             // touching them - no watcher, no walk, no write. The membership
@@ -780,7 +824,7 @@ impl Engine {
         state.announce_to_members(&self_node);
         state.persist(&self.store, set_id)?;
         self.sets.insert(set_id.to_string(), state);
-        Ok(())
+        Ok(out)
     }
 
     /// `sync.resolve { set_id, path, keep }`: `keep` is a version_id (that
@@ -824,6 +868,11 @@ impl Engine {
                     }
                     tombstone(state, copy, &key);
                 }
+            } else if copy.as_ref().is_none_or(|c| c.deleted) {
+                // The losing copy has not landed here yet: resolving now
+                // would mark the conflict resolved fleet-wide while this
+                // device still holds one of the two versions.
+                return Err("SYNC_NOT_READY");
             } else if copy_vid.as_deref() == Some(keep) {
                 // The copy's content takes the plain path.
                 let (Some(plain), Some(copy)) = (&plain, &copy) else {
@@ -927,6 +976,11 @@ impl Engine {
             .get_mut(set_id)
             .ok_or_else(|| io::Error::other("unknown set"))?;
         let key = state.clock.self_component(&self_node);
+        // A walk is the slow beat: it re-arms the parked retries, so a
+        // destination unlocked in the meantime is tried again.
+        for parked in state.parked.values_mut() {
+            parked.attempts = 0;
+        }
         let report = crate::scan::fold(observation, &mut state.index, &mut state.clock, &key)?;
         let _ = state.drain_pending(&key);
         state.ignored = report.ignored.clone();
@@ -1058,6 +1112,10 @@ impl Engine {
                 need_id,
                 tx_id,
             } => self.on_done(from, &set_id, need_id, &tx_id),
+            Message::Cannot { set_id, need_id } => {
+                self.on_cannot(from, &set_id, need_id, now);
+                Vec::new()
+            }
         }
     }
 
@@ -1110,14 +1168,28 @@ impl Engine {
                 .get(path)
                 .is_some_and(|e| !e.deleted && e.kind == crate::index::EntryKind::File);
             if !live_file {
-                // One path we cannot vouch for drops the whole need,
-                // loudly: a hostile needer learns nothing piecemeal.
+                // One path we cannot vouch for drops the whole need, and the
+                // needer is TOLD: the ordinary case is a relay that carried
+                // the entry without the bytes, and silence would make the
+                // needer wait out its TTL and then ask us again for ever.
                 eprintln!("[1device-sync] need for a path outside the live index, set {set_id}");
-                return Vec::new();
+                return vec![Effect::send(
+                    from,
+                    &Message::Cannot {
+                        set_id: set_id.to_string(),
+                        need_id,
+                    },
+                )];
             }
             let Some(fs_path) = state.fs_path(path) else {
                 eprintln!("[1device-sync] need for a path we may not read, set {set_id}");
-                return Vec::new();
+                return vec![Effect::send(
+                    from,
+                    &Message::Cannot {
+                        set_id: set_id.to_string(),
+                        need_id,
+                    },
+                )];
             };
             fs_paths.push(fs_path);
             map.insert(crate::protocol::basename(path).to_string(), path.clone());
@@ -1196,10 +1268,19 @@ impl Engine {
         )]
     }
 
-    pub fn on_publish_failed(&mut self, to: &str, set_id: &str, need_id: u64) {
+    pub fn on_publish_failed(&mut self, to: &str, set_id: &str, need_id: u64) -> Vec<Effect> {
         if let Some(state) = self.sets.get_mut(set_id) {
             state.publishing.remove(&(to.to_string(), need_id));
         }
+        // The needer is told, rather than left waiting: a file deleted
+        // between our last walk and its need is the ordinary cause.
+        vec![Effect::send(
+            to,
+            &Message::Cannot {
+                set_id: set_id.to_string(),
+                need_id,
+            },
+        )]
     }
 
     /// Needer side of an offer: only for our own outstanding need, from the
@@ -1423,6 +1504,30 @@ impl Engine {
             }
         }
         out
+    }
+
+    /// The needer's side of a refusal: release the need at once and remember
+    /// that this peer cannot serve those paths, so the next pump asks
+    /// somebody else instead of the same one for ever.
+    fn on_cannot(&mut self, from: &str, set_id: &str, need_id: u64, now: u64) {
+        let Some(state) = self.sets.get_mut(set_id) else {
+            return;
+        };
+        let Some(need) = state.needs.remove(&need_id) else {
+            return;
+        };
+        if need.peer != from {
+            // Not the peer we asked: put it back, ignore the claim.
+            state.needs.insert(need_id, need);
+            return;
+        }
+        for path in need.paths {
+            while state.refused.len() >= REFUSALS_MAX {
+                let oldest = state.refused.keys().next().cloned().expect("non-empty");
+                state.refused.remove(&oldest);
+            }
+            state.refused.insert((from.to_string(), path), now);
+        }
     }
 
     /// Source side of a done: only the peer the slot was published for may
@@ -2123,6 +2228,16 @@ impl Engine {
                 if claimed.contains(path) {
                     continue;
                 }
+                // This peer already said it cannot serve this path: ask
+                // someone else, and only try it again much later (its own
+                // pull may have landed by then).
+                if state
+                    .refused
+                    .get(&(peer.clone(), path.clone()))
+                    .is_some_and(|at| now.saturating_sub(*at) < REFUSAL_TTL_SECS)
+                {
+                    continue;
+                }
                 // A struck path waits for the rest of the batch, then goes
                 // alone: nothing else can starve behind it.
                 if hot.contains(path) && (others_pending || !chunk.is_empty()) {
@@ -2299,6 +2414,7 @@ impl SetState {
             last_answered: BTreeMap::new(),
             last_served: BTreeMap::new(),
             last_round: BTreeMap::new(),
+            refused: BTreeMap::new(),
             needs: BTreeMap::new(),
             need_counter: 0,
             published: BTreeMap::new(),
@@ -2308,6 +2424,7 @@ impl SetState {
             landed_bytes: 0,
             ignored: Vec::new(),
             watch_degraded: false,
+            root_unreadable: false,
             disk_full: false,
             early_outcomes: BTreeMap::new(),
             hot: BTreeMap::new(),
@@ -2372,7 +2489,8 @@ impl SetState {
         let root = self.root.as_ref()?;
         if self.membership.descriptor.kind == SetKind::File {
             // The one name of a single-file set: the root IS the file.
-            return (crate::protocol::basename(wire) == wire).then(|| root.clone());
+            return (crate::protocol::basename(wire) == wire)
+                .then(|| crate::wirepath::long_path(root));
         }
         let mut path = root.clone();
         let mut components = wire.split('/').peekable();
@@ -2394,7 +2512,9 @@ impl SetState {
                 }
             }
         }
-        Some(path)
+        // Windows: the extended-length form, so a deep tree under a long
+        // root cannot wedge on MAX_PATH. Identity everywhere else.
+        Some(crate::wirepath::long_path(&path))
     }
 
     /// The consent guard (the letter, section 2): the inviter's size claim,
@@ -2572,6 +2692,7 @@ impl SetState {
                             staged: home,
                             entry: entry.clone(),
                             reason: format!("blocked: {e}"),
+                            attempts: 0,
                         },
                     );
                 }
@@ -2958,6 +3079,15 @@ impl SetState {
                 .entry(path.clone())
                 .or_default()
                 .push(parked.entry.clone());
+            // Past the cap, a locked destination is only retried when a walk
+            // comes round (the safety tick), not on every drain.
+            if parked.attempts >= PARKED_ATTEMPTS_MAX {
+                self.settle_pending(&path, &parked.entry.vv);
+                continue;
+            }
+            if let Some(held) = self.parked.get_mut(&path) {
+                held.attempts = held.attempts.saturating_add(1);
+            }
             if self.apply_staged_file(&parked.staged, &path, self_component) {
                 self.parked.remove(&path);
             } else {
@@ -3109,6 +3239,7 @@ impl SetState {
                                 "staged": p.staged.to_string_lossy(),
                                 "entry": p.entry.to_value(),
                                 "reason": p.reason,
+                                "attempts": p.attempts,
                             }),
                         )
                     })
@@ -3223,6 +3354,7 @@ impl SetState {
             last_answered: BTreeMap::new(),
             last_served: BTreeMap::new(),
             last_round: BTreeMap::new(),
+            refused: BTreeMap::new(),
             needs: BTreeMap::new(),
             need_counter: meta
                 .get("need_counter")
@@ -3236,6 +3368,7 @@ impl SetState {
                 .ok_or_else(corrupt)?,
             ignored: Vec::new(),
             watch_degraded: false,
+            root_unreadable: false,
             disk_full: meta
                 .get("disk_full")
                 .and_then(Value::as_bool)
@@ -3278,6 +3411,10 @@ impl SetState {
                                 .and_then(Value::as_str)
                                 .ok_or_else(corrupt)?
                                 .to_string(),
+                            attempts: p
+                                .get("attempts")
+                                .and_then(Value::as_u64)
+                                .unwrap_or_default() as u32,
                         },
                     );
                 }
@@ -3483,6 +3620,11 @@ fn materialize_conflict(
         .get(&plain_candidate)
         .is_some_and(|e| !e.deleted && e.hash != loser.hash);
     let loser_vid = if local_wins { &rvid } else { &lvid };
+    let gate = |candidate: String| -> Option<String> {
+        crate::wirepath::check_wire_path(&candidate)
+            .ok()
+            .map(|()| candidate)
+    };
     let loser_path = if taken {
         format!(
             "{dir_prefix}{}",
@@ -3490,6 +3632,12 @@ fn materialize_conflict(
         )
     } else {
         plain_candidate
+    };
+    // A path that would not survive the wire gate must never become an index
+    // entry: it would drop the page carrying it at every peer, for ever.
+    let Some(loser_path) = gate(loser_path) else {
+        eprintln!("[1device-sync] cannot name a conflict copy for {set_path}: kept pending");
+        return false;
     };
     let occupied_same = state
         .index
@@ -4311,6 +4459,69 @@ mod tests {
             a_state.pending.contains_key("from-c.txt") || a_state.index.get("from-c.txt").is_some(),
             "C's entry must reach A through B: {:?}",
             a_state.pending.keys()
+        );
+    }
+
+    /// The relay's corollary: an entry can reach A through B before its
+    /// bytes do, so B must REFUSE the need rather than drop it silently -
+    /// and A must then ask the device that actually holds the bytes.
+    #[test]
+    fn a_refused_need_sends_the_needer_to_another_member() {
+        let mut rig = Rig::new(&['a', 'b', 'c']);
+        let (set_id, _root) = set_with_files(&mut rig, 'a');
+        for letter in ['b', 'c'] {
+            rig.of('a')
+                .invite(&set_id, &node(letter), NOW)
+                .expect("invite");
+        }
+        let peers = rig.peers_of('a');
+        let out = rig.of('a').pump(&peers, NOW + 1, false);
+        rig.deliver(&node('a'), out, NOW + 1);
+        for (letter, at) in [('b', NOW + 2), ('c', NOW + 3)] {
+            let root = tempfile::tempdir().expect("root");
+            rig.of(letter)
+                .accept(&set_id, root.path().to_path_buf(), at)
+                .expect("accept");
+            rig._dirs.push(root);
+        }
+        for i in 0..4 {
+            rig.settle(NOW + 10 + i * 10);
+        }
+
+        // C writes and tells B only; B absorbs the entry but not the bytes.
+        let c_root = root_of(&mut rig, 'c', &set_id);
+        std::fs::write(c_root.join("from-c.txt"), "made by c").expect("write");
+        rig.of('c').rescan_set(&set_id).expect("rescan");
+        let out = rig.of('c').pump(&[node('b')], NOW + 100, true);
+        rig.deliver(&node('c'), out, NOW + 100);
+        assert!(
+            rig.of('b')
+                .set(&set_id)
+                .expect("state")
+                .pending
+                .contains_key("from-c.txt"),
+            "B holds the entry, not the bytes"
+        );
+
+        // A talks to B ALONE: it learns the entry, needs it, and B refuses.
+        for i in 0..3 {
+            let out = rig.of('a').pump(&[node('b')], NOW + 110 + i * 10, true);
+            rig.deliver(&node('a'), out, NOW + 110 + i * 10);
+        }
+        let a_root = root_of(&mut rig, 'a', &set_id);
+        assert!(
+            !a_root.join("from-c.txt").exists(),
+            "B cannot serve what it has not pulled"
+        );
+
+        // C comes back within reach: A asks IT, and the bytes land. Without
+        // the refusal, A's need would still be parked against B.
+        for i in 0..4 {
+            rig.settle(NOW + 200 + i * 10);
+        }
+        assert_eq!(
+            std::fs::read_to_string(a_root.join("from-c.txt")).expect("landed at a"),
+            "made by c"
         );
     }
 
