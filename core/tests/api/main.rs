@@ -22,6 +22,7 @@ mod leave;
 mod login;
 mod offlan;
 mod pairing;
+mod peers;
 mod protocol;
 mod relays;
 mod revocation;

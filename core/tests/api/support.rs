@@ -400,6 +400,26 @@
 //!   installed. A clipboard transaction is not adoptable (`TX_STALE`,
 //!   indistinguishable from unknown). A source-side revoke reaches remote
 //!   consumers as a relayed `TX_STALE` and EVICTS the adopted entry.
+//!
+//! Peer messages between same-role components (#83, `peers.rs`):
+//! - `peers.send { device_id, payload }`, scope `peers.message`, any role.
+//!   The payload is any JSON value, REQUIRED (a missing one is `-32602`, an
+//!   empty one is a message), opaque to the Core, capped at 64 KiB serialized
+//!   (`PAYLOAD_TOO_LARGE`, checked before any dial). One's own `device_id` is
+//!   `-32602`.
+//! - Routing is role-to-same-role, and the sender's role is STAMPED by its
+//!   Core from the registry, never chosen. Arrival is the subscription-less
+//!   `peer.message { device_id, payload }` push to EVERY active connection
+//!   holding the sender's role AND `peers.message`; the sender is named by
+//!   the receiver's own directory (the authenticated node), never by a claim
+//!   in the frame.
+//! - One bounded round-trip (`peer_msg` out, `peer_ack { delivered }` back):
+//!   `DEVICE_UNKNOWN` / `DEVICE_OFFLINE` follow `files.send`'s doctrine
+//!   (`DEVICE_OFFLINE` also covers a dial that produced no usable answer in
+//!   time), `COMPONENT_ABSENT` is the remote Core's word - which deliberately
+//!   does not distinguish "role not held" from "held without the scope" or a
+//!   malformed frame. Delivery stays best-effort: the ack means "queued to at
+//!   least one matching component", nothing more.
 
 #![allow(dead_code)]
 

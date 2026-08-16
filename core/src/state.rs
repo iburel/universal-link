@@ -1001,6 +1001,27 @@ impl Registry {
         }
     }
 
+    /// Pushes a notification to every active connection holding BOTH `role`
+    /// and `scope` - the `peer.message` delivery (a peer message lands on the
+    /// components holding the same role as its sender, doc/core-api.md
+    /// "peers.*"; no subscription, like `component.pending`). Returns whether
+    /// at least one target existed - the wire ack's `delivered`; the
+    /// queue-full drop stays best-effort, as for every notification.
+    pub fn notify_role_scope(&self, role: &str, scope: &str, method: &str, params: &Value) -> bool {
+        let frame = rpc::notification(method, params);
+        let mut delivered = false;
+        for entry in self.conns.values() {
+            if let Phase::Active(a) = &entry.phase
+                && a.role == role
+                && a.has_scope(scope)
+            {
+                delivered = true;
+                let _ = entry.tx.try_send(OutMsg::Frame(frame.clone()));
+            }
+        }
+        delivered
+    }
+
     /// Pushes a notification to the active connections subscribed to `topic`
     /// (the scope was verified at subscription; a connection's scopes do not
     /// change).

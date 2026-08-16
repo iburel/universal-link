@@ -41,7 +41,7 @@ const ROLES: [&str; 5] = ["gui", "clipboard-backend", "menu-backend", "tray", "c
 /// A single clipboard backend active at a time (doc/core-api.md, "Roles").
 const EXCLUSIVE_ROLE: &str = "clipboard-backend";
 
-const SCOPES: [&str; 11] = [
+const SCOPES: [&str; 12] = [
     "session.read",
     "session.manage",
     "devices.read",
@@ -51,6 +51,7 @@ const SCOPES: [&str; 11] = [
     "clipboard.read",
     "clipboard.write",
     "transactions.publish",
+    "peers.message",
     "components.approve",
     "system.shutdown",
 ];
@@ -369,6 +370,7 @@ impl Conn {
             "transactions.publish" => self.transactions_publish(params),
             "transactions.revoke" => self.transactions_revoke(params),
             "transactions.adopt" => self.transactions_adopt(params).await,
+            "peers.send" => self.peers_send(params).await,
             "system.shutdown" => self.system_shutdown(),
             _ => {
                 // Phase first: an unenrolled component learns nothing about
@@ -1559,6 +1561,44 @@ impl Conn {
             cancel,
         ));
         Ok(json!({ "transfer_id": transfer_id }))
+    }
+
+    // -- Peer messages ------------------------------------------------------
+
+    /// Sends an opaque, capped payload to the components holding the SAME role
+    /// on another device of the account (doc/core-api.md, "peers.*"). The
+    /// sender's role is stamped HERE, from the registry - a role talks to
+    /// itself across devices, and no caller chooses whose mailbox it reaches.
+    /// One bounded round-trip, so `COMPONENT_ABSENT` is the remote Core's word;
+    /// delivery stays best-effort (the sender retries on its own schedule).
+    async fn peers_send(&self, params: &Value) -> Result<Value, RpcErr> {
+        let role = {
+            let reg = self.state.registry.lock().expect("lock registry");
+            match &reg.conns.get(&self.conn_id).expect("live connection").phase {
+                Phase::Fresh => return Err(RpcErr::app("NOT_ENROLLED")),
+                Phase::Pending(_) => return Err(RpcErr::app("PENDING_APPROVAL")),
+                Phase::Active(a) if a.has_scope("peers.message") => a.role.clone(),
+                Phase::Active(_) => return Err(RpcErr::app("SCOPE_DENIED")),
+            }
+        };
+        let device_id = rpc::required_str(params, "device_id")?;
+        let payload = params
+            .get("payload")
+            .cloned()
+            .ok_or_else(|| RpcErr::invalid_params("payload"))?;
+        // Messaging one's own device is a loopback nothing needs: refused
+        // rather than dialled.
+        let own = self
+            .state
+            .session
+            .lock()
+            .expect("lock session")
+            .own_device_id
+            .clone();
+        if own.as_deref() == Some(device_id.as_str()) {
+            return Err(RpcErr::invalid_params("device_id"));
+        }
+        crate::peers::send(&self.state, &role, &device_id, payload).await
     }
 
     // -- Lifecycle ----------------------------------------------------------

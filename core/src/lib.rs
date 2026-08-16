@@ -22,6 +22,7 @@ mod http;
 mod identity;
 mod login;
 mod pairing;
+mod peers;
 mod relays;
 mod rpc;
 mod secrets;
