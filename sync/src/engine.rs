@@ -215,6 +215,13 @@ pub struct SetState {
     /// The watcher could not be installed: degraded to periodic scanning,
     /// said on the card. Pushed by the orchestrator.
     watch_degraded: bool,
+    /// The disk said no: pulling stops and the card says why, until a
+    /// resume gesture. Persisted, because a full disk survives a restart.
+    disk_full: bool,
+    /// Paths whose bytes keep failing to arrive, with their strike count:
+    /// beyond one strike a path is needed ALONE, so one hot file cannot
+    /// starve a batch. In memory - a restart may as well try afresh.
+    hot: BTreeMap<String, u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -470,7 +477,9 @@ impl Engine {
         } else {
             "in_order"
         };
-        let problem = if state.size_guard_tripped() {
+        let problem = if state.disk_full {
+            json!("disk_full")
+        } else if state.size_guard_tripped() {
             json!("size_exceeds_invitation")
         } else if state.watch_degraded {
             json!("watch_degraded")
@@ -649,8 +658,10 @@ impl Engine {
             .remove(set_id)
             .ok_or_else(|| io::Error::other("unknown set"))?;
         if status == MemberStatus::Active {
-            // Resuming is the user gesture that lifts the consent guard.
+            // Resuming is the user gesture that lifts both guards: the
+            // consent claim and the disk-full stop.
             state.invite_claim = None;
+            state.disk_full = false;
         }
         let absorbed = self.sign_own(&mut state, status, now);
         debug_assert!(matches!(absorbed, Absorb::Absorbed));
@@ -1107,7 +1118,7 @@ impl Engine {
     /// either outcome every staged file is verified by hash and the
     /// complete ones are applied (the salvage rule): only the remainder is
     /// re-needed, by the next pump.
-    pub fn on_transfer_outcome(&mut self, transfer_id: &str, _ok: bool) -> Vec<Effect> {
+    pub fn on_transfer_outcome(&mut self, transfer_id: &str, ok: bool, error: &str) -> Vec<Effect> {
         let self_node = self.self_node.clone();
         let mut out = Vec::new();
         let set_ids = self.set_ids();
@@ -1123,9 +1134,26 @@ impl Engine {
             let need = state.needs.remove(&need_id).expect("found");
             let pull = need.pull.expect("matched");
             let key = state.clock.self_component(&self_node);
+            // The letter's disk-full rule, from the failure rather than a
+            // prediction: no portable way to ask a filesystem how much room
+            // is left without a new dependency, and a retry loop against a
+            // full disk is exactly what the rule exists to prevent. The set
+            // stops pulling and says why; resuming is a user gesture.
+            if !ok && out_of_space(error) {
+                state.disk_full = true;
+            }
             let mut landed = 0usize;
             for (wire, set_path) in &pull.files {
                 let staged = pull.staging.join(wire);
+                // A path whose bytes keep failing is isolated into a need of
+                // its own with backoff, so one hot file (a log, a database)
+                // never starves the rest of a batch.
+                if !staged.exists() {
+                    let strikes = state.hot.entry(set_path.clone()).or_insert(0);
+                    *strikes = strikes.saturating_add(1);
+                    continue;
+                }
+                state.hot.remove(set_path);
                 match state.apply_staged(&staged, set_path, &key) {
                     Apply::Landed => landed += 1,
                     Apply::Failed => {}
@@ -1809,6 +1837,7 @@ impl Engine {
         if state.root.is_none()
             || state.membership.effective(&self_node) != Effective::Active
             || state.size_guard_tripped()
+            || state.disk_full
         {
             return out;
         }
@@ -1834,8 +1863,25 @@ impl Engine {
             let mut chunk: Vec<String> = Vec::new();
             let mut basenames: BTreeSet<String> = BTreeSet::new();
             let mut bytes = 0u64;
+            // A struck path goes alone, and only once the rest of the batch
+            // has had its turn: the backoff is "after the others".
+            let hot: BTreeSet<String> = state
+                .hot
+                .iter()
+                .filter(|(_, strikes)| **strikes > 1)
+                .map(|(path, _)| path.clone())
+                .collect();
+            let others_pending = state
+                .pending
+                .keys()
+                .any(|p| !hot.contains(p) && !claimed.contains(p));
             for (path, versions) in &state.pending {
                 if claimed.contains(path) {
+                    continue;
+                }
+                // A struck path waits for the rest of the batch, then goes
+                // alone: nothing else can starve behind it.
+                if hot.contains(path) && (others_pending || !chunk.is_empty()) {
                     continue;
                 }
                 let Some(entry) = versions
@@ -1853,9 +1899,10 @@ impl Engine {
                 if !basenames.insert(base) {
                     continue;
                 }
+                let alone = hot.contains(path);
                 chunk.push(path.clone());
                 bytes = bytes.saturating_add(entry.size);
-                if chunk.len() >= NEED_CHUNK_FILES || bytes >= NEED_CHUNK_BYTES {
+                if alone || chunk.len() >= NEED_CHUNK_FILES || bytes >= NEED_CHUNK_BYTES {
                     break;
                 }
             }
@@ -2017,6 +2064,8 @@ impl SetState {
             landed_bytes: 0,
             ignored: Vec::new(),
             watch_degraded: false,
+            disk_full: false,
+            hot: BTreeMap::new(),
         })
     }
 
@@ -2655,6 +2704,7 @@ impl SetState {
             ),
             "need_counter": self.need_counter,
             "landed_bytes": self.landed_bytes,
+            "disk_full": self.disk_full,
             "conflicts": Value::Array(
                 self.conflicts.values().map(ConflictRecord::to_value).collect(),
             ),
@@ -2793,6 +2843,11 @@ impl SetState {
                 .ok_or_else(corrupt)?,
             ignored: Vec::new(),
             watch_degraded: false,
+            disk_full: meta
+                .get("disk_full")
+                .and_then(Value::as_bool)
+                .ok_or_else(corrupt)?,
+            hot: BTreeMap::new(),
             conflicts: {
                 let mut conflicts = BTreeMap::new();
                 for record in meta
@@ -2888,6 +2943,18 @@ fn boot_round_base() -> u64 {
     let mut bytes = [0u8; 8];
     rand::Rng::fill_bytes(&mut rand::rng(), &mut bytes);
     (u64::from_be_bytes(bytes) % (1 << 40)) << 12
+}
+
+/// Whether the Core's words on a failed fill name a full disk. The Core
+/// relays the failure's own words, so this reads them rather than guessing:
+/// a wrong guess would stop a set for nothing (a resume gesture undoes it).
+fn out_of_space(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("no space left")
+        || error.contains("not enough space")
+        || error.contains("disk full")
+        || error.contains("insufficient")
+        || error.contains("enospc")
 }
 
 fn kind_str(kind: SetKind) -> &'static str {
@@ -3338,7 +3405,7 @@ mod tests {
                         let transfer = format!("t-{need_id}");
                         let needer = self.engines.get_mut(&producer).expect("needer");
                         needer.on_pull_started(&set_id, need_id, &transfer);
-                        let more = needer.on_transfer_outcome(&transfer, true);
+                        let more = needer.on_transfer_outcome(&transfer, true, "");
                         queue.extend(more.into_iter().map(|e| (producer.clone(), e)));
                     }
                 }

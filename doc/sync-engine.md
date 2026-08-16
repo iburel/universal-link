@@ -308,14 +308,17 @@ about our own history: the engine jumps its clock above the claim, logs
 loudly, and carries on. A hostile member inflating others' components can
 therefore delay nothing for long and suppress nothing silently.
 
-**Echo suppression.** The applier and the watcher are one process, so echo
-suppression is IN MEMORY, not an index-ordering trick: every path being
-applied sits in a pending-apply table until its watcher echo has been seen
-or a grace window passes. Watcher events for a pending path are verified by
-HASH, never by the size+mtime fast path; the same rule applies to any file
-whose recorded mtime is within the filesystem's timestamp granularity of
-the on-disk value (FAT counts in 2 s steps; "doubt" is defined, not
-felt). Elsewhere the quick-check is size+mtime, hash on mismatch.
+**Echo suppression.** The applier's own writes must not read back as local
+changes. What guarantees it is the apply order itself: the index records
+the mtime READ BACK from the disk after the write (section 6), so the
+watcher's echo finds size and mtime exactly as indexed and the rescan sees
+no difference at all. Where that comparison cannot be trusted, the content
+decides: a whole-second stamp means a coarse-grained filesystem (FAT counts
+in 2 s steps), so the file is hashed rather than believed, and an identical
+hash is not a change. "Doubt" is defined, not felt. Elsewhere the
+quick-check is size+mtime, hash on mismatch. (No timed pending-apply table
+is needed: a hash that matches is proof, and a grace window would only
+have been a weaker version of it.)
 
 **Startup and safety rescan.** On start (and on a slow safety tick, and at
 `sync.resume`): walk the root, compare against the index, bump
@@ -439,12 +442,16 @@ D10).
   publish and pull; its newer entry arrives with the next head.
 - `transfer.failed` is whole-batch, so the engine salvages: each staged
   file is verified by hash and the complete ones are applied; only the
-  remainder is re-needed. A path that repeatedly fails `FILE_CHANGED` (a
-  log, a database) is isolated into its own one-file need with backoff: a
-  hot file must not starve the rest of the batch.
-- Free-space floor: before each fill batch, the destination checks the
-  root's filesystem for batch size plus a floor; short = the set pauses
-  with a visible "disk full" card problem instead of a retry loop.
+  remainder is re-needed. A path whose bytes keep failing to land (a log, a
+  database rewritten under the pull) collects strikes, and beyond the first
+  it is needed ALONE and only once the rest of the batch has had its turn:
+  a hot file must not starve what it shares a need with.
+- A full disk stops the set instead of spinning: the "disk full" card
+  problem is raised from the FAILURE's own words (the Core relays them) and
+  pulling stops until a resume gesture. v1 reads the refusal rather than
+  predicting it: asking a filesystem how much room is left is per-OS work
+  or a new dependency, and the property that matters (a visible problem
+  instead of a retry loop) does not need the prediction.
 
 ## 6. Applying changes: staging and atomicity
 

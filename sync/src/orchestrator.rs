@@ -71,7 +71,8 @@ enum Action {
     PeerMessage(Value),
     /// A `device.*` event: the directory changed; refresh and pump.
     DirectoryStale,
-    /// A terminal `transfer.*` notification: one of our fills ended.
+    /// A terminal `transfer.*` notification: one of our fills ended, with
+    /// the Core's own words on a failure.
     Transfer(Value, bool),
     /// A connected-but-uninteresting event: nothing to do.
     Idle,
@@ -245,8 +246,13 @@ pub async fn run(
                     else {
                         continue;
                     };
+                    let error = params
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
                     let effects = match &mut state.engine {
-                        Some(engine) => engine.on_transfer_outcome(&transfer_id, ok),
+                        Some(engine) => engine.on_transfer_outcome(&transfer_id, ok, &error),
                         None => Vec::new(),
                     };
                     state.execute(effects);
