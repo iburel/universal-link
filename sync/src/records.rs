@@ -25,6 +25,7 @@ const DOMAIN_DESCRIPTOR: &[u8] = b"1device-sync:descriptor:";
 const DOMAIN_MEMBER: &[u8] = b"1device-sync:member-record:";
 const DOMAIN_INVITED: &[u8] = b"1device-sync:invited-record:";
 const DOMAIN_ENDORSEMENT: &[u8] = b"1device-sync:endorsement:";
+const DOMAIN_CONFLICT: &[u8] = b"1device-sync:conflict-record:";
 
 /// Bound on a descriptor's display name (the root's basename at creation):
 /// enough for every real filesystem, and a cap on what a page carries.
@@ -890,5 +891,162 @@ mod tests {
         let mut selfie = endorsement.to_value();
         selfie["endorsed_by"] = json!(NODE_B);
         assert!(Endorsement::from_value(&selfie).is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Conflict records (doc/sync-engine.md, section 7).
+// ---------------------------------------------------------------------------
+
+/// A first-class gossiped object: signed by the detecting device, keyed
+/// `(set_id, path, conflict_id)`, carrying the authoritative location of
+/// the losing copy. `resolved` is a kept tombstone that wins absorption -
+/// a peer that missed the resolution cannot resurrect the conflict from a
+/// stale open record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConflictRecord {
+    pub set_id: String,
+    pub path: String,
+    pub conflict_id: String,
+    /// Where the losing copy lives; only the WINNING record's word counts
+    /// (same-key tie-break: `resolved` beats `open`, then lower signer,
+    /// then lexicographic sig).
+    pub path_on_disk: String,
+    pub resolved: bool,
+    pub resolved_by: Option<String>,
+    pub signed_by: String,
+    pub sig: String,
+}
+
+impl ConflictRecord {
+    pub fn sign(
+        set_id: String,
+        path: String,
+        conflict_id: String,
+        path_on_disk: String,
+        resolved: Option<String>,
+        signed_by: String,
+        identity: &Identity,
+    ) -> ConflictRecord {
+        let mut record = ConflictRecord {
+            set_id,
+            path,
+            conflict_id,
+            path_on_disk,
+            resolved: resolved.is_some(),
+            resolved_by: resolved,
+            signed_by,
+            sig: String::new(),
+        };
+        record.sig = identity.sign(&record.signing_bytes());
+        record
+    }
+
+    fn signing_bytes(&self) -> Vec<u8> {
+        signed_bytes(
+            DOMAIN_CONFLICT,
+            &json!({
+                "set_id": self.set_id,
+                "path": self.path,
+                "conflict_id": self.conflict_id,
+                "path_on_disk": self.path_on_disk,
+                "resolved": self.resolved,
+                "resolved_by": self.resolved_by,
+                "signed_by": self.signed_by,
+            }),
+        )
+    }
+
+    /// True iff the signature verifies under the SIGNER's key, resolved by
+    /// the caller from the pin table.
+    pub fn verify(&self, signer_pub_hex: &str) -> bool {
+        verify_detached(signer_pub_hex, &self.signing_bytes(), &self.sig)
+    }
+
+    /// The same-key absorption order: does `self` beat `other`? `resolved`
+    /// wins over `open`; among equals, lower signer then lower sig (an
+    /// arbitrary total order every device computes identically).
+    pub fn beats(&self, other: &ConflictRecord) -> bool {
+        (
+            self.resolved,
+            std::cmp::Reverse(&self.signed_by),
+            std::cmp::Reverse(&self.sig),
+        ) > (
+            other.resolved,
+            std::cmp::Reverse(&other.signed_by),
+            std::cmp::Reverse(&other.sig),
+        )
+    }
+
+    pub fn to_value(&self) -> Value {
+        json!({
+            "set_id": self.set_id,
+            "path": self.path,
+            "conflict_id": self.conflict_id,
+            "path_on_disk": self.path_on_disk,
+            "resolved": self.resolved,
+            "resolved_by": self.resolved_by,
+            "signed_by": self.signed_by,
+            "sig": self.sig,
+        })
+    }
+
+    pub fn from_value(value: &Value) -> Option<ConflictRecord> {
+        let [
+            set_id,
+            path,
+            conflict_id,
+            path_on_disk,
+            resolved,
+            resolved_by,
+            signed_by,
+            sig,
+        ] = exact_fields(
+            value,
+            &[
+                "set_id",
+                "path",
+                "conflict_id",
+                "path_on_disk",
+                "resolved",
+                "resolved_by",
+                "signed_by",
+                "sig",
+            ],
+        )?
+        .try_into()
+        .ok()?;
+        let set_id = str_field(set_id)?;
+        let path = str_field(path)?;
+        let conflict_id = str_field(conflict_id)?;
+        let path_on_disk = str_field(path_on_disk)?;
+        let signed_by = str_field(signed_by)?;
+        let sig = str_field(sig)?;
+        let resolved = resolved.as_bool()?;
+        let resolved_by = match resolved_by {
+            Value::Null => None,
+            v => Some(v.as_str()?.to_string()),
+        };
+        if !valid_set_id(set_id)
+            || crate::wirepath::check_wire_path(path).is_err()
+            || crate::wirepath::check_wire_path(path_on_disk).is_err()
+            || !lower_hex(conflict_id, 64)
+            || !valid_node_id(signed_by)
+            || !valid_sig(sig)
+            || (resolved_by.is_some() != resolved)
+            || resolved_by.as_deref().is_some_and(|r| !valid_node_id(r))
+        {
+            return None;
+        }
+        Some(ConflictRecord {
+            set_id: set_id.to_string(),
+            path: path.to_string(),
+            conflict_id: conflict_id.to_string(),
+            path_on_disk: path_on_disk.to_string(),
+            resolved,
+            resolved_by,
+            signed_by: signed_by.to_string(),
+            sig: sig.to_string(),
+        })
     }
 }

@@ -117,6 +117,26 @@ impl SetClock {
     pub fn current(&self) -> u64 {
         self.current
     }
+
+    /// The self-component guard's teeth: answers an impossible claim about
+    /// our own history by jumping the clock ABOVE it, reservation
+    /// persisted first, so a hostile member inflating our component can
+    /// delay nothing for long and suppress nothing silently. A claim
+    /// beyond the ceiling is refused (provably absurd) rather than
+    /// poisoning the clock.
+    pub fn jump_above(&mut self, claim: u64) -> io::Result<()> {
+        if claim <= self.current {
+            return Ok(());
+        }
+        if claim > CLOCK_CEILING {
+            return Err(io::Error::other("claim beyond the clock ceiling"));
+        }
+        self.current = claim;
+        if self.current >= self.reserved {
+            self.reserve()?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -185,6 +205,26 @@ mod tests {
         });
         let mut reopened = SetClock::open(dir.path(), &index, A, 1_700_000_001).expect("reopen");
         assert!(reopened.tick().expect("tick") > 5_000);
+    }
+
+    #[test]
+    fn a_jump_outruns_the_claim_and_survives_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let index = SetIndex::new();
+        let mut clock = SetClock::open(dir.path(), &index, A, 1_700_000_000).expect("open");
+        clock.tick().expect("tick");
+        clock.jump_above(50_000).expect("jump");
+        assert!(clock.tick().expect("tick") > 50_000);
+        drop(clock);
+        let mut reopened = SetClock::open(dir.path(), &index, A, 1_700_000_001).expect("reopen");
+        assert!(
+            reopened.tick().expect("tick") > 50_000,
+            "the jump's reservation must be durable"
+        );
+        // An absurd claim is refused, and the clock stays sane.
+        let mut clock = reopened;
+        assert!(clock.jump_above(u64::MAX).is_err());
+        assert!(clock.tick().is_ok());
     }
 
     #[test]

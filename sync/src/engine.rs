@@ -222,7 +222,7 @@ impl Engine {
     pub fn open(store: Store, self_node: String, now: u64) -> io::Result<Engine> {
         let mut sets = BTreeMap::new();
         for (set_id, meta) in store.load_metas()? {
-            let state = SetState::from_meta(&store, &set_id, &meta, now)?;
+            let state = SetState::from_meta(&store, &set_id, &meta, &self_node, now)?;
             state.sweep_staging();
             sets.insert(set_id, state);
         }
@@ -246,6 +246,11 @@ impl Engine {
     #[cfg(test)]
     pub(crate) fn set_mut(&mut self, set_id: &str) -> Option<&mut SetState> {
         self.sets.get_mut(set_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sync_pub(&self) -> String {
+        self.store.identity().public_hex()
     }
 
     pub fn set_ids(&self) -> Vec<String> {
@@ -294,7 +299,15 @@ impl Engine {
         );
         let mut membership = SetMembership::new(descriptor);
         membership.pin_direct(&self.self_node, &self.store.identity().public_hex());
-        let mut state = SetState::fresh(&self.store, &set_id, membership, Some(root), now)?;
+        let self_node = self.self_node.clone();
+        let mut state = SetState::fresh(
+            &self.store,
+            &set_id,
+            membership,
+            Some(root),
+            &self_node,
+            now,
+        )?;
         let record = self.sign_own(&mut state, MemberStatus::Active, now);
         debug_assert!(matches!(record, Absorb::Absorbed));
         state.persist(&self.store, &set_id)?;
@@ -797,12 +810,27 @@ impl Engine {
         sync_pub: String,
         now: u64,
     ) -> Vec<Outgoing> {
+        // The authorization row, before any other processing: an invite
+        // counts only from a device whose CARRIED records make it active in
+        // the set. A never-admitted sibling plants no state and gets no
+        // ack.
         if !self.sets.contains_key(&set_id) {
-            // A new invitation: the shadow state is born here - membership
-            // without a root, until the consent gesture. The inviter's key
-            // is pinned by this very channel.
-            let membership = SetMembership::new(descriptor);
-            let Ok(state) = SetState::fresh(&self.store, &set_id, membership, None, now) else {
+            let mut membership = SetMembership::new(descriptor);
+            membership.pin_direct(from, &sync_pub);
+            for record in &records {
+                let _ = membership.absorb(record);
+            }
+            for endorsement in &endorsements {
+                let _ = membership.absorb_endorsement(endorsement);
+            }
+            if membership.effective(from) != Effective::Active {
+                eprintln!("[1device-sync] invite from a non-admitted device dropped");
+                return Vec::new();
+            }
+            let self_node = self.self_node.clone();
+            let Ok(state) =
+                SetState::fresh(&self.store, &set_id, membership, None, &self_node, now)
+            else {
                 return Vec::new();
             };
             self.sets.insert(set_id.clone(), state);
@@ -815,6 +843,10 @@ impl Engine {
         for endorsement in &endorsements {
             let _ = state.membership.absorb_endorsement(endorsement);
         }
+        if state.membership.effective(from) != Effective::Active {
+            eprintln!("[1device-sync] invite from a non-admitted device dropped");
+            return Vec::new();
+        }
         // The claim is the INVITER's word, kept for the consent card, and
         // only while the invitation stands open.
         if state.membership.effective(&self.self_node) == Effective::Invited {
@@ -824,7 +856,12 @@ impl Engine {
                 total_size: stats.1,
             });
         }
-        let _ = state.persist(&self.store, &set_id);
+        // The ack means "persisted": a failed write keeps the inviter
+        // retrying instead of believing a hold that does not exist.
+        if let Err(e) = state.persist(&self.store, &set_id) {
+            eprintln!("[1device-sync] cannot persist the invitation: {e}");
+            return Vec::new();
+        }
         vec![Outgoing {
             to: from.to_string(),
             payload: Message::InviteAck { set_id }.to_value(),
@@ -935,11 +972,23 @@ impl Engine {
             && state.membership.effective(&self_node) == Effective::Active
             && state.membership.effective(from) == Effective::Active;
         let (entry_pages, complete) = if serving {
-            let delta: Vec<Value> = state
+            // The delta rule, whole: every entry not covered by the peer's
+            // advertised vv, WHEREVER it lives here - the live index, and
+            // the pending set (our advertised vv covers absorbed-but-
+            // unpulled entries, so a relay must serve them too or it
+            // punches the exact hole the watermark rule exists to prevent).
+            let mut delta: Vec<Value> = state
                 .index
                 .not_covered_by(their_vv)
                 .map(Entry::to_value)
                 .collect();
+            for versions in state.pending.values() {
+                for entry in versions {
+                    if !their_vv.covers(&entry.vv) {
+                        delta.push(entry.to_value());
+                    }
+                }
+            }
             (paginate(&delta).unwrap_or_default(), true)
         } else {
             (Vec::new(), false)
@@ -1058,6 +1107,25 @@ impl Engine {
             }
         }
 
+        // The self-component guard: a head or entry claiming OUR component
+        // above our own clock is an impossible claim about our own
+        // history. The clock jumps above it, loudly, and life goes on - a
+        // hostile member inflating our component delays nothing for long
+        // and suppresses nothing silently.
+        let self_key = state.clock.self_component(&self_node);
+        let mut claim = position.set_vv.get(&self_key);
+        for entries in buffer.entries.values() {
+            for entry in entries {
+                claim = claim.max(entry.vv.get(&self_key));
+            }
+        }
+        if claim > state.clock.current() {
+            eprintln!(
+                "[1device-sync] impossible claim about our own clock ({claim}): jumping past it"
+            );
+            let _ = state.clock.jump_above(claim);
+        }
+
         // Entries flow only from a verified-active member (the
         // authorization table); records-only traffic flows from any account
         // device, which is what lets introductions and terminal news
@@ -1083,14 +1151,28 @@ impl Engine {
         let key = state.clock.self_component(&self_node);
         let _ = state.drain_pending(&key);
 
-        // Persist the absorbed state BEFORE the watermark moves: the two
-        // live in one meta.json write here, which makes the letter's
-        // ordering rule an atomicity property of the rename.
+        // The watermark and the state it covers ride ONE atomic meta.json
+        // write - and the advertisement follows the DISK, not the memory: a
+        // failed persist rolls the in-memory watermark back, so nothing is
+        // ever advertised that a crash could lose.
         if position.entries_complete && sender_active {
+            let previous = state.watermarks.get(from).cloned();
             let watermark = state.watermarks.entry(from.to_string()).or_default();
             watermark.merge_max(&position.set_vv);
+            if let Err(e) = state.persist(&self.store, set_id) {
+                eprintln!("[1device-sync] cannot persist the round, watermark held back: {e}");
+                match previous {
+                    Some(vv) => {
+                        state.watermarks.insert(from.to_string(), vv);
+                    }
+                    None => {
+                        state.watermarks.remove(from);
+                    }
+                }
+            }
+        } else if let Err(e) = state.persist(&self.store, set_id) {
+            eprintln!("[1device-sync] cannot persist the round: {e}");
         }
-        let _ = state.persist(&self.store, set_id);
         Vec::new()
     }
 
@@ -1440,11 +1522,12 @@ impl SetState {
         set_id: &str,
         membership: SetMembership,
         root: Option<PathBuf>,
+        self_node: &str,
         now: u64,
     ) -> io::Result<SetState> {
         let dir = store.set_dir(set_id)?;
         let index = SetIndex::new();
-        let clock = SetClock::open(&dir, &index, "", now)?;
+        let clock = SetClock::open(&dir, &index, self_node, now)?;
         Ok(SetState {
             membership,
             index,
@@ -2020,7 +2103,13 @@ impl SetState {
         store.save_index(set_id, &self.index)
     }
 
-    fn from_meta(store: &Store, set_id: &str, meta: &Value, now: u64) -> io::Result<SetState> {
+    fn from_meta(
+        store: &Store,
+        set_id: &str,
+        meta: &Value,
+        self_node: &str,
+        now: u64,
+    ) -> io::Result<SetState> {
         let corrupt = || io::Error::other(format!("corrupt meta for set {set_id}"));
         let membership = meta
             .get("membership")
@@ -2031,7 +2120,7 @@ impl SetState {
         }
         let index = store.load_index(set_id)?.unwrap_or_default();
         let dir = store.set_dir(set_id)?;
-        let clock = SetClock::open(&dir, &index, "", now)?;
+        let clock = SetClock::open(&dir, &index, self_node, now)?;
         let root = match meta.get("root").ok_or_else(corrupt)? {
             Value::Null => None,
             v => Some(PathBuf::from(v.as_str().ok_or_else(corrupt)?)),
@@ -2752,6 +2841,53 @@ mod tests {
         }
     }
 
+    /// The relay rule, whole: an entry a relay has absorbed but not yet
+    /// pulled the bytes of still travels onward - its advertised vv covers
+    /// it, so withholding it would punch a permanent hole at the third
+    /// device.
+    #[test]
+    fn a_relay_serves_what_it_holds_only_as_pending() {
+        let mut rig = Rig::new(&['a', 'b', 'c']);
+        let (set_id, _root) = set_with_files(&mut rig, 'a');
+        rig.of('a')
+            .invite(&set_id, &node('b'), NOW)
+            .expect("invite b");
+        rig.of('a')
+            .invite(&set_id, &node('c'), NOW)
+            .expect("invite c");
+        let peers = rig.peers_of('a');
+        let out = rig.of('a').pump(&peers, NOW + 1, false);
+        rig.deliver(&node('a'), out, NOW + 1);
+        for (letter, at) in [('b', NOW + 2), ('c', NOW + 3)] {
+            let root = tempfile::tempdir().expect("root");
+            rig.of(letter)
+                .accept(&set_id, root.path().to_path_buf(), at)
+                .expect("accept");
+            rig._dirs.push(root);
+        }
+        for i in 0..4 {
+            rig.settle(NOW + 10 + i * 10);
+        }
+
+        // C edits, talks to B ONLY, and goes away.
+        let c_root = root_of(&mut rig, 'c', &set_id);
+        std::fs::write(c_root.join("from-c.txt"), "made by c").expect("write");
+        rig.of('c').rescan_set(&set_id).expect("rescan");
+        let out = rig.of('c').pump(&[node('b')], NOW + 100, true);
+        rig.deliver(&node('c'), out, NOW + 100);
+
+        // A and B exchange with C absent: B must forward C's entry even
+        // though B itself has not pulled the bytes yet.
+        let out = rig.of('a').pump(&[node('b')], NOW + 110, true);
+        rig.deliver(&node('a'), out, NOW + 110);
+        let a_state = rig.of('a').set(&set_id).expect("state");
+        assert!(
+            a_state.pending.contains_key("from-c.txt") || a_state.index.get("from-c.txt").is_some(),
+            "C's entry must reach A through B: {:?}",
+            a_state.pending.keys()
+        );
+    }
+
     /// Leaving grows a stub that keeps proving itself until the member
     /// echoes the terminal record back, then drops.
     #[test]
@@ -2909,6 +3045,62 @@ mod tests {
         let state = a.set(&set_id).expect("state");
         assert!(state.pending.is_empty(), "no entry from a non-member");
         assert!(!state.watermarks.contains_key(&node('b')));
+    }
+
+    /// The self-component guard: an active member inflating OUR component
+    /// makes the clock jump past the claim, so nothing we edit next can be
+    /// covered by the lie.
+    #[test]
+    fn an_impossible_claim_about_our_clock_is_outrun() {
+        let mut rig = Rig::new(&['a', 'b']);
+        let (set_id, _a_root) = synced_pair(&mut rig);
+        let a_root = root_of(&mut rig, 'a', &set_id);
+        let gen_a = rig.of('a').set(&set_id).expect("state").clock.generation();
+        let b_pub = rig.of('b').sync_pub();
+        let descriptor = rig
+            .of('a')
+            .set(&set_id)
+            .expect("state")
+            .membership
+            .descriptor
+            .clone();
+
+        // B (a real, active member) declares a set_vv claiming A's own
+        // component far above A's clock.
+        let claim = 40_000;
+        let mut lying_vv = Vv::new();
+        lying_vv.set(&crate::vv::component(&node('a'), gen_a), claim);
+        let head = Message::Head {
+            set_id: set_id.clone(),
+            round: 4242,
+            answers: None,
+            position: Some(HeadPosition {
+                descriptor_hash: descriptor_hash(&descriptor),
+                set_vv: lying_vv,
+                records_pages: 0,
+                entries_pages: 0,
+                entries_complete: false,
+            }),
+            sync_pub: b_pub,
+        };
+        rig.of('a')
+            .on_message(&node('b'), &head.to_value(), NOW + 100);
+
+        // A's very next local edit outruns the claim.
+        std::fs::write(a_root.join("next.txt"), "after the lie").expect("write");
+        rig.of('a').rescan_set(&set_id).expect("rescan");
+        let entry = rig
+            .of('a')
+            .set(&set_id)
+            .expect("state")
+            .index
+            .get("next.txt")
+            .expect("indexed")
+            .clone();
+        assert!(
+            entry.vv.get(&crate::vv::component(&node('a'), gen_a)) > claim,
+            "the clock must jump past the impossible claim"
+        );
     }
 
     /// The engine's whole conversation state survives a restart.
