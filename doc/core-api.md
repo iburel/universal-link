@@ -829,8 +829,9 @@ engine. Every method of the `sync.*` namespace except `sync.emit` is
 **forwarded** to the connected exclusive `sync-backend` component (the
 requests-in-both-directions principle, `clipboard.get_data`'s pattern in the
 other direction), and its reply - result or error - relays verbatim: the
-vocabulary's semantics live entirely in the engine (frozen with it, #84),
-the Core checks scopes and shapes, caches nothing, interprets nothing.
+vocabulary's semantics live entirely in the engine (frozen in
+[sync-engine.md](sync-engine.md), section 10), the Core checks scopes and
+shapes, caches nothing, interprets nothing.
 
 - `sync.status` - the `sync` topic's snapshot method, per the resync rule -
   requires `sync.read`; every other `sync.*` gesture requires `sync.manage`.
@@ -849,7 +850,7 @@ component-originated topic. The Core checks the shape (`method` a `sync.*`
 name other than `sync.emit`, `params` an object), requires the backend's
 role and `sync.serve` exactly as a clipboard announce requires its own, and
 relays verbatim. The vocabulary of those notifications is the engine
-contract's (#84).
+contract's ([sync-engine.md](sync-engine.md), section 10).
 
 ## `components.*`
 
