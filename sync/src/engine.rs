@@ -173,6 +173,16 @@ pub struct SetState {
     /// Source side: a publish the orchestrator is running, with the
     /// basename map the offer will carry.
     publishing: BTreeMap<(String, u64), BTreeMap<String, String>>,
+    /// Verified staged bytes whose final rename keeps failing (the Office
+    /// case): kept, persisted, retried - never re-transferred.
+    parked: BTreeMap<String, ParkedEntry>,
+}
+
+#[derive(Clone, Debug)]
+struct ParkedEntry {
+    staged: PathBuf,
+    entry: Entry,
+    reason: String,
 }
 
 struct NeedState {
@@ -213,6 +223,7 @@ impl Engine {
         let mut sets = BTreeMap::new();
         for (set_id, meta) in store.load_metas()? {
             let state = SetState::from_meta(&store, &set_id, &meta, now)?;
+            state.sweep_staging();
             sets.insert(set_id, state);
         }
         Ok(Engine {
@@ -424,6 +435,7 @@ impl Engine {
             &mut state.clock,
             &key,
         )?;
+        let _ = state.drain_pending(&key);
         state.persist(&self.store, set_id)?;
         Ok(report)
     }
@@ -732,11 +744,11 @@ impl Engine {
             let mut landed = 0usize;
             for (wire, set_path) in &pull.files {
                 let staged = pull.staging.join(wire);
-                if state.apply_staged_file(&staged, set_path) {
+                if state.apply_staged_file(&staged, set_path, &key) {
                     landed += 1;
                 }
             }
-            let _ = key;
+            let _ = state.drain_pending(&key);
             // The staging dir has served: verified files were moved out,
             // failures are re-pulled whole.
             let _ = std::fs::remove_dir_all(&pull.staging);
@@ -1067,8 +1079,9 @@ impl Engine {
             }
         }
 
-        // Directories carry no bytes: what dominates lands now.
-        state.apply_pending_dirs();
+        // What can settle without bytes settles now.
+        let key = state.clock.self_component(&self_node);
+        let _ = state.drain_pending(&key);
 
         // Persist the absorbed state BEFORE the watermark moves: the two
         // live in one meta.json write here, which makes the letter's
@@ -1450,6 +1463,7 @@ impl SetState {
             need_counter: 0,
             published: BTreeMap::new(),
             publishing: BTreeMap::new(),
+            parked: BTreeMap::new(),
         })
     }
 
@@ -1498,7 +1512,7 @@ impl SetState {
     /// verified by hash, moved into place filesystem-first, and only then
     /// indexed. Anything else stays pending. Returns whether the path no
     /// longer needs bytes.
-    fn apply_staged_file(&mut self, staged: &Path, set_path: &str) -> bool {
+    fn apply_staged_file(&mut self, staged: &Path, set_path: &str, self_component: &str) -> bool {
         use crate::vv::Relation;
 
         let Some(root) = self.root.clone() else {
@@ -1516,15 +1530,20 @@ impl SetState {
         else {
             return true;
         };
-        let dominates = match self.index.get(set_path) {
-            None => true,
-            Some(ours) => matches!(
-                entry.vv.relation(&ours.vv),
-                Relation::Descends | Relation::Equal
-            ),
+        let (dominates, resurrects) = match self.index.get(set_path) {
+            None => (true, false),
+            Some(ours) => match entry.vv.relation(&ours.vv) {
+                Relation::Descends | Relation::Equal => (true, false),
+                // A live version concurrent with our TOMBSTONE: the edit
+                // wins (the lossless doctrine), and the survivor will
+                // dominate the tombstone.
+                Relation::Concurrent if ours.deleted => (true, true),
+                Relation::Concurrent | Relation::Precedes => (false, false),
+            },
         };
         if !dominates {
-            // Concurrent with a local version: the conflict brick's work.
+            // Concurrent with a local live version: the conflict
+            // machinery's work.
             return false;
         }
         let Ok(hash) = crate::scan::hash_file(staged) else {
@@ -1544,9 +1563,45 @@ impl SetState {
         {
             return false;
         }
-        if std::fs::rename(staged, &dest).is_err() {
-            // EXDEV or a locked destination: the parked machinery is the
-            // next brick's; for now the pull retries whole.
+        // A kind change applies as remove-old-kind-then-create: a directory
+        // in the way goes only if empty (its children's tombstones come in
+        // the same batch and land first).
+        if dest.is_dir() && std::fs::remove_dir(&dest).is_err() {
+            return false;
+        }
+        // Windows: a read-only destination refuses the replace; clearing
+        // the attribute is deliberate (the incoming version supersedes it).
+        #[cfg(windows)]
+        if let Ok(meta) = std::fs::metadata(&dest) {
+            let mut perms = meta.permissions();
+            if perms.readonly() {
+                perms.set_readonly(false);
+                let _ = std::fs::set_permissions(&dest, perms);
+            }
+        }
+        if let Err(e) = std::fs::rename(staged, &dest) {
+            // A destination held open by an application (the Office case):
+            // keep the VERIFIED staged copy and retry the rename alone,
+            // never the transfer. The staged file moves to a parked home
+            // that survives the pull's staging-dir cleanup.
+            let parked_dir = root.join(crate::wirepath::STAGING_DIR).join("parked");
+            if std::fs::create_dir_all(&parked_dir).is_ok() {
+                let home = parked_dir.join(format!(
+                    "{}-{}",
+                    &entry.hash[..16.min(entry.hash.len())],
+                    crate::protocol::basename(set_path)
+                ));
+                if std::fs::rename(staged, &home).is_ok() {
+                    self.parked.insert(
+                        set_path.to_string(),
+                        ParkedEntry {
+                            staged: home,
+                            entry: entry.clone(),
+                            reason: format!("blocked: {e}"),
+                        },
+                    );
+                }
+            }
             return false;
         }
         #[cfg(unix)]
@@ -1571,6 +1626,17 @@ impl SetState {
         let size = std::fs::metadata(&dest)
             .map(|m| m.len())
             .unwrap_or(entry.size);
+        let mut vv = entry.vv.clone();
+        if resurrects {
+            // The survivor dominates the tombstone it beat: merged, then
+            // bumped past it.
+            if let Some(ours) = self.index.get(set_path) {
+                vv.merge_max(&ours.vv);
+            }
+            if let Ok(tick) = self.clock.tick() {
+                vv.set(self_component, tick);
+            }
+        }
         self.index.upsert(Entry {
             path: set_path.to_string(),
             kind: crate::index::EntryKind::File,
@@ -1578,7 +1644,7 @@ impl SetState {
             mtime,
             exec: entry.exec,
             hash,
-            vv: entry.vv.clone(),
+            vv,
             deleted: false,
         });
         // Everything this landed version covers leaves the pending set.
@@ -1589,6 +1655,254 @@ impl SetState {
             }
         }
         true
+    }
+
+    /// Drains everything the pending set can settle WITHOUT pulling bytes
+    /// (the letter, sections 6 and 7): covered versions drop; same-hash
+    /// concurrents merge silently (vv = max); a tombstone concurrent with
+    /// a local live edit loses (the edit wins, vv = max + bump); FILE
+    /// tombstones that dominate apply under the case-fold guard, deletes
+    /// before creates; directories materialize; DIRECTORY tombstones are
+    /// evaluated at the END, remove only a then-empty directory, and lose
+    /// to any concurrent live descendant - which, with its ancestors,
+    /// takes vv = max + bump so the tombstone retires everywhere instead
+    /// of oscillating back. Parked renames retry here too.
+    fn drain_pending(&mut self, self_component: &str) -> io::Result<()> {
+        use crate::vv::Relation;
+
+        self.retry_parked(self_component);
+
+        // Quiet passes first: drops and merges that touch no filesystem.
+        let paths: Vec<String> = self.pending.keys().cloned().collect();
+        for path in &paths {
+            let Some(versions) = self.pending.get_mut(path) else {
+                continue;
+            };
+            let local = self.index.get(path).cloned();
+            versions.retain(|incoming| {
+                let Some(ours) = &local else { return true };
+                match incoming.vv.relation(&ours.vv) {
+                    // Old news.
+                    Relation::Precedes | Relation::Equal => false,
+                    Relation::Descends | Relation::Concurrent => true,
+                }
+            });
+            if let Some(ours) = &local {
+                let mut merged = ours.clone();
+                let mut changed = false;
+                let mut beat_a_tombstone = false;
+                versions.retain(|incoming| {
+                    if incoming.vv.relation(&merged.vv) != Relation::Concurrent {
+                        return true;
+                    }
+                    let same_content = incoming.deleted == merged.deleted
+                        && incoming.kind == merged.kind
+                        && incoming.hash == merged.hash;
+                    if same_content {
+                        // Both sides did the identical thing (tombstones
+                        // included): merge silently, NO bump.
+                        merged.vv.merge_max(&incoming.vv);
+                        changed = true;
+                        return false;
+                    }
+                    if incoming.deleted && !merged.deleted {
+                        // Delete vs edit: the edit wins, and the survivor
+                        // must DOMINATE the tombstone so it retires
+                        // everywhere instead of oscillating back.
+                        merged.vv.merge_max(&incoming.vv);
+                        changed = true;
+                        beat_a_tombstone = true;
+                        return false;
+                    }
+                    true
+                });
+                if changed {
+                    if beat_a_tombstone && let Ok(tick) = self.clock.tick() {
+                        merged.vv.set(self_component, tick);
+                    }
+                    self.index.upsert(merged);
+                }
+            }
+            if self
+                .pending
+                .get(path)
+                .is_some_and(|versions| versions.is_empty())
+            {
+                self.pending.remove(path);
+            }
+        }
+
+        // File tombstones that dominate: deletes before creates.
+        let paths: Vec<String> = self.pending.keys().cloned().collect();
+        for path in &paths {
+            let Some(tomb) = self.pending.get(path).and_then(|versions| {
+                versions
+                    .iter()
+                    .rfind(|e| e.deleted && e.kind == crate::index::EntryKind::File)
+                    .cloned()
+            }) else {
+                continue;
+            };
+            let dominates = match self.index.get(path) {
+                None => true,
+                Some(ours) => matches!(
+                    tomb.vv.relation(&ours.vv),
+                    Relation::Descends | Relation::Equal
+                ),
+            };
+            if !dominates {
+                continue;
+            }
+            self.apply_file_tombstone(&tomb);
+        }
+
+        // Directories materialize (creates after deletes).
+        self.apply_pending_dirs();
+
+        // Directory tombstones, at the end, only-if-empty.
+        let paths: Vec<String> = self.pending.keys().cloned().collect();
+        for path in &paths {
+            let Some(tomb) = self.pending.get(path).and_then(|versions| {
+                versions
+                    .iter()
+                    .rfind(|e| e.deleted && e.kind == crate::index::EntryKind::Dir)
+                    .cloned()
+            }) else {
+                continue;
+            };
+            self.apply_dir_tombstone(&tomb, self_component);
+        }
+        Ok(())
+    }
+
+    /// One dominating FILE tombstone. The guard: no LIVE index entry may
+    /// case- or normalization-fold to the same path (on a case-insensitive
+    /// filesystem the on-disk file belongs to the live entry: a case-only
+    /// rename arriving as create-then-tombstone across two rounds must not
+    /// delete the renamed file).
+    fn apply_file_tombstone(&mut self, tomb: &Entry) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        let fold = tomb.path.to_lowercase();
+        let folded_live = self
+            .index
+            .live()
+            .any(|e| e.path != tomb.path && e.path.to_lowercase() == fold);
+        let mut dest = root;
+        for component in tomb.path.split('/') {
+            dest.push(component);
+        }
+        if !folded_live {
+            match std::fs::remove_file(&dest) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    eprintln!("[1device-sync] tombstone blocked on {}: {e}", tomb.path);
+                    return;
+                }
+            }
+        }
+        // Folded twin on disk: the file belongs to the live entry; the
+        // tombstone still lands in the index (the version is gone).
+        self.index.upsert(tomb.clone());
+        self.settle_pending(&tomb.path, &tomb.vv);
+    }
+
+    /// One DIRECTORY tombstone, end-of-batch: remove only a directory that
+    /// is then empty; a concurrent live descendant resurrects the chain
+    /// (every survivor takes vv = max + bump).
+    fn apply_dir_tombstone(&mut self, tomb: &Entry, self_component: &str) {
+        use crate::vv::Relation;
+
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        let prefix = format!("{}/", tomb.path);
+        let live_descendants: Vec<String> = self
+            .index
+            .live()
+            .filter(|e| e.path.starts_with(&prefix))
+            .map(|e| e.path.clone())
+            .collect();
+        let dominates_dir = match self.index.get(&tomb.path) {
+            None => true,
+            Some(ours) => matches!(
+                tomb.vv.relation(&ours.vv),
+                Relation::Descends | Relation::Equal
+            ),
+        };
+        if !live_descendants.is_empty() || !dominates_dir {
+            // The edit wins, up the tree: the directory and every live
+            // descendant dominate the tombstone from now on.
+            let mut survivors = live_descendants;
+            survivors.push(tomb.path.clone());
+            for path in survivors {
+                let Some(mut entry) = self.index.get(&path).cloned() else {
+                    continue;
+                };
+                if entry.deleted {
+                    continue;
+                }
+                entry.vv.merge_max(&tomb.vv);
+                if let Ok(tick) = self.clock.tick() {
+                    entry.vv.set(self_component, tick);
+                }
+                self.index.upsert(entry);
+            }
+            self.settle_pending(&tomb.path, &tomb.vv);
+            return;
+        }
+        let mut dest = root;
+        for component in tomb.path.split('/') {
+            dest.push(component);
+        }
+        match std::fs::remove_dir(&dest) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {
+                // Not empty on disk (unindexed junk, an ignored name): the
+                // only-if-empty rule leaves it pending for a later drain.
+                return;
+            }
+        }
+        self.index.upsert(tomb.clone());
+        self.settle_pending(&tomb.path, &tomb.vv);
+    }
+
+    /// Removes the pending versions `vv` covers, and the path when none
+    /// remain.
+    fn settle_pending(&mut self, path: &str, vv: &Vv) {
+        if let Some(versions) = self.pending.get_mut(path) {
+            versions.retain(|held| !vv.covers(&held.vv));
+            if versions.is_empty() {
+                self.pending.remove(path);
+            }
+        }
+    }
+
+    /// Retries the parked renames (a destination unlocked since).
+    fn retry_parked(&mut self, self_component: &str) {
+        let paths: Vec<String> = self.parked.keys().cloned().collect();
+        for path in paths {
+            let Some(parked) = self.parked.get(&path).cloned() else {
+                continue;
+            };
+            if !parked.staged.exists() {
+                self.parked.remove(&path);
+                continue;
+            }
+            // Back through the ordinary gate: pending must still name it.
+            self.pending
+                .entry(path.clone())
+                .or_default()
+                .push(parked.entry.clone());
+            if self.apply_staged_file(&parked.staged, &path, self_component) {
+                self.parked.remove(&path);
+            } else {
+                self.settle_pending(&path, &parked.entry.vv);
+            }
+        }
     }
 
     /// Directories carry no bytes: a pending DIR entry that dominates
@@ -1623,6 +1937,11 @@ impl SetState {
             let mut dest = root.clone();
             for component in path.split('/') {
                 dest.push(component);
+            }
+            // Remove-old-kind-then-create: a FILE standing where the
+            // directory goes is the superseded kind.
+            if dest.is_file() && std::fs::remove_file(&dest).is_err() {
+                continue;
             }
             if std::fs::create_dir_all(&dest).is_err() {
                 continue;
@@ -1681,6 +2000,21 @@ impl SetState {
                     .collect(),
             ),
             "need_counter": self.need_counter,
+            "parked": Value::Object(
+                self.parked
+                    .iter()
+                    .map(|(path, p)| {
+                        (
+                            path.clone(),
+                            json!({
+                                "staged": p.staged.to_string_lossy(),
+                                "entry": p.entry.to_value(),
+                                "reason": p.reason,
+                            }),
+                        )
+                    })
+                    .collect(),
+            ),
         });
         store.save_meta(set_id, &meta)?;
         store.save_index(set_id, &self.index)
@@ -1788,7 +2122,58 @@ impl SetState {
                 .ok_or_else(corrupt)?,
             published: BTreeMap::new(),
             publishing: BTreeMap::new(),
+            parked: {
+                let mut parked = BTreeMap::new();
+                for (path, p) in meta
+                    .get("parked")
+                    .and_then(Value::as_object)
+                    .ok_or_else(corrupt)?
+                {
+                    parked.insert(
+                        path.clone(),
+                        ParkedEntry {
+                            staged: PathBuf::from(
+                                p.get("staged")
+                                    .and_then(Value::as_str)
+                                    .ok_or_else(corrupt)?,
+                            ),
+                            entry: p
+                                .get("entry")
+                                .and_then(Entry::from_value)
+                                .ok_or_else(corrupt)?,
+                            reason: p
+                                .get("reason")
+                                .and_then(Value::as_str)
+                                .ok_or_else(corrupt)?
+                                .to_string(),
+                        },
+                    );
+                }
+                parked
+            },
         })
+    }
+
+    /// Removes the staging leftovers a crash abandoned: only our own
+    /// `pull-*` directories, never the parked home (verified bytes a
+    /// locked file is waiting on) and never anything we did not name.
+    fn sweep_staging(&self) {
+        let Some(root) = &self.root else {
+            return;
+        };
+        let staging = root.join(crate::wirepath::STAGING_DIR);
+        let Ok(entries) = std::fs::read_dir(&staging) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.starts_with("pull-") {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
     }
 
     /// Marks every eligible member as owed a records-only opener: the
@@ -1994,6 +2379,39 @@ mod tests {
         (set_id, root)
     }
 
+    /// A pair created, consented and fully converged (contents included).
+    fn synced_pair(rig: &mut Rig) -> (String, tempfile::TempDir) {
+        let (set_id, a_root) = set_with_files(rig, 'a');
+        rig.of('a')
+            .invite(&set_id, &node('b'), NOW)
+            .expect("invite");
+        let peers = rig.peers_of('a');
+        let out = rig.of('a').pump(&peers, NOW + 1, false);
+        rig.deliver(&node('a'), out, NOW + 1);
+        let b_root = tempfile::tempdir().expect("b root");
+        rig.of('b')
+            .accept(&set_id, b_root.path().to_path_buf(), NOW + 2)
+            .expect("accept");
+        rig._dirs.push(b_root);
+        for i in 0..4 {
+            rig.settle(NOW + 10 + i * 10);
+        }
+        assert!(
+            rig.of('b').set(&set_id).expect("state").pending.is_empty(),
+            "the pair must converge before the scenario starts"
+        );
+        (set_id, a_root)
+    }
+
+    fn root_of(rig: &mut Rig, letter: char, set_id: &str) -> PathBuf {
+        rig.of(letter)
+            .set(set_id)
+            .expect("state")
+            .root
+            .clone()
+            .expect("root")
+    }
+
     /// A creates and invites; B consents; the first ordinary rounds carry
     /// the records both ways and A's entries into B's pending set, and the
     /// exchange goes quiet.
@@ -2095,6 +2513,112 @@ mod tests {
         let before = rig.settle(NOW + 80);
         let after = rig.settle(NOW + 90);
         assert!(after <= before, "the exchange must quiet down");
+    }
+
+    /// A deletion travels as a tombstone; a CONCURRENT edit beats it
+    /// everywhere and the tombstone retires instead of oscillating.
+    #[test]
+    fn a_deletion_travels_and_a_concurrent_edit_survives_it() {
+        let mut rig = Rig::new(&['a', 'b']);
+        let (set_id, _a_root) = synced_pair(&mut rig);
+        let a_root = root_of(&mut rig, 'a', &set_id);
+        let b_root = root_of(&mut rig, 'b', &set_id);
+
+        // Plain deletion: A removes, B follows.
+        std::fs::remove_file(a_root.join("a.txt")).expect("rm");
+        rig.of('a').rescan_set(&set_id).expect("rescan");
+        rig.settle(NOW + 100);
+        rig.settle(NOW + 110);
+        assert!(!b_root.join("a.txt").exists(), "the tombstone must land");
+        assert!(
+            rig.of('b')
+                .set(&set_id)
+                .expect("state")
+                .index
+                .get("a.txt")
+                .expect("tombstone")
+                .deleted
+        );
+
+        // Concurrent delete vs edit: A deletes sub/b.txt while B edits it.
+        std::fs::remove_file(a_root.join("sub").join("b.txt")).expect("rm");
+        rig.of('a').rescan_set(&set_id).expect("rescan");
+        std::fs::write(b_root.join("sub").join("b.txt"), "beta edited").expect("edit");
+        rig.of('b').rescan_set(&set_id).expect("rescan");
+        for i in 0..4 {
+            rig.settle(NOW + 120 + i * 10);
+        }
+        for letter in ['a', 'b'] {
+            let root = root_of(&mut rig, letter, &set_id);
+            assert_eq!(
+                std::fs::read_to_string(root.join("sub").join("b.txt")).expect("survives"),
+                "beta edited",
+                "the edit wins at {letter}"
+            );
+        }
+    }
+
+    /// Both sides make the IDENTICAL change concurrently: silent merge, no
+    /// conflict, no re-transfer ping-pong.
+    #[test]
+    fn identical_concurrent_writes_merge_silently() {
+        let mut rig = Rig::new(&['a', 'b']);
+        let (set_id, _a_root) = synced_pair(&mut rig);
+        let a_root = root_of(&mut rig, 'a', &set_id);
+        let b_root = root_of(&mut rig, 'b', &set_id);
+
+        std::fs::write(a_root.join("same.txt"), "twin").expect("write");
+        std::fs::write(b_root.join("same.txt"), "twin").expect("write");
+        rig.of('a').rescan_set(&set_id).expect("rescan");
+        rig.of('b').rescan_set(&set_id).expect("rescan");
+        for i in 0..3 {
+            rig.settle(NOW + 200 + i * 10);
+        }
+        for letter in ['a', 'b'] {
+            let state = rig.of(letter).set(&set_id).expect("state");
+            let entry = state.index.get("same.txt").expect("indexed");
+            assert!(!entry.deleted);
+            assert!(
+                !state.pending.contains_key("same.txt"),
+                "nothing pending at {letter}"
+            );
+            // The merged vv carries BOTH devices' components.
+            assert!(entry.vv.components().count() >= 2, "at {letter}");
+        }
+    }
+
+    /// A directory tombstone loses to a concurrent live descendant: the
+    /// chain survives with a dominating vv, on both ends.
+    #[test]
+    fn a_directory_tombstone_loses_to_a_concurrent_descendant() {
+        let mut rig = Rig::new(&['a', 'b']);
+        let (set_id, _a_root) = synced_pair(&mut rig);
+        let a_root = root_of(&mut rig, 'a', &set_id);
+        let b_root = root_of(&mut rig, 'b', &set_id);
+
+        // A removes the whole folder while B drops a new file into it.
+        std::fs::remove_file(a_root.join("sub").join("b.txt")).expect("rm");
+        std::fs::remove_dir(a_root.join("sub")).expect("rmdir");
+        rig.of('a').rescan_set(&set_id).expect("rescan");
+        std::fs::write(b_root.join("sub").join("new.txt"), "fresh").expect("write");
+        rig.of('b').rescan_set(&set_id).expect("rescan");
+        for i in 0..5 {
+            rig.settle(NOW + 300 + i * 10);
+        }
+        for letter in ['a', 'b'] {
+            let root = root_of(&mut rig, letter, &set_id);
+            assert_eq!(
+                std::fs::read_to_string(root.join("sub").join("new.txt")).expect("survives"),
+                "fresh",
+                "the descendant survives at {letter}"
+            );
+            assert!(
+                !root.join("sub").join("b.txt").exists(),
+                "the uncontested deletion still lands at {letter}"
+            );
+            let state = rig.of(letter).set(&set_id).expect("state");
+            assert!(!state.index.get("sub").expect("dir").deleted, "at {letter}");
+        }
     }
 
     /// Pause travels as a records-only push, the paused device keeps
