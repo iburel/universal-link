@@ -253,6 +253,12 @@ impl PeerTransport for MemoryTransport {
             // exactly what the cap refuses. Checked on the CALLER's own
             // route entry: the policy is what this device's transport heard
             // and enforces, not a property of the callee.
+            //
+            // The refusal is minted ONLY when the relay route is the one
+            // route there is: the real transport refuses after a connect
+            // that succeeded over the relay, so a peer with no route at all
+            // must keep failing as unreachable (`open`'s error), never as a
+            // policy refusal - the two carry different remedies.
             let over_cap = {
                 let routes = self.switchboard.routes.lock().unwrap();
                 let cap = routes
@@ -261,19 +267,21 @@ impl PeerTransport for MemoryTransport {
                 cap.is_some_and(|cap| payload > cap)
             };
             if over_cap {
-                let direct = {
+                let relay_only = {
                     let routes = self.switchboard.routes.lock().unwrap();
                     let me_on_lan = routes.get(&self.node_id).is_some_and(|r| r.on_lan);
                     routes.get(&peer.node_id).is_some_and(|route| {
+                        let relay_route =
+                            route.relay_url.is_some() && peer.relay_url == route.relay_url;
                         let lan_route = me_on_lan && route.on_lan;
                         let addr_route = peer
                             .addrs
                             .iter()
                             .any(|presented| route.reach.addrs.contains(presented));
-                        lan_route || addr_route
+                        relay_route && !lan_route && !addr_route
                     })
                 };
-                if !direct {
+                if relay_only {
                     return Err(Error::other(format!(
                         "{}: the deployment's relays are rendezvous-only and no direct \
                          path formed (in-memory double)",

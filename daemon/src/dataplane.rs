@@ -150,9 +150,19 @@ const CLOSE_BUDGET: Duration = Duration::from_secs(3);
 /// path (#88). `Endpoint::connect` returns as soon as ANY path completes the
 /// handshake - usually the relay path - and the direct one arrives
 /// asynchronously when the punch succeeds, typically within a couple of
-/// seconds. Short enough that, added to the connect itself, the whole open
-/// stays inside the Core's 15-second connection budget.
+/// seconds.
 const DIRECT_PATH_GRACE: Duration = Duration::from_secs(5);
+
+/// Bound on the CONNECT half of an over-cap open (#88). The Core wraps the
+/// whole sized open in its 15-second connection budget; an unbounded
+/// connect that lands late would leave the grace less than its five seconds
+/// and, worse, let the caller's outer timeout fire MID-grace - the refusal
+/// would then surface as a generic timeout instead of `NO_DIRECT_PATH`,
+/// hiding from the user exactly the sentence this policy owes them. Ten
+/// seconds = that budget minus the full grace, so the refusal always gets
+/// to speak first. (The plain `open` keeps its unbounded connect: with no
+/// policy to name, the caller's timeout says everything there is to say.)
+const OVER_CAP_CONNECT_BOUND: Duration = Duration::from_secs(10);
 
 pub struct IrohTransport {
     endpoint: Endpoint,
@@ -980,11 +990,18 @@ impl IrohTransport {
 
 /// Bounded wait for the connection to carry its application data over a
 /// DIRECT path (#88): resolved as soon as the selected path is an IP one,
-/// refused (and the connection closed) when the grace runs out or the
-/// connection dies first. Selected, not merely open: iroh prefers a punched
-/// direct path as soon as it exists, so "still selecting the relay" after
-/// the grace means the punch failed - and bytes written then would ride the
-/// relay, which is exactly what the announced role forbids.
+/// refused (and the connection closed) when the grace runs out. Selected,
+/// not merely open: iroh prefers a punched direct path as soon as it
+/// exists, so "still selecting the relay" after the grace means the punch
+/// failed - and bytes written then would ride the relay, which is exactly
+/// what the announced role forbids.
+///
+/// A connection that closes UNDER the wait (the stream ends: the peer shut
+/// down cleanly mid-grace) is not a policy refusal - the peer is gone, the
+/// punch never got its chance - so that arm mints a plain connection error,
+/// exactly what the under-cap path would report from `open_bi` in the same
+/// state, and the interfaces say "peer gone" rather than prescribing a VPN
+/// to reach a machine that is off.
 async fn require_direct(conn: &Connection, payload: u64, cap: u64) -> io::Result<()> {
     let punched = tokio::time::timeout(DIRECT_PATH_GRACE, async {
         let mut snapshots = conn.paths_stream();
@@ -996,15 +1013,23 @@ async fn require_direct(conn: &Connection, payload: u64, cap: u64) -> io::Result
         false // The stream ended: the connection closed under us.
     })
     .await;
-    if punched == Ok(true) {
-        return Ok(());
+    match punched {
+        Ok(true) => Ok(()),
+        // Already dead: nothing to close, and nothing to blame on the relay
+        // role. `close_reason` names what ended it when iroh knows.
+        Ok(false) => Err(io::Error::other(match conn.close_reason() {
+            Some(reason) => format!("connection closed during hole punching: {reason}"),
+            None => "connection closed during hole punching".to_string(),
+        })),
+        Err(_) => {
+            conn.close(0u32.into(), onedevice_core::NO_DIRECT_PATH.as_bytes());
+            Err(io::Error::other(format!(
+                "{}: the deployment's relays are rendezvous-only above {cap} bytes \
+                 (payload: {payload}) and hole punching produced no direct path",
+                onedevice_core::NO_DIRECT_PATH
+            )))
+        }
     }
-    conn.close(0u32.into(), onedevice_core::NO_DIRECT_PATH.as_bytes());
-    Err(io::Error::other(format!(
-        "{}: the deployment's relays are rendezvous-only above {cap} bytes \
-         (payload: {payload}) and hole punching produced no direct path",
-        onedevice_core::NO_DIRECT_PATH
-    )))
 }
 
 impl PeerTransport for IrohTransport {
@@ -1018,15 +1043,24 @@ impl PeerTransport for IrohTransport {
 
     fn open_for_payload<'a>(&'a self, peer: &'a PeerAddr, payload: u64) -> Opening<'a> {
         Box::pin(async move {
-            let conn = self.connect_to(peer).await?;
             // The announced role (#88), enforced where the bytes are about
             // to flow: an over-cap payload needs the punched path before the
             // stream opens. At-or-under-cap payloads ride whatever path the
             // connection has - the relay included, that is what the cap
             // allows.
-            if let Some(cap) = self.relay_max_payload
-                && payload > cap
-            {
+            let over_cap = self.relay_max_payload.filter(|cap| payload > *cap);
+            let conn = match over_cap {
+                // Connect bounded (OVER_CAP_CONNECT_BOUND) so the grace
+                // always fits under the caller's budget and a punch failure
+                // speaks as NO_DIRECT_PATH, never as the outer timeout.
+                Some(_) => tokio::time::timeout(OVER_CAP_CONNECT_BOUND, self.connect_to(peer))
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "iroh connection: timed out")
+                    })??,
+                None => self.connect_to(peer).await?,
+            };
+            if let Some(cap) = over_cap {
                 require_direct(&conn, payload, cap).await?;
             }
             let (send, recv) = conn.open_bi().await.map_err(|e| wrap("open_bi", e))?;
