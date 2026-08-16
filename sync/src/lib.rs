@@ -23,6 +23,7 @@ pub mod records;
 pub mod scan;
 pub mod store;
 pub mod vv;
+pub mod watcher;
 pub mod wirepath;
 
 pub use orchestrator::{Outcome, SERVED_METHODS, run};

@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 
 use crate::engine::{Effect, Engine};
 use crate::store::Store;
+use crate::watcher::{DEBOUNCE, WatchHandle};
 
 /// The facade methods the engine serves today. The list grows brick by brick
 /// toward the frozen vocabulary (doc/sync-engine.md, section 10); a `sync.*`
@@ -168,6 +169,9 @@ struct Loop {
     engine: Option<Engine>,
     directory: Directory,
     internal_tx: mpsc::Sender<Internal>,
+    /// One living watch per rooted set; kept in step by `sync_watchers`.
+    watchers: BTreeMap<String, WatchHandle>,
+    quiesced_tx: mpsc::Sender<String>,
 }
 
 /// Runs the engine until a terminal condition. Consumes the Core `events`
@@ -182,12 +186,15 @@ pub async fn run(
 ) -> Outcome {
     tokio::pin!(stdin_closed);
     let (internal_tx, mut internal_rx) = mpsc::channel::<Internal>(8);
+    let (quiesced_tx, mut quiesced_rx) = mpsc::channel::<String>(64);
     let mut state = Loop {
         client,
         store: Some(store),
         engine: None,
         directory: Directory::default(),
         internal_tx,
+        watchers: BTreeMap::new(),
+        quiesced_tx,
     };
     let mut ticker = tokio::time::interval(tick);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -259,6 +266,7 @@ pub async fn run(
                     }
                 }
             },
+            Some(set_id) = quiesced_rx.recv() => state.on_quiesced(&set_id),
             _ = ticker.tick() => state.on_tick(),
         }
     }
@@ -302,7 +310,10 @@ impl Loop {
             && let Some(store) = self.store.take()
         {
             match Engine::open(store, self_node, unix_now()) {
-                Ok(engine) => self.engine = Some(engine),
+                Ok(engine) => {
+                    self.engine = Some(engine);
+                    self.sync_watchers();
+                }
                 // A corrupt state is deliberately NOT self-healing: report
                 // and serve nothing (the status stays empty; the facade
                 // stays honest through COMPONENT... the snapshot).
@@ -335,6 +346,50 @@ impl Loop {
         self.execute(out);
     }
 
+    /// The watcher went quiet after a burst: look again, then talk.
+    fn on_quiesced(&mut self, set_id: &str) {
+        let Some(engine) = &mut self.engine else {
+            return;
+        };
+        if let Err(e) = engine.rescan_set(set_id) {
+            eprintln!("[1device-sync] rescan of {set_id} failed: {e}");
+        }
+        self.pump(false);
+    }
+
+    /// Keeps one watch alive per rooted set: install what is missing, drop
+    /// what no longer is. An installation failure degrades that set to the
+    /// periodic scanning of the safety tick, loudly.
+    fn sync_watchers(&mut self) {
+        let Some(engine) = &self.engine else {
+            return;
+        };
+        let mut wanted: BTreeMap<String, (std::path::PathBuf, crate::records::SetKind)> =
+            BTreeMap::new();
+        for set_id in engine.set_ids() {
+            if let Some(state) = engine.set(&set_id)
+                && let Some(root) = &state.root
+            {
+                wanted.insert(set_id, (root.clone(), state.membership.descriptor.kind));
+            }
+        }
+        self.watchers
+            .retain(|set_id, _| wanted.contains_key(set_id));
+        for (set_id, (root, kind)) in wanted {
+            if self.watchers.contains_key(&set_id) {
+                continue;
+            }
+            match crate::watcher::watch(&set_id, &root, kind, DEBOUNCE, self.quiesced_tx.clone()) {
+                Ok(handle) => {
+                    self.watchers.insert(set_id, handle);
+                }
+                Err(e) => {
+                    eprintln!("[1device-sync] set {set_id} degraded to periodic scanning: {e}");
+                }
+            }
+        }
+    }
+
     fn on_tick(&mut self) {
         let Some(engine) = &mut self.engine else {
             // Not resolved yet (or never joined): keep asking.
@@ -352,6 +407,7 @@ impl Loop {
             }
         }
         self.pump(true);
+        self.sync_watchers();
         self.request_directory();
     }
 

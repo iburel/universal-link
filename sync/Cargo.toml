@@ -48,6 +48,10 @@ blake3 = "1"
 # classic Mac normalization trap). New package, MIT OR Apache-2.0; its
 # only dependency (tinyvec) is already in the lock.
 unicode-normalization = "0.1"
+# The filesystem watcher (section 8: inotify / FSEvents /
+# ReadDirectoryChangesW behind one crate). CC0-1.0, reviewed and added to
+# deny.toml's allow-list alongside the Unlicense.
+notify = "8"
 
 [dev-dependencies]
 tempfile = "3"
