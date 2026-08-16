@@ -320,11 +320,17 @@ quick-check is size+mtime, hash on mismatch. (No timed pending-apply table
 is needed: a hash that matches is proof, and a grace window would only
 have been a weaker version of it.)
 
-**Startup and safety rescan.** On start (and on a slow safety tick, and at
-`sync.resume`): walk the root, compare against the index, bump
-`clock[self]` for every real difference, tombstone what disappeared: a
-path present only in the PENDING set (section 4) is expected-absent and
-is never tombstoned.
+**Startup and safety rescan.** On start (and on a slow safety tick, on
+watcher quiescence, and at `sync.resume`): walk the root, compare against
+the index, bump `clock[self]` for every real difference, tombstone what
+disappeared: a path present only in the PENDING set (section 4) is
+expected-absent and is never tombstoned. The walk runs OFF the event
+loop, against a snapshot of the index: reading and hashing a large tree
+takes far longer than the facade's 10 s budget, and an engine that went
+quiet while scanning would read as absent. Folding the observation back in
+(clock values, tombstones) touches no file and stays on the loop, where the
+clock lives. Tombstones are ordered deepest-first, so a vanished folder's
+contents carry the lower clock.
 Crash recovery falls out (section 6 makes the crash windows converge to
 the RIGHT state). Watcher overflow (inotify queue, ReadDirectoryChangesW
 buffer, FSEvents must-scan flags) triggers an immediate targeted rescan of
@@ -404,7 +410,9 @@ records place in the set (section 2). One connect failure is debug-level
 ordinary.
 
 **Behindness for the cards.** "Up to date" = the peer's advertised vv
-covers ours; "N files behind" = count of our entries it does not cover;
+covers ours; "N files behind" = count of our LIVE FILE entries it does not
+cover (never tombstones or directories: a number a human can compare with
+what the folder shows);
 "offline since T, will catch up" = no route (devices topic) with T = last
 successful round. Per-device truth, never an average: exactly the #82
 card.
@@ -612,8 +620,12 @@ and degraded modes: section 3.
 Excluded and refused:
 
 - `.1device.tmp/` (staging) and `.<name>.1dtmp` (the EXDEV fallback),
-  always; a USER entry usurping the reserved directory name is surfaced
-  as ignored-with-reason (section 6).
+  always, and SILENTLY: they are the engine's own, so they are excluded
+  rather than reported (a card's ignored list is what the user should look
+  at, not what we wrote ourselves). The watcher ignores them too, or every
+  fill would nudge a fresh walk of the whole root. A USER entry usurping
+  the reserved directory name is refused at `sync.create`/`sync.accept`
+  (section 6).
 - Symlinks: ignored in v1 (not followed, not synced, surfaced as ignored).
 - Names that fail the wire gate (section 4) or collide under case-folding
   OR Unicode normalization-folding: indexed as `ignored` with a reason,
@@ -682,7 +694,7 @@ on the same root is `SYNC_ROOT_OVERLAP`.
 | `sync.status {}` | → `{ sets: [Card], invitations: [Invitation] }`: the `sync` topic's snapshot, and the AUTHORITATIVE state the notifications merely echo |
 | `sync.create { path, device_ids }` | → `{ set_id }`. Registers the set, then scans and invites asynchronously. `path` may be a file (set of one) |
 | `sync.invite { set_id, device_ids }` | → `{}`. Same machinery, existing set |
-| `sync.accept { set_id, path }` | → `{}`. The local consent; `path` = locally chosen root (must not exist, or be an empty dir) |
+| `sync.accept { set_id, path }` | → `{}`. The local consent; `path` = locally chosen root. A `dir` set takes an absent or empty directory; a `file` set takes an absent FILE path (the pull creates it, so the engine only ensures the parent) |
 | `sync.decline { set_id }` | → `{}`. Signed, travels (with the stub guarantee): the inviter's card stops waiting |
 | `sync.pause { set_id }` / `sync.resume { set_id }` | → `{}`. Travels as membership |
 | `sync.leave { set_id }` | → `{}`. Local files stay in place (and the interface says so) |
@@ -693,10 +705,12 @@ Errors (engine's own, relayed verbatim): `SYNC_UNKNOWN_SET` (including a
 `SYNC_ROOT_OVERLAP`, `SYNC_ROOT_NOT_EMPTY`, `SYNC_ROOT_UNKNOWN` (the path
 is not there, or cannot be made), `SYNC_ROOT_RESERVED` (a pre-existing
 entry named like the staging directory), `SYNC_NOT_INVITED`,
-`SYNC_NO_CONFLICT`, `SYNC_DEVICE_INELIGIBLE` (mobile, unknown, or already
-a member), `SYNC_NOT_READY` (the engine has not resolved the account's
-directory yet: a Core that joined nothing has no sets to manage either),
-`SYNC_INTERNAL` (a local failure the caller can only retry), plus a
+`SYNC_NO_CONFLICT`, `SYNC_NO_VERSION` (`keep` names neither version),
+`SYNC_DEVICE_INELIGIBLE` (mobile, unknown, or already in the set),
+`SYNC_NOT_A_MEMBER` (a gesture this state does not offer: pausing a set one
+was only invited to), `SYNC_NOT_READY` (the engine has not resolved the
+account's directory yet: a Core that joined nothing has no sets to manage
+either), `SYNC_INTERNAL` (a local failure the caller can only retry), plus a
 genuine JSON-RPC `-32602` for shape - a malformed request is not an
 application state, and the engine emits the real code rather than
 dressing one as an app code.

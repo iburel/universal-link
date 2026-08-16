@@ -45,34 +45,48 @@ pub struct ScanReport {
     pub ignored: Vec<Ignored>,
 }
 
-/// Walks `root` and reconciles `index` with the tree. `pending` names the
-/// wire paths absorbed but not yet applied: expected-absent, never
-/// tombstoned. `self_component` is the clock's own vv key.
-pub fn rescan(
+/// What one walk SAW, without deciding anything about clocks. The walk is
+/// the expensive half (it reads and hashes every doubtful file), so it runs
+/// off the event loop against a snapshot of the index; folding the
+/// observation back in is pure bookkeeping and stays on the loop, where the
+/// clock and the index actually live.
+#[derive(Debug, Default)]
+pub struct Observation {
+    /// A real difference: this is what the disk holds now.
+    pub changed: Vec<Observed>,
+    /// Same content, moved stamp: the record follows the disk, no bump.
+    pub touched: Vec<Observed>,
+    /// Live index paths the walk did not meet, deepest first.
+    pub tombstoned: Vec<String>,
+    pub ignored: Vec<Ignored>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Observed {
+    pub path: String,
+    pub kind: EntryKind,
+    pub size: u64,
+    pub mtime: Mtime,
+    pub exec: bool,
+    pub hash: String,
+}
+
+/// Walks `root` and reports what it saw against `index` (read-only, so it
+/// is safe to run off the event loop). `pending` names the wire paths
+/// absorbed but not yet applied: expected-absent, never tombstoned.
+pub fn observe(
     root: &Path,
     kind: SetKind,
-    index: &mut SetIndex,
+    index: &SetIndex,
     pending: &BTreeSet<String>,
-    clock: &mut SetClock,
-    self_component: &str,
-) -> io::Result<ScanReport> {
-    let mut report = ScanReport::default();
+) -> io::Result<Observation> {
+    let mut report = Observation::default();
     let mut seen: BTreeSet<String> = BTreeSet::new();
 
     match kind {
-        SetKind::File => {
-            scan_single_file(root, index, clock, self_component, &mut report, &mut seen)?
-        }
+        SetKind::File => scan_single_file(root, index, &mut report, &mut seen)?,
         SetKind::Dir => {
-            walk_dir(
-                root,
-                "",
-                index,
-                clock,
-                self_component,
-                &mut report,
-                &mut seen,
-            )?;
+            walk_dir(root, "", index, &mut report, &mut seen)?;
         }
     }
 
@@ -91,8 +105,58 @@ pub fn rescan(
         let depth = |p: &String| p.matches('/').count();
         depth(b).cmp(&depth(a)).then_with(|| b.cmp(a))
     });
-    for path in missing {
-        let entry = index.get(&path).expect("listed from the index").clone();
+    report.tombstoned = missing;
+    Ok(report)
+}
+
+/// Folds an [`Observation`] into the index: a clock value per real
+/// difference, a stamp refresh for what only looked different, a tombstone
+/// per disappearance. Cheap by construction - no file is read here.
+pub fn fold(
+    observation: Observation,
+    index: &mut SetIndex,
+    clock: &mut SetClock,
+    self_component: &str,
+) -> io::Result<ScanReport> {
+    let mut report = ScanReport {
+        changed: 0,
+        tombstoned: 0,
+        ignored: observation.ignored,
+    };
+    for seen in observation.touched {
+        // Same content: keep the vv, follow the disk's stamp.
+        if let Some(known) = index.get(&seen.path) {
+            let mut refreshed = known.clone();
+            refreshed.size = seen.size;
+            refreshed.mtime = seen.mtime;
+            index.upsert(refreshed);
+        }
+    }
+    for seen in observation.changed {
+        let mut vv = index
+            .get(&seen.path)
+            .map(|e| e.vv.clone())
+            .unwrap_or_default();
+        vv.set(self_component, clock.tick()?);
+        index.upsert(Entry {
+            path: seen.path,
+            kind: seen.kind,
+            size: seen.size,
+            mtime: seen.mtime,
+            exec: seen.exec,
+            hash: seen.hash,
+            vv,
+            deleted: false,
+        });
+        report.changed += 1;
+    }
+    for path in observation.tombstoned {
+        let Some(entry) = index.get(&path).cloned() else {
+            continue;
+        };
+        if entry.deleted {
+            continue;
+        }
         let mut vv = entry.vv;
         vv.set(self_component, clock.tick()?);
         index.upsert(Entry {
@@ -110,14 +174,26 @@ pub fn rescan(
     Ok(report)
 }
 
+/// The inline pair, for callers that may block (the engine's own tests, and
+/// any path where the tree is known small).
+pub fn rescan(
+    root: &Path,
+    kind: SetKind,
+    index: &mut SetIndex,
+    pending: &BTreeSet<String>,
+    clock: &mut SetClock,
+    self_component: &str,
+) -> io::Result<ScanReport> {
+    let observation = observe(root, kind, index, pending)?;
+    fold(observation, index, clock, self_component)
+}
+
 /// The set-of-one-file case: the root IS the file, its wire path its NFC
 /// basename.
 fn scan_single_file(
     root: &Path,
-    index: &mut SetIndex,
-    clock: &mut SetClock,
-    self_component: &str,
-    report: &mut ScanReport,
+    index: &SetIndex,
+    report: &mut Observation,
     seen: &mut BTreeSet<String>,
 ) -> io::Result<()> {
     let Some(disk_name) = root.file_name().and_then(|n| n.to_str()) else {
@@ -150,7 +226,7 @@ fn scan_single_file(
         });
         return Ok(());
     }
-    reconcile_file(root, &wire, &meta, index, clock, self_component, report)?;
+    reconcile_file(root, &wire, &meta, index, report)?;
     seen.insert(wire);
     Ok(())
 }
@@ -160,10 +236,8 @@ fn scan_single_file(
 fn walk_dir(
     dir: &Path,
     prefix: &str,
-    index: &mut SetIndex,
-    clock: &mut SetClock,
-    self_component: &str,
-    report: &mut ScanReport,
+    index: &SetIndex,
+    report: &mut Observation,
     seen: &mut BTreeSet<String>,
 ) -> io::Result<()> {
     struct Candidate {
@@ -240,19 +314,11 @@ fn walk_dir(
         let path = dir.join(&c.disk_name);
         let wire = wire_path(prefix, &c.wire);
         if c.is_dir {
-            reconcile_dir(&wire, index, clock, self_component, report)?;
+            reconcile_dir(&wire, index, report);
             seen.insert(wire.clone());
-            walk_dir(
-                &path,
-                &format!("{wire}/"),
-                index,
-                clock,
-                self_component,
-                report,
-                seen,
-            )?;
+            walk_dir(&path, &format!("{wire}/"), index, report, seen)?;
         } else {
-            reconcile_file(&path, &wire, &c.meta, index, clock, self_component, report)?;
+            reconcile_file(&path, &wire, &c.meta, index, report)?;
             seen.insert(wire);
         }
     }
@@ -269,8 +335,16 @@ fn fold_key(wire: &str) -> String {
     wire.to_lowercase()
 }
 
-fn accepted_name_at(disk_name: &str, prefix: &str, report: &mut ScanReport) -> Option<String> {
+fn accepted_name_at(disk_name: &str, prefix: &str, report: &mut Observation) -> Option<String> {
     let full = format!("{prefix}{disk_name}");
+    // Our own staging is EXCLUDED, not refused: reporting it would put the
+    // engine's own working directory in every card's ignored list, as though
+    // the user had done something wrong.
+    if disk_name == crate::wirepath::STAGING_DIR
+        || (disk_name.starts_with('.') && disk_name.ends_with(crate::wirepath::STAGING_SUFFIX))
+    {
+        return None;
+    }
     let Some(wire) = wire_name(disk_name) else {
         report.ignored.push(Ignored {
             name: full,
@@ -287,51 +361,44 @@ fn accepted_name_at(disk_name: &str, prefix: &str, report: &mut ScanReport) -> O
     }
 }
 
-fn accepted_name(disk_name: &str, report: &mut ScanReport) -> Option<String> {
+fn accepted_name(disk_name: &str, report: &mut Observation) -> Option<String> {
     accepted_name_at(disk_name, "", report)
 }
 
-fn reconcile_dir(
-    wire: &str,
-    index: &mut SetIndex,
-    clock: &mut SetClock,
-    self_component: &str,
-    report: &mut ScanReport,
-) -> io::Result<()> {
+fn reconcile_dir(wire: &str, index: &SetIndex, report: &mut Observation) {
     let known = index.get(wire);
-    let unchanged = known.is_some_and(|e| !e.deleted && e.kind == EntryKind::Dir);
-    if unchanged {
-        return Ok(());
+    if known.is_some_and(|e| !e.deleted && e.kind == EntryKind::Dir) {
+        return;
     }
-    let mut vv = known.map(|e| e.vv.clone()).unwrap_or_default();
-    vv.set(self_component, clock.tick()?);
-    index.upsert(Entry {
+    report.changed.push(Observed {
         path: wire.to_string(),
         kind: EntryKind::Dir,
         size: 0,
         mtime: Mtime::default(),
         exec: false,
         hash: String::new(),
-        vv,
-        deleted: false,
     });
-    report.changed += 1;
-    Ok(())
 }
 
 fn reconcile_file(
     path: &Path,
     wire: &str,
     meta: &std::fs::Metadata,
-    index: &mut SetIndex,
-    clock: &mut SetClock,
-    self_component: &str,
-    report: &mut ScanReport,
+    index: &SetIndex,
+    report: &mut Observation,
 ) -> io::Result<()> {
     let size = meta.len();
     let mtime = Mtime::of(meta.modified()?);
     let known = index.get(wire).cloned();
     let exec = exec_bit(meta, known.as_ref());
+    let seen = |hash: String| Observed {
+        path: wire.to_string(),
+        kind: EntryKind::File,
+        size,
+        mtime,
+        exec,
+        hash,
+    };
 
     if let Some(k) = &known
         && !k.deleted
@@ -353,24 +420,10 @@ fn reconcile_file(
             // disk); an exec flip alone is one.
             let hash = hash_file(path)?;
             if hash == k.hash && k.exec == exec {
-                let mut refreshed = k.clone();
-                refreshed.mtime = mtime;
-                index.upsert(refreshed);
+                report.touched.push(seen(hash));
                 return Ok(());
             }
-            let mut vv = k.vv.clone();
-            vv.set(self_component, clock.tick()?);
-            index.upsert(Entry {
-                path: wire.to_string(),
-                kind: EntryKind::File,
-                size,
-                mtime,
-                exec,
-                hash,
-                vv,
-                deleted: false,
-            });
-            report.changed += 1;
+            report.changed.push(seen(hash));
             return Ok(());
         }
     }
@@ -384,25 +437,10 @@ fn reconcile_file(
         && k.exec == exec
     {
         // Same content after all (a touch): follow the disk, no bump.
-        let mut refreshed = k.clone();
-        refreshed.mtime = mtime;
-        refreshed.size = size;
-        index.upsert(refreshed);
+        report.touched.push(seen(hash));
         return Ok(());
     }
-    let mut vv = known.map(|e| e.vv).unwrap_or_default();
-    vv.set(self_component, clock.tick()?);
-    index.upsert(Entry {
-        path: wire.to_string(),
-        kind: EntryKind::File,
-        size,
-        mtime,
-        exec,
-        hash,
-        vv,
-        deleted: false,
-    });
-    report.changed += 1;
+    report.changed.push(seen(hash));
     Ok(())
 }
 
@@ -595,23 +633,37 @@ mod tests {
         assert_eq!(report.tombstoned, 1);
     }
 
+    /// What the user did wrong is reported with a reason; what is OURS is
+    /// simply not there. The engine's own staging directory must never show
+    /// up in a card's ignored list.
     #[test]
-    fn exclusions_are_reported_not_silent() {
+    fn exclusions_are_reported_but_our_own_staging_is_silent() {
         let mut f = Fixture::new();
         f.write("ok.txt", "x");
         f.write(".1device.tmp/staged", "x");
+        f.write(".partial.1dtmp", "x");
         f.write("bad:name.txt", "x");
         #[cfg(unix)]
         std::os::unix::fs::symlink(f.root.path().join("ok.txt"), f.root.path().join("link.txt"))
             .expect("symlink");
         let report = f.scan();
         let reasons: Vec<&str> = report.ignored.iter().map(|i| i.reason).collect();
-        assert!(reasons.contains(&"reserved staging name"), "{reasons:?}");
         assert!(reasons.contains(&"separator character"), "{reasons:?}");
         #[cfg(unix)]
         assert!(reasons.contains(&"symlink"), "{reasons:?}");
+        assert!(
+            !reasons.contains(&"reserved staging name"),
+            "our own staging must not accuse the user: {reasons:?}"
+        );
+        let names: Vec<&str> = report.ignored.iter().map(|i| i.name.as_str()).collect();
+        assert!(
+            !names.iter().any(|n| n.contains("1device.tmp")),
+            "{names:?}"
+        );
+        assert!(!names.iter().any(|n| n.contains("1dtmp")), "{names:?}");
         assert!(f.index.get("ok.txt").is_some());
         assert!(f.index.get(".1device.tmp/staged").is_none());
+        assert!(f.index.get(".partial.1dtmp").is_none());
     }
 
     #[cfg(unix)]

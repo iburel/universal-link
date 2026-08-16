@@ -20,6 +20,7 @@ use std::time::Duration;
 use notify::Watcher as _;
 
 use crate::records::SetKind;
+use crate::wirepath::STAGING_DIR;
 
 /// Quiescence before a burst of changes reports (the letter: ~2 s).
 pub const DEBOUNCE: Duration = Duration::from_secs(2);
@@ -70,6 +71,12 @@ pub fn watch(
     watcher
         .watch(&target, mode)
         .map_err(|e| format!("cannot install the watch: {e}"))?;
+    // Ours, not the user's: every fill and every apply writes in there, and a
+    // rescan nudged by our own staging would chase its own tail through a
+    // whole tree walk. Best-effort (the directory may not exist yet, and not
+    // every backend honours a nested unwatch), which is why `matters` filters
+    // by path as well.
+    let _ = watcher.unwatch(&root.join(STAGING_DIR));
 
     let set_id = set_id.to_string();
     std::thread::spawn(move || {
@@ -88,11 +95,21 @@ pub fn watch(
 }
 
 /// Which events deserve a rescan: anything that touches data or the
-/// namespace. Pure accesses stay silent; everything unknown nudges (the
-/// rescan is idempotent, a spurious nudge costs a walk).
+/// namespace, ANYWHERE but our own staging directory (whose every write is
+/// ours). Pure accesses stay silent; everything unknown nudges (the rescan
+/// is idempotent, a spurious nudge costs a walk).
 fn matters(event: &notify::Event) -> bool {
     use notify::EventKind;
-    !matches!(event.kind, EventKind::Access(_))
+
+    if matches!(event.kind, EventKind::Access(_)) {
+        return false;
+    }
+    // `unwatch` covers the recursive watch on platforms that honour it;
+    // this covers the rest, and the paths a rename drags in.
+    !event
+        .paths
+        .iter()
+        .all(|path| path.components().any(|c| c.as_os_str() == STAGING_DIR))
 }
 
 #[cfg(test)]

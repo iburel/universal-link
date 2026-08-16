@@ -131,6 +131,11 @@ enum Internal {
     /// before this (the facade's 10 s budget), progress shows up on the
     /// `sync` topic.
     Scan { set_id: String },
+    /// A walk finished off the loop: fold it in (cheap) and talk.
+    Scanned {
+        set_id: String,
+        observation: crate::scan::Observation,
+    },
 }
 
 /// The directory's translation tables, rebuilt from every snapshot.
@@ -202,6 +207,8 @@ struct Loop {
     /// The snapshot the notifications are diffed against: they echo what
     /// `sync.status` will say, never lead it.
     last_snapshot: Value,
+    /// Sets with a walk in flight: one at a time each.
+    scanning: BTreeSet<String>,
 }
 
 /// Runs the engine until a terminal condition. Consumes the Core `events`
@@ -226,6 +233,7 @@ pub async fn run(
         watchers: BTreeMap::new(),
         quiesced_tx,
         last_snapshot: empty_status(),
+        scanning: BTreeSet::new(),
     };
     let mut ticker = tokio::time::interval(tick);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -277,20 +285,27 @@ pub async fn run(
                     state.execute(effects);
                 }
                 Internal::PullStarted { set_id, need_id, transfer_id } => {
-                    if let Some(engine) = &mut state.engine {
-                        engine.on_pull_started(&set_id, need_id, &transfer_id);
-                    }
+                    let effects = match &mut state.engine {
+                        Some(engine) => {
+                            engine.on_pull_started(&set_id, need_id, &transfer_id, unix_now())
+                        }
+                        None => Vec::new(),
+                    };
+                    state.execute(effects);
+                    state.emit_changes();
                 }
                 Internal::PullFailed { set_id, need_id } => {
                     if let Some(engine) = &mut state.engine {
                         engine.on_pull_failed(&set_id, need_id);
                     }
                 }
-                Internal::Scan { set_id } => {
+                Internal::Scan { set_id } => state.start_scan(&set_id),
+                Internal::Scanned { set_id, observation } => {
+                    state.scanning.remove(&set_id);
                     if let Some(engine) = &mut state.engine
-                        && let Err(e) = engine.rescan_set(&set_id)
+                        && let Err(e) = engine.fold_scan(&set_id, observation)
                     {
-                        eprintln!("[1device-sync] first scan of {set_id} failed: {e}");
+                        eprintln!("[1device-sync] scan of {set_id} failed: {e}");
                     }
                     state.sync_watchers();
                     state.pump(true);
@@ -422,6 +437,14 @@ impl Loop {
                 if engine.set(&set_id).is_none() {
                     return Err("SYNC_UNKNOWN_SET");
                 }
+                for node in &nodes {
+                    // Already in the set (member, paused, or invited and
+                    // thinking about it): re-inviting is the caller's
+                    // mistake, and answering {} would hide it.
+                    if engine.already_in(&set_id, node) {
+                        return Err("SYNC_DEVICE_INELIGIBLE");
+                    }
+                }
                 for node in nodes {
                     engine
                         .invite(&set_id, &node, now)
@@ -443,18 +466,33 @@ impl Loop {
                 if engine.overlaps(&path) {
                     return Err("SYNC_ROOT_OVERLAP");
                 }
-                // v1: an empty (or absent) target. Merging a pre-existing
-                // tree at accept time is a conflict storm by construction.
-                match std::fs::read_dir(&path) {
-                    Ok(mut entries) => {
-                        if entries.next().is_some() {
-                            return Err("SYNC_ROOT_NOT_EMPTY");
+                // A set of ONE FILE takes a file path: the pull creates the
+                // file itself, so the target must be absent (and its parent
+                // there). Creating a directory in its place would put the
+                // engine's own root where the file belongs.
+                let single_file = engine
+                    .set(&set_id)
+                    .is_some_and(|s| s.membership.descriptor.kind == crate::records::SetKind::File);
+                if single_file {
+                    if path.exists() {
+                        return Err("SYNC_ROOT_NOT_EMPTY");
+                    }
+                    let parent = path.parent().ok_or("param:path")?;
+                    std::fs::create_dir_all(parent).map_err(|_| "SYNC_ROOT_UNKNOWN")?;
+                } else {
+                    // v1: an empty (or absent) target. Merging a pre-existing
+                    // tree at accept time is a conflict storm by construction.
+                    match std::fs::read_dir(&path) {
+                        Ok(mut entries) => {
+                            if entries.next().is_some() {
+                                return Err("SYNC_ROOT_NOT_EMPTY");
+                            }
                         }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            std::fs::create_dir_all(&path).map_err(|_| "SYNC_ROOT_UNKNOWN")?;
+                        }
+                        Err(_) => return Err("SYNC_ROOT_NOT_EMPTY"),
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        std::fs::create_dir_all(&path).map_err(|_| "SYNC_ROOT_UNKNOWN")?;
-                    }
-                    Err(_) => return Err("SYNC_ROOT_NOT_EMPTY"),
                 }
                 engine
                     .accept(&set_id, path, now)
@@ -477,13 +515,14 @@ impl Loop {
                 if method == "sync.decline" && !engine.is_invited(&set_id) {
                     return Err("SYNC_NOT_INVITED");
                 }
+                // A gesture the state does not offer (pausing a set one was
+                // only invited to) is not an internal failure: it is a
+                // refusal the interface can phrase.
                 engine
                     .sign_status(&set_id, status, now)
-                    .map_err(|_| "SYNC_INTERNAL")?;
-                if method == "sync.resume"
-                    && let Err(e) = self.engine.as_mut().expect("checked").rescan_set(&set_id)
-                {
-                    eprintln!("[1device-sync] rescan at resume failed: {e}");
+                    .map_err(|_| "SYNC_NOT_A_MEMBER")?;
+                if method == "sync.resume" {
+                    self.start_scan(&set_id);
                 }
                 self.sync_watchers();
                 self.pump(true);
@@ -503,9 +542,7 @@ impl Loop {
                 if engine.set(&set_id).is_none() {
                     return Err("SYNC_UNKNOWN_SET");
                 }
-                engine
-                    .resolve(&set_id, path, keep)
-                    .map_err(|_| "SYNC_NO_CONFLICT")?;
+                engine.resolve(&set_id, path, keep)?;
                 self.pump(false);
                 Ok(json!({}))
             }
@@ -604,14 +641,17 @@ impl Loop {
             }
         }
         self.last_snapshot = snapshot;
-        for (method, params) in emissions {
-            let client = self.client.clone();
-            tokio::spawn(async move {
+        // ONE task, in order: two cards for the same set emitted from
+        // independent tasks could arrive newest-first, and an interface that
+        // trusted the last one would show a stale card.
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            for (method, params) in emissions {
                 let _ = client
                     .request("sync.emit", json!({ "method": method, "params": params }))
                     .await;
-            });
-        }
+            }
+        });
     }
 
     /// Fires a `devices.list` on its own task; the snapshot comes back as
@@ -694,14 +734,44 @@ impl Loop {
 
     /// The watcher went quiet after a burst: look again, then talk.
     fn on_quiesced(&mut self, set_id: &str) {
-        let Some(engine) = &mut self.engine else {
+        self.start_scan(set_id);
+    }
+
+    /// Starts one walk OFF the loop: reading and hashing a tree can take
+    /// minutes, and the loop owes the Core an answer within its 10 s facade
+    /// budget. The observation comes back as [`Internal::Scanned`], and
+    /// folding it is pure bookkeeping.
+    fn start_scan(&mut self, set_id: &str) {
+        let Some(engine) = &self.engine else {
             return;
         };
-        if let Err(e) = engine.rescan_set(set_id) {
-            eprintln!("[1device-sync] rescan of {set_id} failed: {e}");
+        let Some((root, kind, index, pending)) = engine.scan_inputs(set_id) else {
+            return;
+        };
+        if !self.scanning.insert(set_id.to_string()) {
+            // One walk at a time per set: the next quiescence will ask
+            // again, and a walk already in flight sees the same tree.
+            return;
         }
-        self.pump(false);
-        self.emit_changes();
+        let tx = self.internal_tx.clone();
+        let set_id = set_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            match crate::scan::observe(&root, kind, &index, &pending) {
+                Ok(observation) => {
+                    let _ = tx.blocking_send(Internal::Scanned {
+                        set_id,
+                        observation,
+                    });
+                }
+                Err(e) => {
+                    eprintln!("[1device-sync] walk of {set_id} failed: {e}");
+                    let _ = tx.blocking_send(Internal::Scanned {
+                        set_id,
+                        observation: crate::scan::Observation::default(),
+                    });
+                }
+            }
+        });
     }
 
     /// Keeps one watch alive per rooted set: install what is missing, drop
@@ -722,6 +792,7 @@ impl Loop {
         }
         self.watchers
             .retain(|set_id, _| wanted.contains_key(set_id));
+        let mut degraded: Vec<String> = Vec::new();
         for (set_id, (root, kind)) in wanted {
             if self.watchers.contains_key(&set_id) {
                 continue;
@@ -732,7 +803,17 @@ impl Loop {
                 }
                 Err(e) => {
                     eprintln!("[1device-sync] set {set_id} degraded to periodic scanning: {e}");
+                    degraded.push(set_id);
                 }
+            }
+        }
+        // The card says so: a set that cannot watch its root is honestly
+        // degraded, not silently slower. (The letter: "surfaced as a card
+        // problem, never silent.")
+        if let Some(engine) = &mut self.engine {
+            for set_id in engine.set_ids() {
+                let is_degraded = degraded.contains(&set_id);
+                engine.set_watch_degraded(&set_id, is_degraded);
             }
         }
     }
@@ -743,15 +824,15 @@ impl Loop {
             self.request_directory();
             return;
         };
-        // The periodic rescan, until the watcher brick moves detection off
-        // the tick. Synchronous by design for now: the loop owns the
-        // engine, and the tick is rare.
-        for set_id in engine.set_ids() {
-            if engine.set(&set_id).is_some_and(|s| s.root.is_some())
-                && let Err(e) = engine.rescan_set(&set_id)
-            {
-                eprintln!("[1device-sync] rescan of {set_id} failed: {e}");
-            }
+        // The safety net under the watcher: every rooted set is walked
+        // again, off the loop.
+        let rooted: Vec<String> = engine
+            .set_ids()
+            .into_iter()
+            .filter(|id| engine.set(id).is_some_and(|s| s.root.is_some()))
+            .collect();
+        for set_id in rooted {
+            self.start_scan(&set_id);
         }
         self.pump(true);
         self.sync_watchers();

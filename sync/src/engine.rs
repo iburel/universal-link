@@ -127,6 +127,19 @@ const SETS_MAX: usize = 64;
 /// memory in our buffers.
 const ROUNDS_IN_FLIGHT_PER_PEER: usize = 4;
 
+/// Conflict records held per set: far above any real number of open
+/// conflicts, and a bound a member cannot push past.
+const CONFLICTS_MAX: usize = 10_000;
+
+/// Terminal outcomes remembered while their transfer id is still in
+/// flight: a handful is plenty (at most two pulls per peer).
+const EARLY_OUTCOMES_MAX: usize = 16;
+
+/// How long a need waits for its offer and its bytes before it is
+/// reclaimed. Generous: a real pull of a large batch takes minutes, and
+/// reclaiming early would only duplicate work.
+const NEED_TTL_SECS: u64 = 600;
+
 /// Paths the pending set may hold per set: bounds what a hostile active
 /// member can make us remember (and write to meta.json). Far above any
 /// real delta - a bigger initial sync simply arrives in several rounds.
@@ -218,6 +231,9 @@ pub struct SetState {
     /// The disk said no: pulling stops and the card says why, until a
     /// resume gesture. Persisted, because a full disk survives a restart.
     disk_full: bool,
+    /// Terminal transfer outcomes that arrived before the message naming
+    /// their transfer id: applied the moment it registers. Bounded.
+    early_outcomes: BTreeMap<String, (bool, String)>,
     /// Paths whose bytes keep failing to arrive, with their strike count:
     /// beyond one strike a path is needed ALONE, so one hot file cannot
     /// starve a batch. In memory - a restart may as well try afresh.
@@ -245,6 +261,11 @@ struct NeedState {
     /// Set paths still expected under this need.
     paths: BTreeSet<String>,
     pull: Option<ActivePull>,
+    /// When the need was minted (or its pull last progressed). A source that
+    /// silently drops a need must not wedge these paths for ever: past the
+    /// TTL the need is reclaimed and the paths are needed again, from
+    /// whoever can serve them.
+    born_at: u64,
 }
 
 struct ActivePull {
@@ -403,6 +424,12 @@ impl Engine {
         let mut devices = Vec::new();
         let mut any_other_active = false;
         for node in state.membership.device_ids() {
+            // A device the ACCOUNT revoked is gone from the directory, and
+            // gone from here too: its rows go, rather than lingering under a
+            // label no interface could resolve.
+            let Some(device_id) = self.directory.device_of.get(&node).cloned() else {
+                continue;
+            };
             let membership = match state.membership.effective(&node) {
                 Effective::Active => "active",
                 Effective::Paused => "paused",
@@ -414,14 +441,18 @@ impl Engine {
             if node != self.self_node && membership == "active" {
                 any_other_active = true;
             }
+            // "N files behind": live FILES, never tombstones or directories -
+            // a count a human can compare with what they see in the folder.
+            let ours = || {
+                state
+                    .index
+                    .live()
+                    .filter(|e| e.kind == crate::index::EntryKind::File)
+            };
             let behind = match state.watermarks.get(&node) {
                 _ if node == self.self_node => 0,
-                Some(watermark) => state
-                    .index
-                    .iter()
-                    .filter(|e| !watermark.covers(&e.vv))
-                    .count(),
-                None => state.index.len(),
+                Some(watermark) => ours().filter(|e| !watermark.covers(&e.vv)).count(),
+                None => ours().count(),
             };
             let sync = if node == self.self_node {
                 "up_to_date"
@@ -433,7 +464,7 @@ impl Engine {
                 "up_to_date"
             };
             devices.push(json!({
-                "device_id": self.device_id_of(&node),
+                "device_id": device_id,
                 "membership": membership,
                 "sync": sync,
                 "behind": behind,
@@ -443,6 +474,14 @@ impl Engine {
 
         let conflicts: Vec<Value> = open_conflicts
             .iter()
+            // Announced AFTER materialization, per the contract: a record
+            // that reached us by gossip before its second version did says
+            // nothing an interface could act on, so it waits.
+            .filter(|record| {
+                [record.path.as_str(), record.path_on_disk.as_str()]
+                    .iter()
+                    .all(|path| state.index.get(path).is_some_and(|e| !e.deleted))
+            })
             .map(|record| {
                 let mut versions = Vec::new();
                 for path in [record.path.as_str(), record.path_on_disk.as_str()] {
@@ -494,7 +533,9 @@ impl Engine {
             "path": state.root.as_ref().map(|p| p.to_string_lossy().into_owned()),
             "state": state_str,
             "problem": problem,
-            "behind": state.pending.len(),
+            // What is still on the way here: pending paths plus what a
+            // blocked rename is holding.
+            "behind": state.pending.len() + state.parked.len(),
             "devices": devices,
             "conflicts": conflicts,
             "ignored": state
@@ -696,31 +737,20 @@ impl Engine {
     /// (both files stay). The record flips to resolved either way and the
     /// gesture's effects propagate as ordinary synced operations - nothing
     /// else ever deletes.
-    pub fn resolve(&mut self, set_id: &str, path: &str, keep: &str) -> io::Result<()> {
+    pub fn resolve(&mut self, set_id: &str, path: &str, keep: &str) -> Result<(), &'static str> {
         let self_node = self.self_node.clone();
-        let state = self
-            .sets
-            .get_mut(set_id)
-            .ok_or_else(|| io::Error::other("unknown set"))?;
+        let state = self.sets.get_mut(set_id).ok_or("SYNC_UNKNOWN_SET")?;
         let record = state
             .conflicts
             .values()
             .find(|r| !r.resolved && r.path == path)
             .cloned()
-            .ok_or_else(|| io::Error::other("no open conflict at this path"))?;
+            .ok_or("SYNC_NO_CONFLICT")?;
         let key = state.clock.self_component(&self_node);
         if keep != "all" {
-            let root = state
-                .root
-                .clone()
-                .ok_or_else(|| io::Error::other("no root"))?;
-            let join = |wire: &str| {
-                let mut p = root.clone();
-                for c in wire.split('/') {
-                    p.push(c);
-                }
-                p
-            };
+            if state.root.is_none() {
+                return Err("SYNC_INTERNAL");
+            }
             let plain = state.index.get(path).cloned();
             let copy = state.index.get(&record.path_on_disk).cloned();
             let plain_vid = plain.as_ref().filter(|e| !e.deleted).map(version_id);
@@ -738,17 +768,24 @@ impl Engine {
             if plain_vid.as_deref() == Some(keep) {
                 // Keep the plain path's occupant: the copy goes.
                 if let Some(copy) = &copy {
-                    let _ = std::fs::remove_file(join(&copy.path));
+                    if let Some(fs) = state.fs_path(&copy.path) {
+                        let _ = std::fs::remove_file(fs);
+                    }
                     tombstone(state, copy, &key);
                 }
             } else if copy_vid.as_deref() == Some(keep) {
                 // The copy's content takes the plain path.
                 let (Some(plain), Some(copy)) = (&plain, &copy) else {
-                    return Err(io::Error::other("no such version"));
+                    return Err("SYNC_NO_VERSION");
                 };
-                let _ = std::fs::remove_file(join(path));
-                if std::fs::rename(join(&copy.path), join(path)).is_err() {
-                    return Err(io::Error::other("cannot move the kept version"));
+                let (Some(plain_fs), Some(copy_fs)) =
+                    (state.fs_path(path), state.fs_path(&copy.path))
+                else {
+                    return Err("SYNC_INTERNAL");
+                };
+                let _ = std::fs::remove_file(&plain_fs);
+                if std::fs::rename(&copy_fs, &plain_fs).is_err() {
+                    return Err("SYNC_INTERNAL");
                 }
                 let mut kept = copy.clone();
                 kept.path = path.to_string();
@@ -760,7 +797,7 @@ impl Engine {
                 state.index.upsert(kept);
                 tombstone(state, copy, &key);
             } else {
-                return Err(io::Error::other("no such version"));
+                return Err("SYNC_NO_VERSION");
             }
         }
         let resolved = ConflictRecord::sign(
@@ -774,8 +811,21 @@ impl Engine {
         );
         state.absorb_conflict(&resolved);
         state.announce_to_members(&self.self_node.clone());
-        state.persist(&self.store, set_id)?;
+        state
+            .persist(&self.store, set_id)
+            .map_err(|_| "SYNC_INTERNAL")?;
         Ok(())
+    }
+
+    /// Whether `node` is already part of `set_id` in any live or pending
+    /// sense: inviting it again is the caller's mistake, not a gesture.
+    pub fn already_in(&self, set_id: &str, node: &str) -> bool {
+        self.sets.get(set_id).is_some_and(|state| {
+            matches!(
+                state.membership.effective(node),
+                Effective::Active | Effective::Paused | Effective::Invited
+            )
+        })
     }
 
     fn sign_own(&mut self, state: &mut SetState, status: MemberStatus, now: u64) -> Absorb {
@@ -796,8 +846,45 @@ impl Engine {
         state.membership.absorb(&Record::Member(record))
     }
 
-    /// Rescans the set's root against its index (brick 3's machinery),
-    /// persisting the outcome.
+    /// What a walk needs, as a snapshot: the expensive half runs off the
+    /// event loop (it reads and hashes files), so it must not borrow the
+    /// engine. `None` = nothing to walk (no root yet).
+    pub fn scan_inputs(
+        &self,
+        set_id: &str,
+    ) -> Option<(PathBuf, SetKind, SetIndex, BTreeSet<String>)> {
+        let state = self.sets.get(set_id)?;
+        let root = state.root.clone()?;
+        Some((
+            root,
+            state.membership.descriptor.kind,
+            state.index.clone(),
+            state.pending.keys().cloned().collect(),
+        ))
+    }
+
+    /// Folds a walk's observation into the set: clock values, tombstones,
+    /// the drain, the ignored list, one persist. Cheap - no file is read.
+    pub fn fold_scan(
+        &mut self,
+        set_id: &str,
+        observation: crate::scan::Observation,
+    ) -> io::Result<ScanReport> {
+        let self_node = self.self_node.clone();
+        let state = self
+            .sets
+            .get_mut(set_id)
+            .ok_or_else(|| io::Error::other("unknown set"))?;
+        let key = state.clock.self_component(&self_node);
+        let report = crate::scan::fold(observation, &mut state.index, &mut state.clock, &key)?;
+        let _ = state.drain_pending(&key);
+        state.ignored = report.ignored.clone();
+        state.persist(&self.store, set_id)?;
+        Ok(report)
+    }
+
+    /// Rescans inline: the two halves back to back. For callers that may
+    /// block (the tests, and a set whose tree is known small).
     pub fn rescan_set(&mut self, set_id: &str) -> io::Result<ScanReport> {
         let self_node = self.self_node.clone();
         let state = self
@@ -940,9 +1027,9 @@ impl Engine {
         if state.membership.effective(from) != Effective::Active {
             return Vec::new();
         }
-        let Some(root) = state.root.clone() else {
+        if state.root.is_none() {
             return Vec::new();
-        };
+        }
         if state.published.contains_key(&(from.to_string(), need_id))
             || state.publishing.contains_key(&(from.to_string(), need_id))
         {
@@ -962,10 +1049,10 @@ impl Engine {
                 eprintln!("[1device-sync] need for a path outside the live index, set {set_id}");
                 return Vec::new();
             }
-            let mut fs_path = root.clone();
-            for component in path.split('/') {
-                fs_path.push(component);
-            }
+            let Some(fs_path) = state.fs_path(path) else {
+                eprintln!("[1device-sync] need for a path we may not read, set {set_id}");
+                return Vec::new();
+            };
             fs_paths.push(fs_path);
             map.insert(crate::protocol::basename(path).to_string(), path.clone());
         }
@@ -1097,12 +1184,29 @@ impl Engine {
     }
 
     /// The fill is running: remember the transfer id the outcome will name.
-    pub fn on_pull_started(&mut self, set_id: &str, need_id: u64, transfer_id: &str) {
+    pub fn on_pull_started(
+        &mut self,
+        set_id: &str,
+        need_id: u64,
+        transfer_id: &str,
+        now: u64,
+    ) -> Vec<Effect> {
+        let mut early = None;
         if let Some(state) = self.sets.get_mut(set_id)
             && let Some(need) = state.needs.get_mut(&need_id)
-            && let Some(pull) = &mut need.pull
         {
-            pull.transfer = Some(transfer_id.to_string());
+            // Progress: the reclaim clock restarts, so a long transfer is
+            // never taken away from itself.
+            need.born_at = now;
+            if let Some(pull) = &mut need.pull {
+                pull.transfer = Some(transfer_id.to_string());
+            }
+            early = state.early_outcomes.remove(transfer_id);
+        }
+        // The outcome that arrived before this id was known: applied now.
+        match early {
+            Some((ok, error)) => self.finish_pull(set_id, need_id, ok, &error),
+            None => Vec::new(),
         }
     }
 
@@ -1119,20 +1223,60 @@ impl Engine {
     /// complete ones are applied (the salvage rule): only the remainder is
     /// re-needed, by the next pump.
     pub fn on_transfer_outcome(&mut self, transfer_id: &str, ok: bool, error: &str) -> Vec<Effect> {
-        let self_node = self.self_node.clone();
-        let mut out = Vec::new();
         let set_ids = self.set_ids();
         for set_id in set_ids {
             let state = self.sets.get_mut(&set_id).expect("listed");
-            let Some((&need_id, _)) = state.needs.iter().find(|(_, n)| {
-                n.pull
-                    .as_ref()
-                    .is_some_and(|p| p.transfer.as_deref() == Some(transfer_id))
-            }) else {
-                continue;
+            let found = state
+                .needs
+                .iter()
+                .find(|(_, n)| {
+                    n.pull
+                        .as_ref()
+                        .is_some_and(|p| p.transfer.as_deref() == Some(transfer_id))
+                })
+                .map(|(id, _)| *id);
+            match found {
+                Some(need_id) => return self.finish_pull(&set_id, need_id, ok, error),
+                None => continue,
+            }
+        }
+        // The outcome beat the message that names the transfer (both ride the
+        // loop's own channels): remembered briefly, applied the moment the id
+        // is registered. Without this the need would wait out its whole TTL.
+        for state in self.sets.values_mut() {
+            if state.needs.values().any(|n| n.pull.is_some()) {
+                while state.early_outcomes.len() >= EARLY_OUTCOMES_MAX {
+                    let oldest = state
+                        .early_outcomes
+                        .keys()
+                        .next()
+                        .cloned()
+                        .expect("non-empty");
+                    state.early_outcomes.remove(&oldest);
+                }
+                state
+                    .early_outcomes
+                    .insert(transfer_id.to_string(), (ok, error.to_string()));
+            }
+        }
+        Vec::new()
+    }
+
+    /// Applies one finished (or failed) pull: verify what landed, apply or
+    /// keep-both, salvage the rest.
+    fn finish_pull(&mut self, set_id: &str, need_id: u64, ok: bool, error: &str) -> Vec<Effect> {
+        let self_node = self.self_node.clone();
+        let mut out = Vec::new();
+        {
+            let Some(state) = self.sets.get_mut(set_id) else {
+                return out;
             };
-            let need = state.needs.remove(&need_id).expect("found");
-            let pull = need.pull.expect("matched");
+            let Some(need) = state.needs.remove(&need_id) else {
+                return out;
+            };
+            let Some(pull) = need.pull else {
+                return out;
+            };
             let key = state.clock.self_component(&self_node);
             // The letter's disk-full rule, from the failure rather than a
             // prediction: no portable way to ask a filesystem how much room
@@ -1184,18 +1328,17 @@ impl Engine {
             // The staging dir has served: verified files were moved out,
             // failures are re-pulled whole.
             let _ = std::fs::remove_dir_all(&pull.staging);
-            let _ = state.persist(&self.store, &set_id);
+            let _ = state.persist(&self.store, set_id);
             if landed == pull.files.len() {
                 out.push(Effect::send(
                     &need.peer,
                     &Message::Done {
-                        set_id: set_id.clone(),
+                        set_id: set_id.to_string(),
                         need_id,
                         tx_id: pull.tx_id.clone(),
                     },
                 ));
             }
-            break;
         }
         out
     }
@@ -1405,10 +1548,7 @@ impl Engine {
             .values()
             .map(ConflictRecord::to_value)
             .collect();
-        let mut record_pages = paginate(&records).unwrap_or_default();
-        if record_pages.is_empty() && (!endorsements.is_empty() || !conflict_values.is_empty()) {
-            record_pages.push(Vec::new());
-        }
+        let record_pages = paginate_gossip(&records, &endorsements, &conflict_values);
 
         let serving = state.root.is_some()
             && state.membership.effective(&self_node) == Effective::Active
@@ -1453,7 +1593,7 @@ impl Engine {
             to: from.to_string(),
             payload: head.to_value(),
         }];
-        for (page, chunk) in record_pages.into_iter().enumerate() {
+        for (page, (records, endorsements, conflicts)) in record_pages.into_iter().enumerate() {
             out.push(Outgoing {
                 to: from.to_string(),
                 payload: json!({
@@ -1462,9 +1602,9 @@ impl Engine {
                     "set_id": set_id,
                     "round": round,
                     "page": page as u64,
-                    "records": chunk,
-                    "endorsements": if page == 0 { endorsements.clone() } else { Vec::new() },
-                    "conflicts": if page == 0 { conflict_values.clone() } else { Vec::new() },
+                    "records": records,
+                    "endorsements": endorsements,
+                    "conflicts": conflicts,
                 }),
             });
         }
@@ -1770,7 +1910,7 @@ impl Engine {
 
             // Needs: pending FILE bytes pulled from peers whose absorbed
             // watermark says they hold them.
-            let need_effects = self.pump_needs(&set_id, reachable);
+            let need_effects = self.pump_needs(&set_id, reachable, now);
             out.extend(need_effects);
 
             // Introductions: records-only openers toward unpinned devices
@@ -1828,12 +1968,18 @@ impl Engine {
     /// serving peer, chunked so no two paths share a basename (the
     /// published record names files by basename: the bijection), within
     /// the per-peer slots and the chunk bounds.
-    fn pump_needs(&mut self, set_id: &str, reachable: &[String]) -> Vec<Effect> {
+    fn pump_needs(&mut self, set_id: &str, reachable: &[String], now: u64) -> Vec<Effect> {
         let self_node = self.self_node.clone();
         let mut out = Vec::new();
         let Some(state) = self.sets.get_mut(set_id) else {
             return out;
         };
+        // Reclaim what never came back: a need whose offer never arrived, or
+        // whose pull never reported, releases its paths so the next pump can
+        // ask again (of another member, if this one has gone quiet).
+        state
+            .needs
+            .retain(|_, need| now.saturating_sub(need.born_at) <= NEED_TTL_SECS);
         if state.root.is_none()
             || state.membership.effective(&self_node) != Effective::Active
             || state.size_guard_tripped()
@@ -1918,6 +2064,7 @@ impl Engine {
                     peer: peer.clone(),
                     paths: chunk.iter().cloned().collect(),
                     pull: None,
+                    born_at: now,
                 },
             );
             minted = true;
@@ -1961,10 +2108,7 @@ impl Engine {
             .values()
             .map(ConflictRecord::to_value)
             .collect();
-        let mut pages = paginate(&records).unwrap_or_default();
-        if pages.is_empty() && (!endorsements.is_empty() || !conflicts.is_empty()) {
-            pages.push(Vec::new());
-        }
+        let pages = paginate_gossip(&records, &endorsements, &conflicts);
         let head = Message::Head {
             set_id: set_id.to_string(),
             round,
@@ -1981,7 +2125,7 @@ impl Engine {
             sync_pub,
         };
         let mut out = vec![Effect::send(peer, &head)];
-        for (page, chunk) in pages.into_iter().enumerate() {
+        for (page, (records, endorsements, conflicts)) in pages.into_iter().enumerate() {
             out.push(Effect::Send(Outgoing {
                 to: peer.to_string(),
                 payload: json!({
@@ -1990,9 +2134,9 @@ impl Engine {
                     "set_id": set_id,
                     "round": round,
                     "page": page as u64,
-                    "records": chunk,
-                    "endorsements": if page == 0 { endorsements.clone() } else { Vec::new() },
-                    "conflicts": if page == 0 { conflicts.clone() } else { Vec::new() },
+                    "records": records,
+                    "endorsements": endorsements,
+                    "conflicts": conflicts,
                 }),
             }));
         }
@@ -2065,6 +2209,7 @@ impl SetState {
             ignored: Vec::new(),
             watch_degraded: false,
             disk_full: false,
+            early_outcomes: BTreeMap::new(),
             hot: BTreeMap::new(),
         })
     }
@@ -2112,6 +2257,46 @@ impl SetState {
         true
     }
 
+    /// Where a wire path lives on this disk. Two rules in one place:
+    ///
+    /// - a set of ONE FILE has the file itself as its root, so its single
+    ///   wire name resolves to the root rather than under it;
+    /// - no component of the resolved path may be a SYMLINK. Symlinks are
+    ///   never indexed (section 8), so one standing where a directory of the
+    ///   set should be can only be a local trap - and following it would
+    ///   write or unlink outside the root, which the letter forbids
+    ///   absolutely.
+    ///
+    /// `None` means "not somewhere we may touch": the caller refuses.
+    fn fs_path(&self, wire: &str) -> Option<PathBuf> {
+        let root = self.root.as_ref()?;
+        if self.membership.descriptor.kind == SetKind::File {
+            // The one name of a single-file set: the root IS the file.
+            return (crate::protocol::basename(wire) == wire).then(|| root.clone());
+        }
+        let mut path = root.clone();
+        let mut components = wire.split('/').peekable();
+        while let Some(component) = components.next() {
+            path.push(component);
+            // The last component may be anything (we are about to create or
+            // replace it); every ANCESTOR must be a real directory.
+            if components.peek().is_some() {
+                match std::fs::symlink_metadata(&path) {
+                    Ok(meta) if meta.is_dir() => {}
+                    // Absent is fine: we create it ourselves.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    _ => {
+                        eprintln!(
+                            "[1device-sync] refusing to work through a non-directory: {wire}"
+                        );
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(path)
+    }
+
     /// The consent guard (the letter, section 2): the inviter's size claim,
     /// honestly enforced with a stated margin. Tripped = the set stops
     /// pulling and the card says why; resuming is a user gesture.
@@ -2149,9 +2334,9 @@ impl SetState {
     fn apply_staged(&mut self, staged: &Path, set_path: &str, self_component: &str) -> Apply {
         use crate::vv::Relation;
 
-        let Some(root) = self.root.clone() else {
+        if self.root.is_none() {
             return Apply::Failed;
-        };
+        }
         let Some(versions) = self.pending.get(set_path) else {
             // Nothing pending anymore (superseded mid-pull): nothing owed.
             return Apply::Landed;
@@ -2187,11 +2372,37 @@ impl SetState {
             eprintln!("[1device-sync] staged bytes do not match their entry: re-needed");
             return Apply::Failed;
         }
-        // Filesystem first, index after (load-bearing, the letter).
-        let mut dest = root.clone();
-        for component in set_path.split('/') {
-            dest.push(component);
+        // The "catching up" window, honestly: the disk may have moved under
+        // the pull. Replacing what the index does not recognise would destroy
+        // a local edit silently, so an unrecognised occupant is treated as
+        // what it is - a concurrent change - and takes the conflict path once
+        // the next walk has given it a version of its own.
+        if let Some(ours) = self.index.get(set_path).filter(|e| !e.deleted) {
+            let disk = self
+                .fs_path(set_path)
+                .and_then(|p| std::fs::symlink_metadata(&p).ok().map(|m| (p, m)));
+            if let Some((path, meta)) = disk {
+                let moved = meta.len() != ours.size
+                    || meta
+                        .modified()
+                        .map(crate::index::Mtime::of)
+                        .is_ok_and(|m| m != ours.mtime);
+                if moved
+                    && crate::scan::hash_file(&path)
+                        .map(|h| h != ours.hash)
+                        .unwrap_or(true)
+                {
+                    eprintln!(
+                        "[1device-sync] {set_path} changed locally under the pull: kept, not replaced"
+                    );
+                    return Apply::Failed;
+                }
+            }
         }
+        // Filesystem first, index after (load-bearing, the letter).
+        let Some(dest) = self.fs_path(set_path) else {
+            return Apply::Failed;
+        };
         if let Some(parent) = dest.parent()
             && std::fs::create_dir_all(parent).is_err()
         {
@@ -2213,11 +2424,40 @@ impl SetState {
                 let _ = std::fs::set_permissions(&dest, perms);
             }
         }
-        if let Err(e) = std::fs::rename(staged, &dest) {
+        // A mount point inside the root makes the staging rename cross a
+        // filesystem: copy beside the target and rename from there, which is
+        // still atomic where it matters (the final replace).
+        let staged = match std::fs::rename(staged, &dest) {
+            Ok(()) => {
+                return self.record_landed(
+                    set_path,
+                    &dest,
+                    &entry,
+                    hash,
+                    resurrects,
+                    self_component,
+                );
+            }
+            Err(e) if is_cross_device(&e) => {
+                let beside =
+                    dest.with_file_name(format!(".{}.1dtmp", crate::protocol::basename(set_path)));
+                if std::fs::copy(staged, &beside).is_err() {
+                    let _ = std::fs::remove_file(&beside);
+                    return Apply::Failed;
+                }
+                let _ = std::fs::remove_file(staged);
+                beside
+            }
+            Err(_) => staged.to_path_buf(),
+        };
+        if let Err(e) = std::fs::rename(&staged, &dest) {
             // A destination held open by an application (the Office case):
             // keep the VERIFIED staged copy and retry the rename alone,
             // never the transfer. The staged file moves to a parked home
             // that survives the pull's staging-dir cleanup.
+            let Some(root) = self.root.clone() else {
+                return Apply::Failed;
+            };
             let parked_dir = root.join(crate::wirepath::STAGING_DIR).join("parked");
             if std::fs::create_dir_all(&parked_dir).is_ok() {
                 let home = parked_dir.join(format!(
@@ -2225,7 +2465,7 @@ impl SetState {
                     &entry.hash[..16.min(entry.hash.len())],
                     crate::protocol::basename(set_path)
                 ));
-                if std::fs::rename(staged, &home).is_ok() {
+                if std::fs::rename(&staged, &home).is_ok() {
                     self.parked.insert(
                         set_path.to_string(),
                         ParkedEntry {
@@ -2238,26 +2478,40 @@ impl SetState {
             }
             return Apply::Failed;
         }
+        self.record_landed(set_path, &dest, &entry, hash, resurrects, self_component)
+    }
+
+    /// The index half of a landed file: permissions, the mtime read BACK from
+    /// the disk, the consent-guard accounting, the vv.
+    fn record_landed(
+        &mut self,
+        set_path: &str,
+        dest: &Path,
+        entry: &Entry,
+        hash: String,
+        resurrects: bool,
+        self_component: &str,
+    ) -> Apply {
         #[cfg(unix)]
         if entry.exec {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755));
         }
         // The source's mtime, then the filesystem's own rounding read BACK:
         // the index records what the disk will report, not our wish.
         let mtime = (|| {
-            let file = std::fs::File::options().write(true).open(&dest).ok()?;
+            let file = std::fs::File::options().write(true).open(dest).ok()?;
             let secs = u64::try_from(entry.mtime.secs).ok()?;
             let stamp = std::time::SystemTime::UNIX_EPOCH
                 + std::time::Duration::new(secs, entry.mtime.nanos);
             file.set_times(std::fs::FileTimes::new().set_modified(stamp))
                 .ok()?;
             Some(crate::index::Mtime::of(
-                std::fs::metadata(&dest).ok()?.modified().ok()?,
+                std::fs::metadata(dest).ok()?.modified().ok()?,
             ))
         })()
         .unwrap_or(entry.mtime);
-        let size = std::fs::metadata(&dest)
+        let size = std::fs::metadata(dest)
             .map(|m| m.len())
             .unwrap_or(entry.size);
         if self.invite_claim.is_some() {
@@ -2419,18 +2673,17 @@ impl SetState {
     /// rename arriving as create-then-tombstone across two rounds must not
     /// delete the renamed file).
     fn apply_file_tombstone(&mut self, tomb: &Entry) {
-        let Some(root) = self.root.clone() else {
+        if self.root.is_none() {
             return;
-        };
+        }
         let fold = tomb.path.to_lowercase();
         let folded_live = self
             .index
             .live()
             .any(|e| e.path != tomb.path && e.path.to_lowercase() == fold);
-        let mut dest = root;
-        for component in tomb.path.split('/') {
-            dest.push(component);
-        }
+        let Some(dest) = self.fs_path(&tomb.path) else {
+            return;
+        };
         if !folded_live {
             match std::fs::remove_file(&dest) {
                 Ok(()) => {}
@@ -2453,9 +2706,9 @@ impl SetState {
     fn apply_dir_tombstone(&mut self, tomb: &Entry, self_component: &str) {
         use crate::vv::Relation;
 
-        let Some(root) = self.root.clone() else {
+        if self.root.is_none() {
             return;
-        };
+        }
         let prefix = format!("{}/", tomb.path);
         let live_descendants: Vec<String> = self
             .index
@@ -2491,10 +2744,9 @@ impl SetState {
             self.settle_pending(&tomb.path, &tomb.vv);
             return;
         }
-        let mut dest = root;
-        for component in tomb.path.split('/') {
-            dest.push(component);
-        }
+        let Some(dest) = self.fs_path(&tomb.path) else {
+            return;
+        };
         match std::fs::remove_dir(&dest) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -2517,6 +2769,15 @@ impl SetState {
         if record.set_id != self.membership.descriptor.set_id {
             return;
         }
+        // Signed by a device the set ADMITS: a conflict record moves files
+        // around (the fold) and shows up in every interface, so a mere
+        // account device's word is not enough.
+        if !matches!(
+            self.membership.effective(&record.signed_by),
+            Effective::Active | Effective::Paused
+        ) {
+            return;
+        }
         let Some(signer_key) = self.membership.key_for(&record.signed_by) else {
             return;
         };
@@ -2524,6 +2785,10 @@ impl SetState {
             return;
         }
         let key = (record.path.clone(), record.conflict_id.clone());
+        if !self.conflicts.contains_key(&key) && self.conflicts.len() >= CONFLICTS_MAX {
+            eprintln!("[1device-sync] too many conflict records: one dropped");
+            return;
+        }
         let superseded = match self.conflicts.get(&key) {
             Some(held) => record.beats(held),
             None => true,
@@ -2552,12 +2817,33 @@ impl SetState {
 
     /// Retries the parked renames (a destination unlocked since).
     fn retry_parked(&mut self, self_component: &str) {
+        use crate::vv::Relation;
+
         let paths: Vec<String> = self.parked.keys().cloned().collect();
         for path in paths {
             let Some(parked) = self.parked.get(&path).cloned() else {
                 continue;
             };
+            // Superseded: the index already holds this version or better, so
+            // the staged bytes have no work left. Release them.
+            if self.index.get(&path).is_some_and(|ours| {
+                matches!(
+                    ours.vv.relation(&parked.entry.vv),
+                    Relation::Descends | Relation::Equal
+                )
+            }) {
+                let _ = std::fs::remove_file(&parked.staged);
+                self.parked.remove(&path);
+                continue;
+            }
             if !parked.staged.exists() {
+                // The bytes are gone (a sweep, a human): the path goes back
+                // to the pending set so the next pump needs it again, rather
+                // than being forgotten.
+                self.pending
+                    .entry(path.clone())
+                    .or_default()
+                    .push(parked.entry.clone());
                 self.parked.remove(&path);
                 continue;
             }
@@ -2580,9 +2866,9 @@ impl SetState {
     fn apply_pending_dirs(&mut self) {
         use crate::vv::Relation;
 
-        let Some(root) = self.root.clone() else {
+        if self.root.is_none() {
             return;
-        };
+        }
         let paths: Vec<String> = self.pending.keys().cloned().collect();
         for path in paths {
             let Some(entry) = self.pending.get(&path).and_then(|versions| {
@@ -2603,10 +2889,9 @@ impl SetState {
             if !dominates {
                 continue;
             }
-            let mut dest = root.clone();
-            for component in path.split('/') {
-                dest.push(component);
-            }
+            let Some(dest) = self.fs_path(&path) else {
+                continue;
+            };
             // Remove-old-kind-then-create: a FILE standing where the
             // directory goes is the superseded kind.
             if dest.is_file() && std::fs::remove_file(&dest).is_err() {
@@ -2847,6 +3132,7 @@ impl SetState {
                 .get("disk_full")
                 .and_then(Value::as_bool)
                 .ok_or_else(corrupt)?,
+            early_outcomes: BTreeMap::new(),
             hot: BTreeMap::new(),
             conflicts: {
                 let mut conflicts = BTreeMap::new();
@@ -2933,6 +3219,49 @@ impl SetState {
     }
 }
 
+/// One page of gossip: membership records, endorsements, conflict records.
+type GossipPage = (Vec<Value>, Vec<Value>, Vec<Value>);
+
+/// Pages the three gossip lists TOGETHER under the byte budget. Putting
+/// endorsements and conflict records on page 0 would have let a set with
+/// enough of them exceed the transport's hard 64 KiB cap, and a frame that
+/// cannot be sent stalls the exchange silently.
+fn paginate_gossip(
+    records: &[Value],
+    endorsements: &[Value],
+    conflicts: &[Value],
+) -> Vec<GossipPage> {
+    // Tagged so one budget covers all three, then split back per page.
+    let tagged: Vec<Value> = records
+        .iter()
+        .map(|v| json!({ "k": "r", "v": v }))
+        .chain(endorsements.iter().map(|v| json!({ "k": "e", "v": v })))
+        .chain(conflicts.iter().map(|v| json!({ "k": "c", "v": v })))
+        .collect();
+    let mut pages: Vec<GossipPage> = paginate(&tagged)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|chunk| {
+            let mut page: GossipPage = (Vec::new(), Vec::new(), Vec::new());
+            for item in chunk {
+                let value = item["v"].clone();
+                match item["k"].as_str() {
+                    Some("r") => page.0.push(value),
+                    Some("e") => page.1.push(value),
+                    _ => page.2.push(value),
+                }
+            }
+            page
+        })
+        .collect();
+    // An empty page is still a page when there is nothing to say and a head
+    // must declare something (never for a set with no gossip at all).
+    if pages.is_empty() && !tagged.is_empty() {
+        pages.push((Vec::new(), Vec::new(), Vec::new()));
+    }
+    pages
+}
+
 fn wrap(out: Vec<Outgoing>) -> Vec<Effect> {
     out.into_iter().map(Effect::Send).collect()
 }
@@ -2948,6 +3277,20 @@ fn boot_round_base() -> u64 {
 /// Whether the Core's words on a failed fill name a full disk. The Core
 /// relays the failure's own words, so this reads them rather than guessing:
 /// a wrong guess would stop a set for nothing (a resume gesture undoes it).
+/// Whether an I/O error is the cross-device one (`EXDEV`, and Windows's
+/// own refusal to rename across volumes). `raw_os_error` rather than a
+/// string: the message is localized, the number is not.
+fn is_cross_device(e: &io::Error) -> bool {
+    #[cfg(unix)]
+    let codes = [18];
+    #[cfg(windows)]
+    // ERROR_NOT_SAME_DEVICE.
+    let codes = [17];
+    #[cfg(not(any(unix, windows)))]
+    let codes: [i32; 0] = [];
+    e.raw_os_error().is_some_and(|c| codes.contains(&c))
+}
+
 fn out_of_space(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     error.contains("no space left")
@@ -2989,9 +3332,9 @@ fn materialize_conflict(
     set_path: &str,
     self_component: &str,
 ) -> bool {
-    let Some(root) = state.root.clone() else {
+    if state.root.is_none() {
         return false;
-    };
+    }
     let Some(local) = state.index.get(set_path).cloned() else {
         return false;
     };
@@ -3047,15 +3390,10 @@ fn materialize_conflict(
         .get(&loser_path)
         .is_some_and(|e| !e.deleted && e.hash == loser.hash);
 
-    let join = |wire: &str| {
-        let mut p = root.clone();
-        for c in wire.split('/') {
-            p.push(c);
-        }
-        p
+    let (Some(plain_fs), Some(loser_fs)) = (state.fs_path(set_path), state.fs_path(&loser_path))
+    else {
+        return false;
     };
-    let plain_fs = join(set_path);
-    let loser_fs = join(&loser_path);
 
     if local_wins {
         // The staged remote version becomes the copy; the plain path keeps
@@ -3404,7 +3742,8 @@ mod tests {
                         }
                         let transfer = format!("t-{need_id}");
                         let needer = self.engines.get_mut(&producer).expect("needer");
-                        needer.on_pull_started(&set_id, need_id, &transfer);
+                        let started = needer.on_pull_started(&set_id, need_id, &transfer, now);
+                        queue.extend(started.into_iter().map(|e| (producer.clone(), e)));
                         let more = needer.on_transfer_outcome(&transfer, true, "");
                         queue.extend(more.into_iter().map(|e| (producer.clone(), e)));
                     }
