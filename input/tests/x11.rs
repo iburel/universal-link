@@ -1153,6 +1153,43 @@ async fn a_wheel_notch_travels_as_a_notch_and_not_as_a_button() {
         "and it is never also a button press, or every scroll would click"
     );
 
+    // And again while SWALLOWING, which is a different stream and not a detail: a grab
+    // delivers core events and nothing raw, so the wheel a driving session forwards comes
+    // through the other half of `on_event`. Settled and drained first, so what is asserted
+    // is a notch generated while the grab was in place.
+    handle.capture(CaptureMode::Swallow);
+    thread::sleep(Duration::from_millis(400));
+    while events.try_recv().is_ok() {}
+    let mut grabbed_wheel = None;
+    let start = std::time::Instant::now();
+    while start.elapsed() < DEADLINE && grabbed_wheel.is_none() {
+        for kind in [4u8, 5u8] {
+            peer.conn.send_request(&xcb::xtest::FakeInput {
+                r#type: kind,
+                detail: 5,
+                time: 0,
+                root: peer.root,
+                root_x: 0,
+                root_y: 0,
+                deviceid: 0,
+            });
+        }
+        let _ = peer.conn.flush();
+        grabbed_wheel = wait_within(&mut events, Duration::from_millis(200), &mut |e| {
+            matches!(e, BackendEvent::Wheel { .. })
+        })
+        .await;
+    }
+    assert_eq!(
+        grabbed_wheel,
+        Some(BackendEvent::Wheel {
+            dx: 0,
+            dy: -1,
+            pixels: false
+        }),
+        "a notch down while swallowing is one notch down"
+    );
+
     session.close();
 }
 
