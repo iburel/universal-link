@@ -91,6 +91,9 @@ pub struct AppState {
     /// takes effect at once rather than at the next request. `notify_waiters`
     /// (not `notify_one`): all sessions must be cut.
     pub clipboard_reset: tokio::sync::Notify,
+    /// The live peer channels (#124), one per (role, peer) pair. LEAF lock:
+    /// taken alone, never across an await.
+    pub peer_channels: Mutex<crate::peerchannel::PeerChannels>,
     /// Nudges the directory sync task (`dirsync`) into a round right away: a
     /// local rename or revocation is something the account's other devices should
     /// hear now, not at the next tick. `notify_one` memorizes a single permit, so
@@ -780,6 +783,14 @@ pub enum ChannelKind {
     Provider {
         sink: mpsc::Sender<crate::datachannel::ProviderMsg>,
     },
+    /// The local end of a peer channel THIS device opened (`peers.channel`,
+    /// #124): the peer stream is already open and parked, waiting for its
+    /// component to come and take it.
+    PeerOpen(crate::peerchannel::Parked),
+    /// The local end of a peer channel a PEER opened to us: the handler still
+    /// holds the peer stream, so the attaching component hands its own halves
+    /// back to it instead.
+    PeerJoin(crate::peerchannel::Joining),
 }
 
 /// Rights carried by a `channel_token`: what it opens, and the pid of the
@@ -968,6 +979,20 @@ impl Registry {
     /// the second connection) does not linger.
     pub fn drop_channel_tokens_of(&mut self, conn_id: ConnId) {
         self.channel_tokens.retain(|_, g| g.conn_id != conn_id);
+    }
+
+    /// Every active connection holding `role` with `scope`, each with its pid:
+    /// the `peer.channel` fan-out (#124). One frame cannot serve here the way
+    /// `peer.message`'s broadcast does, because a channel token is bound to one
+    /// component: each candidate is offered its own.
+    pub fn conns_for_role_scope(&self, role: &str, scope: &str) -> Vec<(ConnId, Option<u32>)> {
+        self.conns
+            .iter()
+            .filter_map(|(id, e)| match &e.phase {
+                Phase::Active(a) if a.role == role && a.has_scope(scope) => Some((*id, e.pid)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Delivers a component's reply to the waiter that issued the request (a

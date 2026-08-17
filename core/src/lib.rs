@@ -22,6 +22,7 @@ mod http;
 mod identity;
 mod login;
 mod pairing;
+mod peerchannel;
 mod peers;
 mod relays;
 mod rpc;
@@ -257,6 +258,10 @@ impl Drop for CoreHandle {
             .expect("lock clipboard")
             .clear_all();
         self.state.clipboard_reset.notify_waiters();
+        // Same reasoning for the live peer channels (#124), whose pipes are not
+        // in `conns` either: a channel does not outlive the Core that carries
+        // it, and its component hears why rather than watching a pipe go mute.
+        crate::peerchannel::cut_all(&self.state, crate::peerchannel::reason::SHUTDOWN);
         // The session and login tasks are held by the state (logout and flow
         // replacement go through it): stopped via their handles.
         if let Some(abort) = self
@@ -349,6 +354,7 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
         transfers: Mutex::new(Transfers::new()),
         clipboard: Mutex::new(crate::clipboard::ClipboardState::new()),
         clipboard_reset: tokio::sync::Notify::new(),
+        peer_channels: Mutex::new(crate::peerchannel::PeerChannels::default()),
         dirsync_wake: tokio::sync::Notify::new(),
         reach_wake: tokio::sync::Notify::new(),
         reconnect_base_delay: config.reconnect_base_delay,

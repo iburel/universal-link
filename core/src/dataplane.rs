@@ -1163,7 +1163,8 @@ async fn write_ack(stream: &mut Box<dyn IoStream>) -> std::io::Result<()> {
 /// its `type`. `offer` is a file transfer (below); `clip_announce` /
 /// `clip_session` are the clipboard network plane (`clipnet`); `dir_sync` is the
 /// directory's (`dirsync`); `lan_pair` is a device asking for its first
-/// introduction (`pairing`).
+/// introduction (`pairing`); `peer_msg` / `peer_channel` are the components'
+/// own primitives (`peers`, `peerchannel`).
 ///
 /// `known`: is this peer a device of the account (`peer_in_directory`, C7)? Only
 /// `lan_pair` is served to one that is not — everything else here presupposes a
@@ -1198,6 +1199,7 @@ async fn serve_incoming(
         Some("clip_session") => crate::clipnet::serve_session(state, first, stream).await,
         Some("tx_fetch") => crate::clipnet::serve_tx_fetch(state, first, stream).await,
         Some("peer_msg") => crate::peers::recv(state, peer, first, stream).await,
+        Some("peer_channel") => crate::peerchannel::recv(state, peer, first, stream).await,
         Some("dir_sync") => crate::dirsync::recv_sync(state, peer, first, stream).await,
         other => {
             tracing::debug!(peer = %peer, kind = ?other, "unknown incoming frame type: abandoned");
