@@ -65,13 +65,18 @@
 //!    convert into, so the grabbing client is the one client that stops receiving
 //!    them (measured in #125 as zero upcalls for eighteen faked events, and the
 //!    same measurement is the reason the grabs there carry an event mask). So while
-//!    swallowing, the delta is the difference of the positions the grab reports:
-//!    the ACCELERATED movement, which is what Windows gets for free from its hook
+//!    swallowing, the delta is the difference of two REPORTED POSITIONS: the
+//!    ACCELERATED movement, which is what Windows gets for free from its hook
 //!    (truth 7), bounded by the pin's anchor being at the centre of the screen so
-//!    one event carries up to half a screen. Applying the device's own acceleration
-//!    profile to the raw valuators instead is a third option and a ticket of its
-//!    own. Nothing on this seam changes either way: the engine consumes
-//!    [`Motion::dx`] and [`Motion::dy`] and asks no questions.
+//!    one event carries up to half a screen. Two traps in that arithmetic cost a
+//!    measurement each and are written up in `input/src/x11.rs`: differencing
+//!    against the ANCHOR rather than against the last position multiplies the
+//!    movement of a burst, and a warp generates a motion event even when it changes
+//!    nothing, so a pin whose anchor the server will not accept warps for ever.
+//!    Applying the device's own acceleration profile to the raw valuators instead is
+//!    a third option and a ticket of its own. Nothing on this seam changes either
+//!    way: the engine consumes [`Motion::dx`] and [`Motion::dy`] and asks no
+//!    questions.
 //! 5. **`CGWarpMouseCursorPosition` suppresses local mouse events for about
 //!    250 ms** unless it is followed by
 //!    `CGAssociateMouseAndMouseCursorPosition(true)`, or unless

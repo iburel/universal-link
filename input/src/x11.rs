@@ -47,12 +47,12 @@
 //!    hook. That is truth 4 of the seam, which asked #125 to choose and to name its
 //!    choice, and on this platform the choice turned out to be made by what a grab will
 //!    and will not deliver: the pointer feels the way this machine's own pointer feels
-//!    while driving. The cost is stated where it is paid (`on_core_motion`): a
-//!    difference against the pin's anchor carries at most half a screen of movement per
-//!    event before the server's own clamp eats the rest, which at 125 events a second is
-//!    a hand nobody has. Reading the device's acceleration profile out of its XI2
-//!    properties and applying it to the raw valuators is a third option and a ticket of
-//!    its own rather than a line of this one.
+//!    while driving. The cost is stated where it is paid (`on_core_motion`): the movement
+//!    of one event is the distance between two reported positions, so the pin's anchor at
+//!    the centre of the screen leaves half a screen of room before the server's own clamp
+//!    eats the rest, which at 125 events a second is a hand nobody has. Reading the
+//!    device's acceleration profile out of its XI2 properties and applying it to the raw
+//!    valuators is a third option and a ticket of its own rather than a line of this one.
 //! 3. **A grab redirects events, it does not stop the pointer moving.** So swallowing
 //!    and pinning are two separate mechanisms: the core `GrabKeyboard` and `GrabPointer`
 //!    with `owner_events: false` are what keep the source's own input from acting
@@ -154,6 +154,13 @@ const FAKE_MOTION: u8 = 6;
 
 /// `XTestFakeInput`'s device id for "the default XTEST device".
 const FAKE_DEVICE: u8 = 0;
+
+/// How many warps may go unanswered before the pin accepts that its anchor is unreachable.
+///
+/// Generous, because in the ordinary case the answer comes within a turn or two: every warp
+/// that lands reports its arrival, which resets the count. Small enough that the pathological
+/// case (an anchor no pointer can occupy) costs a bounded burst rather than a live lock.
+const WARPS_BEFORE_REANCHOR: u32 = 64;
 
 /// One wheel notch, as X11 counts them: a button press and release.
 const WHEEL_PIXELS_PER_NOTCH: i32 = 120;
@@ -748,10 +755,13 @@ struct Backend {
     confine: Option<Rect>,
     anchor: Point,
 
-    /// Raw motion summed since the last turn, in 32nds of a pixel (see [`raw_delta`]),
+    /// Movement summed since the last turn, as 32.32 fixed point pixels (see [`raw_delta`]),
     /// so a burst of device events becomes one upcall with one round trip for the
     /// position rather than one each, and a fraction of a pixel is carried over rather
     /// than truncated away.
+    ///
+    /// Both streams feed it: the raw valuators arrive as a fraction and the core positions as
+    /// whole pixels shifted into the same units, so one arithmetic serves the two modes.
     pending_dx: i64,
     pending_dy: i64,
     /// Scroll movement below one notch, in pixels, kept so a trackpad is not rounded to
@@ -780,9 +790,12 @@ struct Backend {
     engine_gone: bool,
     /// Whether that has already been seen once.
     gone_seen: bool,
-    /// The last pointer position a GRABBED pointer reported, so an unpinned grab still
-    /// produces a movement rather than a position (see `on_core_motion`).
+    /// The last pointer position a GRABBED pointer reported, which is what the movement it
+    /// means is measured against (see `on_core_motion`).
     last_core: Option<Point>,
+    /// How many warps have been issued since one was seen to arrive on the anchor. It is the
+    /// only bound on a pin whose anchor the server will not accept: see `on_core_motion`.
+    unanswered_warps: u32,
 }
 
 impl Backend {
@@ -1018,23 +1031,28 @@ impl Backend {
             // swallowing backend can see (truth 8's exception). The mode gate is the
             // other half of the one above: outside a grab of ours these are events this
             // backend never asked for.
-            xcb::Event::X(x::Event::KeyPress(ev)) => {
-                if self.grabbed {
-                    self.on_key(ev.detail(), true);
-                }
-            }
+            // NOT gated on `grabbed`, and the measurement is why: an ungrab is not
+            // synchronous (it is a request with no reply), so everything the server had
+            // already generated under the grab arrives as core events after the flag has
+            // flipped. Measured: eleven keys injected at the instant of the flip produced ONE
+            // upcall, against eleven with no flip. Outside a grab of ours nothing delivers
+            // these at all, so ungating them costs nothing real; the theoretical cost on a
+            // server that delivered both streams is a duplicate press, which is what a key
+            // repeat already looks like.
+            xcb::Event::X(x::Event::KeyPress(ev)) => self.on_key(ev.detail(), true),
             // Ungated in the other direction too, and symmetrically: a release delivered just
             // after the ungrab (its press having come from the core stream) is the same
             // stranded key seen from the other end.
             xcb::Event::X(x::Event::KeyRelease(ev)) => self.on_key(ev.detail(), false),
             xcb::Event::X(x::Event::ButtonPress(ev)) => {
-                if self.grabbed {
-                    self.on_button(u32::from(ev.detail()), true);
-                }
+                self.on_button(u32::from(ev.detail()), true)
             }
             xcb::Event::X(x::Event::ButtonRelease(ev)) => {
                 self.on_button(u32::from(ev.detail()), false)
             }
+            // MOTION stays gated, and it is the one that has to be: two streams counted at
+            // once is a pointer at double speed, which is the one duplicate that would be felt.
+            // What the gate costs here is a few pixels at the flip, which nobody can see.
             xcb::Event::X(x::Event::MotionNotify(ev)) => {
                 if self.grabbed {
                     self.on_core_motion(ev.root_x(), ev.root_y());
@@ -1096,30 +1114,53 @@ impl Backend {
     /// cursor, so one event can carry at most half a screen of movement before the server's
     /// own clamp eats the rest.
     fn on_core_motion(&mut self, x: i16, y: i16) {
-        let (at, from) = (
-            Point {
-                x: i32::from(x),
-                y: i32::from(y),
-            },
-            match self.confine {
-                Some(_) => self.anchor,
-                None => self.last_core.unwrap_or(Point {
-                    x: i32::from(x),
-                    y: i32::from(y),
-                }),
-            },
-        );
+        let at = Point {
+            x: i32::from(x),
+            y: i32::from(y),
+        };
+        let confined = self.confine.is_some();
+        // The warp's OWN motion, which is not movement anybody made. A `WarpPointer` generates
+        // a `MotionNotify` even when it changes nothing (measured), so this arm is what keeps
+        // the pin from feeding itself, and swallowing the one real movement that happens to
+        // land exactly on the anchor costs a pixel nobody can see.
+        if confined && (at.x, at.y) == (self.anchor.x, self.anchor.y) {
+            self.last_core = Some(at);
+            self.unanswered_warps = 0;
+            return;
+        }
+        // Against the LAST POSITION SEEN, never against the anchor. Differencing against the
+        // anchor looks equivalent and is not: a warp is queued rather than immediate, so when
+        // two motion events land in one turn of the pump (which is what the accumulator below
+        // exists for) the second one measures its distance from the anchor rather than from the
+        // first, and the movement of each event is counted once per event still to come.
+        // Measured at 360 reported pixels for 80 real ones in a burst of eight.
+        let from = self.last_core.unwrap_or(at);
         self.last_core = Some(at);
         let (dx, dy) = (at.x - from.x, at.y - from.y);
         // Whole pixels already, so they go straight into the same accumulator the raw path
         // uses: the fixed point shift keeps one arithmetic for both streams.
         self.pending_dx = self.pending_dx.saturating_add(i64::from(dx) << 32);
         self.pending_dy = self.pending_dy.saturating_add(i64::from(dy) << 32);
-        // The pin, and only when the pointer is not already on it: this stream includes the
-        // motion the WARP itself generates, which arrives at the anchor and would otherwise
-        // buy a second warp request for a pointer that is already where it belongs.
-        if self.confine.is_some() && (at.x, at.y) != (self.anchor.x, self.anchor.y) {
-            self.warp_to(self.anchor);
+        if !confined {
+            return;
+        }
+        self.warp_to(self.anchor);
+        self.unanswered_warps = self.unanswered_warps.saturating_add(1);
+        if self.unanswered_warps > WARPS_BEFORE_REANCHOR {
+            // The anchor is not a pixel this pointer can occupy, so no warp will ever report
+            // arriving there and the arm above will never fire: the pin warps for ever.
+            // Measured, with a rectangle whose centre lay outside the root window: eleven
+            // thousand upcalls a second, the queue overflowing, the pointer frozen in a corner
+            // and the keyboard still swallowed, for as long as the process lived. It can happen
+            // for real from a stale plane (a screen unplugged between the crossing and the
+            // acceptance), so the pin gives up on the point it was asked for and holds the
+            // nearest one the server will actually give it.
+            warn(&format!(
+                "the pointer cannot be held at {},{}; holding it at {},{} instead",
+                self.anchor.x, self.anchor.y, at.x, at.y
+            ));
+            self.anchor = at;
+            self.unanswered_warps = 0;
         }
     }
 
@@ -1258,16 +1299,29 @@ impl Backend {
             CaptureMode::Watch | CaptureMode::Swallow => {
                 if was_off {
                     self.select_raw(true);
-                    // Seeded from the server, and only here: while nothing is grabbed
-                    // the server's own state IS the truth, and once this backend
-                    // swallows, a modifier the user is holding never reaches it.
-                    self.read_state();
                 }
                 if mode == CaptureMode::Swallow {
                     self.grab();
                 } else {
                     self.ungrab();
                 }
+                // Seeded from the server whenever nothing is grabbed, because then the
+                // server's own state IS the truth. It used to happen only on the way out of
+                // Off, which left one hole: an event lost at the moment a grab goes away (the
+                // ungrab is not synchronous, so the last events under it can be discarded) can
+                // be the RELEASE of a modifier, and a bit left set there stays set for the
+                // life of the process, mis-levelling every symbol reported afterwards and
+                // quietly stopping the edge crossings the engine gates on the modifiers.
+                if mode == CaptureMode::Watch {
+                    self.read_state();
+                }
+                // Nothing carries over from the last mode: a sub-pixel remainder of an
+                // unaccelerated delta must not be spent as the first accelerated pixel, and a
+                // fraction of a notch must not become the next session's first scroll.
+                self.pending_dx = 0;
+                self.pending_dy = 0;
+                self.wheel_x = 0;
+                self.wheel_y = 0;
             }
         }
     }
@@ -1313,10 +1367,10 @@ impl Backend {
     /// serializes the device at offset zero of a `Vec`, which the allocator aligns.
     ///
     /// The core requests are not a downgrade. `GrabKeyboard` and `GrabPointer` deliver the
-    /// device's events to the GRAB WINDOW and to nobody else, and this backend selects
-    /// nothing on that window, so the events are discarded: that is exactly what swallowing
-    /// is, and the live suite proves it against a second client whose focused window stops
-    /// receiving keys. The pointer grab's event mask is empty for the same reason.
+    /// device's events to the GRAB WINDOW and to nobody else, which is exactly what
+    /// swallowing is, and the live suite proves it against a second client whose focused
+    /// window stops receiving keys. What the grab delivers to THIS client is what the mask
+    /// below asks for, and that is the only observation a swallowing backend gets.
     ///
     /// # The pointer mask is not optional, and finding that out cost a measurement
     ///
@@ -1398,6 +1452,11 @@ impl Backend {
             // mode") and this machine would report that it is swallowing while every
             // keystroke acted locally and remotely at once.
             self.mode = CaptureMode::Watch;
+            // No pin either. The engine will lift it when it reads the `CaptureLost` below,
+            // but until it does, a confinement left set here has the raw path warping the
+            // pointer back to an anchor for a session that does not exist.
+            self.confine = None;
+            self.last_core = None;
             self.emit(BackendEvent::CaptureLost(CaptureLoss::Broken));
             return;
         }
@@ -1437,14 +1496,26 @@ impl Backend {
 
     fn set_confine(&mut self, rect: Option<Rect>) {
         self.confine = rect;
-        if let Some(rect) = rect {
-            self.anchor = Point {
-                x: rect.x.saturating_add(rect.w / 2),
-                y: rect.y.saturating_add(rect.h / 2),
-            };
-            // The centre, so a single event's movement has half a monitor of room
-            // before the server's own clamp at the screen edge could eat part of it.
-            self.warp_to(self.anchor);
+        self.unanswered_warps = 0;
+        match rect {
+            Some(rect) => {
+                self.anchor = Point {
+                    x: rect.x.saturating_add(rect.w / 2),
+                    y: rect.y.saturating_add(rect.h / 2),
+                };
+                // The centre, so a single event's movement has half a monitor of room
+                // before the server's own clamp at the screen edge could eat part of it.
+                self.warp_to(self.anchor);
+                // Where the warp is about to put it, so the first movement of the session is
+                // measured from the anchor and not from wherever the pointer was before.
+                self.last_core = Some(self.anchor);
+            }
+            // Forgotten, and this is not tidiness. `bring_home` lifts the pin and then warps
+            // the pointer home, as two separate commands: a position remembered across those
+            // two would make the home warp read as half a screen of movement, which the engine
+            // would hand to the crossing graph as a hand travelling back past the edge it just
+            // came home from, and that can restart the session that just ended.
+            None => self.last_core = None,
         }
         let _ = self.conn.flush();
     }
@@ -2169,9 +2240,11 @@ impl Backend {
             // Raw events can be observed but not consumed; swallowing is the device
             // grab, which is the same extension.
             swallow: observe,
-            // The two part promise: the pin is a grab plus a warp to an anchor, and
-            // the OS native relative source is the raw valuators. Both are XInput2,
-            // and neither works without the ability to warp, which is core.
+            // The two part promise: the pin is a grab plus a warp to an anchor, and the OS
+            // native relative source is the raw valuators while watching and the difference
+            // of the positions the grab reports while swallowing (truth 8's exception). Both
+            // rest on XInput2 being there, and neither works without the ability to warp,
+            // which is core.
             confine: observe,
             warp: true,
             inject_keys: inject,
@@ -2504,6 +2577,7 @@ pub fn create() -> Result<crate::os::Created, Unsupported> {
         errors: 0,
         engine_gone: false,
         last_core: None,
+        unanswered_warps: 0,
         gone_seen: false,
     };
     // Read before the handle is handed over, so the first `capabilities()` the engine

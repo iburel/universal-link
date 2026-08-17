@@ -1216,28 +1216,34 @@ W stuck down, or a Control, for the rest of the session.
    driven is not capturing (section 4, rule 3). Anything that changes that
    rule owes echo suppression a different mechanism, and this is the note
    that says so.
-4. **On X11 the only OS-native relative source under a confining grab is
-   `XI_RawMotion`, whose valuators are UNACCELERATED device deltas.** So the
-   pointer will feel materially different while driving than while local, on
-   the one platform where "mixing a 4K at 100% with a Retina at 200% does not
-   change how the mouse feels" is actually checked. #125 has to choose, and
-   name its choice: apply the device's own acceleration profile, or use
-   `XI_Motion` deltas against the confining window and accept its clamp.
+4. **On X11 the relative source is not the same one in both modes, and the
+   platform decides which.** The design believed `XI_RawMotion`'s valuators
+   (UNACCELERATED device deltas) were the only OS-native relative source under a
+   confining grab, and asked #125 to choose between them and an accelerated
+   difference of positions. The choice turned out not to be available: under a
+   grab the raw valuators are not delivered to the grabbing client at all (truth
+   9 below, measured), so watching reads the raw deltas and driving reads the
+   difference of the positions the grab reports, which is the ACCELERATED
+   movement and is the same thing Windows gets for free (truth 7). The pointer
+   therefore feels the way the machine's own pointer feels while driving, on the
+   one platform where "mixing a 4K at 100% with a Retina at 200% does not change
+   how the mouse feels" is actually checked.
 
-   **#125 chose the raw valuators and then the platform overruled it**, which
-   is worth reading in that order because the first half was implemented and
-   shipped in a review before the second half was measured. The raw valuators
-   are what the backend reads while it only WATCHES. While it SWALLOWS it
-   cannot read them at all: a grabbed device's events go to the grab, and a raw
-   event has no core form to convert into, so the grabbing client gets nothing
-   (truth 9 below, measured). So the delta while driving is the difference of
-   the positions the grab reports, which is the ACCELERATED movement, the same
-   thing Windows gets for free from its hook (truth 7). The clamp the choice
-   was made to avoid is real and is bounded where it is paid: the difference is
-   taken against the pin's anchor at the centre of the screen, so one event
-   carries up to half a screen. Reading the device's acceleration profile out
-   of its XI2 properties and applying it to the raw valuators is a third option
-   and a ticket of its own.
+   Two things about the accelerated half are worth having written down, because
+   both were found by measurement rather than by reading. The difference has to
+   be taken between two REPORTED POSITIONS and never against the anchor: a warp
+   is queued rather than immediate, so two motion events in one turn of the pump
+   would each measure their distance from the anchor and the movement of each
+   would be counted once per event still to come (measured at 360 reported
+   pixels for 80 real ones in a burst of eight). And a `WarpPointer` generates a
+   motion event even when it changes nothing, so the pin has to recognise its own
+   warp arriving, and has to give up on an anchor the server will not accept: a
+   rectangle whose centre lay outside the root window produced eleven thousand
+   upcalls a second with the pointer frozen in a corner. The clamp the original
+   choice was made to avoid is real and bounded: one event carries at most the
+   distance from the anchor at the centre of the screen to its edge. Reading the
+   device's acceleration profile out of its XI2 properties and applying it to
+   the raw valuators is a third option and a ticket of its own.
 5. **`CGWarpMouseCursorPosition` suppresses local mouse events for about
    250 ms** unless it is followed by
    `CGAssociateMouseAndMouseCursorPosition(true)` (or

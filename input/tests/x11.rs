@@ -238,6 +238,15 @@ impl Peer {
     }
 
     fn fake_move(&self, dx: i16, dy: i16) {
+        self.fake_move_unflushed(dx, dy);
+        self.flush();
+    }
+
+    /// The same, without the flush, so a caller can put several of them on the wire at once
+    /// and have the server generate them as a BURST. That is what a real mouse at 1000 Hz
+    /// looks like to a pump that turns at 125, and it is the case the pin's arithmetic used to
+    /// get wrong.
+    fn fake_move_unflushed(&self, dx: i16, dy: i16) {
         self.conn.send_request(&xcb::xtest::FakeInput {
             r#type: 6,
             detail: 1,
@@ -247,6 +256,9 @@ impl Peer {
             root_y: dy,
             deviceid: 0,
         });
+    }
+
+    fn flush(&self) {
         let _ = self.conn.flush();
     }
 
@@ -749,11 +761,19 @@ async fn a_confined_pointer_reports_a_delta_and_comes_back_to_its_anchor() {
     handle.capture(CaptureMode::Watch);
     handle.capture(CaptureMode::Swallow);
     handle.confine(Some(rect));
-    // Settled, so the grab and the pin are certainly installed, and then everything the
-    // channel holds from before them is thrown away: what this test asserts is that a
-    // FRESH device move is observed while grabbed and confined.
+    // Settled, and then everything the channel holds from before the grab is thrown away:
+    // what this test asserts is that a FRESH device move is observed while grabbed and
+    // confined. The drain also PROVES the grab, which the sleep alone did not: a grab that
+    // fails reports `CaptureLost` and puts the mode back to Watch, and every assertion below
+    // would then pass through the raw path and prove nothing about a swallowing backend.
     thread::sleep(Duration::from_millis(400));
-    while events.try_recv().is_ok() {}
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(event, BackendEvent::CaptureLost(_)),
+            "the grab did not take, so nothing below would be about a grabbed backend: \
+             {event:?}"
+        );
+    }
     let mut at_anchor = false;
     let start = std::time::Instant::now();
     while start.elapsed() < DEADLINE && !at_anchor {
@@ -794,6 +814,34 @@ async fn a_confined_pointer_reports_a_delta_and_comes_back_to_its_anchor() {
         peer.pointer()
     );
 
+    // A BURST, which is the case the pin's arithmetic gets wrong if it measures each event
+    // against the anchor instead of against the last position it saw. Eight moves of ten
+    // pixels in ONE flush arrive together, and the sum of what the engine is told has to be
+    // the eighty pixels the hand moved: differencing against the anchor reported 360, because
+    // the warp between them is queued rather than immediate, so every event still to come
+    // counted the movement again.
+    while events.try_recv().is_ok() {}
+    for _ in 0..8 {
+        peer.fake_move_unflushed(10, 0);
+    }
+    peer.flush();
+    let mut sum = 0i32;
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_millis(1500) {
+        match wait_within(&mut events, Duration::from_millis(250), &mut |e| {
+            matches!(e, BackendEvent::Motion(_))
+        })
+        .await
+        {
+            Some(BackendEvent::Motion(m)) => sum += m.dx,
+            _ => break,
+        }
+    }
+    assert_eq!(
+        sum, 80,
+        "a burst of eight ten-pixel moves is eighty pixels of movement, not more"
+    );
+
     // Back to WATCHING, which is where a machine goes when a session ends, and the
     // observation has to come back with it: the two modes read two different streams, so a
     // backend that swallowed once and then watched with nothing arriving would let a person
@@ -819,7 +867,26 @@ async fn a_confined_pointer_reports_a_delta_and_comes_back_to_its_anchor() {
         "after the session, watching must observe movement again"
     );
 
+    // Pinned once more, so that the release below has something to release. Without this the
+    // assertion that follows was vacuous: the block above leaves the pointer away from the
+    // anchor with no pin, so "it moved" was already true before anything was released.
+    handle.confine(Some(rect));
+    assert!(
+        wait_until(DEADLINE, || peer.pointer() == Some(anchor)),
+        "the pin goes back on: {:?}",
+        peer.pointer()
+    );
+    // One move, and then the wait: asking "did it move and is it back" in one closure is a
+    // race against the warp rather than a test of it.
+    peer.fake_move(11, 0);
+    assert!(
+        wait_until(DEADLINE, || peer.pointer() == Some(anchor)),
+        "and while it holds, a device move ends back at the anchor: {:?}",
+        peer.pointer()
+    );
+
     // Released, and the pointer is free again.
+    handle.confine(None);
     handle.capture(CaptureMode::Off);
     assert!(
         wait_until(DEADLINE, || {
@@ -827,6 +894,85 @@ async fn a_confined_pointer_reports_a_delta_and_comes_back_to_its_anchor() {
             peer.pointer().is_some_and(|p| p != anchor)
         }),
         "after the release the pointer must move again"
+    );
+
+    session.close();
+}
+
+/// A pin whose anchor the server will not accept must give up on the anchor, not warp for
+/// ever.
+///
+/// The pointer cannot be put outside the root window (nor outside every CRTC), so a warp
+/// there lands somewhere else, and a warp generates a motion event even when it changes
+/// nothing: the pin then measures a movement, warps again, and the two feed each other. It
+/// was measured at eleven thousand upcalls a second with the pointer frozen in a corner, the
+/// queue overflowing and the keyboard still swallowed, for as long as the process lived. It is
+/// reachable for real from a stale plane, so it is bounded and it is tested.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pin_whose_anchor_no_pointer_can_reach_gives_up_on_the_anchor() {
+    let _guard = X_LOCK.lock().await;
+    let (mut session, mut events) = skip_if_no_x!(spawn_backend!());
+    let handle = session.handle().clone();
+    let caps = handle.capabilities();
+    if !caps.confine || !caps.inject_pointer {
+        eprintln!("skipping: this server cannot both grab and fake input: {caps:?}");
+        return;
+    }
+    let peer = Peer::new().expect("a second connection to the same server");
+
+    handle.capture(CaptureMode::Swallow);
+    // A rectangle far off the screen, so its centre is a point no pointer can occupy.
+    handle.confine(Some(Rect {
+        x: 20_000,
+        y: 20_000,
+        w: 200,
+        h: 200,
+    }));
+    thread::sleep(Duration::from_millis(400));
+    while events.try_recv().is_ok() {}
+
+    // One real movement, which is all it takes to start the chain. What is measured after it
+    // is this PROCESS's cpu time, because the loop is what has to stop: the backend runs on a
+    // thread of the test's own process, and with the deltas correctly measured between two
+    // reported positions the warp storm reports nothing at all, so counting upcalls cannot see
+    // it. A pump that has given up is idle; a pump that is warping itself is a busy core.
+    peer.fake_move(10, 0);
+    let before = cpu_time();
+    thread::sleep(Duration::from_millis(1000));
+    let spent = cpu_time().saturating_sub(before);
+    let mut upcalls = 0usize;
+    while events.try_recv().is_ok() {
+        upcalls += 1;
+    }
+    assert!(
+        spent < Duration::from_millis(300),
+        "the pin is warping itself: {spent:?} of cpu in one idle second, {upcalls} upcalls"
+    );
+    assert!(
+        upcalls < 300,
+        "one movement produced {upcalls} upcalls: the pin is warping itself"
+    );
+
+    // And the backend is still there, still swallowing, and still answering: a bounded
+    // give-up is only worth anything if what comes after it works.
+    let Some((_, _, keycode)) = a_key_nothing_binds(&handle).await else {
+        eprintln!("skipping the rest: this keymap has none of the keys this test presses");
+        session.close();
+        return;
+    };
+    let mut alive = None;
+    let start = std::time::Instant::now();
+    while start.elapsed() < DEADLINE && alive.is_none() {
+        peer.fake_key(keycode, true);
+        peer.fake_key(keycode, false);
+        alive = wait_within(&mut events, Duration::from_millis(200), &mut |e| {
+            matches!(e, BackendEvent::Key(_))
+        })
+        .await;
+    }
+    assert!(
+        alive.is_some(),
+        "the loop is still pumping and the capture still works after giving up"
     );
 
     session.close();
@@ -1213,8 +1359,46 @@ async fn a_wheel_notch_travels_as_a_notch_and_not_as_a_button() {
         }),
         "a notch down while swallowing is one notch down"
     );
+    // And NOTHING behind it. Taking the first upcall and stopping there would pass just as
+    // happily if the release also carried a notch, or if both streams had delivered the same
+    // one: the assertion is that one notch of the wheel is one notch on the wire.
+    assert!(
+        wait_within(&mut events, Duration::from_millis(300), &mut |e| matches!(
+            e,
+            BackendEvent::Wheel { .. } | BackendEvent::Button { .. }
+        ))
+        .await
+        .is_none(),
+        "one notch is one upcall and never two, and never a button"
+    );
 
     session.close();
+}
+
+/// This process's cpu time, user plus system, for the one assertion that has to be about a
+/// loop rather than about an event: the backend's pump runs on a thread of this process, so a
+/// spin shows up here and nowhere else.
+fn cpu_time() -> Duration {
+    let ticks_per_second = 100u64; // `sysconf(_SC_CLK_TCK)`, 100 on every Linux this runs on.
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    // The comm field can contain spaces and parentheses, so the fields are counted from the
+    // LAST ')' rather than from the start.
+    let tail = match stat.rfind(')') {
+        Some(at) => &stat[at + 1..],
+        None => return Duration::ZERO,
+    };
+    let fields: Vec<&str> = tail.split_whitespace().collect();
+    // After the comm and its state, utime is field 14 of the whole line and stime is 15, which
+    // is index 11 and 12 here.
+    let ticks: u64 = fields
+        .get(11)
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+        + fields
+            .get(12)
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+    Duration::from_millis(ticks * 1000 / ticks_per_second)
 }
 
 /// Waits for a condition the server answers, bounded.
