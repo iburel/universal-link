@@ -57,20 +57,21 @@
 //! a truth rediscovered at a desk costs a week and a truth written down costs a
 //! paragraph.
 //!
-//! 4. **A relative delta taken under confinement on X11 is UNACCELERATED.** The
-//!    only OS-native relative source available under a confining grab is
-//!    `XI_RawMotion`, whose valuators are the raw device deltas with no pointer
-//!    acceleration profile applied. Truth 1 says the deltas must come from there;
-//!    the consequence, which truth 1 does not say, is that the pointer will feel
-//!    MATERIALLY DIFFERENT while driving than while local, on the one platform
-//!    where "it does not change how the mouse feels" is a thing anyone checks. A
-//!    backend has two honest choices and must make one on purpose: apply the
-//!    device's own acceleration profile to the raw valuators (correct, and the
-//!    profile has to be read from the device's XI2 properties), or use
-//!    `XI_Motion`'s deltas against the confine window and accept that the deltas
-//!    clamp at the window's edge when the hand outruns the pin. Nothing else on
-//!    this seam has to change either way: the engine consumes [`Motion::dx`] and
-//!    [`Motion::dy`] and asks no questions.
+//! 4. **On X11 the relative source is not the same one in both modes, and the
+//!    platform decides which.** `XI_RawMotion`'s valuators are the raw device
+//!    deltas with no acceleration profile applied, and they are what an X11 backend
+//!    reads while it only watches. Under a GRAB it gets nothing from them: a
+//!    grabbed device's events go to the grab, and a raw event has no core form to
+//!    convert into, so the grabbing client is the one client that stops receiving
+//!    them (measured in #125 as zero upcalls for eighteen faked events, and the
+//!    same measurement is the reason the grabs there carry an event mask). So while
+//!    swallowing, the delta is the difference of the positions the grab reports:
+//!    the ACCELERATED movement, which is what Windows gets for free from its hook
+//!    (truth 7), bounded by the pin's anchor being at the centre of the screen so
+//!    one event carries up to half a screen. Applying the device's own acceleration
+//!    profile to the raw valuators instead is a third option and a ticket of its
+//!    own. Nothing on this seam changes either way: the engine consumes
+//!    [`Motion::dx`] and [`Motion::dy`] and asks no questions.
 //! 5. **`CGWarpMouseCursorPosition` suppresses local mouse events for about
 //!    250 ms** unless it is followed by
 //!    `CGAssociateMouseAndMouseCursorPosition(true)`, or unless

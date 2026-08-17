@@ -620,8 +620,28 @@ async fn watching_lets_a_focused_window_see_the_key_and_swallowing_does_not() {
 
     // Swallowing: it does not.
     handle.capture(CaptureMode::Swallow);
-    // The grab is taken by the loop, so wait until the backend itself proves it is in
-    // place by reporting a key it had to be capturing to see.
+    // The GRAB first, proved by the witness going quiet, and only then the observation.
+    // This order is the point, and the version that had it the other way round passed for
+    // a bad reason: the raw event it waited for could have been generated before the
+    // server processed the grab request, so it proved nothing about the grabbed state. It
+    // hid a real bug for exactly as long as it existed. A grab taken with
+    // `owner_events: false` silences this backend's own capture completely, and only a
+    // FRESH event, observed after the witness has stopped hearing anything, can tell that
+    // apart from a working one.
+    let mut grabbed = false;
+    let start = std::time::Instant::now();
+    while start.elapsed() < DEADLINE && !grabbed {
+        peer.drain();
+        peer.fake_key(keycode, true);
+        peer.fake_key(keycode, false);
+        grabbed = !peer.focused_saw_a_key(Duration::from_millis(200));
+    }
+    assert!(
+        grabbed,
+        "the grab must reach the server: the focused window is still receiving keys"
+    );
+    // Everything the channel already holds is from before the grab, and none of it counts.
+    while events.try_recv().is_ok() {}
     let mut ours = None;
     let start = std::time::Instant::now();
     while start.elapsed() < DEADLINE && ours.is_none() {
@@ -721,8 +741,19 @@ async fn a_confined_pointer_reports_a_delta_and_comes_back_to_its_anchor() {
         y: rect.y + rect.h / 2,
     };
 
+    // Through WATCH and then Swallow, which is the sequence a real session takes (a warm
+    // peer puts this machine in Watch and the crossing puts it in Swallow) and which is
+    // not the same thing as going straight to Swallow. It is the sequence that found the
+    // grab silencing this backend's own capture, because going straight there let a raw
+    // event generated before the grab satisfy the assertion below.
+    handle.capture(CaptureMode::Watch);
     handle.capture(CaptureMode::Swallow);
     handle.confine(Some(rect));
+    // Settled, so the grab and the pin are certainly installed, and then everything the
+    // channel holds from before them is thrown away: what this test asserts is that a
+    // FRESH device move is observed while grabbed and confined.
+    thread::sleep(Duration::from_millis(400));
+    while events.try_recv().is_ok() {}
     let mut at_anchor = false;
     let start = std::time::Instant::now();
     while start.elapsed() < DEADLINE && !at_anchor {

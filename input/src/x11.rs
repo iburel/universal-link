@@ -39,22 +39,27 @@
 //!    never sees it. `XI_RawMotion` and friends are delivered to every client that
 //!    selected them ON THE ROOT and are not propagated or intercepted, which is why
 //!    #123 could measure XTEST to raw capture at 81 microseconds with nothing missed.
-//! 2. **The raw valuators are UNACCELERATED device deltas**, and this backend uses
-//!    them as they are. That is truth 4 of the seam, which asked #125 to choose and to
-//!    name its choice: the pointer feels linear while driving rather than following
-//!    this machine's acceleration profile. The alternative was to difference the cooked
-//!    position, which is accelerated and is what the Windows backend gets for free, and
-//!    it was rejected here because on X11 the cooked position is CLAMPED to the screen
-//!    and pinned by this backend, so its difference is zero exactly when the hand moves
-//!    fastest. Reading the device's own acceleration profile out of its XI2 properties
-//!    and applying it by hand is the third option, and it is a ticket of its own rather
-//!    than a line of this one.
+//! 2. **The delta comes from a different place in each mode, and the platform decides
+//!    which.** While this backend only WATCHES, it reads the raw XInput2 valuators,
+//!    which are UNACCELERATED device deltas. While it SWALLOWS, it cannot read them at
+//!    all (see truth 8), so it differences the position the grab reports, which is the
+//!    ACCELERATED movement, the same thing the Windows backend gets for free from its
+//!    hook. That is truth 4 of the seam, which asked #125 to choose and to name its
+//!    choice, and on this platform the choice turned out to be made by what a grab will
+//!    and will not deliver: the pointer feels the way this machine's own pointer feels
+//!    while driving. The cost is stated where it is paid (`on_core_motion`): a
+//!    difference against the pin's anchor carries at most half a screen of movement per
+//!    event before the server's own clamp eats the rest, which at 125 events a second is
+//!    a hand nobody has. Reading the device's acceleration profile out of its XI2
+//!    properties and applying it to the raw valuators is a third option and a ticket of
+//!    its own rather than a line of this one.
 //! 3. **A grab redirects events, it does not stop the pointer moving.** So swallowing
-//!    and pinning are two separate mechanisms: `XiGrabDevice` with `GrabOwner::NoOwner`
-//!    is what keeps the source's own input from acting locally, and a `WarpPointer`
-//!    back to an anchor on every raw motion is what keeps the pointer on this desktop.
-//!    A warp generates no raw event (no device moved), so the two do not feed each
-//!    other.
+//!    and pinning are two separate mechanisms: the core `GrabKeyboard` and `GrabPointer`
+//!    with `owner_events: false` are what keep the source's own input from acting
+//!    locally, and a `WarpPointer` back to an anchor on every motion is what keeps the
+//!    pointer on this desktop. A warp generates no raw event (no device moved) and the
+//!    core motion it does generate is measured against the anchor it warped TO, so the
+//!    two do not feed each other.
 //! 4. **The core keyboard mapping cannot be read unambiguously, and XKB can.** The
 //!    core protocol says the first four keysyms of a keycode are "group 1 levels 1 and
 //!    2, group 2 levels 1 and 2", and an XKB server synthesises that list as
@@ -84,17 +89,27 @@
 //!    against the server's own keymap rather than trusting it: every usage in the table
 //!    is resolved and the keysym the server reports for the resulting keycode is
 //!    compared with the one the usage means.
-//! 8. **A grab does not stop the raw events, and it does not hide an injection
-//!    either.** Measured with a second client on the same server: a client that has
-//!    selected `XI_RawKeyPress` on the root keeps receiving keys while another client
-//!    holds a keyboard grab, which is the opposite of what the obvious reading of the
-//!    XInput2 specification suggests. That is why the swallow is proved against a
+//! 8. **A grab does not stop ANOTHER client's raw events, and it does not hide an
+//!    injection either.** Measured with a second client on the same server: a client
+//!    that has selected `XI_RawKeyPress` on the root keeps receiving keys while another
+//!    client holds a keyboard grab, which is the opposite of what the obvious reading of
+//!    the XInput2 specification suggests. That is why the swallow is proved against a
 //!    FOCUSED WINDOW (which does stop receiving keys) rather than against a raw
 //!    watcher, and it is also why this backend hears its own XTEST injections come
 //!    back: X11 offers no `dwExtraInfo` to mark them with. In v1 nothing needs it to
 //!    (a machine being driven is not capturing, D15), and there IS a mechanism when
 //!    something does: a raw event's `source` device is the XTEST virtual device, which
 //!    a real keyboard's never is.
+//!
+//!    The GRABBING client is the exception, and it is the sharpest thing in this file:
+//!    while a device is grabbed the server hands its events to the grab rather than to
+//!    the ordinary selections, and a raw event has no core form to convert into, so
+//!    while this backend holds its grabs it receives NO raw events at all. Measured, not
+//!    reasoned: a Watch to Swallow transition followed by six faked moves and twelve
+//!    faked keys produced zero upcalls. That is why the grabs carry an event mask and why
+//!    `on_event` reads the core stream while grabbed and the raw stream while watching
+//!    ([`Backend::grab`] has the whole measurement), and it is why two live tests now
+//!    prove the grab is installed before they look for anything.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -765,6 +780,9 @@ struct Backend {
     engine_gone: bool,
     /// Whether that has already been seen once.
     gone_seen: bool,
+    /// The last pointer position a GRABBED pointer reported, so an unpinned grab still
+    /// produces a movement rather than a position (see `on_core_motion`).
+    last_core: Option<Point>,
 }
 
 impl Backend {
@@ -965,12 +983,62 @@ impl Backend {
 
     fn on_event(&mut self, event: xcb::Event) {
         match event {
-            xcb::Event::Input(xinput::Event::RawMotion(ev)) => self.on_raw_motion(&ev),
-            xcb::Event::Input(xinput::Event::RawKeyPress(ev)) => self.on_raw_key(&ev, true),
-            xcb::Event::Input(xinput::Event::RawKeyRelease(ev)) => self.on_raw_key(&ev, false),
-            xcb::Event::Input(xinput::Event::RawButtonPress(ev)) => self.on_raw_button(&ev, true),
+            // The RAW stream, which is what arrives while this backend only WATCHES.
+            // Ignored while grabbed, and that is not belt and braces: a server that
+            // delivered both streams at once would report every movement twice.
+            xcb::Event::Input(xinput::Event::RawMotion(ev)) => {
+                if !self.grabbed {
+                    self.on_raw_motion(&ev);
+                }
+            }
+            xcb::Event::Input(xinput::Event::RawKeyPress(ev)) => {
+                if !self.grabbed {
+                    self.on_raw_key(&ev, true);
+                }
+            }
+            xcb::Event::Input(xinput::Event::RawKeyRelease(ev)) => {
+                if !self.grabbed {
+                    self.on_raw_key(&ev, false);
+                }
+            }
+            xcb::Event::Input(xinput::Event::RawButtonPress(ev)) => {
+                if !self.grabbed {
+                    self.on_raw_button(&ev, true);
+                }
+            }
             xcb::Event::Input(xinput::Event::RawButtonRelease(ev)) => {
-                self.on_raw_button(&ev, false)
+                if !self.grabbed {
+                    self.on_raw_button(&ev, false);
+                }
+            }
+            // The CORE stream, which is what a GRAB delivers and the only thing a
+            // swallowing backend can see (truth 8's exception). The mode gate is the
+            // other half of the one above: outside a grab of ours these are events this
+            // backend never asked for.
+            xcb::Event::X(x::Event::KeyPress(ev)) => {
+                if self.grabbed {
+                    self.on_key(ev.detail(), true);
+                }
+            }
+            xcb::Event::X(x::Event::KeyRelease(ev)) => {
+                if self.grabbed {
+                    self.on_key(ev.detail(), false);
+                }
+            }
+            xcb::Event::X(x::Event::ButtonPress(ev)) => {
+                if self.grabbed {
+                    self.on_button(u32::from(ev.detail()), true);
+                }
+            }
+            xcb::Event::X(x::Event::ButtonRelease(ev)) => {
+                if self.grabbed {
+                    self.on_button(u32::from(ev.detail()), false);
+                }
+            }
+            xcb::Event::X(x::Event::MotionNotify(ev)) => {
+                if self.grabbed {
+                    self.on_core_motion(ev.root_x(), ev.root_y());
+                }
             }
             xcb::Event::Xkb(xkb::Event::StateNotify(ev)) => {
                 let group = ev.group() as u32;
@@ -1015,6 +1083,43 @@ impl Backend {
         }
     }
 
+    /// One pointer position from a grabbed pointer, turned into the movement it means.
+    ///
+    /// The delta is a DIFFERENCE of positions here and not a device delta, because a grab
+    /// is what makes the raw stream unavailable (truth 8's exception) and this is what the
+    /// grab hands over instead. Two consequences worth having written down. It is the
+    /// ACCELERATED movement, the same thing the Windows backend gets from its hook, so the
+    /// pointer feels the way this machine's own pointer feels rather than linear; that is
+    /// the choice the seam's truth 4 asked to be made on purpose, and on this platform it is
+    /// now made by what a grab will and will not deliver. And while the pin is in place the
+    /// difference is taken against the ANCHOR, which is where the last event's warp put the
+    /// cursor, so one event can carry at most half a screen of movement before the server's
+    /// own clamp eats the rest.
+    fn on_core_motion(&mut self, x: i16, y: i16) {
+        let (at, from) = (
+            Point {
+                x: i32::from(x),
+                y: i32::from(y),
+            },
+            match self.confine {
+                Some(_) => self.anchor,
+                None => self.last_core.unwrap_or(Point {
+                    x: i32::from(x),
+                    y: i32::from(y),
+                }),
+            },
+        );
+        self.last_core = Some(at);
+        let (dx, dy) = (at.x - from.x, at.y - from.y);
+        // Whole pixels already, so they go straight into the same accumulator the raw path
+        // uses: the fixed point shift keeps one arithmetic for both streams.
+        self.pending_dx = self.pending_dx.saturating_add(i64::from(dx) << 32);
+        self.pending_dy = self.pending_dy.saturating_add(i64::from(dy) << 32);
+        if self.confine.is_some() {
+            self.warp_to(self.anchor);
+        }
+    }
+
     /// The end of a turn: one motion upcall for everything the burst added up to.
     fn flush_motion(&mut self) {
         if self.pending_dx == 0 && self.pending_dy == 0 {
@@ -1040,11 +1145,15 @@ impl Backend {
     }
 
     fn on_raw_key(&mut self, ev: &xinput::RawKeyPressEvent, down: bool) {
+        self.on_key((ev.detail() & 0xFF) as u8, down);
+    }
+
+    /// One key, from whichever of the two streams this mode gets (see `on_event`).
+    fn on_key(&mut self, keycode: u8, down: bool) {
         // A key repeat is the OS repeating what is already held. The far side would
         // receive a press for a key it believes is down, and its held set would then
         // hold one entry for two presses; the release still matches, so this is
         // forwarded rather than dropped, exactly as a local application would see it.
-        let keycode = (ev.detail() & 0xFF) as u8;
         let usage = usage_of_keycode(keycode).unwrap_or(0);
         if let Some(bit) = keys::mod_of_usage(usage) {
             if down {
@@ -1085,7 +1194,11 @@ impl Backend {
     }
 
     fn on_raw_button(&mut self, ev: &xinput::RawButtonPressEvent, down: bool) {
-        let detail = ev.detail();
+        self.on_button(ev.detail(), down);
+    }
+
+    /// One button or wheel notch, from whichever of the two streams this mode gets.
+    fn on_button(&mut self, detail: u32, down: bool) {
         match detail {
             // X11 delivers the wheel as buttons: 4 up, 5 down, 6 left, 7 right. Only
             // the press carries the notch, so the release is dropped rather than
@@ -1196,14 +1309,38 @@ impl Backend {
     /// `XiSelectEvents` is the exception and is safe, because its `EventMaskBuf`
     /// serializes the device at offset zero of a `Vec`, which the allocator aligns.
     ///
-    /// The core requests are not a downgrade. `GrabKeyboard` and `GrabPointer` with
-    /// `owner_events: false` deliver the device's events to the GRAB WINDOW and to
-    /// nobody else, and this backend selects nothing on that window, so the events are
-    /// discarded: that is exactly what swallowing is, and the live suite proves it
-    /// against a second client whose focused window stops receiving keys. The pointer
-    /// grab's event mask is empty for the same reason. Meanwhile the raw XInput2 events
-    /// this backend actually reads keep arriving, because a grab does not affect them
-    /// (truth 8).
+    /// The core requests are not a downgrade. `GrabKeyboard` and `GrabPointer` deliver the
+    /// device's events to the GRAB WINDOW and to nobody else, and this backend selects
+    /// nothing on that window, so the events are discarded: that is exactly what swallowing
+    /// is, and the live suite proves it against a second client whose focused window stops
+    /// receiving keys. The pointer grab's event mask is empty for the same reason.
+    ///
+    /// # The pointer mask is not optional, and finding that out cost a measurement
+    ///
+    /// The mask used to be empty, on the reasoning that this backend reads the raw XInput2
+    /// stream and wants none of the events the grab takes away from everybody else. That
+    /// reasoning was wrong, and wrong in the worst possible place: while a device is
+    /// GRABBED the server hands its events to the grab rather than to the ordinary
+    /// selections, and a raw event has no core form to convert into, so a core grab drops
+    /// it entirely. Measured on an Xvfb after a Watch to Swallow transition, which is the
+    /// sequence a real session takes: six faked pointer moves and twelve faked keys
+    /// produced ZERO upcalls. The capture died at the exact moment a session started, and
+    /// two live tests passed anyway because the one event each waited for had been
+    /// generated before the server processed the grab request.
+    ///
+    /// So while grabbed this backend reads the CORE events the grab delivers (this mask,
+    /// plus the key events `GrabKeyboard` reports by definition), and while only watching it
+    /// reads the raw stream, which is the only thing that works THERE because a core mask
+    /// on the root is subject to propagation (truth 1). `on_event` gates the two on
+    /// `grabbed` so nothing is ever counted twice, and `on_core_motion` says what the
+    /// difference costs: the movement becomes the accelerated one, which is what the
+    /// Windows backend gets from its hook and is the choice the seam's truth 4 asked to be
+    /// made deliberately.
+    ///
+    /// `owner_events: false` stays, and now it is the whole swallow rather than half of it:
+    /// every pointer and key event goes to the grab window and to nobody else. The live
+    /// suite proves the grab is in place BEFORE it looks for an upcall, and drains
+    /// everything older, so neither half can pass by that race again.
     fn grab(&mut self) {
         if self.grabbed {
             return;
@@ -1218,9 +1355,13 @@ impl Backend {
         let pointer = self.conn.send_request(&x::GrabPointer {
             owner_events: false,
             grab_window: self.root,
-            // Nothing: the events this grab would deliver are the ones being taken
-            // away from everybody else, and this backend reads the raw stream instead.
-            event_mask: x::EventMask::empty(),
+            // NOT empty, and this mask is the swallowing backend's only source of
+            // observation: while the pointer is grabbed the server hands its events to
+            // this grab instead of to the raw selection, so an empty mask is a session
+            // that sees nothing at all (see this function's own documentation).
+            event_mask: x::EventMask::POINTER_MOTION
+                | x::EventMask::BUTTON_PRESS
+                | x::EventMask::BUTTON_RELEASE,
             pointer_mode: x::GrabMode::Async,
             keyboard_mode: x::GrabMode::Async,
             confine_to: x::WINDOW_NONE,
@@ -1258,6 +1399,9 @@ impl Backend {
             return;
         }
         self.grabbed = true;
+        // Nothing carries over from the last grab: the first position a new one reports is
+        // where the pointer IS, not a movement from wherever it was left.
+        self.last_core = None;
         // The pointer is about to sit on one pixel for the whole session; hiding it is
         // what makes that invisible rather than odd. XFixes counts this per client, so
         // the server restores the cursor by itself if this process dies.
@@ -1270,6 +1414,7 @@ impl Backend {
     }
 
     fn ungrab(&mut self) {
+        self.last_core = None;
         if self.grabbed {
             self.conn.send_request(&x::UngrabKeyboard {
                 time: x::CURRENT_TIME,
@@ -2355,6 +2500,7 @@ pub fn create() -> Result<crate::os::Created, Unsupported> {
         dropped: 0,
         errors: 0,
         engine_gone: false,
+        last_core: None,
         gone_seen: false,
     };
     // Read before the handle is handed over, so the first `capabilities()` the engine

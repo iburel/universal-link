@@ -1224,13 +1224,20 @@ W stuck down, or a Control, for the rest of the session.
    name its choice: apply the device's own acceleration profile, or use
    `XI_Motion` deltas against the confining window and accept its clamp.
 
-   **#125 chose the raw valuators, unmodified**, and the reason is the other
-   half of the same fact: on X11 the cooked position is what this backend
-   PINS, so its difference is zero exactly when the hand is moving fastest,
-   which is the failure truth 1 exists to prevent. Reading the device's own
-   acceleration profile out of its XI2 properties and applying it by hand is
-   the third option and is a ticket of its own. Windows needed no such choice
-   and got the better answer for free (truth 7).
+   **#125 chose the raw valuators and then the platform overruled it**, which
+   is worth reading in that order because the first half was implemented and
+   shipped in a review before the second half was measured. The raw valuators
+   are what the backend reads while it only WATCHES. While it SWALLOWS it
+   cannot read them at all: a grabbed device's events go to the grab, and a raw
+   event has no core form to convert into, so the grabbing client gets nothing
+   (truth 9 below, measured). So the delta while driving is the difference of
+   the positions the grab reports, which is the ACCELERATED movement, the same
+   thing Windows gets for free from its hook (truth 7). The clamp the choice
+   was made to avoid is real and is bounded where it is paid: the difference is
+   taken against the pin's anchor at the centre of the screen, so one event
+   carries up to half a screen. Reading the device's acceleration profile out
+   of its XI2 properties and applying it to the raw valuators is a third option
+   and a ticket of its own.
 5. **`CGWarpMouseCursorPosition` suppresses local mouse events for about
    250 ms** unless it is followed by
    `CGAssociateMouseAndMouseCursorPosition(true)` (or
@@ -1270,17 +1277,29 @@ W stuck down, or a Control, for the rest of the session.
    on that host, and would have typed a whole session into nothing while
    reporting success. This is the sharpest example there is of the difference
    between "best effort" and "best effort that lies".
-9. **On X11 a grab does not stop the raw events.** Measured with a second
-   client on the same server: a client that has selected `XI_RawKeyPress` on
-   the root keeps receiving keys while another client holds a keyboard grab,
-   which is the opposite of what the obvious reading of the XInput2
-   specification suggests. Two consequences. The swallow has to be proved
-   against a FOCUSED WINDOW, which does stop receiving keys, and that is what
-   #125's live suite does. And an X11 backend hears its own XTEST injections
-   come back, because X11 offers no `dwExtraInfo` to mark them with; v1 does
-   not need it to (rule 3 again), and when something does, a raw event's
-   `source` device is the XTEST virtual device, which a real keyboard's never
-   is.
+9. **On X11 a grab does not stop ANOTHER client's raw events, and it stops the
+   grabbing client's own completely.** Both halves are measured with a second
+   client on the same server, and the second half is the sharpest thing #125
+   found. A client that has selected `XI_RawKeyPress` on the root keeps
+   receiving keys while another client holds a keyboard grab, which is the
+   opposite of what the obvious reading of the XInput2 specification suggests:
+   so the swallow has to be proved against a FOCUSED WINDOW, which does stop
+   receiving keys, and that is what the live suite does. But the GRABBING
+   client receives no raw events at all, because while a device is grabbed the
+   server hands its events to the grab instead of to the ordinary selections
+   and a raw event has no core form to convert into. A backend that grabs and
+   then waits for raw events observes NOTHING for the whole session: measured
+   as zero upcalls from six faked moves and twelve faked keys after a Watch to
+   Swallow transition, which is exactly the sequence a real session takes. So
+   the X11 backend gives its grabs an event mask and reads the CORE events
+   while grabbed, keeping the raw stream for watching, where a core mask would
+   be propagated away instead. That decides truth 4 above on this platform: the
+   delta is unaccelerated while watching and accelerated while driving, because
+   that is what a grab delivers, not because either was preferred. Finally, an
+   X11 backend hears its own XTEST injections come back, because X11 offers no
+   `dwExtraInfo` to mark them with; v1 does not need it to (rule 3 again), and
+   when something does, a raw event's `source` device is the XTEST virtual
+   device, which a real keyboard's never is.
 10. **A wheel notch is a different number on each of the three platforms, and
     one of them is not a fixed number at all.** Windows delivers the notch in
     `WHEEL_DELTA` units, which is 120 by definition, and X11 delivers it as a
