@@ -767,28 +767,31 @@ pub struct SpawnGrant {
     pub scopes: Vec<String>,
 }
 
-/// Which end of the data channel a `channel_token` opens.
+/// What a `channel_token` opens, and what the Core needs to serve it. A sum
+/// type rather than a flat record with optional fields: the kinds share the
+/// token machinery and nothing else, so each carries exactly its own means.
 pub enum ChannelKind {
-    /// Destination side: the component pulls (`transactions.open`).
-    Consumer,
-    /// Source side: the backend pushes an inline blob (`clipboard.get_data`).
-    Provider,
+    /// Destination side of a transaction: the component pulls
+    /// (`transactions.open`).
+    Consumer { tx_id: String },
+    /// Source side of a transaction: the backend pushes an inline blob
+    /// (`clipboard.get_data`). The sink is where the blob is forwarded to the
+    /// consumer's waiting `FETCH`.
+    Provider {
+        sink: mpsc::Sender<crate::datachannel::ProviderMsg>,
+    },
 }
 
-/// Rights carried by a `channel_token`: the transaction it opens, the direction,
-/// and the pid of the component it was minted for (peer-credential binding — the
-/// data connection carries no `hello`). Single-use, taken at the attach.
+/// Rights carried by a `channel_token`: what it opens, and the pid of the
+/// component it was minted for (peer-credential binding: the data connection
+/// carries no `hello`). Single-use, taken at the attach.
 pub struct ChannelGrant {
-    pub tx_id: String,
     pub kind: ChannelKind,
     pub pid: Option<u32>,
     /// The connection that owns this grant (the opener for a consumer, the
     /// announcer for a provider): reclaimed when it tears down, so a token that
     /// is never attached does not linger.
     pub conn_id: ConnId,
-    /// Where a provider channel forwards the backend's blob (the consumer's
-    /// `FETCH` holds the other end). `None` for a consumer grant.
-    pub sink: Option<mpsc::Sender<crate::datachannel::ProviderMsg>>,
 }
 
 /// An enrolled third-party component: the token persists beyond the connection.

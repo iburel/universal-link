@@ -1543,11 +1543,9 @@ impl Conn {
             .lock()
             .expect("lock registry")
             .mint_channel_token(crate::state::ChannelGrant {
-                tx_id,
-                kind: crate::state::ChannelKind::Consumer,
+                kind: crate::state::ChannelKind::Consumer { tx_id },
                 pid: self.peer.pid,
                 conn_id: self.conn_id,
-                sink: None,
             });
         Ok(json!({ "channel_token": token }))
     }

@@ -104,14 +104,10 @@ pub(crate) async fn run<R, W>(
         return;
     }
     match grant.kind {
-        ChannelKind::Consumer => serve_consumer(&state, reader, write, grant.tx_id).await,
+        ChannelKind::Consumer { tx_id } => serve_consumer(&state, reader, write, tx_id).await,
         // Provider: the backend pushes the inline blob it was asked for; we
         // forward it to the consumer that is waiting on the sink.
-        ChannelKind::Provider => {
-            if let Some(sink) = grant.sink {
-                serve_provider(reader, sink).await;
-            }
-        }
+        ChannelKind::Provider { sink } => serve_provider(reader, sink).await,
     }
 }
 
@@ -387,11 +383,9 @@ where
         // token is bound to its opener.
         let announcer_pid = reg.conns.get(&announcer).and_then(|e| e.pid);
         let token = reg.mint_channel_token(ChannelGrant {
-            tx_id: tx_id.to_string(),
-            kind: ChannelKind::Provider,
+            kind: ChannelKind::Provider { sink },
             pid: announcer_pid,
             conn_id: announcer,
-            sink: Some(sink),
         });
         let issued = reg.issue_request(
             announcer,
