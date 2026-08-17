@@ -198,7 +198,11 @@ pub struct PeerChannels {
     /// pipe from a past era never starts.
     era: u64,
     /// Why the last mass cut happened, so a pipe refused for being of a past era
-    /// gives its component the same word its siblings got.
+    /// gives its component the same word its siblings got. ONE slot, not one per
+    /// era: with two mass cuts inside a single attach grace (a logout then a
+    /// leave, say) the LATEST reason is reported, and that is the better answer
+    /// anyway - a component wants the state it is in now, not the first thing
+    /// that went wrong on the way there.
     era_reason: Option<&'static str>,
 }
 
@@ -612,6 +616,14 @@ pub(crate) async fn recv(
     // before attaching (each grant holds a clone; the last one going closes the
     // channel).
     drop(handoff);
+    // This wait happens in a data-plane handler, which is one of a bounded set
+    // (`MAX_PEER_TASKS`), and it is left there on purpose. In practice it is a
+    // local socket connect: sub-millisecond. It only becomes a real wait when a
+    // component holds the role and the scope and does not come, and a device of
+    // the account could hold slots that way (as it could with `peer_msg`'s
+    // linger, or with a paste session, which is the same accepted shape). The
+    // alternative, spawning it, trades a bounded handler set for an unbounded
+    // number of tasks a peer can create, which is a worse bargain.
     let arrival = tokio::time::timeout(ATTACH_GRACE, arrivals.recv())
         .await
         .ok()
