@@ -78,14 +78,21 @@ pub(crate) const SCOPE: &str = "peers.channel";
 /// this primitive: the channel dies rather than the Core growing its buffer.
 pub(crate) const MAX_FRAME: usize = 1024;
 
-/// Frames allowed per second, in either direction, over a fixed window. The
-/// highest rate this primitive was designed for is a 1000 Hz gaming mouse
-/// (measured in #123), so four times that is headroom no legitimate flow
-/// reaches and a runaway component cannot hide behind. A fixed window admits
-/// twice the cap across a window boundary; that is a deliberate simplification,
-/// the cap is a guardrail and not a scheduler.
+/// Frames allowed per second, in either direction. The highest rate this
+/// primitive was designed for is a 1000 Hz gaming mouse (measured in #123), so
+/// four times that is headroom no legitimate flow reaches and a runaway
+/// component cannot hide behind.
 const RATE_MAX_PER_WINDOW: u32 = 4000;
 const RATE_WINDOW: Duration = Duration::from_secs(1);
+/// Consecutive windows over the cap before the channel is cut, and it is TWO
+/// because one is not a rate at all: the frames counted here are the ones read
+/// off a socket, not the ones a sender emitted. A network stall backs a
+/// legitimate flow up in the local buffer, and the drain that follows is a burst
+/// far above the cap while the sender never left 1000 Hz. Cutting on that would
+/// blame a component for a network hiccup, which is exactly the kind of lie this
+/// feature exists to avoid. A backlog drains in one window; a runaway does not
+/// stop, so it fills the next one too.
+const RATE_STRIKES: u32 = 2;
 
 /// No frame in EITHER direction for this long and the channel is swept.
 ///
@@ -100,14 +107,24 @@ const RATE_WINDOW: Duration = Duration::from_secs(1);
 /// picks.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Whole-exchange budget for `peers.channel` (connect + one frame each way +
-/// the far end's attach): the house exchange norm, as `peers.send` uses.
-const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Budget for the DIAL alone, and it is 15 s for a precise reason rather than
+/// by analogy: the daemon's sized open (#88) spends up to 10 s connecting plus a
+/// 5 s hole-punching grace before it can say `NO_DIRECT_PATH`, and it sized
+/// those two against a 15 s caller. A channel declares itself over ANY cap, so
+/// it always takes that path on a capped deployment; a tighter budget here would
+/// fire mid-grace and turn the one refusal this primitive owes the user into a
+/// bare "offline".
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Budget for the frames, once connected: one out, one back, and the far end's
+/// wait for its own component in between ([`ATTACH_GRACE`]). Separate from the
+/// dial so neither has to be widened for the other's worst case.
+const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a minted `channel_token` waits for its second connection. On the
 /// receiving side it is also how long the far Core holds its answer, so it must
-/// stay comfortably under [`OPEN_TIMEOUT`]: a component that does not come is
-/// answered `COMPONENT_ABSENT` rather than left to the caller's timeout.
+/// stay comfortably under [`EXCHANGE_TIMEOUT`]: a component that does not come
+/// is answered `COMPONENT_ABSENT` rather than left to the caller's timeout.
 const ATTACH_GRACE: Duration = Duration::from_secs(5);
 
 /// How long a REFUSED opening is held after its answer, so the answer is not
@@ -190,6 +207,11 @@ struct Live {
     /// has already been replaced must not unregister its successor on the way
     /// out, so every removal compares the ordinal.
     id: u64,
+    /// The component that owns the local end. The pipe tells it why the channel
+    /// ended, so this copy exists for the one case the pipe cannot serve: a Core
+    /// stopping, which has to speak BEFORE the teardown closes that very
+    /// connection (see [`announce_stop`]).
+    conn_id: ConnId,
     cut: Arc<Cut>,
 }
 
@@ -221,7 +243,7 @@ impl Cut {
 impl PeerChannels {
     /// Registers a channel that is about to start piping, cutting whatever held
     /// the same pair, and returns the ordinal plus the cut order to obey.
-    fn register(&mut self, role: &str, device_id: &str) -> (u64, Arc<Cut>) {
+    fn register(&mut self, role: &str, device_id: &str, conn_id: ConnId) -> (u64, Arc<Cut>) {
         self.next_id += 1;
         let id = self.next_id;
         let cut = Arc::new(Cut {
@@ -232,6 +254,7 @@ impl PeerChannels {
             (role.to_string(), device_id.to_string()),
             Live {
                 id,
+                conn_id,
                 cut: cut.clone(),
             },
         );
@@ -256,6 +279,37 @@ impl PeerChannels {
         if self.live.get(&key).is_some_and(|live| live.id == id) {
             self.live.remove(&key);
         }
+    }
+}
+
+/// Tells every live channel's component that the Core is stopping, and does it
+/// BEFORE the teardown closes their connections. Without that ordering the word
+/// would be dead on arrival: a connection's write queue is drained in order and
+/// the drain STOPS at the close the teardown enqueues, so anything a pipe
+/// reported afterwards would never be written. The pipes are cut by
+/// [`cut_all`] a moment later, and their own report then lands in a queue
+/// nobody reads, which is harmless.
+pub(crate) fn announce_stop(state: &AppState) {
+    // Snapshot under the leaf lock, notify under the registry's: never both at
+    // once, and never in an order anything else takes them in.
+    let owners: Vec<(ConnId, String)> = {
+        let channels = state.peer_channels.lock().expect("lock peer_channels");
+        channels
+            .live
+            .iter()
+            .map(|((_role, device_id), live)| (live.conn_id, device_id.clone()))
+            .collect()
+    };
+    if owners.is_empty() {
+        return;
+    }
+    let reg = state.registry.lock().expect("lock registry");
+    for (conn_id, device_id) in owners {
+        reg.notify_conn(
+            conn_id,
+            "peer.channel_closed",
+            &json!({ "device_id": device_id, "reason": reason::SHUTDOWN }),
+        );
     }
 }
 
@@ -296,6 +350,9 @@ pub struct Parked {
 /// here it is the component's halves that travel.
 pub struct Joining {
     handoff: mpsc::Sender<Attached>,
+    /// The peer this offer names, so a candidate that loses the race can be
+    /// told which offer it lost.
+    device_id: String,
 }
 
 /// The local halves of an attached component, on their way to the handler that
@@ -309,18 +366,30 @@ struct Attached {
 impl Joining {
     /// Hands the attaching connection's halves to the waiting handler. Nothing
     /// is awaited: the handler is parked on a channel of capacity one, and a
-    /// full one means a sibling won the race, in which case these halves drop
-    /// and that connection closes.
-    pub fn hand_over<R, W>(&self, conn_id: ConnId, read: R, write: W)
+    /// full or closed one means this candidate lost, either to a sibling that
+    /// attached first or to the grace running out a moment earlier. It is told
+    /// so, rather than left to read a closed connection: an offer taken from
+    /// under a component is the same fact as a channel replaced.
+    pub fn hand_over<R, W>(&self, state: &AppState, conn_id: ConnId, read: R, write: W)
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let _ = self.handoff.try_send(Attached {
-            conn_id,
-            read: Box::new(read),
-            write: Box::new(write),
-        });
+        let handed = self
+            .handoff
+            .try_send(Attached {
+                conn_id,
+                read: Box::new(read),
+                write: Box::new(write),
+            })
+            .is_ok();
+        if !handed {
+            state.registry.lock().expect("lock registry").notify_conn(
+                conn_id,
+                "peer.channel_closed",
+                &json!({ "device_id": self.device_id, "reason": reason::REPLACED }),
+            );
+        }
     }
 }
 
@@ -371,9 +440,7 @@ pub(crate) async fn open(
         channels.supersede(role, device_id);
         channels.era
     };
-    let stream = tokio::time::timeout(OPEN_TIMEOUT, handshake(state, &peer, role))
-        .await
-        .map_err(|_| RpcErr::app("DEVICE_OFFLINE"))??;
+    let stream = handshake(state, &peer, role).await?;
     // The pipe cannot start before its component is here, so the stream waits.
     // Reclaimed by the grace sweep below and by the connection's teardown:
     // either way the grant goes, the stream drops with it, and the far end sees
@@ -416,25 +483,26 @@ async fn handshake(
     peer: &dataplane::PeerAddr,
     role: &str,
 ) -> Result<Box<dyn IoStream>, RpcErr> {
-    let mut stream = state
-        .transport
-        .open_for_payload(peer, u64::MAX)
-        .await
-        .map_err(|e| {
-            if dataplane::failure_code(&e) == dataplane::NO_DIRECT_PATH {
-                RpcErr::app(dataplane::NO_DIRECT_PATH)
-            } else {
-                RpcErr::app("DEVICE_OFFLINE")
-            }
-        })?;
+    let opening = state.transport.open_for_payload(peer, u64::MAX);
+    let mut stream = match tokio::time::timeout(CONNECT_TIMEOUT, opening).await {
+        Ok(Ok(stream)) => stream,
+        // The policy's own word survives its own budget; anything else, the
+        // timeout included, is the peer being unreachable for this purpose.
+        Ok(Err(e)) if dataplane::failure_code(&e) == dataplane::NO_DIRECT_PATH => {
+            return Err(RpcErr::app(dataplane::NO_DIRECT_PATH));
+        }
+        Ok(Err(_)) | Err(_) => return Err(RpcErr::app("DEVICE_OFFLINE")),
+    };
     let frame = serde_json::to_vec(&json!({ "type": "peer_channel", "role": role }))
         .expect("serialize peer_channel");
-    dataplane::write_frame(&mut stream, &frame)
-        .await
-        .map_err(|_| RpcErr::app("DEVICE_OFFLINE"))?;
-    let reply = dataplane::read_frame(&mut stream)
-        .await
-        .map_err(|_| RpcErr::app("DEVICE_OFFLINE"))?;
+    let exchange = async {
+        dataplane::write_frame(&mut stream, &frame).await?;
+        dataplane::read_frame(&mut stream).await
+    };
+    let reply = match tokio::time::timeout(EXCHANGE_TIMEOUT, exchange).await {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(_)) | Err(_) => return Err(RpcErr::app("DEVICE_OFFLINE")),
+    };
     let reply: Value = serde_json::from_slice(&reply).map_err(|_| RpcErr::app("DEVICE_OFFLINE"))?;
     if reply.get("type").and_then(Value::as_str) != Some("peer_channel_ack") {
         return Err(RpcErr::app("DEVICE_OFFLINE"));
@@ -501,7 +569,7 @@ pub(crate) async fn recv(
     // A malformed frame and a role nobody holds collapse into the same answer:
     // the ack owes the sender no inventory of this device's components.
     let Some(role) = role else {
-        answer(&mut stream, false).await;
+        let _ = answer(&mut stream, false).await;
         return;
     };
     let device_id =
@@ -522,6 +590,7 @@ pub(crate) async fn recv(
                 let token = reg.mint_channel_token(ChannelGrant {
                     kind: ChannelKind::PeerJoin(Joining {
                         handoff: handoff.clone(),
+                        device_id: device_id.clone(),
                     }),
                     pid,
                     conn_id,
@@ -536,7 +605,7 @@ pub(crate) async fn recv(
             .collect()
     };
     if tokens.is_empty() {
-        answer(&mut stream, false).await;
+        let _ = answer(&mut stream, false).await;
         return;
     }
     // Dropped so the wait ends by itself if every candidate's connection dies
@@ -557,10 +626,21 @@ pub(crate) async fn recv(
         }
     }
     let Some(attached) = arrival else {
-        answer(&mut stream, false).await;
+        let _ = answer(&mut stream, false).await;
         return;
     };
-    answer(&mut stream, true).await;
+    // A component is holding both halves of a pipe now, so an acceptance that
+    // does not go out cannot simply be dropped: that component would sit on a
+    // channel nobody will ever join. Dropping `attached` closes its connection,
+    // and it hears the word for a far end that did not make it.
+    if !answer(&mut stream, true).await {
+        state.registry.lock().expect("lock registry").notify_conn(
+            attached.conn_id,
+            "peer.channel_closed",
+            &json!({ "device_id": device_id, "reason": reason::PEER_GONE }),
+        );
+        return;
+    }
     // Detached, and this is the one place it matters: the data plane serves its
     // incoming streams from a bounded set (`MAX_PEER_TASKS`), and a channel that
     // lives for hours would hold one of those slots against every file, paste
@@ -582,24 +662,30 @@ pub(crate) async fn recv(
     ));
 }
 
-/// Writes the `peer_channel_ack`. Best-effort: a caller that has already given
-/// up is no reason to fail here.
+/// Writes the `peer_channel_ack`, and says whether it went out.
 ///
-/// A REFUSAL then holds the stream until the initiator closes, exactly as every
-/// responder in this codebase does, and for the reason learned the hard way in
-/// the transfer protocol: dropping the connection right after the write abandons
-/// the bytes in flight on the QUIC side. Without the wait, `COMPONENT_ABSENT`
-/// would reach the caller as an unreadable stream, and it would word a peer that
-/// answered honestly as one that is unreachable. An acceptance needs none of
-/// this: the stream lives on as the pipe.
-async fn answer(stream: &mut Box<dyn IoStream>, accepted: bool) {
+/// Bounded, like every responder's reply in this codebase: a peer that grants no
+/// credit must not pin this handler forever (it holds one of the data plane's
+/// slots), and on an acceptance it must not leave a component holding a pipe
+/// that will never be piped either.
+///
+/// A REFUSAL then holds the stream until the initiator closes, for the reason
+/// learned the hard way in the transfer protocol: dropping the connection right
+/// after the write abandons the bytes in flight on the QUIC side. Without the
+/// wait, `COMPONENT_ABSENT` would reach the caller as an unreadable stream, and
+/// a peer that answered honestly would be worded as one that is unreachable. An
+/// acceptance needs none of that: the stream lives on as the pipe.
+async fn answer(stream: &mut Box<dyn IoStream>, accepted: bool) -> bool {
     let ack = serde_json::to_vec(&json!({ "type": "peer_channel_ack", "accepted": accepted }))
         .expect("serialize peer_channel_ack");
-    let _ = dataplane::write_frame(stream, &ack).await;
+    let written = crate::datachannel::bounded(dataplane::write_frame(stream, &ack))
+        .await
+        .is_ok();
     if !accepted {
         let _ = stream.shutdown().await;
         let _ = tokio::time::timeout(LINGER, dataplane::drain(stream)).await;
     }
+    written
 }
 
 // ---------------------------------------------------------------------------
@@ -649,7 +735,7 @@ async fn pipe(
     let registered = {
         let mut channels = state.peer_channels.lock().expect("lock peer_channels");
         if channels.era == ends.era {
-            Ok(channels.register(&ends.role, &ends.device_id))
+            Ok(channels.register(&ends.role, &ends.device_id, ends.conn_id))
         } else {
             Err(channels.era_reason.unwrap_or(reason::CLOSED))
         }
@@ -685,6 +771,9 @@ async fn pipe(
     // than a guardrail. A stuck write stops advancing this mark, so a genuinely
     // wedged end is swept by the idle budget while a merely slow one is not.
     let born = Instant::now();
+    // An atomic and not a `Cell`, and not for concurrency: the whole pipe is one
+    // task, but that task is SPAWNED on the receiving side, so everything it
+    // holds across an await must be `Sync`.
     let last = AtomicU64::new(0);
     let touch = || last.store(born.elapsed().as_millis() as u64, Ordering::Relaxed);
 
@@ -742,7 +831,11 @@ async fn pipe(
                     return cut.reason().unwrap_or(reason::CLOSED);
                 }
                 _ = tokio::time::sleep(TRUST_POLL) => {
-                    let idle = born.elapsed().as_millis() as u64 - last.load(Ordering::Relaxed);
+                    // Saturating: the mark can only be behind the clock while
+                    // one task polls all three futures, and this stays true if
+                    // anyone ever spawns one of them.
+                    let idle = (born.elapsed().as_millis() as u64)
+                        .saturating_sub(last.load(Ordering::Relaxed));
                     if idle >= IDLE_TIMEOUT.as_millis() as u64 {
                         return reason::IDLE_TIMEOUT;
                     }
@@ -784,6 +877,21 @@ async fn pipe(
     // rather than waiting on a mute pipe.
     let _ = net_write.shutdown().await;
     let _ = local_write.shutdown().await;
+    // One line in the log, and never a byte of the payload: a channel cut by a
+    // cap is a component or a peer misbehaving and belongs at warn, the rest is
+    // ordinary life at debug. Without this the only witness to a cap violation
+    // would be the component that may itself be the culprit.
+    if reason == reason::FRAME_TOO_LARGE || reason == reason::RATE_EXCEEDED {
+        tracing::warn!(
+            role = %ends.role, device = %ends.device_id, reason,
+            "peer channel cut by a cap"
+        );
+    } else {
+        tracing::debug!(
+            role = %ends.role, device = %ends.device_id, reason,
+            "peer channel ended"
+        );
+    }
     report(&state, &ends, reason);
 }
 
@@ -830,11 +938,16 @@ fn classify(e: &std::io::Error) -> &'static str {
     }
 }
 
-/// A fixed-window frame counter. `tick` returns whether the cap has just been
-/// exceeded.
+/// A fixed-window frame counter with a memory. `tick` counts one frame and says
+/// whether the flow has now been over the cap for [`RATE_STRIKES`] windows
+/// running: a burst is forgiven, a flood is not.
 struct Rate {
     window: Instant,
     count: u32,
+    /// How many windows in a row closed over the cap. A window that closes under
+    /// it forgives every one before it: the cap is about a sustained rate, and
+    /// two bursts an hour apart are not one.
+    strikes: u32,
 }
 
 impl Rate {
@@ -842,16 +955,32 @@ impl Rate {
         Rate {
             window: Instant::now(),
             count: 0,
+            strikes: 0,
         }
+    }
+
+    /// Ends the current window early. Only the tests call it: waiting out a real
+    /// second per window would make the rule's own unit tests slower than the
+    /// integration test that exercises it end to end.
+    #[cfg(test)]
+    fn close_window(&mut self) {
+        self.window = Instant::now() - RATE_WINDOW;
     }
 
     fn tick(&mut self) -> bool {
         if self.window.elapsed() >= RATE_WINDOW {
+            self.strikes = if self.count > RATE_MAX_PER_WINDOW {
+                self.strikes.saturating_add(1)
+            } else {
+                0
+            };
             self.window = Instant::now();
             self.count = 0;
         }
-        self.count += 1;
-        self.count > RATE_MAX_PER_WINDOW
+        // Saturating: a flood inside one window must not wrap the counter back
+        // under the cap (and must not panic a debug build getting there).
+        self.count = self.count.saturating_add(1);
+        self.strikes.saturating_add(1) >= RATE_STRIKES && self.count > RATE_MAX_PER_WINDOW
     }
 }
 
@@ -890,5 +1019,65 @@ where
         Ok(_) => Frame::Bytes(buf),
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Frame::End,
         Err(e) => Frame::Broken(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rate rule, pinned without waiting out real seconds. What matters is
+    /// not the number but the SHAPE: one window over the cap is a burst (a
+    /// backlog draining after a network stall), two running is a flow that will
+    /// not stop, and a window under the cap forgives what came before.
+    #[test]
+    fn the_rate_cap_forgives_a_burst_and_cuts_a_flood() {
+        let mut rate = Rate::new();
+        // A whole window far over the cap: never cut.
+        for _ in 0..RATE_MAX_PER_WINDOW * 2 {
+            assert!(!rate.tick(), "a single burst must be forgiven");
+        }
+        // A window that closes UNDER the cap wipes the strike, so a burst an hour
+        // before another one is not a flood.
+        rate.close_window();
+        assert!(!rate.tick());
+        rate.close_window();
+        for _ in 0..RATE_MAX_PER_WINDOW * 2 {
+            assert!(!rate.tick(), "a strike forgiven is a strike gone");
+        }
+        // Two windows over the cap running: the frame past the cap in the second
+        // is the one refused, and not one before it.
+        rate.close_window();
+        for _ in 0..RATE_MAX_PER_WINDOW {
+            assert!(!rate.tick(), "up to the cap is allowed, always");
+        }
+        assert!(
+            rate.tick(),
+            "the frame past the cap in a second window is cut"
+        );
+    }
+
+    /// The one code that travels the mid-stream failure path (#88). It cannot be
+    /// staged end to end here (the in-memory transport refuses at OPEN time,
+    /// never mid-stream), so the wording is pinned against the shape the daemon's
+    /// watcher really produces: the marker STARTS the message, detail follows.
+    #[test]
+    fn a_lost_direct_path_is_worded_as_the_policy_and_nothing_else_is() {
+        let policed = std::io::Error::other(format!(
+            "{}: the selected path stopped being direct",
+            dataplane::NO_DIRECT_PATH
+        ));
+        assert_eq!(classify(&policed), dataplane::NO_DIRECT_PATH);
+
+        let reset = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset");
+        assert_eq!(classify(&reset), reason::PEER_GONE);
+
+        // Merely MENTIONING the marker is not the policy speaking: a peer's own
+        // error text must never be able to borrow the sentence.
+        let mentions = std::io::Error::other(format!(
+            "read failed, and someone said {}",
+            dataplane::NO_DIRECT_PATH
+        ));
+        assert_eq!(classify(&mentions), reason::PEER_GONE);
     }
 }

@@ -231,6 +231,11 @@ impl Drop for CoreHandle {
         // `shutdown` is set under the same lock as the sweep: a connection
         // accepted but not yet registered will give up on its own by reading it
         // at registration.
+        // BEFORE that sweep: a live peer channel's component is told why its
+        // channel is about to end. A connection's write queue is drained in
+        // order and the drain stops at the close enqueued below, so this is the
+        // only moment at which the word can still be written (#124).
+        crate::peerchannel::announce_stop(&self.state);
         let mut reg = self.state.registry.lock().expect("lock registry");
         reg.shutdown = true;
         for entry in reg.conns.values() {
@@ -270,9 +275,9 @@ impl Drop for CoreHandle {
         // every one of those connections, so a pipe would end within one poll
         // anyway. This makes it immediate instead, which is what shuts the peer
         // streams now and lets the far ends see an end rather than a wait. The
-        // reason it carries is best-effort for the same reason: the component's
-        // own connection is closing in this very breath, and that says the same
-        // thing.
+        // reason it carries here is a duplicate of what `announce_stop` already
+        // said, and it lands in a queue nobody drains: harmless, and simpler
+        // than teaching the pipe that it has already been announced.
         crate::peerchannel::cut_all(&self.state, crate::peerchannel::reason::SHUTDOWN);
 
         // The session and login tasks are held by the state (logout and flow

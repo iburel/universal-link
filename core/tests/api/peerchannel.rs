@@ -420,14 +420,23 @@ async fn a_second_open_on_the_same_pair_replaces_the_first() {
 
     // Both ends of the first are told, each in the words of the Core that saw
     // the cause. The side that asked for the replacement names it (its Core
-    // supersedes before it dials, so this is not a race); the far side hears its
-    // peer's pipe end, because a closed stream carries no reason and this
+    // supersedes before it dials, so THAT one is not a race); the far side hears
+    // its peer's pipe end, because a closed stream carries no reason and this
     // primitive invents none: no control frame lives inside an opaque pipe.
     assert_eq!(
         closed_reason(&mut ca, CONVERGENCE_TIMEOUT).await,
         "REPLACED"
     );
-    assert_eq!(closed_b["reason"], json!("PEER_GONE"));
+    // The far side's word is NOT asserted exactly, and that is the honest state
+    // of it: its old pipe normally sees the closed stream first (`PEER_GONE`, two
+    // IPC round trips ahead of anything else), but if its own Core has already
+    // registered the replacement it says `REPLACED`. Both are true, and pinning
+    // one of them would be pinning a race.
+    let far = closed_b["reason"].as_str().expect("a reason");
+    assert!(
+        far == "PEER_GONE" || far == "REPLACED",
+        "the far end must hear the end, in one of the two true words: {far}"
+    );
     first_a.expect_closed().await;
     first_b.expect_closed().await;
 
@@ -579,15 +588,19 @@ async fn a_core_stopping_ends_the_channel_at_the_far_end() {
 
     // A's Core stops. Its pipe is NOT one of the connections the teardown
     // sweeps (a second connection is never registered as one), so the pipe has
-    // to be ended on purpose: two mechanisms do it, the mass cut immediately and
-    // each vigil's owner check within a poll. What is pinned here is the
-    // OUTCOME, not which of the two fired.
+    // to be ended on purpose: the mass cut does it immediately, and each vigil's
+    // owner check would within a poll anyway.
     drop(a);
 
-    // The far end hears the end rather than waiting on a mute pipe, and the
-    // local half is closed too. What this side's own component is TOLD is
-    // deliberately not asserted: the same teardown is closing its control
-    // connection, which says the same thing and usually says it first.
+    // The word reaches this side's component, and that ORDER is the whole point:
+    // the teardown closes that very connection, and a connection's queue is
+    // drained only up to its close, so a reason queued afterwards would never be
+    // written at all.
+    assert_eq!(
+        closed_reason(&mut ca, CONVERGENCE_TIMEOUT).await,
+        "SHUTDOWN"
+    );
+    // And the far end hears the end rather than waiting on a mute pipe.
     assert_eq!(
         closed_reason(&mut cb, CONVERGENCE_TIMEOUT).await,
         "PEER_GONE"
@@ -614,6 +627,25 @@ async fn a_component_dying_whole_ends_the_channel_at_the_far_end() {
     pb.expect_closed().await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_component_that_leaves_the_control_plane_loses_its_pipe() {
+    let server = TestServer::start().await;
+    let (a, mut ca, b, mut cb) = channel_pair(&server).await;
+    let (mut pa, mut pb) = joined(&a, &mut ca, &b, &mut cb).await;
+
+    // Only the CONTROL connection goes; the pipe connection is left wide open,
+    // and both peers are perfectly present. The grant was bound to that
+    // connection, so the channel does not outlive it: nothing else here would
+    // have noticed.
+    drop(ca);
+    assert_eq!(
+        closed_reason(&mut cb, CONVERGENCE_TIMEOUT).await,
+        "PEER_GONE"
+    );
+    pa.expect_closed().await;
+    pb.expect_closed().await;
+}
+
 // ---------------------------------------------------------------------------
 // The caps.
 // ---------------------------------------------------------------------------
@@ -622,8 +654,7 @@ async fn a_component_dying_whole_ends_the_channel_at_the_far_end() {
 async fn a_frame_above_the_cap_from_the_component_ends_the_channel() {
     let server = TestServer::start().await;
     let (a, mut ca, b, mut cb) = channel_pair(&server).await;
-    let (_pa, mut pb) = joined(&a, &mut ca, &b, &mut cb).await;
-    let mut pa = _pa;
+    let (mut pa, mut pb) = joined(&a, &mut ca, &b, &mut cb).await;
 
     // Announced, not sent: the length alone is refused, before one byte of it
     // is allocated.
@@ -640,20 +671,37 @@ async fn a_frame_above_the_cap_from_the_component_ends_the_channel() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_runaway_flow_ends_the_channel_by_the_rate_cap() {
+async fn one_burst_is_forgiven_and_a_sustained_flood_is_cut() {
     let server = TestServer::start().await;
     let (a, mut ca, b, mut cb) = channel_pair(&server).await;
-    let (mut pa, _pb) = joined(&a, &mut ca, &b, &mut cb).await;
+    let (mut pa, pb) = joined(&a, &mut ca, &b, &mut cb).await;
+    // The far end reads continuously: what is under test is the rate the Core
+    // reads at, not a component that stopped reading (which is backpressure, and
+    // a different rule).
+    let drain = tokio::spawn(async move {
+        let mut pb = pb;
+        while pb.recv().await.is_some() {}
+    });
 
     // Far above the 4000 frames per second the cap allows (itself four times the
-    // highest rate this primitive was designed for, a 1000 Hz mouse). Empty
-    // frames, written in one go: what is under test is the rate, and the test
-    // must not be the bottleneck that keeps the flow under the cap.
+    // highest rate this primitive was designed for, a 1000 Hz mouse), in ONE
+    // window. Empty frames written in one go: the test must not be the
+    // bottleneck that keeps the flow under the cap.
+    //
+    // Forgiven, deliberately: this is the shape a legitimate flow takes when a
+    // network stall backs it up and the backlog then drains at socket speed.
+    // Cutting here would blame the component for a hiccup it did not cause.
+    pa.send_burst(5000, &[]).await;
+    ca.assert_silent().await;
+
+    // A second window over the cap is not a hiccup any more.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
     pa.send_burst(5000, &[]).await;
     assert_eq!(
         closed_reason(&mut ca, CONVERGENCE_TIMEOUT).await,
         "RATE_EXCEEDED"
     );
+    drain.await.expect("the draining end");
 }
 
 #[tokio::test(flavor = "multi_thread")]

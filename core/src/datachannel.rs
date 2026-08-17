@@ -121,7 +121,7 @@ pub(crate) async fn run<R, W>(
         // A peer channel a peer opened: its handler holds the peer stream and is
         // waiting for these halves. Handing them over ends this task, and the
         // connection stays open because the handler now owns both of its halves.
-        ChannelKind::PeerJoin(joining) => joining.hand_over(owner, reader, write),
+        ChannelKind::PeerJoin(joining) => joining.hand_over(&state, owner, reader, write),
     }
 }
 

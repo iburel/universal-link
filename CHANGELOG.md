@@ -22,8 +22,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   properly, which is the whole point: revoke the far device, log out, leave
   the account, stop the Core, let the component crash or the peer vanish, and
   both ends see a clean end with a reason the interface can say, never a pipe
-  that goes quiet. One channel per pair of components, so a retry replaces
-  its predecessor instead of leaking pipes. And a deployment whose relays are
+  that goes quiet. One channel between a given kind of component and a given
+  device, so a retry replaces its predecessor instead of leaking pipes. And a
+  deployment whose relays are
   rendezvous-only (the setting below) refuses such a channel by its own code
   rather than quietly carrying a live flow it said it would not: a live
   session names no size, so it asks for a direct path. Nothing of this shows

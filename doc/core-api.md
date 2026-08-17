@@ -637,9 +637,16 @@ on two devices, carrying OPAQUE bytes the Core interprets in no way.
 - **Framing**: `u32` big-endian length, then exactly that many bytes, on
   both halves. A frame is capped at **1 KiB**; a zero-length frame is legal
   and is what a keepalive looks like to a Core that does not know what a
-  keepalive is. Beyond the frame cap there is a **rate cap** (4000 frames
-  per second, either direction) and an **idle sweep** (10 s with no frame in
-  EITHER direction). Any frame resets the idle budget.
+  keepalive is. An end of stream in the MIDDLE of a frame (a length with no
+  body) is a close, not a protocol violation: the length and the body are two
+  writes, so a channel cut mid-frame can legitimately look like that.
+- Beyond the frame cap: a **rate cap** and an **idle sweep**. The rate cap is
+  4000 frames per second in either direction, and it cuts only after TWO
+  consecutive seconds above it, because the Core counts the frames it reads
+  and not the ones a sender emitted: a network stall backs a legitimate flow
+  up in the local buffer, and the drain that follows is one burst far above
+  the cap. One burst is forgiven, a flood is not. The idle sweep is 10 s with
+  no frame in EITHER direction; any frame resets it.
 - **Targeting** follows `files.send`'s doctrine, and the whole handshake
   happens before the call returns, so every refusal is an answer and never a
   silence to interpret: `DEVICE_UNKNOWN` (absent, or attested under a
@@ -648,7 +655,12 @@ on two devices, carrying OPAQUE bytes the Core interprets in no way.
   word: nobody there holds the role with the scope, or nobody came to take
   the channel), `NO_DIRECT_PATH`. `accepted` on the wire therefore means the
   far end has ATTACHED, not merely that a notification was queued: the token
-  it comes back with opens a pipe that is already alive at both ends.
+  it comes back with opens a pipe that is already alive at both ends. The
+  worst case is slow on purpose: up to 15 s of dialling (a cold relay connect
+  plus hole punching, the budget the rendezvous-only refusal needs in order to
+  be able to speak at all) plus 10 s for the two frames and the far end's
+  attach. A component must not set a tighter budget on the call than that, or
+  it will read a refusal it could have understood as a timeout.
 - **Relays**: such a session declares no size, so it opens through the sized
   path (#88) declaring itself above ANY cap. On a deployment whose relays
   are rendezvous-only above a cap, the open is refused with
@@ -680,6 +692,18 @@ on two devices, carrying OPAQUE bytes the Core interprets in no way.
   A channel authorized but not yet started when the trust ends (the token
   minted, the second connection not yet made) never starts, and its component
   is told with the same reason its siblings got.
+- **The pair is (role, device), not (component, component).** Every component
+  holding the role and the scope on a device shares that one channel slot:
+  any of them may open one (and replace another's), and any of them may take
+  an offer that arrives. `custom` is ONE role, so third-party components
+  sharing it share the slot exactly as they share `peer.message`'s mailbox.
+  A component that loses an offer to a sibling is told (`REPLACED`) rather
+  than left reading a closed connection.
+- **The notification identifies the pair, not the channel.**
+  `peer.channel_closed` carries the `device_id`, so a component that opened
+  twice in quick succession can receive one closure per open: treat it
+  idempotently ("my channel to that device is over"), which is all the
+  primitive promises, since only one can be live at a time anyway.
 - **What it deliberately is not**: no store and forward, no reconnection
   logic (the component retries on its own schedule, and the `devices` topic
   already says when a peer is reachable again), no interpretation, and no
