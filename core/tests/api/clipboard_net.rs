@@ -989,6 +989,17 @@ impl RawPeer {
         &self,
         wanted: &str,
     ) -> Option<Box<dyn onedevice_core::IoStream>> {
+        self.next_open_of(wanted)
+            .await
+            .map(|(_frame, stream)| stream)
+    }
+
+    /// [`Self::next_stream_of`], keeping the opening frame: what a test needs
+    /// when the frame itself is the subject (the role a `peer_channel` carries).
+    pub(crate) async fn next_open_of(
+        &self,
+        wanted: &str,
+    ) -> Option<(Value, Box<dyn onedevice_core::IoStream>)> {
         loop {
             let Ok((_peer, mut stream)) = self.transport.accept().await else {
                 return None;
@@ -1012,7 +1023,7 @@ impl RawPeer {
                 continue;
             };
             if frame.get("type").and_then(Value::as_str) == Some(wanted) {
-                return Some(stream);
+                return Some((frame, stream));
             }
         }
     }

@@ -87,10 +87,18 @@ pub(crate) const MAX_FRAME: usize = 1024;
 const RATE_MAX_PER_WINDOW: u32 = 4000;
 const RATE_WINDOW: Duration = Duration::from_secs(1);
 
-/// No frame in EITHER direction for this long and the channel is swept. A
-/// component that wants a long silent channel sends a frame: the Core does not
-/// know what a keepalive is, so any frame, a zero-length one included, counts.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// No frame in EITHER direction for this long and the channel is swept.
+///
+/// Short on purpose, and shorter than the Core's other no-progress budgets (30
+/// s on the data channel): this is a LIVE channel, whose whole premise is that
+/// both ends are present NOW, and a component that wants to keep one open
+/// proves it by sending something. That is not an extra burden: it has to prove
+/// liveness anyway, because a peer can vanish in a way that produces no end of
+/// stream at all, and this primitive would rather sweep a silent channel than
+/// hold one whose far end is a ghost. Any frame counts, a zero-length one
+/// included, so the keepalive costs 4 bytes at whatever cadence the component
+/// picks.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Whole-exchange budget for `peers.channel` (connect + one frame each way +
 /// the far end's attach): the house exchange norm, as `peers.send` uses.
@@ -216,6 +224,14 @@ impl PeerChannels {
         (id, cut)
     }
 
+    /// Cuts the channel holding this pair, if there is one: what a fresh
+    /// `peers.channel` on the same pair does BEFORE it dials.
+    fn supersede(&self, role: &str, device_id: &str) {
+        if let Some(live) = self.live.get(&(role.to_string(), device_id.to_string())) {
+            live.cut.fire(reason::REPLACED);
+        }
+    }
+
     /// Removes a channel, but only if it is still the one holding the key: a
     /// channel that was replaced finds its successor there and leaves it alone.
     fn unregister(&mut self, role: &str, device_id: &str, id: u64) {
@@ -319,6 +335,20 @@ pub(crate) async fn open(
     if !dataplane::peer_reachable(state, &peer) {
         return Err(RpcErr::app("DEVICE_OFFLINE"));
     }
+    // The pair carries one channel, and it is the OPEN that supersedes, before
+    // anything is dialled. Two reasons for that order, both about honesty.
+    // Deterministic wording: the far end replaces its own the instant it accepts
+    // this one, and its stream closing would otherwise reach the old pipe here
+    // first, telling this component "the peer is gone" about a peer that is
+    // perfectly present. And a cost stated rather than hidden: an open that then
+    // fails leaves the pair with no channel, which is the right outcome for the
+    // component that asked to start again and the reason the doctrine is one
+    // channel per pair rather than a fresh one per attempt.
+    state
+        .peer_channels
+        .lock()
+        .expect("lock peer_channels")
+        .supersede(role, device_id);
     let stream = tokio::time::timeout(OPEN_TIMEOUT, handshake(state, &peer, role))
         .await
         .map_err(|_| RpcErr::app("DEVICE_OFFLINE"))??;
@@ -653,14 +683,19 @@ async fn pipe(
         }
     };
 
-    // The first of the three to finish names the reason; the other two are
+    // The first of the three to finish ends the channel; the other two are
     // abandoned mid-frame, which is safe precisely because this is a teardown:
     // no session survives to be desynchronized by a half-read frame.
-    let reason = tokio::select! {
+    let outcome = tokio::select! {
         r = up => r,
         r = down => r,
         r = vigil => r,
     };
+    // A standing cut order outranks what the halves observed. Without this the
+    // reason would be a coin toss: an order is fired while the pipe may already
+    // be reading its last frame, and "the peer's stream ended" is what a
+    // revocation, a logout and a replacement all LOOK like from the inside.
+    let reason = cut.reason().unwrap_or(outcome);
     state
         .peer_channels
         .lock()

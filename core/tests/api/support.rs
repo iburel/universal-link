@@ -1387,6 +1387,16 @@ impl TestCore {
         stream.write_all(&attach).await.expect("attach frame");
         DataChannel { stream }
     }
+
+    /// Opens the local end of a peer channel (#124): the same second connection
+    /// and the same attach frame, but the connection then speaks the peer
+    /// channel's own grammar (u32 length + opaque bytes, both ways).
+    pub async fn open_peer_pipe(&self, channel_token: &str) -> PeerPipe {
+        let mut stream = connect_stream(self.handle.ipc_path()).await;
+        let attach = frame(&json!({ "channel_token": channel_token }).to_string());
+        stream.write_all(&attach).await.expect("attach frame");
+        PeerPipe { stream }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1522,10 +1532,17 @@ impl TestComponent {
 
     /// Next notification (buffered or upcoming) → `(method, params)`.
     pub async fn notification(&mut self) -> (String, Value) {
+        self.notification_within(RESPONSE_TIMEOUT).await
+    }
+
+    /// Like `notification`, with a caller-chosen budget: for the rare state
+    /// whose arrival is a Core-side budget elapsing (a peer channel's idle
+    /// sweep), which is legitimately slower than any control-plane round trip.
+    pub async fn notification_within(&mut self, budget: Duration) -> (String, Value) {
         if let Some(n) = self.notifications.pop_front() {
             return n;
         }
-        timeout(RESPONSE_TIMEOUT, async {
+        timeout(budget, async {
             let v = self.recv_json().await;
             assert!(
                 v.get("method").is_some(),
@@ -1546,8 +1563,14 @@ impl TestComponent {
 
     /// Waits for a `method` notification, ignoring the others.
     pub async fn wait_notification(&mut self, method: &str) -> Value {
+        self.wait_notification_within(method, RESPONSE_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::wait_notification`] with a caller-chosen budget per notification.
+    pub async fn wait_notification_within(&mut self, method: &str, budget: Duration) -> Value {
         loop {
-            let (m, params) = self.notification().await;
+            let (m, params) = self.notification_within(budget).await;
             if m == method {
                 return params;
             }
@@ -1815,6 +1838,102 @@ impl DataChannel {
             .expect("data-channel payload");
         let tag = buf.remove(0);
         Some((tag, buf))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Peer-channel client (#124): the same second connection, another grammar. A
+// frame is a u32 big-endian length then exactly that many opaque bytes, both
+// ways, and the Core relays them without looking inside. An independent mirror
+// of the Core's codec, like the data channel's above.
+// ---------------------------------------------------------------------------
+
+pub struct PeerPipe {
+    stream: ClientStream,
+}
+
+impl PeerPipe {
+    /// Sends one frame. A failed write is not the assertion: the Core may have
+    /// cut the channel already (a cap, a revocation), and what a test asserts is
+    /// the reason it hears on the control plane.
+    pub async fn send(&mut self, bytes: &[u8]) {
+        let mut frame = (bytes.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(bytes);
+        self.write(&frame).await;
+    }
+
+    /// Announces `len` bytes and sends none: how a test probes the frame cap
+    /// without having to produce the bytes.
+    pub async fn send_announced_len(&mut self, len: u32) {
+        self.write(&len.to_be_bytes()).await;
+    }
+
+    /// Sends `frames` copies of `payload` in ONE write: for the rate cap, whose
+    /// test must not itself be the throttle that keeps the flow under the cap.
+    pub async fn send_burst(&mut self, frames: usize, payload: &[u8]) {
+        let mut burst = Vec::with_capacity(frames * (4 + payload.len()));
+        for _ in 0..frames {
+            burst.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            burst.extend_from_slice(payload);
+        }
+        self.write(&burst).await;
+    }
+
+    async fn write(&mut self, bytes: &[u8]) {
+        match self.stream.write_all(bytes).await {
+            Ok(()) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ) => {}
+            Err(e) => panic!("peer-channel send: {e}"),
+        }
+    }
+
+    /// The next frame; `None` when the channel ends.
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        timeout(RESPONSE_TIMEOUT, self.read_frame())
+            .await
+            .expect("timeout on the peer channel")
+    }
+
+    /// Asserts the channel ends (rather than a frame arriving).
+    pub async fn expect_closed(&mut self) {
+        assert_eq!(self.recv().await, None, "the peer channel is still open");
+    }
+
+    async fn read_frame(&mut self) -> Option<Vec<u8>> {
+        let mut len = [0u8; 4];
+        match self.stream.read_exact(&mut len).await {
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                return None;
+            }
+            Err(e) => panic!("peer-channel read: {e}"),
+        }
+        let mut buf = vec![0u8; u32::from_be_bytes(len) as usize];
+        match self.stream.read_exact(&mut buf).await {
+            Ok(_) => Some(buf),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                None
+            }
+            Err(e) => panic!("peer-channel payload: {e}"),
+        }
     }
 }
 
