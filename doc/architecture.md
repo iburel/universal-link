@@ -269,7 +269,7 @@ Central daemon, launched automatically at session login.
 
 | Component | Launch | Role |
 |---|---|---|
-| **Tray / notifier** | spawned by the Core | Minimal always-present surface: status icon, native notifications (session expired, pending approval…), "open the GUI" / "open the browser" actions. It is the Core's doorbell. |
+| **Tray / notifier** | spawned by the Core | Minimal always-present surface: status icon, native notifications (session expired, pending approval…), "open the GUI" / "open the browser" actions. It is the Core's doorbell. It also reads `input.read`, so a keyboard and mouse session shows on both sides, in the tooltip and in the menu's first line, for the whole time it lasts. |
 | **Clipboard manager** | spawned by the Core | Per-OS backends to read/write the clipboard and be notified of changes (X11 with ICCCM INCR on Linux, the Win32 clipboard and OLE `IDataObject` on Windows, `NSPasteboard` with an `NSFilePresenter` on macOS). Handles the "blocking paste" for the duration of the download, and honors the OS's confidentiality markers in both directions. Protocol specified in [core-api.md](core-api.md) (`clipboard.*`, transactions). |
 | **Contextual menu manager** | spawned by the Core | Per-contextual-menu-surface backends. See the dedicated section. |
 | **Sync engine** | spawned by the Core | The exclusive `sync-backend` behind the routed `sync.*` facade: keeps chosen folders identical across the account's computers, over the generic primitives (published transactions, `peers.send`). Design and protocol in [sync-engine.md](sync-engine.md). |

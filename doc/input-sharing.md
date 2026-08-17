@@ -1482,7 +1482,7 @@ snapshot either way. The column below says which of the two each code is.
 | `locked` | `problem` | that computer's pointer is pinned to its own screen, or it is locked and cannot be driven at all |
 | `no_backend` | `problem` | nothing on that computer can type, or its permission is refused |
 | `no_path` | `problem` | the deployment's relays are rendezvous-only above a cap (#88) and no direct path formed |
-| `too_slow` | `problem` | the path to that computer is past the pointer threshold |
+| `too_slow` | `problem` | the path to that computer is past the pointer threshold. **Reserved**: nothing sets it in v1, because the threshold is enforced where a pointer is actually asked for (`input.take` answers `INPUT_TOO_SLOW`) and the number an interface would word it from is already in `rtt_ms`. An interface still needs its sentence, for the day something does |
 | `plane_stale` | `problem` | the two ends do not hold the same plane. Self-repairing: a layout round is already running |
 
 A malformed request is not an application state, and the engine emits the
@@ -1571,22 +1571,41 @@ that carry them.
 
 | Code | Where | The sentence |
 |---|---|---|
-| `NOT_ALLOWED` | `no` frame, `INPUT_NOT_ALLOWED` | "That computer has not been told to accept your keyboard. Allow it there." |
+| `NOT_ALLOWED` | `no` frame, `problem: "not_allowed"` | "That computer has not been told to accept your keyboard. Allow it there." |
 | `BUSY` | `no` frame, `INPUT_BUSY` | "Another of your computers is using that keyboard right now." |
 | `PLANE_STALE` | `no` frame | "The two computers do not agree on where the screens are yet. Trying again." |
 | `NO_BACKEND` | `no` / `end`, `INPUT_NO_BACKEND` | "That computer cannot be driven: nothing there can type." On macOS with the grant refused: "1Device needs Accessibility permission on that computer to type on it." |
-| `LOCKED` | `no` / `end`, `INPUT_LOCKED` | "This computer cannot be driven while it is locked." Or, when the pointer was pinned there on purpose: "That computer's pointer is locked to its own screen." |
+| `LOCKED` | `no` / `end`, `INPUT_LOCKED` | "This computer cannot be driven while it is locked." Or, when the pointer was pinned there on purpose: "That computer's pointer is locked to its own screen." One code carries both, and an interface that has only the code says both rather than guessing: the remedies are in two different places (#127 words it "cannot be driven while it is locked, or while its pointer is pinned to its own screen") |
 | `IDLE` | `end` | "Your keyboard went quiet, so that computer released it." |
 | `TAKEN` | `end` | "Someone is using that computer directly." |
+| `REVOKED` | `end` | "That computer took its permission back, so your keyboard came back." |
 | `ELEVATED_WINDOW` | `oops` | "Nothing was typed: this window runs as administrator." |
 | `SECURE_INPUT` | `oops` | "Nothing was typed: password fields block synthetic keystrokes on macOS." |
 | `SCREEN_LOCKED` | `oops` | "Nothing was typed: that computer is locked." |
 | `NO_PERMISSION` | `oops` | "Nothing was typed: 1Device is not allowed to type on that computer." |
 | `UNRESOLVED` | `oops` | "That key does not exist on the other computer's keyboard." |
-| `NO_DIRECT_PATH` | `INPUT_NO_PATH` | "This account's relays do not carry a keyboard session. The two computers need a network they share." |
+| `NO_DIRECT_PATH` | `problem: "no_path"` | "This account's relays do not carry a keyboard session. The two computers need a network they share." |
 | `INPUT_TOO_SLOW` | `input.take` | "That computer is <n> ms away, too far for the pointer to feel right. Its keyboard alone would work." |
 | `SLOW` | `stop` | "The connection to that computer slowed down, so your keyboard came back." |
+| `GONE` | `stop` | "Your keyboard came back: the session with that computer ended on its own." One code for three causes (this machine's capture died, its grant went away, the channel did), so the sentence says the one thing all three share, and `here.problem` carries the local half when there is one |
 | `UNKNOWN` | any of the four | "That computer refused, and this version does not know the reason it gave." What every code outside a frame's closed set becomes on arrival, so a later version's vocabulary degrades to a sentence rather than reaching an interface as prose a peer chose |
+
+**Every code above reaches an interface as an `input.refused`, and two of them
+did not until #127 went looking for them.** The `stop` codes an interface must
+hear (`SLOW`, `GONE`) end a session with no other trace at all: the session
+simply vanishes from the snapshot and no `problem` is set, because nothing about
+the far side went wrong. `RETURNED` and `MOVED` stay silent on purpose, being the
+human's own gesture. And the `end` codes were remembered as that device's
+`problem` without being announced, which left `IDLE` (a target letting go of a
+hung source's keyboard) as the one case with no sentence anywhere, since it
+deliberately sets no `problem`. Both are announced now, through the same
+coalescing window as every other refusal.
+
+Two rows also named an error code that does not exist and never did.
+`INPUT_NOT_ALLOWED` is forbidden by section 12's own doctrine (D21: a gesture
+answers only with what THIS machine knows), and `INPUT_NO_PATH` was never minted
+either: what an interface sees for both is that device's `problem`, which is what
+the rows now say.
 
 Plus the two states that are not refusals and still need words: a session
 over a slow path announces its number ("Your keyboard is on **Desk**, 32 ms

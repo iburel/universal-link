@@ -8,6 +8,55 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The Input tab: the plane you drag, the switches, and where your keyboard
+  is.** A fifth section in the app, and the part of keyboard and mouse sharing
+  a person actually touches. It invents nothing: every rectangle, every switch
+  and every sentence comes from the engine's own state.
+
+  - **One plane, every monitor of every computer.** A machine's screens arrive
+    already arranged the way that machine has them, and move as one block; one
+    can be pulled out of the block, because a laptop's external screen may
+    genuinely sit next to another computer; and there is a way back, since an
+    arrangement that is imported rather than re-invented should not have to be
+    re-invented by hand. Dropping a screen near an edge lands it exactly on
+    that edge, so the pointer really crosses instead of stopping at a gap
+    nobody can see. Two drops are refused rather than accepted quietly: two
+    screens in the same place (which would take away the very crossing you
+    were making) and a screen dragged off the plane. Arrow keys do the same
+    work without a mouse. A screen that is away keeps its place and says so.
+  - **Two lists, and only one of them grants anything.** Who may drive this
+    computer is decided here, on this computer, and never leaves it. Who this
+    computer is willing to drive is its own shortlist, and the tab says
+    plainly that it grants nothing on the other side and that this computer
+    finds out by trying.
+  - **Where your keyboard is, on both sides, and in the tray.** While it is
+    away, this computer says which one has it and which keys bring it back;
+    the computer using it says so too. The tray says it as well, in its
+    tooltip and in the first line of its menu, for as long as the session
+    lasts, so nothing needs to be open to notice.
+  - **Nothing is swallowed.** Every refusal the engine can report has a
+    sentence, including a window that runs as administrator, a password field
+    on a Mac, a locked screen, and a deployment whose relays introduce
+    computers without carrying a keyboard session. A refusal from a newer
+    engine than this app is carried rather than dropped. A relayed session
+    shows the path and the measured number; handing the pointer across a slow
+    one warns first and offers the keyboard alone instead, and past the point
+    where a pointer stops feeling like a pointer it is not offered at all.
+  - **A permission that is missing is explained.** On a Mac the two grants
+    this needs are two different lists in System Settings, and the tab names
+    the one that is missing rather than telling you to check your permissions.
+    Input Monitoring granted and Accessibility not is the normal state of a
+    fresh Mac, and it is the case that says the most: your keyboard can still
+    drive the others, nothing can type here yet, and here is the one switch
+    to flick.
+  - **The crossing guards in words**, since a number of milliseconds is not
+    what anybody is choosing, and a pair of computers whose screens do not
+    touch says why the pointer cannot cross rather than leaving you pressing
+    against an edge.
+
+  Not on the phone: a phone is neither a source nor a target, so the section
+  does not exist there at all rather than offering something that cannot work.
+
 - **Your real keyboard and mouse, on all three desktops.** The half of the
   keyboard and mouse engine that touches the operating system: reading the
   keyboard and mouse of the computer you are looking at, and typing and

@@ -273,3 +273,59 @@ async fn bringing_the_keyboard_back_releases_the_target_too() {
         })
         .await;
 }
+
+/// A session that ends without the human asking is SAID, not merely undone. This
+/// is the epic's rule applied to the one case that leaves no other trace: the
+/// keyboard comes home, the session vanishes from the snapshot, and no `problem`
+/// is set, because nothing about the far side went wrong. Without a word for it,
+/// the person is left with a keyboard that moved twice and one explanation.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_that_ends_on_its_own_is_said_out_loud() {
+    let mut fleet = Fleet::start().await;
+    fleet.driving().await;
+
+    fleet.b.kill_engine();
+
+    let said = loop {
+        let refusal = fleet.a.ui.notification("input.refused").await;
+        if refusal["code"] == json!("GONE") {
+            break refusal;
+        }
+    };
+    assert_eq!(
+        said["device_id"],
+        json!(fleet.b.device_id()),
+        "the sentence is about the computer the keyboard was on: {said:#}"
+    );
+    // At least once: `announce` coalesces per code per second, so an earlier
+    // teardown inside the window arrives as a count of two.
+    assert!(said["count"].as_u64().is_some_and(|n| n >= 1), "{said:#}");
+}
+
+/// A grant withdrawn while the session runs ends it, and the source is TOLD which
+/// word the target used. The standing half is in the snapshot (`not_allowed`), and
+/// the event is what a person actually notices, since they are looking at the
+/// machine whose keyboard just came back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_grant_withdrawn_mid_session_is_said_to_the_source() {
+    let mut fleet = Fleet::start().await;
+    fleet.driving().await;
+
+    // B, the machine being driven, takes its permission back.
+    fleet.b.allow(&fleet.a, false).await;
+
+    let said = loop {
+        let refusal = fleet.a.ui.notification("input.refused").await;
+        if refusal["code"] == json!("REVOKED") {
+            break refusal;
+        }
+    };
+    assert_eq!(said["device_id"], json!(fleet.b.device_id()));
+    // And the standing half of it, for a window that opens afterwards.
+    fleet
+        .a
+        .until_peer(fleet.b.device_id(), "A to record why", |row| {
+            row["problem"] == json!("not_allowed")
+        })
+        .await;
+}

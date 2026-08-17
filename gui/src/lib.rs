@@ -47,6 +47,31 @@ pub const GUI_SCOPES: [&str; 7] = [
     "components.approve",
 ];
 
+/// The Input tab's own surface, asked for by the DESKTOP shell alone and asked
+/// for OPTIONALLY (`ClientConfig::optional_scopes` /
+/// `optional_topics`).
+///
+/// Optional for the same reason as [`GUI_OPTIONAL_TOPICS`] and with sharper
+/// consequences: a scope the Core has never heard of fails the whole `hello`, so
+/// a GUI newer than the Core running on the machine would not merely lose the
+/// Input tab, it would never connect at all. `input.read` is the plane, the
+/// switches and the live session; `input.manage` is every gesture on that tab
+/// (arranging the screens, allowing a computer to drive this one, taking the
+/// keyboard). The tab is shown only once the engine has actually answered, so a
+/// Core that grants neither simply has no Input tab.
+///
+/// Desktop alone because a phone is neither a source nor a target in v1 (the
+/// engine is not even spawned there): the mobile shell asks for what it can
+/// serve and nothing else. To be promoted into [`GUI_SCOPES`] and [`GUI_TOPICS`]
+/// once no Core that predates them is in the field.
+pub const GUI_INPUT_SCOPES: [&str; 2] = ["input.read", "input.manage"];
+
+/// The topic behind [`GUI_INPUT_SCOPES`], gated on `input.read`, and the reason
+/// the client's fallback for an optional topic is per topic: dropping the whole
+/// optional half would have cost pairing its events on a Core that knows pairing
+/// perfectly well and merely predates the Input tab.
+pub const GUI_INPUT_TOPICS: [&str; 1] = ["input"];
+
 /// Topics subscribed to by the official GUI. The `component.pending`
 /// notifications have no topic: they follow the `gui` role.
 pub const GUI_TOPICS: [&str; 3] = ["session", "devices", "transfers"];

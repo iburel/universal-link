@@ -386,6 +386,7 @@ pub fn component_config(
         role: role.into(),
         scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
         topics: topics.iter().map(|t| (*t).to_string()).collect(),
+        optional_scopes: Vec::new(),
         optional_topics: Vec::new(),
         served_methods: served.iter().map(|m| (*m).to_string()).collect(),
         reconnect_base_delay: Duration::from_millis(25),

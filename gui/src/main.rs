@@ -53,8 +53,15 @@ fn main() {
             .iter()
             .map(|s| s.to_string())
             .collect(),
+        // The Input tab's surface is asked for optionally, so a Core that
+        // predates it costs the tab and not the connection (see the constants).
+        optional_scopes: onedevice_gui::GUI_INPUT_SCOPES
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         optional_topics: onedevice_gui::GUI_OPTIONAL_TOPICS
             .iter()
+            .chain(onedevice_gui::GUI_INPUT_TOPICS.iter())
             .map(|s| s.to_string())
             .collect(),
         served_methods: vec![],

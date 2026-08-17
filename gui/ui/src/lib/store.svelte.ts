@@ -44,9 +44,11 @@ import {
   type AccountKey,
   type Component,
   type Device,
+  type InputState,
   type PairingDevice,
   type PairingRole,
   type PendingRequest,
+  type PlacedSpot,
   type SessionState,
 } from "./api";
 import {
@@ -78,6 +80,7 @@ import {
   scanFailure,
 } from "./errors";
 import { formatSize } from "./format";
+import { gestureFailure, refusalSentence } from "./input";
 
 export interface Notice {
   kind: "info" | "error";
@@ -344,6 +347,27 @@ export class CoreStore {
    * ({@link #startPairing} returns early when busy).
    */
   scanning = $state(false);
+  /**
+   * The whole keyboard and mouse state, or `null` when this computer has none to
+   * show: no engine answered (a phone, where it is never even started, or a
+   * desktop whose engine is restarting), or this Core does not know the
+   * `input.*` facade at all. Never a stale copy: a snapshot that could not be
+   * read is not a state, and the tab says so instead of showing a plane the
+   * engine may have moved on from.
+   */
+  input = $state<InputState | null>(null);
+  /**
+   * Whether the Input tab exists at all. Set the first time an engine answers,
+   * and cleared only when a fresh connection turns out not to grant the input
+   * scopes. Not cleared by an engine that has gone quiet, deliberately: the tab
+   * then stays and says the engine is not running, where taking the section away
+   * under a person who is reading it would explain nothing.
+   *
+   * A phone never sets it: the engine is not spawned on Android (a phone is
+   * neither a source nor a target in v1), so `input.status` is answered
+   * `COMPONENT_ABSENT` for ever there and the section never appears.
+   */
+  inputSeen = $state(false);
   /** Why the directory is empty, when the Core refuses to serve it. */
   devicesError = $state<string | null>(null);
   /** The last action's feedback, shown as a banner. */
@@ -374,6 +398,43 @@ export class CoreStore {
     return (
       this.session?.configured === false && this.session.logged_in !== true
     );
+  }
+
+  /**
+   * Whether the Core granted the two scopes the Input tab needs. They are asked
+   * for OPTIONALLY (`GUI_INPUT_SCOPES` in gui/src/lib.rs), because a scope a Core
+   * has never heard of fails the whole hello: a Core older than the facade grants
+   * neither, and this is how the interface finds out rather than by calling a
+   * method it has no right to.
+   */
+  get inputGranted(): boolean {
+    return (
+      this.connection.status === "connected" &&
+      this.connection.granted_scopes.includes("input.read") &&
+      this.connection.granted_scopes.includes("input.manage")
+    );
+  }
+
+  /** This machine's own platform, from its own directory record. */
+  get selfPlatform(): string | undefined {
+    return this.devices.find((d) => d.is_self)?.platform;
+  }
+
+  /**
+   * The name of one of the account's computers, for a sentence. The engine's own
+   * list first (it names them from the same directory), the Core's next, and
+   * `null` rather than an invented word: a sentence about a device nobody names
+   * says "That computer" instead of a device_id no human recognizes.
+   */
+  inputName(device_id: string | null | undefined): string | null {
+    if (!device_id) return null;
+    const known =
+      this.input?.devices.find((d) => d.device_id === device_id)?.name ??
+      this.devices.find((d) => d.device_id === device_id)?.name;
+    if (known) return known;
+    return this.input?.here.device_id === device_id
+      ? this.input.here.name || null
+      : null;
   }
 
   /** Delay before retrying a missed resnapshot. Lowered by the tests. */
@@ -515,13 +576,18 @@ export class CoreStore {
     const generation = ++this.#generation;
     this.#buffer = [];
 
-    const [session, account, devices, pending, components] =
+    const [session, account, devices, pending, components, input] =
       await Promise.allSettled([
         api.sessionStatus(),
         api.accountStatus(),
         api.devicesList(),
         api.componentsPending(),
         api.componentsList(),
+        // Only if the Core granted the scope: calling without it would be a
+        // SCOPE_DENIED on every resnapshot, which is noise rather than news.
+        this.inputGranted
+          ? api.inputStatus()
+          : Promise.resolve<InputState | null>(null),
       ]);
     // A more recent resnapshot has taken over: it owns the buffer.
     if (generation !== this.#generation) return;
@@ -567,6 +633,20 @@ export class CoreStore {
     this.pending =
       pending.status === "fulfilled" ? pending.value.map(normalizePending) : [];
     this.components = components.status === "fulfilled" ? components.value : [];
+
+    // The engine's snapshot is the whole state of the Input tab, and a failed
+    // read is not a state: `COMPONENT_ABSENT` (no engine here, restarting, or a
+    // phone), `-32601` (a Core older than the facade). The section stays if it
+    // has ever been served, and says what is missing.
+    this.input = input.status === "fulfilled" ? input.value : null;
+    // The SCOPE is what decides whether the section exists, not whether the
+    // engine happened to answer this time. It very often does not on a cold
+    // start: this interface spawns the Core and connects to it immediately, while
+    // the engine is still a process being launched, and nothing would resnapshot
+    // afterwards on an account with no server to send a `session.changed`. The
+    // section can say the engine is not running; it cannot say it about a section
+    // that is not there.
+    this.inputSeen = this.inputGranted || this.input !== null;
     this.primed = true;
     // A fresh snapshot expires any earlier message: without this, the error
     // from a missed resnapshot survives the recovery and lies to the user. A
@@ -591,6 +671,14 @@ export class CoreStore {
     // progress" forever, for lack of recovery. So we ALWAYS apply them, outside
     // the buffer and outside the `primed` barrier.
     if (notification.method.startsWith("transfer.")) {
+      this.#apply(notification);
+      return;
+    }
+    // A refusal is announced once and nothing resnapshots it, exactly like a
+    // transfer: buffering it would lose the sentence whenever the resnapshot it
+    // was waiting behind fails and drops its buffer. It only ever sets the
+    // banner, so it is safe before the first snapshot too.
+    if (notification.method === "input.refused") {
       this.#apply(notification);
       return;
     }
@@ -731,6 +819,42 @@ export class CoreStore {
           kind: "error",
           sticky: true,
           text: pairingFailure(p?.reason ?? "server"),
+        };
+        return false;
+      }
+      // The whole input state, not a delta: the engine coalesces it to at most
+      // ten a second and sends nothing when nothing changed. Applied wholesale,
+      // which is what makes it idempotent.
+      case "input.updated": {
+        const state = (params as { state?: InputState } | null)?.state;
+        // A `state` this interface cannot recognize is not applied: the plane and
+        // the switches would render as blanks, and a tab of blanks says less than
+        // a tab that keeps the last thing the engine actually said.
+        if (!state || typeof state !== "object" || !state.here || !state.plane) {
+          return false;
+        }
+        this.input = state;
+        this.inputSeen = true;
+        return false;
+      }
+      // A refusal is an EVENT and not a state (the standing half of it is that
+      // device's `problem` in the snapshot), so it goes where an event goes: the
+      // banner, sticky. The person may well be looking at the machine that
+      // refused rather than at this window, and this sentence is the only account
+      // they get of a keystroke that went nowhere.
+      case "input.refused": {
+        const p = params as {
+          device_id?: string;
+          code?: string;
+          count?: number;
+        } | null;
+        if (typeof p?.code !== "string") return false;
+        const times =
+          typeof p.count === "number" && p.count > 1 ? ` (${p.count} times)` : "";
+        this.notice = {
+          kind: "error",
+          sticky: true,
+          text: `${refusalSentence(p.code, this.inputName(p.device_id))}${times}`,
         };
         return false;
       }
@@ -1229,6 +1353,92 @@ export class CoreStore {
         };
       }
     });
+  }
+
+  // -- Keyboard and mouse -------------------------------------------------
+  //
+  // Same rule as everywhere else: no optimistic write. Every one of these
+  // gestures makes the engine publish `input.updated`, which is the whole state,
+  // so what the screen shows is always the engine's word and never this
+  // interface's hope. And none of them waits for the far side: a gesture answers
+  // with what THIS machine knows (D21), the rest arrives as that device's
+  // `problem` and as `input.refused`.
+
+  /**
+   * An `input.*` gesture, with the engine's own vocabulary in the banner.
+   * Answers whether it went through, which is what lets a control that the
+   * browser has already moved (a checkbox) be put back when the engine says no:
+   * a tick left standing on the list that decides who may type here would be this
+   * interface asserting a grant nobody holds.
+   */
+  async #inputAct(action: () => Promise<unknown>): Promise<boolean> {
+    let done = false;
+    await this.#act(async () => {
+      try {
+        await action();
+        done = true;
+      } catch (e) {
+        this.notice = { kind: "error", text: gestureFailure(e) ?? humanize(e) };
+      }
+    });
+    return done;
+  }
+
+  /**
+   * The arrangement a human dragged. The whole set of spots, always, and never an
+   * empty one: `input.place` REPLACES the placement, so an empty set would erase
+   * the arrangement of every computer on the account (and every kept place of a
+   * screen that is away) from one gesture. No interface ever means that.
+   */
+  placeScreens(spots: PlacedSpot[]): Promise<boolean> {
+    if (spots.length === 0) return Promise.resolve(false);
+    return this.#inputAct(() => api.inputPlace(spots));
+  }
+
+  /** Who may drive THIS computer: the authority, and it stays here. */
+  allowInput(device_id: string, allowed: boolean): Promise<boolean> {
+    return this.#inputAct(() => api.inputAllow(device_id, allowed));
+  }
+
+  /** Who this computer may drive: a convenience list, and the far side decides. */
+  driveInput(device_id: string, allowed: boolean): Promise<boolean> {
+    return this.#inputAct(() => api.inputDrive(device_id, allowed));
+  }
+
+  /** Take the keyboard and mouse there now, or the keyboard alone. */
+  takeInput(device_id: string, mode?: "full" | "keys"): Promise<boolean> {
+    return this.#inputAct(() => api.inputTake(device_id, mode));
+  }
+
+  /** Bring them back. The method twin of the return hotkey. */
+  releaseInput(): Promise<boolean> {
+    return this.#inputAct(() => api.inputRelease());
+  }
+
+  /**
+   * The guards for one crossing. Applied crossing by crossing by the caller: a
+   * pair of computers can share more than one edge, and the engine stores a
+   * guard per crossing rather than per device.
+   */
+  setGuards(
+    device_id: string,
+    monitor: string,
+    side: string,
+    guards: Record<string, number | boolean>,
+  ): Promise<boolean> {
+    return this.#inputAct(() =>
+      api.inputGuards(device_id, monitor, side, guards),
+    );
+  }
+
+  /** Pin the pointer to this screen, both ways. */
+  lockPointer(locked: boolean): Promise<boolean> {
+    return this.#inputAct(() => api.inputLock(locked));
+  }
+
+  /** The return hotkey. Refused by the engine unless it can enforce it. */
+  setHotkey(keys: string[]): Promise<boolean> {
+    return this.#inputAct(() => api.inputHotkey(keys));
   }
 
   approve(request_id: string, scopes: string[]): Promise<void> {

@@ -242,7 +242,11 @@ pub mod stopped {
     pub const RETURNED: &str = "RETURNED";
     /// On to another screen: the pointer left this target for the next one.
     pub const MOVED: &str = "MOVED";
-    /// The local capture backend died under us.
+    /// The session could not go on, for a reason this end owns rather than the
+    /// target: the local capture backend died, the local grant to capture went
+    /// away, or the live channel to that computer ended. One code for the three,
+    /// which is why the sentence an interface says for it blames nobody
+    /// (doc/input-sharing.md, section 13).
     pub const GONE: &str = "GONE";
     /// The measured path degraded past the pointer threshold.
     pub const SLOW: &str = "SLOW";

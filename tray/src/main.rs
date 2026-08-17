@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use onedevice_ipc_client::{ClientConfig, TokenSource};
-use onedevice_tray::{Outcome, TrayStatus, UiCommand, run};
+use onedevice_tray::{Outcome, TrayView, UiCommand, run};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -30,8 +30,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 enum UserEvent {
     /// A menu item was chosen.
     Menu(MenuEvent),
-    /// The brain reports a status to reflect on the icon.
-    Status(TrayStatus),
+    /// The brain reports what to show: the tooltip and the menu's status line.
+    View(TrayView),
     /// The brain (or a startup failure) asks the process to exit with a code.
     Exit(i32),
 }
@@ -58,11 +58,21 @@ fn main() {
     }
 
     // Menu built now that tao has initialized gtk; ids captured to match clicks.
+    //
+    // The first item is disabled and is not a command: it is where the state is
+    // written. It has to exist because on Linux the tooltip below is a silent
+    // no-op (the libappindicator backend discards it), so without a line in the
+    // menu a whole platform would have no sign that its keyboard is somewhere
+    // else. Its handle is kept (cloned into the loop): a `muda` item is not
+    // Send, so it can only be written from the main thread, which is where the
+    // loop runs.
+    let status_item = MenuItem::new(TrayView::connecting().menu_line(), false, None);
     let open_item = MenuItem::new("Open 1Device", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
     let open_id = open_item.id().clone();
     let quit_id = quit_item.id().clone();
     let menu = Menu::new();
+    menu.append(&status_item).expect("append the status line");
     menu.append(&open_item).expect("append Open");
     menu.append(&quit_item).expect("append Quit");
 
@@ -104,15 +114,16 @@ fn main() {
                         TrayIconBuilder::new()
                             .with_menu(Box::new(menu))
                             .with_icon(icon)
-                            .with_tooltip(TrayStatus::Connecting.tooltip())
+                            .with_tooltip(TrayView::connecting().tooltip())
                             .build()
                             .expect("build tray icon"),
                     );
                 }
             }
-            Event::UserEvent(UserEvent::Status(status)) => {
+            Event::UserEvent(UserEvent::View(view)) => {
+                status_item.set_text(view.menu_line());
                 if let Some(tray) = &tray {
-                    let _ = tray.set_tooltip(Some(status.tooltip()));
+                    let _ = tray.set_tooltip(Some(view.tooltip()));
                 }
             }
             Event::UserEvent(UserEvent::Menu(menu_event)) => {
@@ -163,11 +174,19 @@ async fn brain(cmd_rx: mpsc::Receiver<UiCommand>, proxy: EventLoopProxy<UserEven
         name: "1device-tray".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         role: "tray".into(),
-        // session.read for the status icon, system.shutdown for the Quit — both
+        // session.read for the status icon, system.shutdown for the Quit: both
         // within the supervisor's grant.
         scopes: vec!["session.read".into(), "system.shutdown".into()],
         topics: vec!["session".into()],
-        optional_topics: Vec::new(),
+        // The keyboard and mouse session, which the tray must show for as long
+        // as it lasts. OPTIONAL, and not because of an old Core (the supervisor
+        // that spawns us is the Core, so we are always its own version), but
+        // because a spawn token bounds the scopes by the supervisor's GRANT: a
+        // hello asking for one outside it is refused whole, and the tray would
+        // then sit on "connecting" for ever rather than lose one line. (The token
+        // itself survives a refused hello, which is why the retry can use it.)
+        optional_scopes: vec!["input.read".into()],
+        optional_topics: vec!["input".into()],
         served_methods: vec![],
         reconnect_base_delay: RECONNECT_BASE_DELAY,
         request_timeout: REQUEST_TIMEOUT,
@@ -179,8 +198,8 @@ async fn brain(cmd_rx: mpsc::Receiver<UiCommand>, proxy: EventLoopProxy<UserEven
         let _ = stdin.read_to_end(&mut sink).await;
     };
 
-    let outcome = run(client, events, stdin_closed, cmd_rx, move |status| {
-        let _ = proxy.send_event(UserEvent::Status(status));
+    let outcome = run(client, events, stdin_closed, cmd_rx, move |view| {
+        let _ = proxy.send_event(UserEvent::View(view));
     })
     .await;
 

@@ -285,6 +285,139 @@ async fn an_optional_topic_the_core_does_not_know_costs_only_that_topic() {
     expect_connected(&mut events, &["session.read"]).await;
 }
 
+// Two optional topics, one of which this Core does not know. The fallback must
+// not be "the required set alone": that would cost the interface a topic this
+// Core does know, so growing a second optional topic would silently break the
+// feature behind the first one.
+#[tokio::test]
+async fn an_unknown_optional_topic_does_not_take_a_known_one_down_with_it() {
+    let mut scripted = ScriptedCore::start().await;
+    let mut config = client_config_at(scripted.path());
+    config.topics = vec!["session".into()];
+    config.optional_topics = vec!["pairing".into(), "input".into()];
+
+    let (_client, mut events) = onedevice_ipc_client::spawn(config);
+    let mut conn = scripted.accept().await;
+    conn.handle_hello(1).await;
+
+    async fn refuse(conn: &mut ScriptedConn, id: &serde_json::Value) {
+        conn.send(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32602, "message": "invalid params: topics" },
+        }))
+        .await;
+    }
+
+    // Everything at once, refused whole: the Core subscribes all or nothing.
+    let all = conn.recv().await;
+    assert_eq!(
+        all["params"]["topics"],
+        json!(["session", "pairing", "input"])
+    );
+    refuse(&mut conn, &all["id"]).await;
+
+    // Then one optional topic at a time, to find out which one it will not have.
+    let first = conn.recv().await;
+    assert_eq!(first["params"]["topics"], json!(["session", "pairing"]));
+    conn.send(&json!({ "jsonrpc": "2.0", "id": first["id"], "result": {} }))
+        .await;
+    let second = conn.recv().await;
+    assert_eq!(second["params"]["topics"], json!(["session", "input"]));
+    refuse(&mut conn, &second["id"]).await;
+
+    // And the LAST call is what the connection ends subscribed to, because the
+    // Core replaces the set rather than adding to it.
+    let keep = conn.recv().await;
+    assert_eq!(keep["params"]["topics"], json!(["session", "pairing"]));
+    conn.send(&json!({ "jsonrpc": "2.0", "id": keep["id"], "result": {} }))
+        .await;
+
+    expect_connected(&mut events, &["session.read"]).await;
+}
+
+// A scope this Core has never heard of is `invalid params` for the WHOLE hello,
+// so an interface that has grown one would not merely lose a feature: it would
+// never connect at all. The retry is what keeps the rest of it alive, and
+// `granted_scopes` is what tells the interface the feature is not available.
+#[tokio::test]
+async fn an_optional_scope_the_core_does_not_know_costs_only_that_scope() {
+    let mut scripted = ScriptedCore::start().await;
+    let mut config = client_config_at(scripted.path());
+    config.optional_scopes = vec!["input.read".into()];
+
+    let (_client, mut events) = onedevice_ipc_client::spawn(config);
+    let mut conn = scripted.accept().await;
+
+    let both = conn.recv().await;
+    assert_eq!(both["method"], "hello");
+    assert_eq!(
+        both["params"]["scopes"],
+        json!(["session.read", "input.read"]),
+        "the optional scope is asked for in the first hello, not in a second one"
+    );
+    conn.send(&json!({
+        "jsonrpc": "2.0",
+        "id": both["id"],
+        "error": { "code": -32602, "message": "invalid params: scopes" },
+    }))
+    .await;
+
+    // A second hello on the SAME connection: a refused one leaves the Core's
+    // phase untouched, and the token unconsumed.
+    let required = conn.recv().await;
+    assert_eq!(required["method"], "hello");
+    assert_eq!(required["params"]["scopes"], json!(["session.read"]));
+    assert_eq!(
+        required["params"]["token"], both["params"]["token"],
+        "the same token: a refused hello did not consume it"
+    );
+    conn.send(&json!({
+        "jsonrpc": "2.0",
+        "id": required["id"],
+        "result": { "status": "ok", "granted_scopes": ["session.read"], "api_version": 1 },
+    }))
+    .await;
+
+    expect_connected(&mut events, &["session.read"]).await;
+}
+
+// An optional scope this Core DOES know costs nothing at all: one hello, and it
+// comes back granted. Without this, every connection of every component would
+// pay a second round trip for a scope that was never in doubt.
+#[tokio::test]
+async fn an_optional_scope_the_core_knows_is_granted_in_one_hello() {
+    let core = TestCore::start().await;
+    let mut config = client_config(&core, "gui", &["session.read"], &[]);
+    config.optional_scopes = vec!["devices.read".into()];
+
+    let (_client, mut events) = onedevice_ipc_client::spawn(config);
+    expect_connected(&mut events, &["session.read", "devices.read"]).await;
+}
+
+// Against the REAL Core, with a real single-use spawn token, which is the case
+// the tray depends on: a scope outside the supervisor's grant is `SCOPE_DENIED`
+// for the whole hello, and the retry has to work with the SAME token. Two things
+// are being proved here that a scripted Core cannot prove: that the Core does not
+// consume a token on a refused hello, and that it accepts a second hello on the
+// same connection.
+#[tokio::test]
+async fn a_scope_outside_the_grant_is_dropped_and_the_spawn_token_still_works() {
+    let core = TestCore::start().await;
+    let token = core.mint("tray", &["session.read"]);
+    let mut config = client_config(&core, "tray", &["session.read"], &[]);
+    config.token = TokenSource::Spawn(token);
+    // The grant does not cover it: the Core answers SCOPE_DENIED, not -32602.
+    config.optional_scopes = vec!["devices.read".into()];
+
+    let (client, mut events) = onedevice_ipc_client::spawn(config);
+    expect_connected(&mut events, &["session.read"]).await;
+    client
+        .request("session.status", json!({}))
+        .await
+        .expect("the connection is live on the second hello's grant");
+}
+
 // The fallback is for the OPTIONAL half only: a required topic that is refused is
 // still a cycle failure. Nothing is downgraded silently.
 #[tokio::test]
@@ -321,6 +454,7 @@ pub fn client_config_at(path: std::path::PathBuf) -> onedevice_ipc_client::Clien
         role: "gui".into(),
         scopes: vec!["session.read".into()],
         topics: vec![],
+        optional_scopes: Vec::new(),
         optional_topics: Vec::new(),
         served_methods: vec![],
         reconnect_base_delay: std::time::Duration::from_millis(25),

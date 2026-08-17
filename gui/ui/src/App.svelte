@@ -10,11 +10,12 @@
   import Account from "./views/Account.svelte";
   import Approvals from "./views/Approvals.svelte";
   import Devices from "./views/Devices.svelte";
+  import Input from "./views/Input.svelte";
   import Onboarding from "./views/Onboarding.svelte";
   import Pairing from "./views/Pairing.svelte";
   import ServerSetup from "./views/ServerSetup.svelte";
 
-  type View = "account" | "devices" | "approvals" | "settings";
+  type View = "account" | "devices" | "input" | "approvals" | "settings";
 
   let { store }: { store: CoreStore } = $props();
   let view = $state<View>("account");
@@ -35,6 +36,16 @@
   // null on the desktop, where a send starts from a drag-and-drop instead.
   $effect(() => {
     if (store.pendingShare) view = "devices";
+  });
+
+  // The Input section exists only where it can do something: a desktop whose
+  // Core granted the input scopes AND whose engine has answered at least once.
+  // A phone therefore never has it (the engine is not started on Android: a
+  // phone is neither a source nor a target in v1), and neither does a Core older
+  // than the facade. Whoever is standing on the section when the engine goes
+  // quiet keeps it, and it says so itself.
+  $effect(() => {
+    if (view === "input" && !store.inputSeen) view = "account";
   });
 
   const coreLabel = $derived(
@@ -125,6 +136,13 @@
         aria-current={view === "devices" ? "page" : undefined}
         onclick={() => (view = "devices")}>Devices</button
       >
+      {#if store.inputSeen}
+        <button
+          class:active={view === "input"}
+          aria-current={view === "input" ? "page" : undefined}
+          onclick={() => (view = "input")}>Input</button
+        >
+      {/if}
       <button
         class:active={view === "approvals"}
         aria-current={view === "approvals" ? "page" : undefined}
@@ -175,6 +193,8 @@
         <Account {store} />
       {:else if view === "devices"}
         <Devices {store} />
+      {:else if view === "input"}
+        <Input {store} />
       {:else if view === "approvals"}
         <Approvals {store} />
       {:else}

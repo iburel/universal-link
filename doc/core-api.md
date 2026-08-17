@@ -97,7 +97,9 @@ Verification: per method and per topic. Example profiles — menu manager:
 `session.read + devices.read + files.send` (`session.read` is what tells it the
 Core is actually connected to the server: the directory cache is served offline
 too, so without it the menu would offer targets that cannot be reached); tray:
-`session.read + devices.read + transfers.read`; clipboard manager:
+`session.read + system.shutdown + input.read` (the status icon, the Quit that
+stops the whole Core, and the keyboard and mouse session it must show for as long
+as it lasts); clipboard manager:
 `devices.read + clipboard.read + clipboard.write`; sync engine (#84):
 `sync.serve + transactions.publish + peers.message + devices.read +
 session.read + transfers.read`; keyboard and mouse engine (#126):
@@ -119,9 +121,22 @@ Topics filtered by scopes. Notifications are named (below, by namespace). After 
 (`-32602` / `SCOPE_DENIED`) — never a partial subscription nobody was told about.
 A consequence for anything that has grown a topic since: asking a Core that
 predates it fails the subscription, and with it the connection. The client crate
-takes topics that may be refused separately (`ClientConfig::optional_topics`) and
-falls back to the required set alone, which is how an interface keeps working
-against an older Core while simply not seeing that topic's events.
+takes topics that may be refused separately (`ClientConfig::optional_topics`): it
+asks for everything, and when that is refused it tries each optional topic on its
+own and ends subscribed to the required set plus those that were accepted. That is
+how an interface keeps working against an older Core while simply not seeing the
+events of the topic that Core does not have, and why a SECOND optional topic does
+not cost the first one its events (#127).
+
+The same hazard exists one step earlier, in the `hello`: a scope name the Core has
+never heard of is `invalid params` for the whole handshake, so an interface that
+has grown a scope would not lose a feature, it would never connect. A refused
+`hello` leaves the connection pristine (above), so the client asks for
+`ClientConfig::optional_scopes` alongside the required ones and, if that is
+refused, sends a second `hello` without them on the same connection. What the
+feature behind such a scope must gate on is `granted_scopes` in the reply, never
+the mere fact of having connected. Unlike the topics, this fallback is all or
+nothing: only scopes that shipped in one release together belong in that list.
 
 ## `session.*`
 

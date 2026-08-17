@@ -14,6 +14,7 @@ import type {
   AccountKey,
   Component,
   Device,
+  InputState,
   PendingRequest,
   SessionState,
 } from "./api";
@@ -2687,4 +2688,419 @@ test("an outcome this page has no word for is still reported", async () => {
   await store.scanPairingCode();
 
   expect(store.notice?.text).toContain("could not be read");
+});
+
+// -- Keyboard and mouse (the `input.*` facade) -------------------------------
+
+const INPUT_CONNECTED: ConnectionStatus = {
+  status: "connected",
+  granted_scopes: [
+    "session.read",
+    "devices.read",
+    "components.approve",
+    "input.read",
+    "input.manage",
+  ],
+  api_version: 1,
+};
+
+const NODE_A = "a".repeat(64);
+const NODE_B = "b".repeat(64);
+
+function inputState(over: Partial<InputState> = {}): InputState {
+  return {
+    here: {
+      device_id: "d_self",
+      name: "PC-Core",
+      monitors: [
+        {
+          id: "A1",
+          name: "Built in",
+          w: 1920,
+          h: 1080,
+          x: 0,
+          y: 0,
+          scale: 1000,
+          primary: true,
+          present: true,
+        },
+      ],
+      problem: null,
+      can_drive: true,
+      can_be_driven: true,
+    },
+    plane: {
+      id: "f".repeat(32),
+      by: null,
+      spots: [
+        {
+          monitor: `${NODE_A}/A1`,
+          device_id: "d_self",
+          name: "Built in",
+          x: 0,
+          y: 0,
+          w: 1920,
+          h: 1080,
+          present: true,
+          primary: true,
+        },
+        {
+          monitor: `${NODE_B}/B1`,
+          device_id: "d_win",
+          name: "Main",
+          x: 1920,
+          y: 0,
+          w: 2560,
+          h: 1440,
+          present: true,
+          primary: true,
+        },
+      ],
+    },
+    devices: [
+      {
+        device_id: "d_win",
+        name: "Living Room PC",
+        state: "ready",
+        monitors: [],
+        rtt_ms: 4,
+        lan: true,
+        allowed: false,
+        drive: false,
+        mode: "typing",
+        problem: null,
+      },
+    ],
+    session: null,
+    guards: [],
+    lock: false,
+    hotkey: ["ctrl", "alt", "Escape"],
+    ...over,
+  };
+}
+
+/** A primed store whose Core granted the input scopes and serves the engine. */
+async function withInput(over: Partial<InputState> = {}, extra: Record<string, Method> = {}) {
+  const fake = mockCore({
+    status: INPUT_CONNECTED,
+    methods: { "input.status": () => inputState(over), ...extra },
+  });
+  await store.start();
+  await vi.waitFor(() => expect(store.primed).toBe(true));
+  return fake;
+}
+
+test("the engine's snapshot is read at every resnapshot, and the section appears", async () => {
+  const fake = await withInput();
+
+  expect(store.input?.plane.spots).toHaveLength(2);
+  expect(store.inputSeen).toBe(true);
+  expect(fake.calls.map((c) => c.method)).toContain("input.status");
+});
+
+// Asked for optionally (a scope a Core has never heard of fails the whole
+// hello), so a Core that did not grant them is not asked for the snapshot at
+// all: a SCOPE_DENIED on every resnapshot would be noise rather than news.
+test("without the scopes, the engine is never asked and the section stays away", async () => {
+  const fake = await primed({ "input.status": () => inputState() });
+
+  expect(store.input).toBeNull();
+  expect(store.inputSeen).toBe(false);
+  expect(fake.calls.map((c) => c.method)).not.toContain("input.status");
+});
+
+// An engine that has not answered YET is the ordinary cold start: this interface
+// spawns the Core and connects at once, while the engine is still a process being
+// launched. The section exists (the scope is what decides), and it holds no state
+// to show until the engine speaks.
+test("an engine that has not answered yet leaves the section with nothing in it", async () => {
+  const fake = mockCore({
+    status: INPUT_CONNECTED,
+    methods: {
+      "input.status": () => {
+        throw appError("COMPONENT_ABSENT");
+      },
+    },
+  });
+  await store.start();
+  await vi.waitFor(() => expect(store.primed).toBe(true));
+
+  expect(store.input).toBeNull();
+  expect(store.inputSeen).toBe(true);
+  expect(fake.calls.map((c) => c.method)).toContain("input.status");
+});
+
+// An engine that has answered once and then goes quiet keeps its section (it
+// says so itself), but never a stale plane: a snapshot that could not be read is
+// not a state.
+test("an engine that goes quiet keeps the section and loses the plane", async () => {
+  await withInput();
+  expect(store.input?.plane.spots).toHaveLength(2);
+
+  // The same store, with an engine that has died under it: the next resnapshot
+  // cannot read it.
+  const fake = mockCore({
+    status: INPUT_CONNECTED,
+    methods: {
+      "input.status": () => {
+        throw appError("COMPONENT_ABSENT");
+      },
+    },
+  });
+  await store.resync();
+
+  expect(fake.calls.map((c) => c.method)).toContain("input.status");
+  expect(store.input).toBeNull();
+  expect(store.inputSeen).toBe(true);
+});
+
+test("a downgraded Core that grants nothing takes the section away", async () => {
+  await withInput();
+  expect(store.inputSeen).toBe(true);
+
+  store.connection = CONNECTED;
+  await store.resync();
+
+  expect(store.inputSeen).toBe(false);
+  expect(store.input).toBeNull();
+});
+
+// `input.updated` carries the WHOLE state, not a delta: applied wholesale, which
+// is what makes replaying it harmless.
+test("the topic's update replaces the state whole", async () => {
+  await withInput();
+
+  await emit("core:notification", {
+    method: "input.updated",
+    params: {
+      state: inputState({
+        session: {
+          device_id: "d_win",
+          direction: "out",
+          mode: "full",
+          since: 1,
+          rtt_ms: 4,
+        },
+      }),
+    },
+  });
+
+  expect(store.input?.session?.device_id).toBe("d_win");
+  expect(store.input?.plane.spots).toHaveLength(2);
+});
+
+test("an update this version cannot recognize is not applied over a good one", async () => {
+  await withInput();
+
+  await emit("core:notification", { method: "input.updated", params: {} });
+  await emit("core:notification", {
+    method: "input.updated",
+    params: { state: { lock: true } },
+  });
+
+  expect(store.input?.plane.spots).toHaveLength(2);
+  expect(store.input?.lock).toBe(false);
+});
+
+// An update arriving before any snapshot is what makes the section appear on a
+// window opened after a crossing had already started.
+test("an update alone is enough to fill the section in", async () => {
+  // An engine that was not there when the snapshot was read, and speaks after:
+  // its first published snapshot is what a window opened too early renders from,
+  // with no resnapshot in between (a serverless account sends no
+  // `session.changed` to provoke one).
+  mockCore({
+    status: INPUT_CONNECTED,
+    methods: {
+      "input.status": () => {
+        throw appError("COMPONENT_ABSENT");
+      },
+    },
+  });
+  await store.start();
+  await vi.waitFor(() => expect(store.primed).toBe(true));
+  expect(store.input).toBeNull();
+
+  await emit("core:notification", {
+    method: "input.updated",
+    params: { state: inputState() },
+  });
+
+  expect(store.inputSeen).toBe(true);
+  expect(store.input?.plane.id).toHaveLength(32);
+});
+
+// A refusal is an event: it goes to the banner, sticky, because the person may
+// well be looking at the machine that refused rather than at this window.
+test("a refusal becomes the sentence for its code, with the device's name", async () => {
+  await withInput();
+
+  await emit("core:notification", {
+    method: "input.refused",
+    params: { device_id: "d_win", code: "ELEVATED_WINDOW", count: 1 },
+  });
+
+  expect(store.notice?.kind).toBe("error");
+  expect(store.notice?.sticky).toBe(true);
+  expect(store.notice?.text).toBe(
+    "Nothing was typed: this window runs as administrator.",
+  );
+});
+
+test("a refusal that happened more than once says how many", async () => {
+  await withInput();
+
+  await emit("core:notification", {
+    method: "input.refused",
+    params: { device_id: "d_win", code: "IDLE", count: 7 },
+  });
+
+  expect(store.notice?.text).toContain("Living Room PC");
+  expect(store.notice?.text).toContain("(7 times)");
+});
+
+// The engine emits an injection's refusal on BOTH ends of a session, and the
+// notification carries a device_id with no direction: a sentence that named the
+// device would name the wrong machine on one of the two sides every time.
+test("an injection's refusal names no machine at all", async () => {
+  await withInput();
+
+  await emit("core:notification", {
+    method: "input.refused",
+    params: { device_id: "d_win", code: "UNRESOLVED", count: 1 },
+  });
+
+  expect(store.notice?.text).toContain("the computer being driven");
+  expect(store.notice?.text).not.toContain("Living Room PC");
+});
+
+test("a refusal about a device nobody names still says something", async () => {
+  await withInput();
+
+  await emit("core:notification", {
+    method: "input.refused",
+    params: { code: "BUSY" },
+  });
+
+  expect(store.notice?.text).toContain("That computer");
+  // And a payload that is not a refusal at all changes nothing.
+  store.notice = null;
+  await emit("core:notification", { method: "input.refused", params: {} });
+  expect(store.notice).toBeNull();
+});
+
+// Same reason as a transfer: nothing resnapshots a refusal, so a buffer that is
+// dropped would lose the sentence.
+test("a refusal is not buffered behind a resnapshot", async () => {
+  const gate = deferred<SessionState>();
+  mockCore({
+    status: INPUT_CONNECTED,
+    methods: {
+      "session.status": () => gate.promise,
+      "input.status": () => inputState(),
+    },
+  });
+  await store.start();
+
+  await emit("core:notification", {
+    method: "input.refused",
+    params: { device_id: "d_win", code: "SECURE_INPUT", count: 1 },
+  });
+
+  expect(store.notice?.text).toContain("password fields");
+  gate.resolve(SESSION);
+});
+
+// -- The gestures ------------------------------------------------------------
+
+test("every gesture reaches the Core with the engine's own parameters", async () => {
+  const fake = await withInput({}, {
+    "input.allow": () => ({}),
+    "input.drive": () => ({}),
+    "input.take": () => ({}),
+    "input.release": () => ({}),
+    "input.place": () => ({}),
+    "input.guards": () => ({}),
+    "input.lock": () => ({}),
+    "input.hotkey": () => ({}),
+  });
+
+  await store.allowInput("d_win", true);
+  await store.driveInput("d_win", false);
+  await store.takeInput("d_win");
+  await store.takeInput("d_win", "keys");
+  await store.releaseInput();
+  await store.placeScreens([{ monitor: `${NODE_B}/B1`, x: 10, y: 20 }]);
+  await store.setGuards("d_win", `${NODE_B}/B1`, "right", { wall: true });
+  await store.lockPointer(true);
+  await store.setHotkey(["ctrl", "shift", "Home"]);
+
+  const sent = fake.calls.filter((c) => c.method.startsWith("input."));
+  expect(sent).toEqual([
+    { method: "input.status", params: undefined },
+    { method: "input.allow", params: { device_id: "d_win", allowed: true } },
+    { method: "input.drive", params: { device_id: "d_win", allowed: false } },
+    { method: "input.take", params: { device_id: "d_win" } },
+    { method: "input.take", params: { device_id: "d_win", mode: "keys" } },
+    { method: "input.release", params: undefined },
+    { method: "input.place", params: { spots: [{ monitor: `${NODE_B}/B1`, x: 10, y: 20 }] } },
+    {
+      method: "input.guards",
+      params: {
+        device_id: "d_win",
+        monitor: `${NODE_B}/B1`,
+        side: "right",
+        guards: { wall: true },
+      },
+    },
+    { method: "input.lock", params: { locked: true } },
+    { method: "input.hotkey", params: { keys: ["ctrl", "shift", "Home"] } },
+  ]);
+});
+
+// No optimistic write: the engine publishes the whole state after every gesture,
+// so what the screen shows is the engine's word and never this interface's hope.
+test("a gesture writes nothing into the state", async () => {
+  await withInput({}, { "input.allow": () => ({}) });
+
+  await store.allowInput("d_win", true);
+
+  expect(store.input?.devices[0].allowed).toBe(false);
+});
+
+test("a refused gesture gets the engine's own sentence", async () => {
+  await withInput({}, {
+    "input.take": () => {
+      throw appError("INPUT_TOO_SLOW");
+    },
+  });
+
+  await store.takeInput("d_win");
+
+  expect(store.notice?.kind).toBe("error");
+  expect(store.notice?.text).toContain("keyboard alone");
+});
+
+// A malformed request is this interface's own bug: it is reported as the Core
+// worded it rather than dressed up as advice to the user.
+test("a malformed gesture is reported as the Core worded it", async () => {
+  await withInput({}, {
+    "input.place": () => {
+      throw invalidParams("spots");
+    },
+  });
+
+  await store.placeScreens([{ monitor: "nope", x: 0, y: 0 }]);
+
+  expect(store.notice?.text).toBe("invalid params: spots");
+});
+
+test("a name comes from the engine's list, then the Core's, then nowhere", async () => {
+  await withInput();
+
+  expect(store.inputName("d_win")).toBe("Living Room PC");
+  expect(store.inputName("d_self")).toBe("PC-Core");
+  expect(store.inputName("d_nobody")).toBeNull();
+  expect(store.inputName(null)).toBeNull();
+  expect(store.selfPlatform).toBe("linux");
 });

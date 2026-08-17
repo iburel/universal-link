@@ -29,7 +29,15 @@ async fn connection_state_follows_the_core() {
     core.restart().await;
     let snap = shell.expect_connection("connected").await;
     assert_eq!(snap["api_version"], 1);
-    assert_eq!(snap["granted_scopes"], json!(onedevice_gui::GUI_SCOPES));
+    // The Input tab's scopes are asked for optionally, and a Core of this
+    // version grants them: `granted_scopes` is what the interface gates the tab
+    // on, so it has to carry them.
+    let granted: Vec<&str> = onedevice_gui::GUI_SCOPES
+        .iter()
+        .chain(onedevice_gui::GUI_INPUT_SCOPES.iter())
+        .copied()
+        .collect();
+    assert_eq!(snap["granted_scopes"], json!(granted));
     assert_eq!(shell.connection_status().await["status"], "connected");
 
     // Loss of the Core: back to "connecting" — never a lying state.
