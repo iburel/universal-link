@@ -202,6 +202,14 @@ impl FakeBackend {
         .await;
     }
 
+    /// The OS grant arrived (or went away): narrow or widen what the fake claims
+    /// and tell the engine to ask again, which is the pair a real backend does in
+    /// this order.
+    pub async fn grant_changed(&self, caps: Capabilities) {
+        self.set_capabilities(caps);
+        self.emit(BackendEvent::CapabilitiesChanged).await;
+    }
+
     /// Everything the engine has done to this backend so far.
     pub fn calls(&self) -> Calls {
         self.lock().calls.clone()

@@ -459,6 +459,9 @@ pub struct Engine<B> {
     mods_held: u16,
     last_pointer: Option<Point>,
     capture: Option<CaptureMode>,
+    /// Whether a confinement of OURS is in place, so the release can happen even
+    /// after the capability that allowed it has gone (see [`Engine::confine`]).
+    confined: bool,
     peers: BTreeMap<String, Peer>,
     driving: Option<Driving>,
     driven: Option<Driven>,
@@ -540,6 +543,7 @@ impl<B: InputBackend> Engine<B> {
             mods_held: 0,
             last_pointer: None,
             capture: None,
+            confined: false,
             peers: BTreeMap::new(),
             driving: None,
             driven: None,
@@ -1687,18 +1691,38 @@ impl<B: InputBackend> Engine<B> {
         if self.capture == Some(want) {
             return;
         }
+        let was_on = matches!(
+            self.capture,
+            Some(CaptureMode::Watch) | Some(CaptureMode::Swallow)
+        );
         self.capture = Some(want);
-        // A backend that cannot capture is not asked to: with every capability
-        // false there is nothing to turn on or off, and calling anyway would make
-        // a test of the capability-less platform read as if the engine had tried.
-        if self.caps.capture {
+        // A backend that cannot capture is not asked to START: with every
+        // capability false there is nothing to turn on, and calling anyway would
+        // make a test of the capability-less platform read as if the engine had
+        // tried.
+        //
+        // Turning it OFF is not the same call and is deliberately NOT gated on the
+        // capability, as long as we are undoing something we did. The case is a
+        // grant withdrawn mid-session: the capabilities narrow to nothing while the
+        // backend is still swallowing, and a gate on `caps.capture` would then
+        // leave the machine swallowing its owner's keystrokes with no session left
+        // to send them to, which is a dead keyboard until the process is restarted.
+        // Stopping something that was never started stays silent, which is what
+        // keeps the capability-less platform honest.
+        if self.caps.capture || (want == CaptureMode::Off && was_on) {
             self.backend.capture(want);
         }
     }
 
     /// Pins or releases the pointer, if this machine can.
-    fn confine(&self, rect: Option<Rect>) {
-        if self.caps.confine {
+    ///
+    /// Releasing follows [`Engine::apply_capture`]'s rule for the same reason: a
+    /// pointer pinned by a session whose grant was withdrawn mid-flight would stay
+    /// pinned for ever, so `confine(None)` goes through whenever there is a
+    /// confinement of ours to lift, capability or not.
+    fn confine(&mut self, rect: Option<Rect>) {
+        if self.caps.confine || (rect.is_none() && self.confined) {
+            self.confined = rect.is_some();
             self.backend.confine(rect);
         }
     }
@@ -1785,6 +1809,27 @@ impl<B: InputBackend> Engine<B> {
                 // Unicode injection, or to `UNRESOLVED` on a target whose backend
                 // has none.
                 self.mod_keys.learn(&self.backend, &mut self.resolver).await;
+            }
+            BackendEvent::CapabilitiesChanged => {
+                // The whole point of the event: what this machine can do is asked
+                // again, and what it can PRODUCE with it. The resolver caches
+                // negative answers on purpose, so without the relearn a backend
+                // that had no keymap or no grant when it was first asked would be
+                // remembered as unable to type for the life of the process.
+                self.caps = self.backend.capabilities();
+                self.relearn().await;
+                if self.driving.is_some() && !self.caps.can_drive() {
+                    // The grant went the other way: this machine can no longer
+                    // swallow or pin, so the session it is holding somebody's
+                    // keyboard in has to end rather than half work.
+                    self.bring_home(stopped::GONE, now);
+                }
+                if self.driven.is_some() && !self.caps.can_be_driven() {
+                    self.end_driven(Some(refused::NO_BACKEND), now);
+                }
+                self.republish(now);
+                self.apply_capture();
+                self.dirty = true;
             }
             BackendEvent::Refused(refusal) => self.on_backend_refusal(refusal, now),
             BackendEvent::CaptureLost(why) => {
@@ -3224,7 +3269,17 @@ impl<B: InputBackend> Engine<B> {
             self.end_driven(Some(ended::NO_BACKEND), now);
         }
         self.release_held();
-        if self.caps.capture && self.capture != Some(CaptureMode::Off) {
+        // A forced Off rather than `apply_capture`, which would compute Watch again
+        // for a peer that is still warm: this is the end of the process. The
+        // capability is not the only reason to make the call, for the reason
+        // `apply_capture` spells out: a backend that IS swallowing has to be told to
+        // stop even if its grant has been withdrawn since, or the machine is left
+        // swallowing its owner's keystrokes with nothing to send them to.
+        let was_on = matches!(
+            self.capture,
+            Some(CaptureMode::Watch) | Some(CaptureMode::Swallow)
+        );
+        if (self.caps.capture || was_on) && self.capture != Some(CaptureMode::Off) {
             self.capture = Some(CaptureMode::Off);
             self.backend.capture(CaptureMode::Off);
         }
@@ -4872,6 +4927,159 @@ mod tests {
             h.calls().capture.is_empty() && h.calls().actions.is_empty(),
             "and a backend that can do nothing is never asked to: {:?}",
             h.calls()
+        );
+    }
+
+    /// The OS grant that arrives LATE, which is the macOS Accessibility case and
+    /// the reason the seam has a `CapabilitiesChanged` upcall at all.
+    ///
+    /// Two things have to happen when it lands, and only one of them is obvious.
+    /// The capabilities are re-read, so the interface stops saying this computer
+    /// cannot type. And what this machine can PRODUCE is asked all over again,
+    /// because the resolver caches negative answers on purpose: a backend asked
+    /// before its grant existed is otherwise remembered as unable to produce
+    /// anything for the life of the process, and the machine would accept a session
+    /// and then type nothing into it.
+    #[tokio::test]
+    async fn a_grant_that_arrives_late_is_believed_and_everything_is_asked_again() {
+        let shift = keys::usage(keys::PAGE_KEYBOARD, 0xE1);
+        let mut h = Harness::new();
+        h.fake.refused();
+        let peer = h.desk().await;
+        assert_eq!(h.engine.status()["here"]["problem"], json!("no_permission"));
+        assert_eq!(h.engine.status()["here"]["can_be_driven"], json!(false));
+
+        // The grant lands. The backend widens what it claims and, in the same
+        // breath, can answer the layout questions it could not answer before.
+        let (full, _rx) = FakeBackend::new();
+        let caps = full.capabilities();
+        h.fake.teach_usage(shift, 16);
+        h.fake.teach_symbol("A", 65, keys::mods::SHIFT);
+        h.fake.grant_changed(caps).await;
+        h.engine
+            .on_backend(BackendEvent::CapabilitiesChanged, h.t0)
+            .await;
+
+        assert_eq!(h.engine.status()["here"]["problem"], Value::Null);
+        assert_eq!(h.engine.status()["here"]["can_be_driven"], json!(true));
+
+        // And the proof that it asked again rather than only re-read the booleans:
+        // a session started now can type a symbol that needs the modifier the
+        // engine could not resolve a moment ago.
+        h.driven(&peer).await;
+        h.fake.forget();
+        h.feed(
+            &peer,
+            vec![Frame::Key {
+                session: 1,
+                n: 2,
+                usage: 0,
+                key: None,
+                sym: Some("A".into()),
+                mods: keys::mods::SHIFT,
+                layout: "us".into(),
+                down: true,
+                lock: false,
+            }],
+            h.t0,
+        )
+        .await;
+        let actions = h.calls().actions;
+        assert!(
+            actions.contains(&Action::Key {
+                code: PlatformKey {
+                    code: 16,
+                    detail: 0
+                },
+                down: true
+            }),
+            "the modifier was re-learned after the grant: {actions:?}"
+        );
+        assert!(
+            actions.contains(&Action::Key {
+                code: PlatformKey {
+                    code: 65,
+                    detail: 0
+                },
+                down: true
+            }),
+            "and the symbol resolves now: {actions:?}"
+        );
+    }
+
+    /// The grant going the OTHER way, mid-session, and this is the dangerous
+    /// direction: a permission withdrawn while this machine is DRIVING leaves a
+    /// backend that is swallowing its owner's keystrokes and a pointer that is
+    /// pinned, for a session that can no longer exist.
+    ///
+    /// So the two calls that undo those two things are not allowed to depend on the
+    /// capability that allowed them: a gate on `caps` there reads as "we cannot
+    /// capture, so there is nothing to stop", and the machine keeps the keyboard.
+    #[tokio::test]
+    async fn a_grant_taken_away_while_driving_stops_the_swallow_and_lifts_the_pin() {
+        let mut h = Harness::new();
+        let peer = h.desk().await;
+        h.driving(&peer).await;
+        assert_eq!(
+            h.calls().capture.last(),
+            Some(&CaptureMode::Swallow),
+            "the source is swallowing before the grant goes"
+        );
+        assert!(
+            h.calls().confine.last().is_some_and(Option::is_some),
+            "and the pointer is pinned: {:?}",
+            h.calls().confine
+        );
+        h.fake.forget();
+
+        h.fake.refused();
+        h.engine
+            .on_backend(BackendEvent::CapabilitiesChanged, h.t0)
+            .await;
+
+        assert_eq!(
+            h.calls().capture,
+            vec![CaptureMode::Off],
+            "the swallow is lifted even though the capability that allowed it is gone"
+        );
+        assert_eq!(
+            h.calls().confine,
+            vec![None],
+            "and so is the pin: a pointer stuck in a corner is the other dead keyboard"
+        );
+        assert!(
+            h.frames(&peer)
+                .iter()
+                .any(|f| matches!(f, Frame::Stop { code, .. } if code == stopped::GONE)),
+            "and the peer is told the keyboard went home"
+        );
+    }
+
+    /// The same withdrawal on the machine being DRIVEN: it can no longer type what
+    /// it is sent, so the session ends with the word that explains it rather than
+    /// swallowing frames in silence.
+    #[tokio::test]
+    async fn a_grant_taken_away_while_driven_ends_the_session_with_a_reason() {
+        let mut h = Harness::new();
+        let peer = h.desk().await;
+        h.driven(&peer).await;
+        h.fake.forget();
+
+        h.fake.refused();
+        h.engine
+            .on_backend(BackendEvent::CapabilitiesChanged, h.t0)
+            .await;
+
+        assert!(
+            h.frames(&peer)
+                .iter()
+                .any(|f| matches!(f, Frame::Ended { code, .. } if code == ended::NO_BACKEND)),
+            "the source is told why its keyboard stopped arriving"
+        );
+        assert_eq!(
+            h.engine.status()["here"]["can_be_driven"],
+            json!(false),
+            "and the snapshot says what this computer cannot do now"
         );
     }
 

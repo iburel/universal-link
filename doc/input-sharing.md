@@ -1141,11 +1141,29 @@ as upcalls instead, coalesced, which is all the interface needs.
 
 `Motion { x, y, dx, dy }`, `Button`, `Wheel`, `Key { u, key, sym, m, lk,
 dn }`, `MonitorsChanged`, `LayoutChanged { layout, group }`,
-`Refused { code }`, `CaptureLost { why }`.
+`CapabilitiesChanged`, `Refused { code }`, `CaptureLost { why }`.
 
 `Key` upcalls carry the same levels the wire carries, because the source's
 job is to read them off the OS and put them in a frame. Reading the symbol
 the local layout produced is part of capture, not a separate lookup.
+
+**`CapabilitiesChanged` was added by #125, and the seam was wrong without
+it.** The engine re-read the capabilities on exactly three occasions: at
+start, on `MonitorsChanged`, and on `CaptureLost`. An OS grant given after
+the component started is none of the three, so a Mac whose Accessibility
+permission a person granted at the prompt kept saying "nothing here can
+type" until something unrelated happened. Reusing `MonitorsChanged` would
+have worked by accident and lied in the log; `CaptureLost` would have ended a
+live session for a permission that had just been GIVEN.
+
+It carries the `resolve` cache with it, which is the half that is not
+obvious: negative answers are cached on purpose, so a backend asked what it
+can produce before its grant or its keymap existed is remembered as able to
+produce nothing for the life of the process. The engine therefore re-learns
+on this event exactly as it does when a session starts, and a withdrawal in
+the other direction ends whatever the machine was in the middle of (a
+`stop` when it was driving, an `end NO_BACKEND` when it was being driven)
+rather than leaving a session that can no longer work.
 
 **`LayoutChanged` carries the active GROUP as well as the identity**, and it
 has to. A stroke whose symbol resolves in another keyboard group switches to
@@ -1167,11 +1185,28 @@ W stuck down, or a Control, for the rest of the session.
 ### rediscover
 
 1. **Under confinement, `dx` and `dy` must come from the OS's own relative
-   source** (raw input on Windows, XI2 raw events on X11, the `CGEvent`
-   delta fields on macOS), never from differencing successive absolute
-   positions. The engine warps the pointer back each event to keep it
-   pinned, so the difference between two absolute positions is zero exactly
-   when the hand is moving fastest.
+   source** (the low level hook's intended point against the real cursor on
+   Windows, XI2 raw events on X11, the `CGEvent` delta fields on macOS),
+   never from differencing successive absolute positions. The BACKEND is what
+   keeps the pointer pinned while a session is live (a clip plus a swallow, a
+   grab plus a warp, a decoupling), so the difference between two absolute
+   positions is zero exactly when the hand is moving fastest.
+
+   Corrected by #125: the first version of this said the ENGINE warps the
+   pointer back on every event, and it does not. It confines once when the
+   peer accepts and integrates the deltas into a virtual cursor in the
+   target's space; nothing local moves for the whole session. The conclusion
+   was right and the mechanism named was not, which matters because a backend
+   author reading the old sentence would have waited for a warp that never
+   comes.
+
+   And it is not only "under confinement". The same is true while merely
+   WATCHING an edge, for a reason that is easy to miss: the OS clamps its own
+   pointer at the boundary of its own desktop, `at_edge` asks whether the
+   pointer went strictly PAST the last pixel, and a pointer already sitting on
+   that pixel generates no further absolute movement at all. Differenced
+   deltas are zero there, which is precisely where a crossing has to fire, so
+   a backend with no relative source can never hand a pointer over.
 2. **A relative mouse move of (0, 0) is discarded by Windows** and reaches
    no hook at all (#123). A backend must not rely on seeing one; the engine
    never emits one.

@@ -511,6 +511,31 @@ pub enum BackendEvent {
         layout: String,
         group: u32,
     },
+    /// What this backend can do has changed, and nothing else has: the OS grant
+    /// arrived, or was taken away, without a monitor moving and without capture
+    /// being lost. The engine re-reads [`InputBackend::capabilities`], asks what
+    /// this machine can produce all over again, applies the capture mode the new
+    /// answer allows and republishes.
+    ///
+    /// # Why the seam needed one more upcall than the design listed
+    ///
+    /// Added by the platform ticket, because without it a macOS machine whose
+    /// Accessibility grant is given AFTER the component started keeps saying it
+    /// cannot type until something unrelated happens. The engine re-reads the
+    /// capabilities on exactly three occasions: at start, on
+    /// [`BackendEvent::MonitorsChanged`], and on [`BackendEvent::CaptureLost`].
+    /// A grant is none of those. Reusing `MonitorsChanged` would work by accident
+    /// (it does re-read the capabilities) and would lie in the log about what
+    /// happened, and `CaptureLost` would end a live session for a permission that
+    /// had just been GIVEN.
+    ///
+    /// It also closes the trap the seam's `resolve` documents: the resolution cache
+    /// keeps negative answers on purpose, so a backend asked what it can produce
+    /// before its grant exists is remembered as able to produce nothing. A session
+    /// start already re-learns; this makes the moment the grant lands re-learn too,
+    /// so an interface that says "1Device can type on this computer now" is telling
+    /// the truth rather than predicting it.
+    CapabilitiesChanged,
     /// An injection was refused. Coalesced by the engine into one `oops` frame
     /// per code per second, with a count.
     Refused(Refusal),
