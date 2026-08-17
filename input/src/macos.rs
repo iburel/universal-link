@@ -2792,7 +2792,7 @@ mod tests {
     fn the_horizontal_scroll_sign_is_flipped_the_same_way_in_both_directions() {
         // Capture: a macOS delta of +N (left) has to become a dialect dx of -N.
         let acc = AtomicI32::new(0);
-        let mac_left = 240;
+        let mac_left = 20;
         assert_eq!(
             -notches(&acc, mac_left),
             -2,
@@ -2866,20 +2866,31 @@ mod tests {
         }
     }
 
-    /// The pixel accumulator, which is what keeps a trackpad from scrolling nothing.
+    /// The point accumulator, which is what keeps a trackpad from scrolling nothing.
+    ///
+    /// In POINTS and not in Windows wheel units: a macOS notch is about ten of these (see
+    /// [`WHEEL_POINTS_PER_NOTCH`]), and this test used to be written against 120, which is
+    /// the number that made twelve notches of a real wheel travel as one.
     #[test]
     fn a_fraction_of_a_notch_is_kept_until_it_is_a_whole_one() {
         let acc = AtomicI32::new(0);
-        assert_eq!(notches(&acc, 40), 0);
-        assert_eq!(notches(&acc, 40), 0);
-        assert_eq!(notches(&acc, 40), 1, "three forties are one notch");
+        assert_eq!(notches(&acc, 3), 0);
+        assert_eq!(notches(&acc, 3), 0);
+        assert_eq!(notches(&acc, 4), 1, "ten points of movement are one notch");
         assert_eq!(acc.load(Ordering::Relaxed), 0);
         // And the other way, which must not round towards zero and lose it.
-        assert_eq!(notches(&acc, -60), 0);
-        assert_eq!(notches(&acc, -60), -1);
+        assert_eq!(notches(&acc, -5), 0);
+        assert_eq!(notches(&acc, -5), -1);
+        assert_eq!(acc.load(Ordering::Relaxed), 0);
         assert_eq!(notches(&acc, 0), 0);
         // Whole notches at once pass straight through.
-        assert_eq!(notches(&acc, 360), 3);
+        assert_eq!(notches(&acc, 30), 3);
+        // And a number no device could mean neither overflows nor sticks: the accumulator is
+        // clamped, so a debug build cannot panic here and a wedged axis cannot park itself at
+        // the edge of the type.
+        let acc = AtomicI32::new(0);
+        assert_eq!(notches(&acc, i32::MAX), 100_000, "clamped, not overflowed");
+        assert_eq!(acc.load(Ordering::Relaxed), 0);
     }
 
     /// The Carbon modifier state `UCKeyTranslate` wants, which everybody gets wrong
