@@ -202,6 +202,10 @@ test("an XWayland target says which windows will receive the keyboard", () => {
   // It is not a refusal and must not read as one: nothing here says the pair
   // cannot be driven.
   expect(said).not.toContain("cannot be driven");
+  // And the screens warning this code swallows in the engine's single slot, said
+  // here, to the side that drags the plane. Its twin is asserted for
+  // `hereProblemSentence` for the same reason.
+  expect(said).toContain("swap places");
 });
 
 // The grant is the far side's, and the sentence has to send the person THERE.

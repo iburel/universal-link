@@ -245,8 +245,15 @@ const PEER_PROBLEMS: Record<PeerProblem, string> = {
   // called: "this is an XWayland session" is a true sentence that tells a person
   // nothing about the window they are about to type into. The remedy is last because
   // it is on the other computer, and this pair works meanwhile.
+  //
+  // The screens clause is not decoration, and it is here for the same reason its twin
+  // is in `hereProblemSentence`: this code outranks `monitors_unstable` in the
+  // engine's single problem slot, an XWayland's screens NEVER have a stable identity
+  // (its RandR output carries no EDID), and a peer's `monitors_stable` reaches no part
+  // of this interface at all. Without it the warning would be silently deleted for
+  // every session this code covers, on the side that DRAGS the plane.
   xwayland:
-    "Your keyboard and mouse will reach only part of <name>: it is a Wayland desktop being driven through its X11 half. Programs that are X11 receive what you type; programs that speak Wayland directly, which on most desktops is nearly all of them, receive nothing at all. An X11 session on <name> is what works completely today.",
+    "Your keyboard and mouse will reach only part of <name>: it is a Wayland desktop being driven through its X11 half. Programs that are X11 receive what you type; programs that speak Wayland directly, which on most desktops is nearly all of them, receive nothing at all. An X11 session on <name> is what works completely today. This kind of session also cannot tell its screens apart for certain, so they may swap places on the plane after one is unplugged.",
 };
 
 export function peerProblemSentence(

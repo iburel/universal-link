@@ -497,79 +497,130 @@ impl Problem {
     /// with nothing wrong.
     ///
     /// **The match is exhaustive so that a new [`Problem`] cannot be added without
-    /// somebody deciding whether it has a far side.** Most of them do not, and the
-    /// reason is the same for all: they leave the peer unable to type at all, so
-    /// `can_be_driven()` is false and the snapshot already says `no_backend`, which is
-    /// both truer and more useful than repeating a local remedy that only the person
-    /// sitting at that other machine can carry out.
+    /// somebody deciding whether it has a far side.** The nine that map to nothing do
+    /// so for two different reasons, and a review is why they are written out
+    /// separately: the blanket "they all leave a machine unable to type" this comment
+    /// used to give is false for three of them, and a wrong reason in a comment is
+    /// what stops the next person from looking.
     pub fn as_peer(self) -> Option<PeerProblem> {
         match self {
             // The one that is neither "all of it works" nor "none of it does".
             Problem::XWayland => Some(PeerProblem::XWayland),
-            // Nothing there can type. The peer's own `caps` say so through
-            // `can_be_driven()`, and `no_backend` is where those arrive.
+            // These arrive on a machine with no injection at all, so the peer's own
+            // `caps` already carry them: `can_be_driven()` is false and the snapshot
+            // says `no_backend`, which is truer and more use to somebody standing
+            // somewhere else than a remedy only the person at that machine can carry
+            // out. (`Wayland` and its family are reported while `os::create` refuses
+            // to build a backend; `NoBackend` says it in the name.)
             Problem::NoBackend
-            | Problem::NoPermission
             | Problem::Wayland
             | Problem::WaylandNoBus
+            | Problem::WaylandUntested => None,
+            // These three CAN arrive on a machine that types perfectly, and they are
+            // silent on purpose rather than by that reasoning. A Mac with Input
+            // Monitoring refused and Accessibility granted reports `no_permission`
+            // with `inject_keys: true` (the normal asymmetric case there), and a
+            // Wayland desktop with `RemoteDesktop` and no `InputCapture` reports a
+            // portal problem with `inject_keys: true`. In both, what is missing is
+            // the half that lets that machine DRIVE, which is nothing to the machine
+            // driving it: the pair works, and saying otherwise would be a warning
+            // about somebody else's problem.
+            Problem::NoPermission
             | Problem::WaylandNoPortal
             | Problem::WaylandPortalOld
-            | Problem::WaylandPortalRefused
-            | Problem::WaylandUntested => None,
-            // A pair whose target cannot tell its own screens apart is a real
-            // thing to know, and it is not a thing the driving side needs a
-            // REFUSAL slot for: the plane already keeps an absent screen's place
-            // and says so on the screen itself (section 6), and the one `problem`
-            // slot per device is worth more to a reason a person can act on. Giving
-            // it a peer code is a product decision about the plane's own wording,
-            // not this mapping's to take.
+            | Problem::WaylandPortalRefused => None,
+            // A pair whose target cannot tell its own screens apart is a real thing
+            // to know, and it is not a thing the driving side needs a `problem` slot
+            // for: the plane already keeps an absent screen's place and says so on
+            // the screen itself (section 6). It is not lost either, because the one
+            // session where it is guaranteed true is XWayland, whose peer sentence
+            // says it. Giving it a code of its own is a product decision about the
+            // plane's wording, not this mapping's to take.
             Problem::MonitorsUnstable => None,
         }
     }
 }
 
-/// What a PAIR cannot do: the far side's word, learned from its handshake or by
-/// trying (doc/input-sharing.md, section 12).
+/// Declares the pair vocabulary ONCE: the enum, [`PeerProblem::ALL`] and
+/// [`PeerProblem::code`] all come out of the single list below it.
 ///
-/// A separate vocabulary from [`Problem`], and separate on purpose: that one is
-/// about the computer a person is sitting at and names remedies they can carry out
-/// where they are, this one is about another computer and has to send them there, or
-/// tell them what will and will not work if they stay. Two of the codes are spelled
-/// the same in both ([`Problem::NoBackend`] and this one's `no_backend`, and now
-/// XWayland), because they are the same platform fact seen from the two ends, and
-/// the interface holds two different sentences for each.
+/// A macro rather than three hand-written lists, and a review is why. The first
+/// version of this vocabulary copied [`Problem`]'s device: an array, plus an
+/// exhaustive `position` match, plus a test that the array holds every position.
+/// That catches a member REMOVED from the array (proven, by removing one) and it
+/// does NOT catch a member appended to the enum past the last position the test
+/// names: the reviewer added a ninth variant, gave it the next position, left the
+/// array alone, and every test passed. A person would then have read "that computer
+/// reported a problem this version does not know", which is the exact defect the
+/// device exists to prevent, with a green gate.
 ///
-/// Every member has a sentence in `gui/ui/src/lib/input.ts` and a name in
-/// `api.ts`'s `PeerProblem` union, and the test in this module reads both files to
-/// make sure of it. [`PeerProblem::position`] is what makes [`PeerProblem::ALL`]
-/// complete by construction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PeerProblem {
+/// Stable Rust cannot count an enum's variants, so ONE declaration is the only shape
+/// that closes it rather than narrowing it. The cost is that the vocabulary is behind
+/// a macro; the gain is that half adding a member is not expressible.
+/// [`Problem`]'s own `ALL` still has the hole this replaces, and closing it is the
+/// same move on a longer list.
+macro_rules! peer_problems {
+    ($( $(#[$about:meta])* $variant:ident => $code:literal, )+) => {
+        /// What a PAIR cannot do: the far side's word, learned from its handshake or
+        /// by trying (doc/input-sharing.md, section 12).
+        ///
+        /// A separate vocabulary from [`Problem`], and separate on purpose: that one
+        /// is about the computer a person is sitting at and names remedies they can
+        /// carry out where they are, this one is about another computer and has to
+        /// send them there, or tell them what will and will not work if they stay.
+        /// `xwayland` is spelled the same in both, because it is one platform fact
+        /// seen from the two ends, and the interface holds a different sentence for
+        /// each end. `no_backend` is spelled the same too and is broader here: it
+        /// also carries a far side whose Core runs no input component at all.
+        ///
+        /// Every member has a sentence in `gui/ui/src/lib/input.ts` and a name in
+        /// `api.ts`'s `PeerProblem` union, and the test in this module reads both
+        /// files to make sure of it.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum PeerProblem {
+            $( $(#[$about])* $variant, )+
+        }
+
+        impl PeerProblem {
+            /// Every problem a pair can have, so a test can walk them. Complete by
+            /// construction: it and the enum come out of one list, so a member that
+            /// is not here does not exist.
+            pub const ALL: &'static [PeerProblem] = &[ $( PeerProblem::$variant, )+ ];
+
+            /// The snapshot spelling (`input.status`'s per device `problem`).
+            pub fn code(self) -> &'static str {
+                match self { $( PeerProblem::$variant => $code, )+ }
+            }
+        }
+    };
+}
+
+peer_problems! {
     /// The far side has no grant for this device. Its word, learned by trying:
     /// grants are never replicated (section 9).
-    NotAllowed,
+    NotAllowed => "not_allowed",
     /// That computer is being driven by another already, or is driving one. One
     /// keyboard, no preemption.
-    Busy,
+    Busy => "busy",
     /// Its pointer is pinned to its own screen, or it is locked and cannot be
     /// driven at all.
-    Locked,
-    /// Nothing on that computer can type, or its permission is refused. Said from
-    /// the handshake alone, before anyone tries, which is what `caps` is on the wire
-    /// for.
-    NoBackend,
+    Locked => "locked",
+    /// Nothing on that computer can type, or its permission is refused, or its Core
+    /// runs no input component at all. Said from the handshake alone, before anyone
+    /// tries, which is what `caps` is on the wire for.
+    NoBackend => "no_backend",
     /// The deployment's relays are rendezvous-only above a cap (#88) and no direct
     /// path formed.
-    NoPath,
+    NoPath => "no_path",
     /// The path to that computer is past the pointer threshold. **Reserved**:
     /// nothing sets it in v1, because the threshold is enforced where a pointer is
     /// actually asked for (`input.take` answers `INPUT_TOO_SLOW`) and the number an
     /// interface would word it from is already in `rtt_ms`. It keeps its sentence
     /// for the day something does.
-    TooSlow,
+    TooSlow => "too_slow",
     /// The two ends do not hold the same plane. Self-repairing: a layout round is
     /// already running.
-    PlaneStale,
+    PlaneStale => "plane_stale",
     /// That computer is a Wayland desktop reached through its XWayland, so it can be
     /// typed into and it cannot be typed into everywhere: X11 programs receive the
     /// keyboard and the pointer, native Wayland ones receive nothing at all.
@@ -580,58 +631,9 @@ pub enum PeerProblem {
     /// screen, which is the "best effort that lies" the whole component is built to
     /// forbid. It is read from the peer's own `caps.problem` (which already
     /// travelled), never guessed, and it never blocks anything: a person told what
-    /// will work may perfectly well want it.
-    XWayland,
-}
-
-impl PeerProblem {
-    /// Every problem a pair can have, so a test can walk them. Complete by
-    /// construction through [`PeerProblem::position`], for the reason
-    /// [`Problem::ALL`] documents at length: a hand-written array silently falls
-    /// short, and every test that walks it then passes while a person is told this
-    /// version does not know why.
-    pub const ALL: &'static [PeerProblem] = &[
-        PeerProblem::NotAllowed,
-        PeerProblem::Busy,
-        PeerProblem::Locked,
-        PeerProblem::NoBackend,
-        PeerProblem::NoPath,
-        PeerProblem::TooSlow,
-        PeerProblem::PlaneStale,
-        PeerProblem::XWayland,
-    ];
-
-    /// Where this problem sits in [`PeerProblem::ALL`]. Exists only to make that
-    /// array exhaustive by construction: a new variant is a compile error here until
-    /// somebody gives it a position, and the test then checks the array holds it
-    /// there.
-    #[cfg(test)]
-    const fn position(self) -> usize {
-        match self {
-            PeerProblem::NotAllowed => 0,
-            PeerProblem::Busy => 1,
-            PeerProblem::Locked => 2,
-            PeerProblem::NoBackend => 3,
-            PeerProblem::NoPath => 4,
-            PeerProblem::TooSlow => 5,
-            PeerProblem::PlaneStale => 6,
-            PeerProblem::XWayland => 7,
-        }
-    }
-
-    /// The snapshot spelling (`input.status`'s per device `problem`).
-    pub fn code(self) -> &'static str {
-        match self {
-            PeerProblem::NotAllowed => "not_allowed",
-            PeerProblem::Busy => "busy",
-            PeerProblem::Locked => "locked",
-            PeerProblem::NoBackend => "no_backend",
-            PeerProblem::NoPath => "no_path",
-            PeerProblem::TooSlow => "too_slow",
-            PeerProblem::PlaneStale => "plane_stale",
-            PeerProblem::XWayland => "xwayland",
-        }
-    }
+    /// will work may perfectly well want it. Nothing writes it into the remembered
+    /// half of a pair's state, so it can never make a row read `refused`.
+    XWayland => "xwayland",
 }
 
 /// What the engine asks a backend to do about the real input devices.
@@ -1215,29 +1217,22 @@ mod tests {
         }
     }
 
-    /// The pair vocabulary gets the same two guarantees as the local one: no two
-    /// members share a code, and the array holds every member at the position the
-    /// enum's exhaustive match gives it.
+    /// No two members of the pair vocabulary share a code. Two codes for one problem,
+    /// or one code for two, would both be a vocabulary with a bug waiting: the
+    /// snapshot carries the code and the interface matches on it.
+    ///
+    /// There is deliberately nothing here about the list being complete. It cannot be
+    /// short: `PeerProblem` and [`PeerProblem::ALL`] are generated from one
+    /// declaration, so a member missing from the list is a member that does not exist.
+    /// That is the whole reason the macro exists, and an assertion pretending to check
+    /// it would be the coverage-shaped nothing the array version turned out to be.
     #[test]
-    fn every_problem_a_pair_can_have_is_in_the_list_exactly_once() {
+    fn no_two_problems_of_a_pair_share_a_code() {
         let mut codes: Vec<&str> = PeerProblem::ALL.iter().map(|p| p.code()).collect();
         let before = codes.len();
         codes.sort_unstable();
         codes.dedup();
         assert_eq!(before, codes.len(), "two peer problems share a code");
-        for (index, problem) in PeerProblem::ALL.iter().enumerate() {
-            assert_eq!(
-                problem.position(),
-                index,
-                "{problem:?} sits at {index} in PeerProblem::ALL and says it belongs at {}",
-                problem.position()
-            );
-        }
-        assert_eq!(
-            PeerProblem::ALL.len(),
-            PeerProblem::XWayland.position() + 1,
-            "the array is shorter than the positions the enum defines"
-        );
     }
 
     /// **Every problem a pair can have has a sentence in the interface**, the same
@@ -1259,10 +1254,11 @@ mod tests {
             .canonicalize()
             .expect("the interface's input module is where this crate's sibling GUI keeps it");
         let source = std::fs::read_to_string(&path).expect("read the interface's input module");
-        // The table itself rather than the whole file: these codes are keys of one
-        // object, and a mention in a comment somewhere else in the module is not a
-        // sentence. `not_allowed` also appears in this file as an `input.allow`
-        // gesture's own wording, which a file-wide scan would have accepted.
+        // The table itself rather than the whole file, and the reason is the shape of
+        // the table: its keys are UNQUOTED, so the sibling test's quoted scan cannot
+        // see them at all, and an unquoted scan of the whole module would be satisfied
+        // by any comment that happens to name a code. Narrowed to the table, a hit is
+        // a key, which is a sentence.
         let table = source
             .split_once("const PEER_PROBLEMS")
             .expect("the interface's table of pair sentences")
@@ -1321,13 +1317,13 @@ mod tests {
                 );
             }
         }
-        // Deliberately no assertion about the other nine here. The reason they map to
-        // nothing is that a machine reporting one cannot type at all, so its own
-        // capability bits already carry it to the driving side as `no_backend`, and
-        // that is a property of the three platform backends rather than of this enum:
-        // asserting it from a `Capabilities::none` would be a tautology dressed as
-        // coverage. What guards it is the exhaustive match itself, which stops a tenth
-        // problem from being added without somebody answering the question.
+        // Deliberately no assertion about the other nine. Four of them cannot reach a
+        // machine that types at all and four of them can (see the match's own
+        // comments), and which is which is a property of the three platform backends
+        // rather than of this enum, so anything asserted here from a synthesised
+        // `Capabilities` would be a tautology dressed as coverage. What guards them is
+        // the exhaustive match itself, which stops a tenth problem from being added
+        // without somebody answering the question.
     }
 
     /// The `oops` codes have ONE spelling, the dialect's. Four of the five are

@@ -1816,13 +1816,14 @@ snapshot either way. The column below says which of the two each code is.
 | `no_path` | `problem` | the deployment's relays are rendezvous-only above a cap (#88) and no direct path formed |
 | `too_slow` | `problem` | the path to that computer is past the pointer threshold. **Reserved**: nothing sets it in v1, because the threshold is enforced where a pointer is actually asked for (`input.take` answers `INPUT_TOO_SLOW`) and the number an interface would word it from is already in `rtt_ms`. An interface still needs its sentence, for the day something does |
 | `plane_stale` | `problem` | the two ends do not hold the same plane. Self-repairing: a layout round is already running |
-| `xwayland` | `problem` | that computer is a Wayland desktop reached through its XWayland: it types into X11 windows and native Wayland ones receive nothing. **The one code here that is not a failure**, so it never blocks a session and the state stays `ready` |
+| `xwayland` | `problem` | that computer is a Wayland desktop reached through its XWayland: it types into X11 windows and native Wayland ones receive nothing. **The one code here that is not a failure**, so it never blocks a session and it never makes the state `refused` (nothing writes it into the remembered half). Its sentence also carries the screens warning that this code outranks in the local slot, because a peer's `monitors_stable` reaches no interface and an XWayland's screens never have a stable identity |
 
-**Two of these are the same word as a member of `here.problem`** (`no_backend`
-and `xwayland`), because they are one platform fact seen from the two ends, and
-the interface holds a different sentence for each end: one names a remedy where
-the person is standing, the other says what will and will not work on a machine
-they are about to type on.
+**`xwayland` is the same word as a member of `here.problem`**, because it is one
+platform fact seen from the two ends, and the interface holds a different
+sentence for each end: one names a remedy where the person is standing, the other
+says what will and will not work on a machine they are about to type on.
+`no_backend` shares its spelling too and is broader here, since it also carries a
+device whose Core runs no input component at all.
 
 **Where a pair's problem comes from.** Two sources, and the precedence between
 them is remembered-first: a refusal the far side has just sent (or a channel that
@@ -1833,12 +1834,19 @@ mapped through the one bridge between the two vocabularies (`Problem::as_peer`,
 an exhaustive match, so a new local code cannot be added without somebody
 deciding whether it has a far side). The standing half is DERIVED at snapshot
 time rather than stored, so a `hi` or an accepted session clearing the remembered
-half cannot erase it, and a peer that re-sends its handshake with different
-capabilities is followed rather than remembered wrongly. Nine of the ten local
-codes map to nothing, and for one reason: they leave a machine unable to type at
-all, so the capability bits already carry them as `no_backend`, which is both
-truer and more use than repeating a remedy only the person at that other machine
-can carry out.
+half cannot erase it.
+
+Nine of the ten local codes map to nothing, and for two different reasons.
+`no_backend`, `wayland`, `wayland_no_bus` and `wayland_untested` arrive on a
+machine with no injection at all, so the capability bits already carry them as
+`no_backend`, which is truer and more use to somebody standing elsewhere than a
+remedy only the person at that machine can carry out. `no_permission`,
+`wayland_no_portal`, `wayland_portal_old` and `wayland_portal_refused` can arrive
+on a machine that types perfectly (a Mac with Input Monitoring refused and
+Accessibility granted, a desktop with `RemoteDesktop` and no `InputCapture`):
+what is missing there is the half that lets that machine DRIVE, which is nothing
+to the machine driving it, so they are silent on purpose rather than by the first
+reason. `monitors_unstable` has its own, above.
 
 A malformed request is not an application state, and the engine emits the
 real JSON-RPC code rather than dressing one as an app code. It also checks
@@ -1949,7 +1957,7 @@ that carry them.
 | `NO_PERMISSION` | `oops` | "Nothing was typed: 1Device is not allowed to type on that computer." |
 | `UNRESOLVED` | `oops` | "That key does not exist on the other computer's keyboard." |
 | `NO_DIRECT_PATH` | `problem: "no_path"` | "This account's relays do not carry a keyboard session. The two computers need a network they share." |
-| `xwayland` (a peer's) | `problem: "xwayland"` | "Your keyboard and mouse will reach only part of that computer: it is a Wayland desktop being driven through its X11 half. Programs that are X11 receive what you type; programs that speak Wayland directly, which on most desktops is nearly all of them, receive nothing at all." The one sentence here about a session that WORKS, said before somebody types into the half that will not answer, and it opens with what will happen rather than with what the session is called: "this is an XWayland session" is true and tells nobody anything about the window in front of them |
+| `xwayland` (a peer's) | `problem: "xwayland"` | "Your keyboard and mouse will reach only part of that computer: it is a Wayland desktop being driven through its X11 half. Programs that are X11 receive what you type; programs that speak Wayland directly, which on most desktops is nearly all of them, receive nothing at all. An X11 session on that computer is what works completely today. This kind of session also cannot tell its screens apart for certain, so they may swap places on the plane after one is unplugged." The one sentence here about a session that WORKS, said before somebody types into the half that will not answer, and it opens with what will happen rather than with what the session is called: "this is an XWayland session" is true and tells nobody anything about the window in front of them. The screens clause is the one `monitors_unstable` would have said, kept because this code outranks it in the single slot and a peer's `monitors_stable` reaches no interface |
 | `INPUT_TOO_SLOW` | `input.take` | "That computer is <n> ms away, too far for the pointer to feel right. Its keyboard alone would work." |
 | `SLOW` | `stop` | "The connection to that computer slowed down, so your keyboard came back." |
 | `GONE` | `stop` | "Your keyboard came back: the session with that computer ended on its own." One code for three causes (this machine's capture died, its grant went away, the channel did), so the sentence says the one thing all three share, and `here.problem` carries the local half when there is one |

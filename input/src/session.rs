@@ -345,11 +345,13 @@ struct Peer {
     /// This is the REMEMBERED half only: what the far side said when it refused, or
     /// what a channel that would not open said. The standing half that a peer's
     /// handshake implies is derived at snapshot time (`peer_problem`) rather than
-    /// copied in here, for two reasons: a `hi` clears this field (a handshake is a
-    /// fresh start for a pair) and would therefore erase a standing fact along with
-    /// the stale refusal, and the dialect accepts a repeated `hi`, so a peer whose
-    /// own capabilities change can say so and a derived value follows while a copy
-    /// would not.
+    /// copied in here, and the reason that holds TODAY is the first of these two: a
+    /// `hi` clears this field (a handshake is a fresh start for a pair), so a copy
+    /// would erase a standing fact along with the stale refusal it came with. The
+    /// second is free rather than load-bearing: the dialect accepts a repeated `hi`
+    /// and a derived value would follow one, while nothing in this build sends a
+    /// second one (`CapabilitiesChanged` refreshes our own caps and tells no peer),
+    /// which is its own gap and its own ticket.
     problem: Option<PeerProblem>,
     /// When the last layout message went out, for the rate limit.
     layout_sent: Option<Instant>,
@@ -984,6 +986,13 @@ impl<B: InputBackend> Engine<B> {
             let peer = self.peers.entry(node.to_string()).or_default();
             peer.link = Link::Cold;
             peer.out = None;
+            // The handshake goes with the channel, which every OTHER path to Cold
+            // already knew (`tear_down`, and the pump dropping an outbox). This one
+            // kept it, and a review found what that costs now that the snapshot reads
+            // it: a peer with a stale `hi` and no channel rendered "Not connected",
+            // "is not answering right now" and a standing sentence about a session
+            // that cannot start, all three at once.
+            peer.hi = None;
             peer.backoff_until = Some(now + BACKOFF_OPEN);
             peer.problem = match code {
                 "NO_DIRECT_PATH" => Some(PeerProblem::NoPath),
@@ -5743,7 +5752,20 @@ mod tests {
             json!("no_path"),
             "what just happened comes first"
         );
+        // A repeated handshake on the live channel, which is what clears the
+        // remembered half, rather than a fresh `attach`: the point being tested is
+        // that the standing word survives the thing that erases the transient one.
         h.warm_with(&peer, xwayland.clone()).await;
+        h.feed(
+            &peer,
+            vec![Frame::Hi {
+                version: wire::VERSION,
+                caps: xwayland.clone(),
+                plane: h.engine.plane_id().to_string(),
+            }],
+            h.t0,
+        )
+        .await;
         assert_eq!(
             h.engine.status()["devices"][0]["problem"],
             json!("xwayland"),
@@ -5760,11 +5782,22 @@ mod tests {
         );
 
         // And it blocks nothing. A person told what will work may want it.
+        //
+        // The assertion is that a session really goes OUT, not that the gesture
+        // returned `Ok`: by D21 a gesture answers only from what this machine knows,
+        // so `input.take` answers `Ok` for every peer including one that cannot type
+        // at all, and asserting that would have proved the pre-existing contract
+        // rather than anything about this code.
         h.warm_with(&peer, xwayland).await;
         assert_eq!(
             h.serve("input.take", json!({ "device_id": "d_b" })),
-            Ok(json!({})),
-            "an honest partial target is offered, never withheld"
+            Ok(json!({}))
+        );
+        assert!(
+            h.frames(&peer)
+                .iter()
+                .any(|f| matches!(f, Frame::Start { .. })),
+            "an honest partial target is offered, never withheld: a start went out"
         );
     }
 

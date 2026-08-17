@@ -203,10 +203,12 @@ export type InputProblem =
  * What a PAIR cannot do. The far side's word, learned from its handshake or by
  * trying.
  *
- * `no_backend` and `xwayland` are spelled the same as their members of
- * `InputProblem`, and mean the same platform fact seen from the other end: the
- * sentences differ, because one is said to the person sitting at that computer and
- * the other to the person about to type on it from somewhere else.
+ * `xwayland` is spelled the same as its member of `InputProblem` and is the same
+ * platform fact seen from the other end: two sentences, because one is said to the
+ * person sitting at that computer and the other to the person about to type on it
+ * from somewhere else. `no_backend` shares its spelling too and is broader here: it
+ * also carries a computer whose Core runs no input component at all, which is not a
+ * problem that computer would report about itself.
  */
 export type PeerProblem =
   | "not_allowed"
