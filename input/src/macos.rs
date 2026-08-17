@@ -1349,8 +1349,25 @@ fn cursor_position() -> Option<Point> {
 /// failure in [`Shared::needs_reassociate`] and the loop retries it every turn.
 #[must_use]
 fn associate(connected: bool) -> bool {
+    associate_said(connected, true)
+}
+
+/// The same call without the line on stderr, for the caller that makes it every quarter of a
+/// second until it works.
+///
+/// A retry that warned every turn would be four lines a second for as long as the failure
+/// lasts, and this repository has already paid once for an unthrottled line per event.
+#[must_use]
+fn associate_quietly(connected: bool) -> bool {
+    associate_said(connected, false)
+}
+
+fn associate_said(connected: bool, say: bool) -> bool {
     let status = CGAssociateMouseAndMouseCursorPosition(connected);
     if status != CGError::Success {
+        if !say {
+            return false;
+        }
         warn(&format!(
             "the pointer could not be {}: CGError {status:?}",
             if connected { "released" } else { "pinned" }
@@ -1937,6 +1954,9 @@ struct Backend {
     /// How many dropped upcalls have been reported, so the count is said when it grows and
     /// not once per turn.
     said_dropped: u32,
+    /// How many times the re-coupling of a decoupled cursor has been retried, so the failure
+    /// is said occasionally rather than four times a second.
+    reassociate_tries: u32,
 }
 
 impl Backend {
@@ -2046,11 +2066,20 @@ impl Backend {
         // machine in and a wasted call costs a microsecond.
         if self.shared.needs_reassociate.load(Ordering::Relaxed)
             && !self.shared.confined.load(Ordering::Relaxed)
-            && associate(true)
         {
-            self.shared
-                .needs_reassociate
-                .store(false, Ordering::Relaxed);
+            self.reassociate_tries = self.reassociate_tries.saturating_add(1);
+            if associate_quietly(true) {
+                self.shared
+                    .needs_reassociate
+                    .store(false, Ordering::Relaxed);
+                if self.reassociate_tries > 1 {
+                    warn("the pointer is coupled to the mouse again");
+                }
+                self.reassociate_tries = 0;
+            } else if self.reassociate_tries.is_multiple_of(40) {
+                // Every ten seconds or so, not every turn.
+                warn("the pointer still cannot be coupled back to the mouse; still trying");
+            }
         }
         // The door back, once a second. Clearing the flag does not build a tap: it widens the
         // capabilities, the engine asks for the capture it wants again, and the next attempt
@@ -2587,6 +2616,7 @@ pub fn create() -> Result<crate::os::Created, Unsupported> {
         exit_code: None,
         gone_seen: false,
         said_dropped: 0,
+        reassociate_tries: 0,
     };
     let handle = MacBackend {
         cmds,
