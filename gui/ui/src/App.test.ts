@@ -10,6 +10,7 @@ import {
   cleanup,
   click,
   render,
+  settle,
   textOf,
 } from "./lib/harness";
 import { CoreStore } from "./lib/store.svelte";
@@ -347,4 +348,47 @@ test("an unconfigured Core still asks for a server first", () => {
   });
 
   expect(textOf(render(App, { store }))).toContain("Set up your server");
+});
+
+// The Input section exists only where it can do something. On a phone it never
+// does: the engine is not started on Android at all (a phone is neither a source
+// nor a target in v1), so the facade never answers and the section never
+// appears. A list only ever offers what can succeed.
+test("no engine, no Input section anywhere in the navigation", () => {
+  store.primed = true;
+  store.session = { logged_in: false, server_connected: false };
+
+  const app = render(App, { store });
+
+  expect(store.inputSeen).toBe(false);
+  expect(() => byText(app, "nav button", "Input")).toThrow();
+  expect(textOf(app)).not.toContain("Input");
+});
+
+test("an engine that has answered puts the Input section in the navigation", () => {
+  store.primed = true;
+  store.session = { logged_in: false, server_connected: false };
+  store.inputSeen = true;
+
+  const app = render(App, { store });
+
+  click(byText(app, "nav button", "Input"));
+  expect(app.querySelector("h1")?.textContent).toBe("Keyboard and mouse");
+});
+
+// The section survives an engine that has gone quiet (it says so itself), but a
+// Core that stops granting the scopes takes it away, and whoever was standing on
+// it has to land somewhere.
+test("the section going away carries the view off it", () => {
+  store.primed = true;
+  store.session = { logged_in: false, server_connected: false };
+  store.inputSeen = true;
+
+  const app = render(App, { store });
+  click(byText(app, "nav button", "Input"));
+  expect(app.querySelector("h1")?.textContent).toBe("Keyboard and mouse");
+
+  store.inputSeen = false;
+  settle();
+  expect(app.querySelector("h1")?.textContent).toBe("Account");
 });

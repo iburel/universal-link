@@ -7,8 +7,9 @@
  * sole authority; this file adds no logic, it just gives names and types to
  * the methods we call.
  *
- * Only the methods covered by the GUI's scopes (`GUI_SCOPES` in gui/src/lib.rs)
- * appear here: session, account, devices, files, components.
+ * Only the methods covered by the GUI's scopes (`GUI_SCOPES` and
+ * `GUI_INPUT_SCOPES` in gui/src/lib.rs) appear here: session, account, devices,
+ * files, components, input.
  */
 
 import { coreRequest } from "./core";
@@ -170,6 +171,153 @@ export interface DiscoveredDeployment {
   oidc_client_secret: string | null;
 }
 
+// --- Keyboard and mouse sharing (the `input.*` facade) ----------------------
+//
+// Every shape below is the engine's own (doc/input-sharing.md, section 12), and
+// `input.status` is the AUTHORITATIVE state: the notifications echo it whole.
+// Nothing in this interface computes a piece of it. The engine hand-writes its
+// JSON, so every field is always present and optionality is a `null`.
+
+/** What this computer cannot do, in the engine's words. */
+export type InputProblem =
+  | "no_backend"
+  | "no_permission"
+  | "monitors_unstable"
+  | "wayland";
+
+/** What a PAIR cannot do. The far side's word, learned by trying. */
+export type PeerProblem =
+  | "not_allowed"
+  | "busy"
+  | "locked"
+  | "no_backend"
+  | "no_path"
+  | "too_slow"
+  | "plane_stale";
+
+/** Where a pair has got to. `refused` is a state, not an error. */
+export type PeerInputState =
+  | "off"
+  | "warming"
+  | "ready"
+  | "driving"
+  | "driven"
+  | "refused";
+
+/**
+ * One screen, as its own machine describes it: `x`/`y` are its position in THAT
+ * machine's own desktop (which is what lets an arrangement be imported as a
+ * block rather than re-invented), `w`/`h` its logical size, `scale` its scale in
+ * permille (1500 is 150%). `present: false` is a ghost: a screen that is away,
+ * whose place is kept.
+ */
+export interface InputMonitor {
+  id: string;
+  name: string;
+  w: number;
+  h: number;
+  x: number;
+  y: number;
+  scale: number;
+  primary: boolean;
+  present: boolean;
+}
+
+/**
+ * One screen's rectangle ON THE PLANE, which is the one list an interface needs
+ * to draw it. `monitor` is the spot key, `"<node_id>/<monitor id>"`, and it is
+ * what `input.place` takes back. `device_id` is `null` for a device this Core's
+ * directory does not name; `name` is the SCREEN's name, and it is empty on a
+ * ghost.
+ */
+export interface InputSpot {
+  monitor: string;
+  device_id: string | null;
+  name: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  present: boolean;
+  primary: boolean;
+}
+
+/** This computer: who it is, its screens, and what it can do. */
+export interface InputHere {
+  /** `null` until the engine has resolved the account's directory. */
+  device_id: string | null;
+  name: string;
+  monitors: InputMonitor[];
+  problem: InputProblem | null;
+  /** It could take a keyboard away: capture, swallow and pin all work. */
+  can_drive: boolean;
+  /** It could accept one: it can type. Keyboard-only is a real session. */
+  can_be_driven: boolean;
+}
+
+/**
+ * Another computer of the account. `allowed` is stored HERE and never
+ * replicated: it is this machine's own answer to "may that one type on me".
+ * `drive` is this machine's convenience list, and the far side still decides.
+ * `mode` is how a key is resolved there, not what a session carries.
+ */
+export interface InputPeer {
+  device_id: string;
+  name: string;
+  state: PeerInputState;
+  monitors: InputMonitor[];
+  /** The round trip the engine measured on the live channel, in ms. */
+  rtt_ms: number | null;
+  lan: boolean;
+  allowed: boolean;
+  drive: boolean;
+  mode: "typing" | "positional";
+  problem: PeerProblem | null;
+}
+
+/** The live session, at most one, in one direction (D15). `since` is Unix ms. */
+export interface InputSession {
+  device_id: string | null;
+  direction: "out" | "in";
+  mode: "full" | "keys";
+  since: number;
+  rtt_ms: number | null;
+}
+
+/**
+ * The crossing guards a human set, per neighbour. `monitor` names the
+ * NEIGHBOUR's screen, whichever end the gesture named. Only what was set is
+ * here: a pair on the defaults has no row at all.
+ */
+export interface InputGuards {
+  device_id: string | null;
+  monitor: string;
+  side: "left" | "right" | "top" | "bottom";
+  dwell_ms: number;
+  double_tap_ms: number;
+  dead_corner: number;
+  require_mods: number;
+  wall: boolean;
+}
+
+/** The whole state: `input.status`, and what `input.updated` carries. */
+export interface InputState {
+  here: InputHere;
+  plane: { id: string; spots: InputSpot[]; by: string | null };
+  devices: InputPeer[];
+  session: InputSession | null;
+  guards: InputGuards[];
+  lock: boolean;
+  hotkey: string[];
+}
+
+/** A spot as `input.place` takes it: the rectangle's corner, on the plane. */
+export interface PlacedSpot {
+  monitor: string;
+  x: number;
+  y: number;
+}
+
 export const api = {
   sessionStatus: () => coreRequest<SessionState>("session.status"),
   /** The caller opens `auth_url`; completion arrives via `session.changed`. */
@@ -258,6 +406,58 @@ export const api = {
   /** Cancels an outgoing transfer. `TRANSFER_UNKNOWN` if it has already finished. */
   filesCancel: (transfer_id: string) =>
     coreRequest<unknown>("files.cancel", { transfer_id }),
+
+  /**
+   * The whole keyboard and mouse state. `COMPONENT_ABSENT` when no engine is
+   * connected, which is the permanent answer on a phone (the engine is not
+   * spawned there) and a transient one on a desktop whose engine is restarting.
+   * `-32601` from a Core older than the facade.
+   */
+  inputStatus: () => coreRequest<InputState>("input.status"),
+  /**
+   * The arrangement a human dragged, as the whole set of spots: `input.place`
+   * REPLACES the placement, so a spot left out becomes unplaced. Sending the
+   * snapshot's own `plane.spots` back is legal and idempotent, and it is what
+   * keeps a ghost's place. `-32602` for a spot off the plane or a set above 256.
+   */
+  inputPlace: (spots: PlacedSpot[]) =>
+    coreRequest<unknown>("input.place", { spots }),
+  /** Who may drive THIS computer. The authority, stored here, never replicated. */
+  inputAllow: (device_id: string, allowed: boolean) =>
+    coreRequest<unknown>("input.allow", { device_id, allowed }),
+  /** Who this computer may drive. A local convenience: the far side decides. */
+  inputDrive: (device_id: string, allowed: boolean) =>
+    coreRequest<unknown>("input.drive", { device_id, allowed }),
+  /**
+   * Take the keyboard and mouse there now. `mode: "keys"` is the keyboard-only
+   * session, which is the offer when `INPUT_TOO_SLOW` refuses the pointer.
+   * Answers only with what THIS machine knows (D21): the far side's word arrives
+   * afterwards as that device's `problem` and as `input.refused`.
+   */
+  inputTake: (device_id: string, mode?: "full" | "keys") =>
+    coreRequest<unknown>("input.take", mode ? { device_id, mode } : { device_id }),
+  /** Bring them back. The return hotkey's method twin. */
+  inputRelease: () => coreRequest<unknown>("input.release"),
+  /**
+   * The guards for one crossing. `monitor` may name either end of it, `side` is
+   * the side of OUR screen the pointer leaves by. `INPUT_UNKNOWN_MONITOR` when
+   * the plane has no such crossing.
+   */
+  inputGuards: (
+    device_id: string,
+    monitor: string,
+    side: string,
+    guards: Partial<
+      Pick<
+        InputGuards,
+        "dwell_ms" | "double_tap_ms" | "dead_corner" | "require_mods" | "wall"
+      >
+    >,
+  ) => coreRequest<unknown>("input.guards", { device_id, monitor, side, guards }),
+  /** Pin the pointer to this screen. Nothing crosses, in either direction. */
+  inputLock: (locked: boolean) => coreRequest<unknown>("input.lock", { locked }),
+  /** The return hotkey, enforced locally by the machine that captures. */
+  inputHotkey: (keys: string[]) => coreRequest<unknown>("input.hotkey", { keys }),
 
   componentsList: () => coreRequest<Component[]>("components.list"),
   componentsPending: () => coreRequest<PendingRequest[]>("components.pending"),

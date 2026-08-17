@@ -26,6 +26,14 @@ export function cleanup(): void {
   document.body.innerHTML = "";
 }
 
+/**
+ * Lets reactivity (and the effects) propagate after a state change made by hand
+ * rather than through a gesture. `click` and the rest do this for you.
+ */
+export function settle(): void {
+  flushSync();
+}
+
 /** Clicks and lets reactivity propagate. */
 export function click(element: Element | null | undefined): void {
   if (!element) throw new Error("missing element");
