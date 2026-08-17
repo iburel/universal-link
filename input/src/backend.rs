@@ -77,8 +77,13 @@
 //!    `CGSetLocalEventsSuppressionInterval` is zeroed first. The engine warps on
 //!    the return path and on every teardown, so a macOS backend that omits that
 //!    call gives its own user a quarter of a second of dead mouse at the exact
-//!    moment they asked for their machine back. [`InputBackend::warp`] on macOS is
-//!    therefore two calls, never one.
+//!    moment they asked for their machine back. A macOS backend must therefore do
+//!    ONE of the two, and it cannot always do the re-association: while a session
+//!    holds the pointer, the decoupling IS the confinement, so re-associating there
+//!    would undo the pin. The backend written against this seam zeroes the interval
+//!    on its own event source and re-associates only after the warps that are not
+//!    part of a pin. (This truth is numbered 5 here and 4 in `input/src/macos.rs`,
+//!    which numbers its own list in the order that file needs.)
 //! 6. **`Want::Symbol` on Windows cannot express a dead key through the easy
 //!    API.** `VkKeyScanEx` returns -1 for a character that needs one, and finding
 //!    the pair means walking the virtual keys by modifier state through

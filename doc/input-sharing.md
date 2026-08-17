@@ -1281,7 +1281,19 @@ W stuck down, or a Control, for the rest of the session.
    not need it to (rule 3 again), and when something does, a raw event's
    `source` device is the XTEST virtual device, which a real keyboard's never
    is.
-10. **The X11 core keyboard mapping cannot be read unambiguously, and XKB
+10. **A wheel notch is a different number on each of the three platforms, and
+    one of them is not a fixed number at all.** Windows delivers the notch in
+    `WHEEL_DELTA` units, which is 120 by definition, and X11 delivers it as a
+    button press and release, which is one notch by definition. macOS delivers
+    BOTH a line count (a detent is exactly 1) and a point delta, which is
+    acceleration-dependent and scaled by `CGEventSourceGetPixelsPerLine`, about
+    10 by default. So the pixel-per-notch constant is per platform and the
+    Windows one is not reusable: applying 120 to a macOS point delta made about
+    twelve notches of a real wheel, or a whole trackpad swipe, travel as one,
+    and made every small scroll travel as nothing. The macOS backend divides
+    the point delta by 10, keeps the remainder, and falls back to the line
+    count per axis when the point delta on that axis is zero.
+11. **The X11 core keyboard mapping cannot be read unambiguously, and XKB
     can.** The core protocol says the first four keysyms of a keycode are
     "group 1 levels 1 and 2, group 2 levels 1 and 2", and an XKB server
     synthesises that list as `width * groups` entries in group-major order.
@@ -1307,7 +1319,15 @@ offers a second space in which both are expressed.
   so `scale` is 1000 everywhere and an interface has one fewer label.
 - **macOS** has exactly what the section imagined: the global display space is
   in points, a Retina display reports half its pixel width, and `scale` is the
-  ratio of the two.
+  ratio of the two. The ratio has to come from the display MODE
+  (`CGDisplayModeGetPixelWidth` over `CGDisplayModeGetWidth`): the obvious call,
+  `CGDisplayPixelsWide`, does not return pixels despite its name and its
+  documentation, it returns the same points as the bounds, so the ratio is
+  exactly 1 on every display including every Retina one. In a fractional "More
+  Space" mode the framebuffer can exceed the panel's own pixels and this reports
+  2.0 where the physical ratio is nearer 1.7, which is not an error: it is the
+  same number `NSScreen.backingScaleFactor` gives, and that is the number an
+  interface showing "200%" means.
 - **Windows** has neither unless a process chooses. A DPI-unaware process gets
   every monitor scaled by the PRIMARY monitor's factor, which is right for one
   screen and wrong for a second one at a different scale; a per-monitor-aware
@@ -1631,16 +1651,34 @@ a sentence rather than to something wrong:
   resolves to nothing rather than to a keystroke that produces nothing.
 - **Windows**: `resolve` answers `None` for a symbol needing a dead key
   (truth 6), which the Unicode path covers.
+  A keycode the Unicode path leaves bound survives the client that bound it:
+  every ordinary teardown unbinds it, including an unwinding panic, but a run
+  killed outright during one `Text` injection leaves one keysym on one keycode
+  no physical key produces, and the next start cannot find it (a spare is
+  chosen by being entirely unbound). Clearing that needs the state directory
+  to reach the backend, which this seam does not carry.
+- **Windows**: `resolve` answers `None` for a symbol needing a dead key
+  (truth 6), which the Unicode path covers. And `inject_keys` is
+  unconditionally true, because the lock is reported per injection as
+  `SCREEN_LOCKED` rather than as a capability; the one consequence is that the
+  crash guard of section 8 is drained optimistically on a machine whose input
+  desktop is not ours, where the release cannot land (the other platforms
+  report the inability in `inject_keys` and the guard is kept).
 - **macOS**: the media keys are not virtual keycodes at all, they travel as
   `NSSystemDefined` events, so this backend does not inject them and the
-  engine reports `UNRESOLVED`. Nor are the Application key (which no Apple
-  keyboard has ever had) or F21 to F24 (macOS stops at F20). There are TWO
-  grants and not one (Input Monitoring for the tap, Accessibility for the
-  injection), so a Mac can be a target and not a source or the other way
-  round, and both halves are reported separately. And a double click is a
-  single click twice: the chain a Mac builds from its own double-click
-  interval and a distance threshold is not synthesised here, because the
-  interval lives in AppKit, which this component does not link.
+  engine reports `UNRESOLVED`. Nor are F21 to F24 (macOS stops at F20). There
+  are TWO grants and not one (Input Monitoring for the tap, Accessibility for
+  the injection), so a Mac can be a target and not a source or the other way
+  round, and both halves are reported separately. A double click is a single
+  click twice: the chain a Mac builds from its own double-click interval and a
+  distance threshold is not synthesised here, because the interval lives in
+  AppKit, which this component does not link. A display's `name` is its
+  position in the active list ("Display 1" is the main one) and not the name a
+  person gave it, which is `NSScreen.localizedName` and therefore AppKit too.
+  And macOS has no `dwExtraInfo`: nothing marks an injected event as this
+  component's own, so a tap cannot tell its own injection from a hand. Rule 3
+  is what makes that safe in v1 (a machine being driven does not capture), and
+  the day something needs it, `kCGEventSourceUserData` is the field.
 
 ## 16. Settled decisions
 

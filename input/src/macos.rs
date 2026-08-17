@@ -92,16 +92,16 @@
 //!    callback, and the only correct answer is to re-enable it, which is why the
 //!    callback does so little: it reads two atomics, pushes one upcall and returns.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use objc2_core_foundation::{
-    CFBoolean, CFData, CFDictionary, CFMachPort, CFRetained, CFRunLoop, CFRunLoopSource,
-    CFRunLoopSourceContext, CFString, CFType, CFUUID, kCFRunLoopDefaultMode,
+    CFBoolean, CFData, CFDictionary, CFMachPort, CFRetained, CFRunLoop, CFRunLoopRunResult,
+    CFRunLoopSource, CFRunLoopSourceContext, CFString, CFType, CFUUID, kCFRunLoopDefaultMode,
 };
 use objc2_core_graphics::{
     CGAssociateMouseAndMouseCursorPosition, CGDirectDisplayID, CGDisplayBounds, CGError, CGEvent,
@@ -135,6 +135,11 @@ const TAP_POLL: Duration = Duration::from_secs(1);
 /// another process.
 const GRANT_POLL: Duration = Duration::from_secs(1);
 
+/// How often the window server is asked whether the screen is locked (truth 7). A lock is a
+/// human action and the question costs a round trip, so it is asked on the injection path at
+/// this rate rather than once per batch.
+const LOCK_POLL: Duration = Duration::from_millis(200);
+
 /// Bounded capacity of the upcall channel. Generous: the engine drains it as its own
 /// loop turns, and a full queue means it has stalled or gone.
 const BACKEND_EVENT_CAPACITY: usize = 256;
@@ -144,11 +149,50 @@ const MODE_OFF: u8 = 0;
 const MODE_WATCH: u8 = 1;
 const MODE_SWALLOW: u8 = 2;
 
-/// One wheel notch, in the pixel unit macOS scroll events use.
-const WHEEL_PIXELS_PER_NOTCH: i32 = 120;
+/// One wheel notch, in the POINT unit a macOS scroll event's `PointDelta` axes carry.
+///
+/// Not 120. That is `WHEEL_DELTA`, a Windows constant, correct where the OS delta is natively
+/// in those units and meaningless here: using it made roughly twelve notches of a real wheel,
+/// or a whole trackpad swipe, travel as one, and made small scrolls travel as nothing.
+///
+/// 10 is macOS's own default pixels-per-line, the number `CGEventSourceGetPixelsPerLine`
+/// returns unless a person has changed it, and a real wheel detent arrives as a point delta of
+/// about that with a LINE delta of exactly one. The line axis is used directly when the point
+/// axis is empty (see the tap's scroll arm), so this divisor only has to be right for the
+/// continuous devices, and how right it is on a real trackpad is on the live validation list:
+/// it is one measurement and nobody has made it.
+const WHEEL_POINTS_PER_NOTCH: i32 = 10;
 
+thread_local! {
+    /// The event source every injected event is created from, one per injecting thread.
+    ///
+    /// Created once and kept, because `CGEventSourceCreate` is a window server round trip and
+    /// the injection path carries 125 events a second. A thread local rather than a field
+    /// because `CFRetained<CGEventSource>` is not `Send` and the handle that would hold it is
+    /// cloned across the engine's threads. `None` is a machine that would not give one, and
+    /// every arm of `post` already treats a sourceless event as the fallback the API allows.
+    static SOURCE: Option<CFRetained<CGEventSource>> = {
+        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState);
+        if let Some(source) = &source {
+            // The non-deprecated half of truth 4's cure, on this backend's own source. The
+            // global `CGSetLocalEventsSuppressionInterval` is zeroed once at construction and
+            // is deprecated; whether it still has any effect is not documented either way, so
+            // both are done, which is what Wine's own comment on this says it settled on.
+            CGEventSource::set_local_events_suppression_interval(Some(source), 0.0);
+        }
+        source
+    };
+}
+
+/// One line to the standard error, and never a panic.
+///
+/// `eprintln!` PANICS when the write fails, and a supervised component's stderr can be closed
+/// or full. Two of this file's callers are inside the event tap's callback, which the window
+/// server calls through `extern "C-unwind"` frames, so a panic there unwinds through somebody
+/// else's C. A warning that cannot be delivered is dropped instead.
 fn warn(message: &str) {
-    eprintln!("[1device-input] {message}");
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "[1device-input] {message}");
 }
 
 // ------------------------------------------------------------- the key table
@@ -216,6 +260,12 @@ const USAGE_VK: &[(u32, u16)] = &[
     (0x62, 82),  // keypad 0
     (0x63, 65),  // keypad decimal
     (0x64, 10),  // the 102nd key, which macOS calls ISO Section
+    // The Application key. No Apple keyboard has ever had one, which is why this row
+    // looked like an omission, but macOS does deliver keycode 110 for the Menu key of a
+    // third party PC keyboard and Chromium's own table maps this usage to it. Without the
+    // row a Windows or Linux peer's Menu key pressed nothing on a Mac that could have
+    // received it, and a Mac's own Menu key reported nothing back.
+    (0x65, 110), // Menu
     (0x67, 81),  // keypad equals
     (0x68, 105), (0x69, 107), (0x6A, 113), (0x6B, 106), (0x6C, 64), (0x6D, 79),
     (0x6E, 80), (0x6F, 90), // F13 to F20
@@ -316,9 +366,12 @@ fn mods_of_flags(flags: CGEventFlags) -> u16 {
     if flags.contains(CGEventFlags::MaskAlphaShift) {
         bits |= keys::mods::CAPS;
     }
-    if flags.contains(CGEventFlags::MaskNumericPad) {
-        bits |= keys::mods::NUM;
-    }
+    // `MaskNumericPad` is deliberately NOT read as Num Lock. Apple's own documentation for
+    // the equivalent `NSEventModifierFlagNumericPad` says "This flag is also set if any of the
+    // arrow keys are pressed", so reading it as a lock made every arrow key on the source
+    // report a lock bit set on the press and clear on the release: a lock nobody touched,
+    // flickering in the `mods` of every forwarded frame. There is no Num Lock on an Apple
+    // keyboard and macOS exposes no state for one, so reporting nothing is the honest answer.
     bits
 }
 
@@ -478,6 +531,14 @@ struct Layout {
     /// An identity for it, so a change is noticed without a notification to subscribe
     /// to: the length and a hash of the bytes.
     identity: String,
+    /// Every character this layout can produce, to the key and modifiers that produce it.
+    ///
+    /// Built on the FIRST symbol this layout is asked to resolve and not in `read`, which runs
+    /// once a second: it costs four modifier levels times 128 keycodes of `UCKeyTranslate`,
+    /// about half a millisecond, and paying that once per layout is right while paying it once
+    /// per second forever is not. Without it every distinct symbol paid the same scan on its
+    /// first press, on the path whose whole local budget is a fifth of a millisecond.
+    reverse: std::sync::OnceLock<HashMap<String, (u16, u16)>>,
 }
 
 impl Layout {
@@ -512,6 +573,7 @@ impl Layout {
                 bytes,
                 kbd_type: u32::from(ffi::LMGetKbdType()),
                 identity,
+                reverse: std::sync::OnceLock::new(),
             })
         }
     }
@@ -549,14 +611,22 @@ impl Layout {
         Some(text)
     }
 
-    /// The key and the modifiers that produce `text`, searched over the levels a
-    /// canonical modifier set can name.
+    /// The key and the modifiers that produce `text`.
     ///
-    /// The order is the order of preference: nothing held first, then Shift, then
-    /// Option, then both, and the lowest virtual keycode within each. So a lower case
-    /// letter costs no modifier and a capital costs a Shift, which is what the engine's
-    /// sequence expects.
+    /// The table is built once per layout, in the order of preference: nothing held first,
+    /// then Shift, then Option, then both, and the lowest virtual keycode within each, with
+    /// the first answer for a character kept. So a lower case letter costs no modifier and a
+    /// capital costs a Shift, which is what the engine's sequence expects.
     fn find(&self, text: &str) -> Option<(u16, u16)> {
+        self.reverse
+            .get_or_init(|| self.build_reverse())
+            .get(text)
+            .copied()
+    }
+
+    /// One pass over the levels a canonical modifier set can name, into the map `find` reads.
+    fn build_reverse(&self) -> HashMap<String, (u16, u16)> {
+        let mut map: HashMap<String, (u16, u16)> = HashMap::new();
         for mods in [
             0,
             keys::mods::SHIFT,
@@ -564,12 +634,12 @@ impl Layout {
             keys::mods::SHIFT | keys::mods::ALTGR,
         ] {
             for vk in 0u16..128 {
-                if self.text(vk, mods).as_deref() == Some(text) {
-                    return Some((vk, mods));
+                if let Some(text) = self.text(vk, mods) {
+                    map.entry(text).or_insert((vk, mods));
                 }
             }
         }
-        None
+        map
     }
 }
 
@@ -608,8 +678,36 @@ struct Shared {
     anchor_x: AtomicI32,
     anchor_y: AtomicI32,
     confined: AtomicBool,
-    /// The canonical modifier bits, from the flags of every event the tap sees.
-    mods: AtomicU32,
+    /// The canonical modifier bits the LOCAL user is holding, from the tap.
+    ///
+    /// Two fields and not one, because the two directions are unrelated state that merely
+    /// share a type, and sharing one made a source Mac's own held Shift stamp every key a
+    /// peer later typed INTO it: the tap stores the local state, the session ends, the tap is
+    /// destroyed, and nothing clears the field the injection path then reads. Both are
+    /// cleared on every capture mode change and on every teardown.
+    local_mods: AtomicU32,
+    /// The canonical modifier bits the INJECTION path has pressed and not released, which is
+    /// what every event it posts is stamped with (truth 6).
+    injected_mods: AtomicU32,
+    /// The lock states the tap last saw, so a lock's transition can be told from a repeat.
+    seen_locks: AtomicU32,
+    /// Where the last injected pointer event put the cursor, or [`NO_WARP`] when nothing has
+    /// been injected yet.
+    ///
+    /// `CGEventPost` is asynchronous, so reading the cursor back after a move can answer with
+    /// where it was BEFORE: a batch of a move and then a click would put the click at the old
+    /// point. This is what a click uses instead.
+    injected_at: AtomicU64,
+    /// How many times the tap's own re-pin could not move the cursor, so the loop can say it
+    /// instead of the callback saying it (see [`warp_quietly`]).
+    warp_failed: AtomicU32,
+    /// Set when re-coupling the cursor to the mouse failed, so the loop can try again.
+    ///
+    /// It is the one failure on this platform that leaves a machine's mouse DEAD: the pin is a
+    /// decoupling, so a `confine(None)` whose re-association returned an error leaves the
+    /// cursor frozen with nobody left to retry it (the tap will not, because it reads
+    /// `confined`, which is already false).
+    needs_reassociate: AtomicBool,
     /// Scroll movement below one notch, kept so a trackpad is not rounded to nothing
     /// event after event.
     wheel_x: AtomicI32,
@@ -650,10 +748,10 @@ impl Shared {
                 self.engine_gone.store(true, Ordering::Relaxed);
             }
             Err(TrySendError::Full(_)) => {
-                let n = self.dropped.fetch_add(1, Ordering::Relaxed);
-                if n.is_multiple_of(128) {
-                    warn("the engine is not draining input events; dropping some");
-                }
+                // COUNTED and not said. `emit` runs inside the tap callback, where an
+                // `eprintln!` can block on a pipe nobody drains and a blocked callback gets the
+                // tap disabled (truth 8). The loop reports the count.
+                self.dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -690,8 +788,16 @@ impl Shared {
 /// to send.
 ///
 /// `CFRunLoopSourceSignal` and `CFRunLoopWakeUp` are the two Core Foundation calls
-/// documented as safe from any thread, and they are the only two made through this
-/// handle. Nothing else touches either pointer off the loop's own thread.
+/// documented as safe from any thread, and they are the only two this type MAKES.
+///
+/// There is a third that it does not make and cannot avoid: `CFRetained`'s `Drop` calls
+/// `CFRelease`, and this type lives in an `Arc` that both the engine's thread and the loop's
+/// thread hold, so the last drop can release a `CFRunLoopSource` and a `CFRunLoop` from
+/// whichever thread got there last. That is sound for a reason worth writing down rather than
+/// leaving implied: `CFRelease` is documented as thread safe, the run loop this handle names is
+/// the main thread's and is immortal, and the run loop holds its own reference to the wake
+/// source (added in `run` and never removed), so neither release can be the one that runs a
+/// deallocator. Nothing else touches either pointer off the loop's own thread.
 struct Wake {
     source: CFRetained<CFRunLoopSource>,
     run_loop: CFRetained<CFRunLoop>,
@@ -733,6 +839,9 @@ pub struct MacBackend {
     layout: Arc<Mutex<Option<Layout>>>,
     /// Whether the Accessibility prompt has been shown (truth 2).
     asked_to_post: Arc<AtomicBool>,
+    /// The last answer to "is the screen locked" and when it was asked, so the window server
+    /// is not asked once per injected batch. See [`MacBackend::screen_is_locked_cached`].
+    locked: Arc<Mutex<(Instant, bool)>>,
 }
 
 impl MacBackend {
@@ -747,7 +856,19 @@ impl MacBackend {
     }
 
     /// Can this machine type at all right now? Asks TCC, and asks the person once.
+    ///
+    /// The CACHED grant first, and the authoritative call only when the cache says no. A
+    /// preflight is a query to another process, this sits on a path that carries 125 events a
+    /// second, and the loop already re-reads both grants every second (truth 3) for exactly
+    /// this reason: querying the same thing per keystroke was the file's own header contradicting
+    /// itself. The cost of the cache is that a grant REVOKED mid-session is noticed up to a
+    /// second late, which costs a second of injections the window server drops anyway; the
+    /// cost of a grant GRANTED late is nothing, because the fall through below is the fast
+    /// path's own answer.
     fn may_post(&self) -> bool {
+        if self.capabilities().inject_keys {
+            return true;
+        }
         if objc2_core_graphics::CGPreflightPostEventAccess() {
             return true;
         }
@@ -815,19 +936,34 @@ impl InputBackend for MacBackend {
                 // Truth 5: this DECOUPLES the cursor from the mouse rather than
                 // clipping it, so the cursor stops moving and the rectangle is advisory.
                 // The warp puts it where the session should see it.
-                associate(false);
-                warp(anchor, false);
+                let _ = associate(false);
+                let _ = warp(anchor, false);
+                // Where the pointer now is, so an injected move on THIS machine composes from
+                // the anchor rather than from wherever it was before the pin.
+                self.injected_to(anchor);
             }
             None => {
                 self.shared.confined.store(false, Ordering::Relaxed);
-                associate(true);
+                // The one failure on this platform that leaves a machine's mouse dead, so it
+                // is recorded rather than only warned about: the loop retries it every turn
+                // until it takes (see `Backend::periodic`).
+                if !associate(true) {
+                    self.shared.needs_reassociate.store(true, Ordering::Relaxed);
+                }
+                self.shared.injected_at.store(NO_WARP, Ordering::Relaxed);
             }
         }
     }
 
     fn warp(&self, to: Point) {
         let confined = self.shared.confined.load(Ordering::Relaxed);
-        warp(to, !confined);
+        // The re-association is skipped while the pointer is pinned, because the pin IS the
+        // decoupling (truth 5). When it is not skipped it can fail, and that is the dead mouse
+        // case again, so it goes on the same retry.
+        if !warp(to, !confined) {
+            self.shared.needs_reassociate.store(true, Ordering::Relaxed);
+        }
+        self.injected_to(to);
     }
 
     fn inject(&self, actions: Vec<Action>) {
@@ -879,61 +1015,98 @@ impl MacBackend {
             // Truth 7, and the only order that does not lie: a password field silences the
             // injection, so it is asked about BEFORE typing rather than after.
             let secure = unsafe { ffi::IsSecureEventInputEnabled() };
+            // `Action::Group` is deliberately NOT counted: it is a documented no-op on this
+            // platform, so a batch of nothing but groups was being refused for secure input
+            // while typing nothing at all.
             let has_keys = actions
                 .iter()
-                .any(|a| matches!(a, Action::Key { .. } | Action::Text(_) | Action::Group(_)));
+                .any(|a| matches!(a, Action::Key { .. } | Action::Text(_)));
             if secure && has_keys {
                 self.shared
                     .emit(BackendEvent::Refused(Refusal::SecureInput));
                 return;
             }
-            if screen_is_locked() {
+            if self.screen_is_locked_cached() {
                 self.shared
                     .emit(BackendEvent::Refused(Refusal::ScreenLocked));
                 return;
             }
         }
-        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState);
-        if let Some(source) = &source {
-            // The non-deprecated half of truth 4's cure, on this backend's own source. The
-            // global `CGSetLocalEventsSuppressionInterval` is zeroed once at construction and
-            // is deprecated; whether it still has any effect is not documented either way,
-            // so both are done, which is what Wine's own comment on this says it settled on.
-            CGEventSource::set_local_events_suppression_interval(Some(source), 0.0);
+        // One event source per thread, created once. `CGEventSourceCreate` is a window server
+        // round trip and this is the 125 Hz path; a `CFRetained<CGEventSource>` is not `Send`,
+        // so it cannot live in the handle the engine clones across threads, and a thread local
+        // is the shape that fits. Truth 4's non-deprecated cure is applied to it at creation.
+        SOURCE.with(|source| {
+            for action in &actions {
+                self.post(source.as_deref(), action);
+            }
+        });
+    }
+
+    /// [`screen_is_locked`], asked at most once every [`LOCK_POLL`].
+    ///
+    /// The uncached call is a window server round trip plus a dictionary and two strings, and
+    /// it was being made once per injected batch. A lock is a human action, so an answer up to
+    /// a fifth of a second stale is an answer: the injections that slip through in that window
+    /// go to a locked screen, where the window server discards them, which is what would have
+    /// happened anyway.
+    fn screen_is_locked_cached(&self) -> bool {
+        let mut guard = match self.locked.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if guard.0.elapsed() >= LOCK_POLL {
+            *guard = (Instant::now(), screen_is_locked());
         }
-        for action in &actions {
-            self.post(source.as_deref(), action);
+        guard.1
+    }
+
+    /// Where the cursor is, for the purpose of composing the next event to post.
+    ///
+    /// The last position THIS BACKEND injected, when it has injected one, and the real cursor
+    /// position otherwise. Reading the real one back is wrong right after an injection:
+    /// `CGEventPost` is asynchronous, so a batch of "move, then click" would read the position
+    /// before the window server had applied the move and post the click at the old point,
+    /// which is a click in the wrong place on somebody else's screen.
+    ///
+    /// It is reset whenever capture changes and on every teardown, so a session never starts
+    /// from where a previous one left the pointer.
+    fn injected_position(&self) -> Point {
+        let packed = self.shared.injected_at.load(Ordering::Relaxed);
+        if packed == NO_WARP {
+            return cursor_position().unwrap_or(Point { x: 0, y: 0 });
         }
+        unpack(packed)
+    }
+
+    /// Records where an injected pointer event put the cursor.
+    fn injected_to(&self, at: Point) {
+        self.shared.injected_at.store(pack(at), Ordering::Relaxed);
     }
 
     /// Posts one action, stamping the modifier flags this backend believes are held
     /// (truth 6).
     fn post(&self, source: Option<&CGEventSource>, action: &Action) {
-        let mods = self.shared.mods.load(Ordering::Relaxed) as u16;
+        let mods = self.shared.injected_mods.load(Ordering::Relaxed) as u16;
         let flags = flags_of_mods(mods);
         match action {
             Action::Key { code, down } => {
                 let vk = (code.code & 0xFFFF) as u16;
-                // The flags are updated BEFORE the event is posted for a press and
-                // AFTER for a release, so a modifier's own event carries the state that
-                // includes it and the one that follows a release does not.
-                if let Some(bit) = mod_of_vk(vk) {
-                    let mut now = mods;
-                    if *down {
-                        now |= bit;
-                    } else {
-                        now &= !bit;
+                // A modifier's OWN event carries the state that already includes it, on the
+                // press and on the release alike: Command down is stamped `MaskCommand`, and
+                // Command up is stamped empty. So the new state is computed once, stored, and
+                // stamped on this very event. Walked through Command-down, c-down, c-up,
+                // Command-up it gives `MaskCommand` three times and then nothing, which is
+                // truth 6.
+                let stamped = match mod_of_vk(vk) {
+                    Some(bit) => {
+                        let now = if *down { mods | bit } else { mods & !bit };
+                        self.shared
+                            .injected_mods
+                            .store(u32::from(now), Ordering::Relaxed);
+                        flags_of_mods(now)
                     }
-                    self.shared.mods.store(u32::from(now), Ordering::Relaxed);
-                }
-                let stamped = if let Some(bit) = mod_of_vk(vk) {
-                    if *down {
-                        flags_of_mods(mods | bit)
-                    } else {
-                        flags_of_mods(mods & !bit)
-                    }
-                } else {
-                    flags
+                    None => flags,
                 };
                 if let Some(event) = CGEvent::new_keyboard_event(source, vk, *down) {
                     CGEvent::set_flags(Some(&event), stamped);
@@ -950,6 +1123,13 @@ impl MacBackend {
                 }
                 for down in [true, false] {
                     if let Some(event) = CGEvent::new_keyboard_event(source, 0, down) {
+                        // Explicitly NO modifiers, and it is the one arm that needs saying so.
+                        // A created event may inherit the local hardware modifier state, so a
+                        // person holding Shift on the TARGET would otherwise corrupt every
+                        // character typed into it; and a driver holding Command whose stroke
+                        // fell through to this level would have the shortcut silently become
+                        // literal text. The Unicode path carries the character and nothing else.
+                        CGEvent::set_flags(Some(&event), CGEventFlags::empty());
                         // SAFETY: a slice we own, with the length the call is given.
                         unsafe {
                             CGEvent::keyboard_set_unicode_string(
@@ -963,7 +1143,7 @@ impl MacBackend {
                 }
             }
             Action::MoveTo(to) => {
-                let from = cursor_position().unwrap_or(*to);
+                let from = self.injected_position();
                 let at = objc2_core_foundation::CGPoint {
                     x: f64::from(to.x),
                     y: f64::from(to.y),
@@ -985,18 +1165,18 @@ impl MacBackend {
                     );
                     self.stamp_mouse(&event, flags);
                     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+                    self.injected_to(*to);
                 }
             }
             Action::MoveBy { dx, dy } => {
                 if *dx == 0 && *dy == 0 {
                     return;
                 }
-                // macOS has no relative mouse event: the position is computed here and
-                // the delta travels in the event's own fields, which is what a game
-                // reading raw movement looks at.
-                let Some(from) = cursor_position() else {
-                    return;
-                };
+                // macOS has no relative mouse event: the position is computed here and the
+                // delta travels in the event's own fields, which is what a game reading raw
+                // movement looks at. From the last INJECTED position for the reason the button
+                // arm gives.
+                let from = self.injected_position();
                 let at = objc2_core_foundation::CGPoint {
                     x: f64::from(from.x.saturating_add(*dx)),
                     y: f64::from(from.y.saturating_add(*dy)),
@@ -1015,13 +1195,22 @@ impl MacBackend {
                     );
                     self.stamp_mouse(&event, flags);
                     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+                    self.injected_to(Point {
+                        x: from.x.saturating_add(*dx),
+                        y: from.y.saturating_add(*dy),
+                    });
                 }
             }
             Action::Button { button, down } => {
                 let Some((kind, mac, number)) = mac_button(*button, *down) else {
                     return;
                 };
-                let at = cursor_position().unwrap_or(Point { x: 0, y: 0 });
+                // Where the last injected move PUT the cursor, and not where the cursor is.
+                // `CGEventPost` is asynchronous, so a batch of a move and then a click can read
+                // the position back before the window server has applied the move, and the
+                // click lands at the old point: on the target that is a click in the wrong
+                // place, which is the one kind of mistake a person cannot undo by trying again.
+                let at = self.injected_position();
                 let at = objc2_core_foundation::CGPoint {
                     x: f64::from(at.x),
                     y: f64::from(at.y),
@@ -1151,15 +1340,24 @@ fn cursor_position() -> Option<Point> {
     })
 }
 
-/// Couples or decouples the cursor from the mouse (truth 5).
-fn associate(connected: bool) {
+/// Couples or decouples the cursor from the mouse (truth 5), and answers with whether it
+/// worked.
+///
+/// The answer is load bearing in one direction only. A failed DECOUPLING is a session whose
+/// pin is advisory, which is a worse driving experience. A failed COUPLING is a mouse that
+/// moves nothing at all until something retries it, so every caller that releases records the
+/// failure in [`Shared::needs_reassociate`] and the loop retries it every turn.
+#[must_use]
+fn associate(connected: bool) -> bool {
     let status = CGAssociateMouseAndMouseCursorPosition(connected);
     if status != CGError::Success {
         warn(&format!(
             "the pointer could not be {}: CGError {status:?}",
             if connected { "released" } else { "pinned" }
         ));
+        return false;
     }
+    true
 }
 
 /// Puts the pointer somewhere.
@@ -1169,20 +1367,36 @@ fn associate(connected: bool) {
 /// happen while a session has the pointer pinned, because the pin IS the decoupling:
 /// the caller decides, and the suppression interval is zeroed once at construction so
 /// that the choice is safe either way.
-fn warp(to: Point, reassociate: bool) {
-    let at = objc2_core_foundation::CGPoint {
-        x: f64::from(to.x),
-        y: f64::from(to.y),
-    };
-    let status = CGWarpMouseCursorPosition(at);
+#[must_use]
+fn warp(to: Point, reassociate: bool) -> bool {
+    let status = warp_quietly(to);
     if status != CGError::Success {
         warn(&format!(
             "the pointer could not be moved: CGError {status:?}"
         ));
     }
     if reassociate {
-        associate(true);
+        return associate(true);
     }
+    true
+}
+
+/// The half of [`warp`] that says NOTHING, for the one caller that is inside the event tap's
+/// callback.
+///
+/// A `warn` there is an `eprintln!` on the window server's own thread: it takes the stderr lock
+/// and writes to a pipe, and a pipe nobody is draining blocks. A blocked tap callback is a tap
+/// the system DISABLES (truth 8), which is a source Mac that stops observing its own keyboard
+/// because it tried to complain. And it would not be one line: a warp fails for reasons that
+/// persist (not the active session, a locked screen, a display capture), so it would be one
+/// line per mouse event. The callback counts instead, and the loop says it (this is the same
+/// answer the Windows hooks arrived at, for the same reason).
+fn warp_quietly(to: Point) -> CGError {
+    let at = objc2_core_foundation::CGPoint {
+        x: f64::from(to.x),
+        y: f64::from(to.y),
+    };
+    CGWarpMouseCursorPosition(at)
 }
 
 /// Is the screen locked, or is somebody else's session in front?
@@ -1192,14 +1406,35 @@ fn warp(to: Point, reassociate: bool) {
 /// injection is concerned, which is that nobody would see it.
 fn screen_is_locked() -> bool {
     let Some(session) = objc2_core_graphics::CGSessionCopyCurrentDictionary() else {
-        // No session dictionary at all is what a process with no window server
-        // connection looks like, and it cannot type either.
-        return true;
+        // No session dictionary AT ALL is not a locked screen, and saying it was would be the
+        // "best effort that lies" this ticket exists to avoid. It is what a process with no
+        // window server session of its own looks like: started over ssh, or by a launchd job
+        // with no Aqua session. The shipped path is a login agent, where the dictionary always
+        // exists, so this branch means somebody is running the component by hand.
+        //
+        // Refusing here reported "that computer is locked" on an unlocked Mac, which sends the
+        // person reading it to look for a lock screen that is not there. Instead the injection
+        // is attempted and fails on its own terms, and the reason is said once.
+        if !NO_SESSION_SAID.swap(true, Ordering::Relaxed) {
+            warn(
+                "this process has no window server session, so it cannot tell whether the \
+                 screen is locked; injections will be attempted and may simply do nothing",
+            );
+        }
+        return false;
     };
     let locked = dictionary_flag(&session, "CGSSessionScreenIsLocked");
     let on_console = dictionary_flag(&session, "kCGSSessionOnConsoleKey");
-    locked == Some(true) || on_console == Some(false)
+    // `!= Some(true)` and not `== Some(false)`: Apple documents the absence of the key as
+    // meaning the session does NOT own the console, so a missing key was being read as the
+    // reassuring answer. Under fast user switching that is a Mac accepting an injection it
+    // shows to nobody.
+    locked == Some(true) || on_console != Some(true)
 }
+
+/// Whether the "no window server session" line has been said. Once per process: it is a
+/// property of how the component was started, so it never changes while it runs.
+static NO_SESSION_SAID: AtomicBool = AtomicBool::new(false);
 
 /// One boolean out of a Core Foundation dictionary, or `None` when it is not there.
 fn dictionary_flag(dictionary: &CFDictionary, key: &str) -> Option<bool> {
@@ -1210,12 +1445,11 @@ fn dictionary_flag(dictionary: &CFDictionary, key: &str) -> Option<bool> {
     if value.is_null() {
         return None;
     }
-    // SAFETY: the session dictionary's documented values for these two keys are
-    // `CFBoolean`s. A dictionary from the window server is not peer input, so trusting
-    // the documented class is reasonable here in a way it would not be for a value that
-    // crossed the network.
-    let flag = unsafe { &*value.cast::<CFBoolean>() };
-    Some(flag.value())
+    // SAFETY: the value follows the Get rule and the dictionary outlives this borrow. The
+    // CLASS is checked rather than assumed: `downcast_ref` is one `CFGetTypeID` call, and a
+    // blind cast of a `*const c_void` to a `CFBoolean` is not worth saving it.
+    let value = unsafe { &*value.cast::<objc2_core_foundation::CFType>() };
+    value.downcast_ref::<CFBoolean>().map(CFBoolean::value)
 }
 
 /// This machine's monitors, and whether their identities survive an unplug.
@@ -1232,7 +1466,10 @@ fn read_monitors() -> (Vec<Monitor>, bool) {
     // SAFETY: an array we own and its length, plus an out parameter for the count.
     let status = unsafe { CGGetActiveDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) };
     if status != CGError::Success {
-        return (Vec::new(), true);
+        // "No monitors, and their identities are UNSTABLE". Not stable: answering stable here
+        // meant a failure to enumerate cleared a real `MonitorsUnstable` problem, so the
+        // interface stopped saying anything was wrong at the moment it knew least.
+        return (Vec::new(), false);
     }
     let main = CGMainDisplayID();
     let mut out = Vec::new();
@@ -1242,11 +1479,28 @@ fn read_monitors() -> (Vec<Monitor>, bool) {
         if bounds.size.width < 1.0 || bounds.size.height < 1.0 {
             continue;
         }
-        let pixels_wide = objc2_core_graphics::CGDisplayPixelsWide(*id) as f64;
-        let scale = if bounds.size.width > 0.0 {
-            ((pixels_wide / bounds.size.width) * 1000.0).round() as i32
-        } else {
-            1000
+        // NOT `CGDisplayPixelsWide`, which despite its name and its documentation returns
+        // POINTS: it is the same number as `CGDisplayBounds().size.width`, so the ratio was
+        // exactly 1000 on every display including every Retina one, and `Monitor::scale` was a
+        // constant lie travelling inside a signed layout document. The display MODE carries
+        // both numbers, and their ratio is the backing scale factor the seam asks for.
+        //
+        // In a non-integer "More Space" mode the framebuffer can exceed the panel's own
+        // pixels, so this reports 2.0 where the physical ratio is nearer 1.7. That is not an
+        // error: it is the same number `NSScreen.backingScaleFactor` gives, which is what an
+        // interface showing "200%" means.
+        let mode = objc2_core_graphics::CGDisplayCopyDisplayMode(*id);
+        let scale = match mode.as_deref() {
+            Some(mode) => {
+                let points = objc2_core_graphics::CGDisplayMode::width(Some(mode)) as f64;
+                let pixels = objc2_core_graphics::CGDisplayMode::pixel_width(Some(mode)) as f64;
+                if points > 0.0 {
+                    ((pixels / points) * 1000.0).round() as i32
+                } else {
+                    1000
+                }
+            }
+            None => 1000,
         };
         let (identity, named) = display_identity(*id);
         if !named {
@@ -1255,9 +1509,13 @@ fn read_monitors() -> (Vec<Monitor>, bool) {
         out.push(Monitor {
             id: identity,
             // Core Graphics has no display NAME: the localised one belongs to AppKit's
-            // `NSScreen`, which this component does not link. The number is what a
-            // person sees until the interface pairs it with something better.
-            name: format!("Display {id}"),
+            // `NSScreen`, which this component does not link. The number is what a person sees
+            // until the interface pairs it with something better, and it is the display's
+            // POSITION in the active list rather than its id: an id is a slot number that
+            // changes across reboots and reconnections, so using it renamed a person's screens
+            // behind their back. Apple documents the main display as first in that list, so
+            // "Display 1" is the main one.
+            name: format!("Display {}", out.len() + 1),
             w: bounds.size.width as i32,
             h: bounds.size.height as i32,
             x: bounds.origin.x as i32,
@@ -1315,6 +1573,22 @@ fn display_identity(id: CGDirectDisplayID) -> (String, bool) {
     (format!("mac:uuid:{}", hex::encode(hex)), true)
 }
 
+/// A position packed into one integer, so a pair can be read atomically.
+fn pack(at: Point) -> u64 {
+    ((at.x as u32 as u64) << 32) | at.y as u32 as u64
+}
+
+fn unpack(packed: u64) -> Point {
+    Point {
+        x: (packed >> 32) as u32 as i32,
+        y: packed as u32 as i32,
+    }
+}
+
+/// The value [`Shared::injected_at`] holds when nothing has been injected yet. Not a position
+/// anything could ask for: both coordinates would have to be `i32::MIN`.
+const NO_WARP: u64 = 0x8000_0000_8000_0000;
+
 /// The centre of a rectangle, which is where the pointer is put while confined.
 fn centre(rect: &Rect) -> Point {
     Point {
@@ -1341,6 +1615,33 @@ unsafe extern "C-unwind" fn tap_callback(
     user_info: *mut c_void,
 ) -> *mut CGEvent {
     let pass = event.as_ptr();
+    // A panic here would unwind into the window server's own frame, which this signature
+    // (`C-unwind`) permits and which nothing downstream is written for. Caught, and the
+    // event is PASSED THROUGH rather than consumed: a session that observes nothing is a
+    // session somebody can end, and a Mac whose keystrokes are being eaten by a panicking
+    // callback is not. The panic message still reaches the log through the ordinary hook.
+    let swallowed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: the caller's own contract, forwarded.
+        unsafe { tap_body(kind, event, user_info) }
+    }))
+    .unwrap_or(false);
+    if swallowed {
+        std::ptr::null_mut()
+    } else {
+        pass
+    }
+}
+
+/// The tap's actual work, so [`tap_callback`] can catch a panic around it. Answers with
+/// whether the event should be consumed.
+///
+/// SAFETY: the caller's contract.
+unsafe fn tap_body(
+    kind: CGEventType,
+    event: std::ptr::NonNull<CGEvent>,
+    user_info: *mut c_void,
+) -> bool {
+    let pass = false;
     if user_info.is_null() {
         return pass;
     }
@@ -1375,42 +1676,74 @@ unsafe extern "C-unwind" fn tap_callback(
             let vk =
                 CGEvent::integer_value_field(Some(event_ref), CGEventField::KeyboardEventKeycode)
                     as u16;
-            // The right Option is AltGr on a Mac and the flags cannot tell the two
-            // apart (see `mods_of_flags`), so the keycode decides.
+            // The right Option is AltGr on a Mac and the flags cannot tell the two apart (see
+            // `mods_of_flags`), so the keycode decides.
             if vk == 61 && mods & keys::mods::ALT != 0 {
                 mods = (mods & !keys::mods::ALT) | keys::mods::ALTGR;
             }
-            shared.mods.store(u32::from(mods), Ordering::Relaxed);
-            // A `FlagsChanged` is a modifier going down or coming up and macOS does not
-            // say which: the flags after the change do. A modifier whose bit is now set
-            // went down.
+            let usage = usage_of_vk(vk).unwrap_or(0);
+            let is_lock = usage != 0 && keys::is_lock(usage);
+            let flags_change = kind == CGEventType::FlagsChanged;
+            if flags_change && !is_lock && mod_of_vk(vk).is_none() {
+                // A flags change that means no canonical modifier and is not a lock has
+                // nothing to report. The `fn` key is the case, and on a laptop it is pressed
+                // constantly (for the F keys, the arrows, Home and End): without this it
+                // produced two frames per press carrying usage 0, no name and no symbol,
+                // which the far side answered with an `oops` each time.
+                return swallow;
+            }
+            if is_lock {
+                // Caps Lock arrives as a flags change on this platform, twice per toggle, and
+                // the FLAG says what the lock is now. Reported on the transition only, which is
+                // what a half duplex lock means: a target that waited for a release would hold
+                // the lock down for ever, and one that saw both would toggle it back.
+                //
+                // An earlier version had no arm for the Caps Lock keycode in `mod_of_vk`, so
+                // `down` was false both times and the `is_lock && !down` rule dropped BOTH
+                // events: pressing Caps Lock while driving did nothing anywhere, not locally
+                // and not on the target.
+                let now = mods & (keys::mods::CAPS | keys::mods::NUM | keys::mods::SCROLL);
+                let before = shared.seen_locks.swap(u32::from(now), Ordering::Relaxed) as u16;
+                if now == before {
+                    return swallow;
+                }
+                shared.local_mods.store(u32::from(mods), Ordering::Relaxed);
+                shared.emit(BackendEvent::Key(KeyEvent {
+                    usage,
+                    key: keys::name_of(usage).map(str::to_string),
+                    sym: None,
+                    mods,
+                    down: true,
+                    lock: true,
+                }));
+                return swallow;
+            }
+            shared.local_mods.store(u32::from(mods), Ordering::Relaxed);
+            // A `FlagsChanged` is a modifier going down or coming up and macOS does not say
+            // which: the flags after the change do. A modifier whose bit is now set went down.
             let down = match kind {
                 CGEventType::KeyDown => true,
                 CGEventType::KeyUp => false,
                 _ => mod_of_vk(vk).is_some_and(|bit| mods & bit != 0),
             };
-            let usage = usage_of_vk(vk).unwrap_or(0);
-            let is_lock = usage != 0 && keys::is_lock(usage);
-            if is_lock && !down {
-                // A half duplex lock reports only its press.
-                return if swallow { std::ptr::null_mut() } else { pass };
-            }
             let sym = tap_symbol(event_ref);
-            let key = (usage != 0).then(|| keys::name_of(usage)).flatten();
             shared.emit(BackendEvent::Key(KeyEvent {
                 usage,
-                key: key.map(str::to_string),
+                key: (usage != 0)
+                    .then(|| keys::name_of(usage))
+                    .flatten()
+                    .map(str::to_string),
                 sym,
                 mods,
                 down,
-                lock: is_lock,
+                lock: false,
             }));
         }
         CGEventType::MouseMoved
         | CGEventType::LeftMouseDragged
         | CGEventType::RightMouseDragged
         | CGEventType::OtherMouseDragged => {
-            shared.mods.store(u32::from(mods), Ordering::Relaxed);
+            shared.local_mods.store(u32::from(mods), Ordering::Relaxed);
             // Truth 5: the deltas are the event's own fields, which keep arriving while
             // the cursor is decoupled and the position does not move.
             let dx = CGEvent::integer_value_field(Some(event_ref), CGEventField::MouseEventDeltaX)
@@ -1435,16 +1768,22 @@ unsafe extern "C-unwind" fn tap_callback(
                     x: shared.anchor_x.load(Ordering::Relaxed),
                     y: shared.anchor_y.load(Ordering::Relaxed),
                 };
-                if (at.x as i32, at.y as i32) != (anchor.x, anchor.y) {
-                    warp(anchor, false);
+                if (at.x as i32, at.y as i32) != (anchor.x, anchor.y)
+                    && warp_quietly(anchor) != CGError::Success
+                {
+                    // Counted rather than said, because this is inside the callback: see
+                    // `warp_quietly`. No re-association and so no dead mouse to record either,
+                    // because the pin IS the decoupling and this warp is part of holding it.
+                    shared.warp_failed.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
         CGEventType::ScrollWheel => {
-            shared.mods.store(u32::from(mods), Ordering::Relaxed);
-            // The pixel axis, accumulated into whole notches with the remainder kept: a
+            shared.local_mods.store(u32::from(mods), Ordering::Relaxed);
+            // The POINT axis, accumulated into whole notches with the remainder kept: a
             // trackpad sends a fraction of a notch per event and rounding each one to
-            // zero would scroll nothing at all.
+            // zero would scroll nothing at all. A real wheel detent arrives here as about
+            // one notch's worth of points, so both devices go through the same arithmetic.
             let py = CGEvent::integer_value_field(
                 Some(event_ref),
                 CGEventField::ScrollWheelEventPointDeltaAxis1,
@@ -1453,12 +1792,33 @@ unsafe extern "C-unwind" fn tap_callback(
                 Some(event_ref),
                 CGEventField::ScrollWheelEventPointDeltaAxis2,
             ) as i32;
-            let ny = notches(&shared.wheel_y, py);
+            // The LINE axis is the fallback and not the first choice, and per axis: it is
+            // already a notch count (a detent is exactly one) but it is ROUNDED, so a
+            // continuous device's small movement reads as zero there while the point axis
+            // still carries it. An event with no point delta at all on an axis is a discrete
+            // one, and then the line count is the whole truth.
+            let ly = CGEvent::integer_value_field(
+                Some(event_ref),
+                CGEventField::ScrollWheelEventDeltaAxis1,
+            ) as i32;
+            let lx = CGEvent::integer_value_field(
+                Some(event_ref),
+                CGEventField::ScrollWheelEventDeltaAxis2,
+            ) as i32;
+            let ny = if py != 0 {
+                notches(&shared.wheel_y, py)
+            } else {
+                ly
+            };
             // NEGATED, and this is truth 9: on macOS a positive horizontal scroll means
             // LEFT, and the dialect says positive is right. Mac to Mac cancelled the error
             // out on both sides, so only a Mac driving anything else showed it, scrolling
             // sideways backwards.
-            let nx = -notches(&shared.wheel_x, px);
+            let nx = -if px != 0 {
+                notches(&shared.wheel_x, px)
+            } else {
+                lx
+            };
             if nx != 0 || ny != 0 {
                 shared.emit(BackendEvent::Wheel {
                     dx: nx,
@@ -1472,7 +1832,7 @@ unsafe extern "C-unwind" fn tap_callback(
                 kind,
                 CGEvent::integer_value_field(Some(event_ref), CGEventField::MouseEventButtonNumber),
             ) {
-                shared.mods.store(u32::from(mods), Ordering::Relaxed);
+                shared.local_mods.store(u32::from(mods), Ordering::Relaxed);
                 let down = matches!(
                     kind,
                     CGEventType::LeftMouseDown
@@ -1483,24 +1843,32 @@ unsafe extern "C-unwind" fn tap_callback(
             }
         }
     }
-    if swallow {
-        // Null is how a tap consumes an event: it never reaches the application that
-        // would have had it.
-        std::ptr::null_mut()
-    } else {
-        pass
-    }
+    // Returning true is how a tap consumes an event (the caller turns it into the null the
+    // API wants): it never reaches the application that would have had it.
+    swallow
 }
 
-/// Whole notches out of a pixel accumulator, with the remainder kept.
-fn notches(accumulator: &AtomicI32, pixels: i32) -> i32 {
-    if pixels == 0 {
+/// Whole notches out of a point accumulator, with the remainder kept.
+///
+/// Saturating and not checked: the numbers come off a device, but `fetch_add` wraps in release
+/// and PANICS in debug, and this runs inside the tap callback where a panic unwinds through
+/// the window server's frames. The accumulator is also clamped, so a stuck axis cannot walk it
+/// to the edge and stay there.
+fn notches(accumulator: &AtomicI32, points: i32) -> i32 {
+    if points == 0 {
         return 0;
     }
-    let total = accumulator.fetch_add(pixels, Ordering::Relaxed) + pixels;
-    let whole = total / WHEEL_PIXELS_PER_NOTCH;
+    let total = accumulator
+        .fetch_add(points, Ordering::Relaxed)
+        .saturating_add(points)
+        .clamp(-1_000_000, 1_000_000);
+    accumulator.store(total, Ordering::Relaxed);
+    let whole = total / WHEEL_POINTS_PER_NOTCH;
     if whole != 0 {
-        accumulator.fetch_sub(whole * WHEEL_PIXELS_PER_NOTCH, Ordering::Relaxed);
+        accumulator.fetch_sub(
+            whole.saturating_mul(WHEEL_POINTS_PER_NOTCH),
+            Ordering::Relaxed,
+        );
     }
     whole
 }
@@ -1557,10 +1925,18 @@ struct Backend {
     layout_at: Instant,
     /// When the tap was last asked whether it is still alive (truth 11).
     tap_at: Instant,
+    /// Whether the last attempt to BUILD a tap failed, and when. While this is set the
+    /// capabilities say this machine cannot capture, which is the truth and is also what keeps
+    /// the engine from asking again in a tight loop (see [`Backend::tap_failed`]).
+    tap_broken: bool,
+    tap_failed_at: Instant,
     shutdown: bool,
     exit_code: Option<i32>,
     /// Whether the engine's departure has been seen once already (see `periodic`).
     gone_seen: bool,
+    /// How many dropped upcalls have been reported, so the count is said when it grows and
+    /// not once per turn.
+    said_dropped: u32,
 }
 
 impl Backend {
@@ -1569,7 +1945,19 @@ impl Backend {
     fn run(&mut self) -> i32 {
         // SAFETY: an AppKit extern static, valid while the framework is loaded.
         let mode = unsafe { kCFRunLoopDefaultMode };
-        let run_loop = CFRunLoop::current().expect("a run loop on the main thread");
+        let Some(run_loop) = CFRunLoop::current() else {
+            // D22 by another route. `create()` answers a missing run loop with `Unsupported`,
+            // which lands in the Absent backend; panicking HERE would be a process that exits
+            // non-zero and a supervisor that relaunches it every minute for the life of the
+            // machine. There is no loop to pump, so this thread does what the Absent loop
+            // does: says so once and stays out of the way without returning.
+            warn(
+                "there is no run loop on this thread; the keyboard and mouse backend will do nothing",
+            );
+            loop {
+                std::thread::park();
+            }
+        };
         run_loop.add_source(Some(&self.wake_source), mode);
         loop {
             self.process_cmds();
@@ -1583,7 +1971,17 @@ impl Backend {
             // One turn. It returns as soon as a source is handled, which is either the
             // tap delivering an event or a downcall signalling the wake source, and
             // after IDLE_TURN when nothing happens.
-            CFRunLoop::run_in_mode(mode, IDLE_TURN.as_secs_f64(), true);
+            //
+            // The RESULT is read, because one of its four values does not wait: `Finished`
+            // means the loop had nothing to wait on and returned at once, and a loop that
+            // ignored it would spin this thread at 100 per cent with the tap still installed.
+            // It should be unreachable (the wake source is added above and never removed), so
+            // the answer is to sleep exactly as long as the turn was supposed to last rather
+            // than to stop: the pump still has commands to drain and a tap to service.
+            let turn = CFRunLoop::run_in_mode(mode, IDLE_TURN.as_secs_f64(), true);
+            if turn == CFRunLoopRunResult::Finished {
+                std::thread::sleep(IDLE_TURN);
+            }
         }
         self.release_everything();
         self.exit_code.unwrap_or(1)
@@ -1598,6 +1996,13 @@ impl Backend {
             guard.drain(..).collect()
         };
         for cmd in drained {
+            // Nothing queued behind an `Exit` runs, and here that is not tidiness: a
+            // `Capture` behind an `Exit` reaches `CGRequestListenEventAccess`, which puts a
+            // permission dialog on the screen on behalf of a component that is shutting down,
+            // and then builds a tap the teardown destroys a moment later.
+            if self.shutdown {
+                break;
+            }
             match cmd {
                 Cmd::Capture(mode) => self.set_capture(mode),
                 Cmd::Exit(code) => {
@@ -1611,6 +2016,13 @@ impl Backend {
     /// The work no event hangs off: the engine still being there, the two grants, and
     /// the keyboard layout.
     fn periodic(&mut self) {
+        // Asked here as well as discovered in `emit`, because `emit` only learns it when there
+        // is something to send: an engine that died having left capture Off produces no
+        // upcalls, so nothing would ever notice. `is_closed` is a load on the channel's own
+        // state and costs nothing.
+        if self.shared.events_tx.is_closed() {
+            self.shared.engine_gone.store(true, Ordering::Relaxed);
+        }
         if self.shared.engine_gone.load(Ordering::Relaxed) {
             // ONE more turn before acting on it, and only then. `main` drops the receiver
             // when the engine returns and only then calls `request_exit`, so at a clean
@@ -1626,6 +2038,40 @@ impl Backend {
                 return;
             }
             self.gone_seen = true;
+        }
+        // The dead mouse retry. `confine(None)` and `warp` record a failed re-coupling here
+        // because nothing else can: the tap will not re-warp (it reads `confined`, already
+        // false) and the engine has already forgotten it ever asked. Every turn, not once a
+        // second, because a cursor that moves nothing is the worst state this file can leave a
+        // machine in and a wasted call costs a microsecond.
+        if self.shared.needs_reassociate.load(Ordering::Relaxed)
+            && !self.shared.confined.load(Ordering::Relaxed)
+            && associate(true)
+        {
+            self.shared
+                .needs_reassociate
+                .store(false, Ordering::Relaxed);
+        }
+        // The door back, once a second. Clearing the flag does not build a tap: it widens the
+        // capabilities, the engine asks for the capture it wants again, and the next attempt
+        // happens then. One attempt per second instead of a spin.
+        if self.tap_broken && self.tap_failed_at.elapsed() >= TAP_POLL {
+            self.tap_broken = false;
+            self.publish_caps();
+            self.shared.emit(BackendEvent::CapabilitiesChanged);
+        }
+        // What the tap callback counted but could not say. Both are said from here because
+        // stderr from inside the callback is a tap the system disables (truth 8).
+        let dropped = self.shared.dropped.load(Ordering::Relaxed);
+        if dropped > self.said_dropped {
+            self.said_dropped = dropped;
+            warn("the engine is not draining input events; dropping some");
+        }
+        let missed = self.shared.warp_failed.swap(0, Ordering::Relaxed);
+        if missed > 0 {
+            warn(&format!(
+                "the pointer could not be held in place ({missed} time(s))"
+            ));
         }
         if self.grants_at.elapsed() >= GRANT_POLL {
             self.grants_at = Instant::now();
@@ -1715,6 +2161,14 @@ impl Backend {
         if mode == self.mode {
             return;
         }
+        // Every mode change forgets what was held and where the pointer was put. Both are
+        // per session state, and keeping them across sessions is how a source Mac's own held
+        // Shift ended up stamped on every key a peer later typed INTO it, and how a click
+        // could land where the last session left the cursor.
+        self.shared.local_mods.store(0, Ordering::Relaxed);
+        self.shared.injected_mods.store(0, Ordering::Relaxed);
+        self.shared.seen_locks.store(0, Ordering::Relaxed);
+        self.shared.injected_at.store(NO_WARP, Ordering::Relaxed);
         let want = match mode {
             CaptureMode::Off => MODE_OFF,
             CaptureMode::Watch => MODE_WATCH,
@@ -1755,6 +2209,37 @@ impl Backend {
         self.create_tap();
     }
 
+    /// What every failure to build the tap does.
+    ///
+    /// The mode goes back to Off (so nothing claims to be swallowing), the failure is
+    /// remembered, and the capabilities NARROW: `capture` stops being "the grant is there" and
+    /// becomes "the grant is there and the tap works". That is what stops the tight loop the
+    /// old shape had, and the loop was real: the engine answers `CaptureLost` by recomputing
+    /// what it wants, `can_drive()` was computed from the grant alone, so it asked for Watch
+    /// again immediately, which tried the create again immediately, for ever, with both threads
+    /// spinning. Narrowed capabilities make the engine want Off, and `periodic` re-opens the
+    /// door once a second.
+    fn tap_failed(&mut self, why: &str, loss: CaptureLoss) {
+        warn(why);
+        self.shared.mode.store(MODE_OFF, Ordering::Relaxed);
+        self.mode = CaptureMode::Off;
+        self.tap_broken = true;
+        self.tap_failed_at = Instant::now();
+        self.publish_caps();
+        self.shared.emit(BackendEvent::CaptureLost(loss));
+    }
+
+    /// Which loss a create failure is. `tap_create` returns nothing but `None`, so the reason
+    /// has to be asked for separately: with the grant in hand it is not a permission problem,
+    /// and calling it one sends the interface to tell a person to grant what they already have.
+    fn create_loss() -> CaptureLoss {
+        if objc2_core_graphics::CGPreflightListenEventAccess() {
+            CaptureLoss::Broken
+        } else {
+            CaptureLoss::Permission
+        }
+    }
+
     fn create_tap(&mut self) {
         let mask = event_mask();
         // SAFETY: the callback matches the signature the API declares, and the user info
@@ -1772,33 +2257,55 @@ impl Backend {
             )
         };
         let Some(tap) = tap else {
-            warn("the event tap could not be created");
-            self.shared.mode.store(MODE_OFF, Ordering::Relaxed);
-            self.mode = CaptureMode::Off;
-            self.shared
-                .emit(BackendEvent::CaptureLost(CaptureLoss::Permission));
+            self.tap_failed("the event tap could not be created", Self::create_loss());
             return;
         };
         let source = CFMachPort::new_run_loop_source(None, Some(&tap), 0);
         let Some(source) = source else {
-            warn("the event tap's run loop source could not be made");
-            self.shared.mode.store(MODE_OFF, Ordering::Relaxed);
-            self.mode = CaptureMode::Off;
-            self.shared
-                .emit(BackendEvent::CaptureLost(CaptureLoss::Broken));
+            tap.invalidate();
+            self.tap_failed(
+                "the event tap's run loop source could not be made",
+                CaptureLoss::Broken,
+            );
             return;
         };
         // SAFETY: an AppKit extern static.
         let mode = unsafe { kCFRunLoopDefaultMode };
-        if let Some(run_loop) = CFRunLoop::current() {
-            run_loop.add_source(Some(&source), mode);
-        }
+        let Some(run_loop) = CFRunLoop::current() else {
+            // A tap whose source is on no run loop is never called, and storing it would have
+            // the mode atomic say Swallow while every keystroke reached the local machine: the
+            // engine would believe it had the keyboard and the person would watch their typing
+            // go into the wrong computer. Unreachable on the main thread, and reported rather
+            // than assumed.
+            source.invalidate();
+            tap.invalidate();
+            self.tap_failed(
+                "there is no run loop to deliver the event tap's events on",
+                CaptureLoss::Broken,
+            );
+            return;
+        };
+        run_loop.add_source(Some(&source), mode);
         CGEvent::tap_enable(&tap, true);
         self.tap = Some(tap);
         self.tap_source = Some(source);
+        self.tap_broken = false;
+        // A tap this new has not had time to go inert, and the watchdog's clock starts here:
+        // without this the first poll after any start fired against a tap created microseconds
+        // earlier, because `tap_at` is not refreshed while capture is Off.
+        self.tap_at = Instant::now();
+        // A disable flagged for a PREVIOUS tap says nothing about this one.
+        self.shared.tap_disabled.store(false, Ordering::Relaxed);
         self.publish_caps();
     }
 
+    /// Takes the tap down, in the order Apple's own teardown uses.
+    ///
+    /// Disable, then invalidate the run loop source (which removes it from every run loop it
+    /// was added to, rather than only marking it), then invalidate the MACH PORT, then drop
+    /// both. The port's invalidation is the step that guarantees no further callback: the
+    /// callback's user info is a raw pointer to this backend's `Shared`, so a callback that
+    /// arrived after the `Arc` was gone would read freed memory.
     fn destroy_tap(&mut self) {
         if let Some(tap) = &self.tap {
             CGEvent::tap_enable(tap, false);
@@ -1806,7 +2313,11 @@ impl Backend {
         if let Some(source) = self.tap_source.take() {
             source.invalidate();
         }
-        self.tap = None;
+        if let Some(tap) = self.tap.take() {
+            tap.invalidate();
+        }
+        // Nothing said about the tap that is gone carries over to the next one.
+        self.shared.tap_disabled.store(false, Ordering::Relaxed);
         self.publish_caps();
     }
 
@@ -1820,11 +2331,24 @@ impl Backend {
 
     fn compute_caps(&self) -> Capabilities {
         let (listen, post) = self.grants;
+        // The GRANT and the tap, not the grant alone: a machine whose tap will not build cannot
+        // capture, whatever permission it holds, and saying otherwise had the engine ask for a
+        // capture it could not get as fast as both threads could go round.
+        let listen = listen && !self.tap_broken;
         let stable = match self.caps.lock() {
             Ok(caps) => caps.monitors_stable,
             Err(p) => p.into_inner().monitors_stable,
         };
-        let problem = if !listen && !post {
+        // OR, not AND. The two grants are separate TCC entries (truth 1) and the asymmetric
+        // case is the NORMAL one on macOS, because a person clicks one dialog and not the
+        // other. Requiring both to be missing meant a Mac that can watch its keyboard but not
+        // type reported no problem at all, so the interface had nothing to turn into the
+        // sentence that names the permission it is still waiting for.
+        let problem = if self.tap_broken {
+            // Not `NoPermission`: the grant may be there and the tap still not build (a code
+            // signing or TCC identity change does exactly that, truth 11).
+            Some(Problem::NoBackend)
+        } else if !listen || !post {
             Some(Problem::NoPermission)
         } else if !stable {
             Some(Problem::MonitorsUnstable)
@@ -1856,11 +2380,24 @@ impl Backend {
         self.mode = CaptureMode::Off;
         self.shared.mode.store(MODE_OFF, Ordering::Relaxed);
         self.destroy_tap();
-        if self.shared.confined.swap(false, Ordering::Relaxed) {
-            // A cursor left decoupled is a mouse that moves nothing, which is this
-            // platform's version of a pointer stuck in a corner.
-            associate(true);
-        }
+        self.shared.confined.store(false, Ordering::Relaxed);
+        self.shared
+            .needs_reassociate
+            .store(false, Ordering::Relaxed);
+        // UNCONDITIONALLY, and that is the whole point of this line. It used to be
+        // `if confined.swap(false)`, which looked like a safety net and was not one: an
+        // ordinary teardown goes through `confine(None)`, which clears that flag BEFORE it
+        // re-associates, so the swap returned false on exactly the path where the
+        // re-association had failed. A cursor left decoupled is a mouse that moves nothing,
+        // this platform's version of a pointer stuck in a corner, and the call costs one round
+        // trip on a path taken once per process.
+        let _ = associate(true);
+        // Nothing is held any more, so nothing is stamped on whatever comes next.
+        self.shared.local_mods.store(0, Ordering::Relaxed);
+        self.shared.injected_mods.store(0, Ordering::Relaxed);
+        self.shared.seen_locks.store(0, Ordering::Relaxed);
+        self.shared.injected_at.store(NO_WARP, Ordering::Relaxed);
+        self.shared.buttons.store(0, Ordering::Relaxed);
     }
 }
 
@@ -1868,6 +2405,13 @@ impl Drop for Backend {
     /// The safety net at thread death: a tap that outlives its process cannot exist (it
     /// belongs to the process), but a DECOUPLED cursor is a window server setting and
     /// this is the last chance to put it back.
+    ///
+    /// It is also load bearing for a second reason, and this is the note that says so: the tap
+    /// callback's user info is a raw pointer into `self.shared`, and Rust drops a structure's
+    /// fields in declaration order, which puts `shared` before `tap`. Running
+    /// `release_everything` HERE, before any field is dropped, is what takes the tap down while
+    /// the memory its callback would read is still alive. Do not reorder the fields expecting
+    /// that to matter, and do not remove this impl.
     fn drop(&mut self) {
         self.release_everything();
     }
@@ -1940,8 +2484,10 @@ pub fn create() -> Result<crate::os::Created, Unsupported> {
              a moment of dead mouse",
         );
     }
-    // The platform half of the crash guard: see this function's own documentation.
-    associate(true);
+    // The platform half of the crash guard: see this function's own documentation. The answer
+    // is ignored on purpose: there may have been nothing to undo, and there is no session yet
+    // to report a failure to.
+    let _ = associate(true);
 
     let run_loop = CFRunLoop::current().ok_or(Unsupported(Problem::NoBackend))?;
     let mut context = CFRunLoopSourceContext {
@@ -1969,7 +2515,12 @@ pub fn create() -> Result<crate::os::Created, Unsupported> {
         anchor_x: AtomicI32::new(0),
         anchor_y: AtomicI32::new(0),
         confined: AtomicBool::new(false),
-        mods: AtomicU32::new(0),
+        warp_failed: AtomicU32::new(0),
+        local_mods: AtomicU32::new(0),
+        injected_mods: AtomicU32::new(0),
+        seen_locks: AtomicU32::new(0),
+        injected_at: AtomicU64::new(NO_WARP),
+        needs_reassociate: AtomicBool::new(false),
         wheel_x: AtomicI32::new(0),
         wheel_y: AtomicI32::new(0),
         buttons: AtomicU32::new(0),
@@ -2005,7 +2556,8 @@ pub fn create() -> Result<crate::os::Created, Unsupported> {
         inject_pointer: grants.1,
         unicode: grants.1,
         monitors_stable: stable,
-        problem: if !grants.0 && !grants.1 {
+        // OR, for the reason `compute_caps` gives.
+        problem: if !grants.0 || !grants.1 {
             Some(Problem::NoPermission)
         } else if !stable {
             Some(Problem::MonitorsUnstable)
@@ -2029,9 +2581,12 @@ pub fn create() -> Result<crate::os::Created, Unsupported> {
         grants_at: Instant::now(),
         layout_at: Instant::now(),
         tap_at: Instant::now(),
+        tap_broken: false,
+        tap_failed_at: Instant::now(),
         shutdown: false,
         exit_code: None,
         gone_seen: false,
+        said_dropped: 0,
     };
     let handle = MacBackend {
         cmds,
@@ -2040,6 +2595,13 @@ pub fn create() -> Result<crate::os::Created, Unsupported> {
         caps,
         layout,
         asked_to_post: Arc::new(AtomicBool::new(false)),
+        // Seeded as "not locked, asked long ago", so the first injection asks for real.
+        locked: Arc::new(Mutex::new((
+            Instant::now()
+                .checked_sub(LOCK_POLL)
+                .unwrap_or_else(Instant::now),
+            false,
+        ))),
     };
     Ok(crate::os::Created {
         handle: crate::os::Backend::Mac(handle),
@@ -2104,10 +2666,11 @@ mod tests {
     fn every_named_key_of_the_dialect_has_a_keycode_or_is_a_key_a_mac_lacks() {
         // The media keys are not virtual keycodes on a Mac at all: they travel as
         // `NSSystemDefined` events, which this backend does not inject.
-        let absent = [
-            "Menu", // the Application key, which no Apple keyboard has ever had
-            "F21", "F22", "F23", "F24", // macOS stops at F20
-        ];
+        //
+        // Menu is deliberately NOT here any more: no Apple keyboard has the key, but macOS
+        // delivers a keycode for the one on a third party PC keyboard, so the honest answer is
+        // the keycode and not "that key does not exist".
+        let absent = ["F21", "F22", "F23", "F24"]; // macOS stops at F20
         let mut missing: Vec<&str> = Vec::new();
         for (name, usage) in keys::NAMED {
             if usage >> 16 == keys::PAGE_CONSUMER {
@@ -2257,7 +2820,12 @@ mod tests {
             anchor_x: AtomicI32::new(0),
             anchor_y: AtomicI32::new(0),
             confined: AtomicBool::new(false),
-            mods: AtomicU32::new(0),
+            warp_failed: AtomicU32::new(0),
+            local_mods: AtomicU32::new(0),
+            injected_mods: AtomicU32::new(0),
+            seen_locks: AtomicU32::new(0),
+            injected_at: AtomicU64::new(NO_WARP),
+            needs_reassociate: AtomicBool::new(false),
             wheel_x: AtomicI32::new(0),
             wheel_y: AtomicI32::new(0),
             buttons: AtomicU32::new(0),
