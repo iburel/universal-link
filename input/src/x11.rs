@@ -648,10 +648,12 @@ struct Backend {
     confine: Option<Rect>,
     anchor: Point,
 
-    /// Raw motion summed since the last turn, so a burst of device events becomes one
-    /// upcall with one round trip for the position rather than one each.
-    pending_dx: i32,
-    pending_dy: i32,
+    /// Raw motion summed since the last turn, in 32nds of a pixel (see [`raw_delta`]),
+    /// so a burst of device events becomes one upcall with one round trip for the
+    /// position rather than one each, and a fraction of a pixel is carried over rather
+    /// than truncated away.
+    pending_dx: i64,
+    pending_dy: i64,
     wheel_x: i32,
     wheel_y: i32,
 
@@ -817,9 +819,12 @@ impl Backend {
         if self.pending_dx == 0 && self.pending_dy == 0 {
             return;
         }
-        let (dx, dy) = (self.pending_dx, self.pending_dy);
-        self.pending_dx = 0;
-        self.pending_dy = 0;
+        // Whole pixels out, the fraction kept for the next turn (see `raw_delta`).
+        let dx = spend_pixels(&mut self.pending_dx);
+        let dy = spend_pixels(&mut self.pending_dy);
+        if dx == 0 && dy == 0 {
+            return;
+        }
         // While watching, the engine needs to know where the pointer IS: it asks the
         // crossing graph about that position plus this delta, and the OS clamps the
         // pointer at its own desktop's edge, so the delta is the only thing that can
@@ -1772,7 +1777,7 @@ fn x_button(button: u8) -> Option<u8> {
     }
 }
 
-/// The relative movement a raw motion event carries.
+/// The relative movement a raw motion event carries, in 32nds of a pixel.
 ///
 /// The first two valuators of a pointer are x and y, and `valuator_mask` says which
 /// of them this event actually carries: a device that moved only vertically sets one
@@ -1780,24 +1785,38 @@ fn x_button(button: u8) -> Option<u8> {
 /// movement as an x movement. `axisvalues_raw` rather than `axisvalues` because the
 /// former is the device's own numbers before any transformation the server applies
 /// (truth 2).
-fn raw_delta(ev: &xinput::RawMotionEvent) -> (i32, i32) {
+fn raw_delta(ev: &xinput::RawMotionEvent) -> (i64, i64) {
     let mask = ev.valuator_mask();
     let values = ev.axisvalues_raw();
     let present = |axis: usize| mask.get(axis / 32).copied().unwrap_or(0) & (1 << (axis % 32)) != 0;
+    // A valuator is a 32.32 fixed point number, and the fraction is kept rather than
+    // truncated: a high resolution device (a touchpad, a mouse reporting at 1000 Hz)
+    // sends a fraction of a pixel per event, and rounding each one to an integer would
+    // report zero for ever, so the pointer would not move at all however far the hand
+    // went. The integral part is signed and the fraction is the unsigned 32nds below
+    // it, so half a pixel backwards is integral -1 with frac 0x80000000.
+    let fixed = |v: &xinput::Fp3232| (i64::from(v.integral) << 32) | i64::from(v.frac);
     // The values are packed: one entry per axis PRESENT, in axis order. So the index
     // of axis one depends on whether axis zero is there, which is why this counts
     // rather than indexing.
     let mut next = 0usize;
-    let mut dx = 0i32;
-    let mut dy = 0i32;
+    let mut dx = 0i64;
+    let mut dy = 0i64;
     if present(0) {
-        dx = values.first().map_or(0, |v| v.integral);
+        dx = values.first().map_or(0, fixed);
         next += 1;
     }
     if present(1) {
-        dy = values.get(next).map_or(0, |v| v.integral);
+        dy = values.get(next).map_or(0, fixed);
     }
     (dx, dy)
+}
+
+/// One fixed point accumulator as whole pixels, with the remainder left behind.
+fn spend_pixels(accumulator: &mut i64) -> i32 {
+    let whole = *accumulator >> 32;
+    *accumulator -= whole << 32;
+    whole.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
 // ------------------------------------------------------------------ the build
@@ -2985,6 +3004,50 @@ mod tests {
         assert_eq!(x_button(5), Some(9), "forward is X's button 9");
         assert_eq!(x_button(6), None);
         assert_eq!(x_button(0), None);
+    }
+
+    /// A fraction of a pixel is carried over rather than truncated, which is what makes
+    /// a high resolution device move the pointer at all: a touchpad sending an eighth of
+    /// a pixel per event would otherwise report zero for ever.
+    #[test]
+    fn a_fraction_of_a_pixel_is_kept_until_it_is_a_whole_one() {
+        let eighth = 1i64 << 29;
+        let mut acc = 0i64;
+        for _ in 0..7 {
+            acc += eighth;
+            assert_eq!(spend_pixels(&mut acc), 0, "seven eighths are no pixel yet");
+        }
+        acc += eighth;
+        assert_eq!(spend_pixels(&mut acc), 1, "and the eighth one is");
+        assert_eq!(acc, 0, "with nothing left over");
+
+        // Backwards, which must not round towards zero and lose the movement.
+        let mut acc = 0i64;
+        for _ in 0..3 {
+            acc -= eighth;
+        }
+        assert_eq!(
+            spend_pixels(&mut acc),
+            -1,
+            "an arithmetic shift rounds down"
+        );
+        assert_eq!(
+            acc,
+            5i64 << 29,
+            "and the remainder is what is left above it"
+        );
+        for _ in 0..5 {
+            acc -= eighth;
+        }
+        assert_eq!(spend_pixels(&mut acc), 0);
+        assert_eq!(acc, 0, "eight eighths backwards are exactly one pixel back");
+
+        // Whole pixels pass straight through, and a number no coordinate could hold is
+        // clamped rather than wrapped.
+        let mut acc = 24i64 << 32;
+        assert_eq!(spend_pixels(&mut acc), 24);
+        let mut acc = i64::MAX;
+        assert!(spend_pixels(&mut acc) > 0);
     }
 
     /// A coordinate that does not fit the wire is clamped rather than wrapped: an X

@@ -422,6 +422,15 @@ struct Shared {
     capture_ok: AtomicBool,
     /// False when a monitor could not be given an identity that survives an unplug.
     monitors_stable: AtomicBool,
+    /// True once the engine's end of the upcall channel has closed.
+    ///
+    /// It is the only way this backend can learn that the engine has GONE without asking
+    /// it to stop, and it is not hypothetical: `main` calls `request_exit` when the engine
+    /// returns normally, so the only way the channel closes first is the engine's thread
+    /// having panicked. A pump that did not notice would keep both hooks installed for
+    /// the life of the process, and a process nobody is talking to that swallows every
+    /// keystroke is exactly the dead keyboard this component exists to avoid.
+    engine_gone: AtomicBool,
     /// The layout the last resolution used, as an identity string. Owned by the
     /// pump, read by nobody else, and here rather than on [`Backend`] so
     /// [`Shared::emit`] is the only way an upcall leaves this file.
@@ -436,7 +445,9 @@ impl Shared {
         use mpsc::error::TrySendError;
         match self.events_tx.try_send(event) {
             Ok(()) => {}
-            Err(TrySendError::Closed(_)) => {}
+            Err(TrySendError::Closed(_)) => {
+                self.engine_gone.store(true, Ordering::Relaxed);
+            }
             Err(TrySendError::Full(_)) => {
                 let n = self.dropped.fetch_add(1, Ordering::Relaxed);
                 if n.is_multiple_of(128) {
@@ -1152,13 +1163,45 @@ impl InputBackend for WindowsBackend {
     }
 
     fn inject(&self, actions: Vec<Action>) {
+        self.send(actions, true);
+    }
+
+    fn release_all(&self, keys: Vec<PlatformKey>) {
+        if keys.is_empty() {
+            return;
+        }
+        let actions: Vec<Action> = keys
+            .into_iter()
+            .map(|code| Action::Key { code, down: false })
+            .collect();
+        // UNGUARDED, which is the whole difference from an ordinary injection: a release
+        // is called from every teardown, including the ones that happen because the
+        // machine is already locked or already out of reach, and a key left down there is
+        // a keyboard that is still broken when somebody comes back to it. A refusal is
+        // still reported, so nothing about it is silent.
+        self.send(actions, false);
+    }
+
+    fn request_exit(&self, code: i32) {
+        // Never `std::process::exit` here: this runs on the engine's thread, and
+        // exiting would skip the teardown on a machine that may be holding somebody's
+        // modifiers down.
+        self.push(Cmd::Exit(code));
+    }
+}
+
+impl WindowsBackend {
+    /// Hands a batch to the operating system.
+    ///
+    /// `guarded` is what tells an ordinary injection from a RELEASE. An ordinary one asks
+    /// whether anybody is looking at this desktop first (truth 6, and the only order that
+    /// does not lie: a locked machine accepts the injection and shows it to nobody). A
+    /// release does not ask, and must not, for the reason given where it is called.
+    fn send(&self, actions: Vec<Action>, guarded: bool) {
         if actions.is_empty() {
             return;
         }
-        // Truth 6, and the only order that does not lie: ask whether anybody is
-        // looking at this desktop BEFORE typing into it, because a locked machine
-        // accepts the injection and shows it to nobody.
-        if !self.desktop_is_ours(false) {
+        if guarded && !self.desktop_is_ours(false) {
             self.shared
                 .emit(BackendEvent::Refused(Refusal::ScreenLocked));
             return;
@@ -1199,28 +1242,6 @@ impl InputBackend for WindowsBackend {
                 ));
             }
         }
-    }
-
-    fn release_all(&self, keys: Vec<PlatformKey>) {
-        if keys.is_empty() {
-            return;
-        }
-        let actions: Vec<Action> = keys
-            .into_iter()
-            .map(|code| Action::Key { code, down: false })
-            .collect();
-        // Through the ordinary path, so a release is subject to the same refusal
-        // detection as anything else. It must work while anything else is in flight,
-        // and it does: `SendInput` is callable from any thread and takes no lock of
-        // ours.
-        self.inject(actions);
-    }
-
-    fn request_exit(&self, code: i32) {
-        // Never `std::process::exit` here: this runs on the engine's thread, and
-        // exiting would skip the teardown on a machine that may be holding somebody's
-        // modifiers down.
-        self.push(Cmd::Exit(code));
     }
 }
 
@@ -1879,6 +1900,14 @@ impl Backend {
     ///
     /// SAFETY: called from `run` with no other borrow of `self` live.
     unsafe fn periodic(&mut self) {
+        if self.shared.engine_gone.load(Ordering::Relaxed) {
+            // The engine has gone without asking to stop, which means its thread died.
+            // Stopping non-zero has the supervisor restart the component fresh, and the
+            // teardown on the way out is what puts the keyboard and the cursor back.
+            warn("the engine's end of the upcall channel closed; stopping");
+            self.shutdown = true;
+            return;
+        }
         // The layout belongs to the foreground thread (truth 5), so it changes by
         // alt-tabbing as well as by a person switching one, and both are real: the
         // next injection will be translated by whatever is active now.
@@ -2073,6 +2102,7 @@ pub fn create() -> Result<crate::os::Created, Unsupported> {
         wheel_y: AtomicI32::new(0),
         capture_ok: AtomicBool::new(true),
         monitors_stable: AtomicBool::new(true),
+        engine_gone: AtomicBool::new(false),
         dropped: AtomicU32::new(0),
     });
     let clip: Arc<Mutex<Option<Rect>>> = Arc::new(Mutex::new(None));

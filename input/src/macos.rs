@@ -570,6 +570,15 @@ struct Shared {
     /// event after event.
     wheel_x: AtomicI32,
     wheel_y: AtomicI32,
+    /// True once the engine's end of the upcall channel has closed.
+    ///
+    /// It is the only way this backend can learn that the engine has GONE without asking
+    /// it to stop, and it is not hypothetical: `main` calls `request_exit` when the engine
+    /// returns normally, so the only way the channel closes first is the engine's thread
+    /// having panicked. A run loop that did not notice would keep the tap installed for
+    /// the life of the process, and a process nobody is talking to that swallows every
+    /// keystroke is exactly the dead keyboard this component exists to avoid.
+    engine_gone: AtomicBool,
     dropped: AtomicU32,
 }
 
@@ -578,7 +587,9 @@ impl Shared {
         use mpsc::error::TrySendError;
         match self.events_tx.try_send(event) {
             Ok(()) => {}
-            Err(TrySendError::Closed(_)) => {}
+            Err(TrySendError::Closed(_)) => {
+                self.engine_gone.store(true, Ordering::Relaxed);
+            }
             Err(TrySendError::Full(_)) => {
                 let n = self.dropped.fetch_add(1, Ordering::Relaxed);
                 if n.is_multiple_of(128) {
@@ -738,34 +749,7 @@ impl InputBackend for MacBackend {
     }
 
     fn inject(&self, actions: Vec<Action>) {
-        if actions.is_empty() {
-            return;
-        }
-        if !self.may_post() {
-            self.shared
-                .emit(BackendEvent::Refused(Refusal::NoPermission));
-            return;
-        }
-        // Truth 7, and the only order that does not lie: a password field silences the
-        // injection, so it is asked about BEFORE typing rather than after.
-        let secure = unsafe { ffi::IsSecureEventInputEnabled() };
-        let has_keys = actions
-            .iter()
-            .any(|a| matches!(a, Action::Key { .. } | Action::Text(_) | Action::Group(_)));
-        if secure && has_keys {
-            self.shared
-                .emit(BackendEvent::Refused(Refusal::SecureInput));
-            return;
-        }
-        if screen_is_locked() {
-            self.shared
-                .emit(BackendEvent::Refused(Refusal::ScreenLocked));
-            return;
-        }
-        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState);
-        for action in &actions {
-            self.post(source.as_deref(), action);
-        }
+        self.send(actions, true);
     }
 
     fn release_all(&self, keys: Vec<PlatformKey>) {
@@ -776,9 +760,12 @@ impl InputBackend for MacBackend {
             .into_iter()
             .map(|code| Action::Key { code, down: false })
             .collect();
-        // Through the ordinary path, so a release is subject to the same refusal
-        // detection as anything else.
-        self.inject(actions);
+        // UNGUARDED, which is the whole difference from an ordinary injection: a release
+        // is called from every teardown, including the ones that happen because a
+        // password field has the keyboard or the screen has locked, and a key left down
+        // there is a keyboard that is still broken when somebody comes back to it. A
+        // refusal is still reported, so nothing about it is silent.
+        self.send(actions, false);
     }
 
     fn request_exit(&self, code: i32) {
@@ -789,6 +776,47 @@ impl InputBackend for MacBackend {
 }
 
 impl MacBackend {
+    /// Hands a batch to the window server.
+    ///
+    /// `guarded` is what tells an ordinary injection from a RELEASE. An ordinary one asks
+    /// about a secure input field and a locked screen first (truth 7, and the only order
+    /// that does not lie: both silence the injection and neither reports anything). A
+    /// release does not ask, for the reason given where it is called. Neither can do
+    /// without the grant: with no Accessibility permission there is nothing to post
+    /// through.
+    fn send(&self, actions: Vec<Action>, guarded: bool) {
+        if actions.is_empty() {
+            return;
+        }
+        if !self.may_post() {
+            self.shared
+                .emit(BackendEvent::Refused(Refusal::NoPermission));
+            return;
+        }
+        if guarded {
+            // Truth 7, and the only order that does not lie: a password field silences the
+            // injection, so it is asked about BEFORE typing rather than after.
+            let secure = unsafe { ffi::IsSecureEventInputEnabled() };
+            let has_keys = actions
+                .iter()
+                .any(|a| matches!(a, Action::Key { .. } | Action::Text(_) | Action::Group(_)));
+            if secure && has_keys {
+                self.shared
+                    .emit(BackendEvent::Refused(Refusal::SecureInput));
+                return;
+            }
+            if screen_is_locked() {
+                self.shared
+                    .emit(BackendEvent::Refused(Refusal::ScreenLocked));
+                return;
+            }
+        }
+        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState);
+        for action in &actions {
+            self.post(source.as_deref(), action);
+        }
+    }
+
     /// Posts one action, stamping the modifier flags this backend believes are held
     /// (truth 6).
     fn post(&self, source: Option<&CGEventSource>, action: &Action) {
@@ -1428,8 +1456,17 @@ impl Backend {
         }
     }
 
-    /// The work no event hangs off: the two grants, and the keyboard layout.
+    /// The work no event hangs off: the engine still being there, the two grants, and
+    /// the keyboard layout.
     fn periodic(&mut self) {
+        if self.shared.engine_gone.load(Ordering::Relaxed) {
+            // The engine has gone without asking to stop, which means its thread died.
+            // Stopping non-zero has the supervisor restart the component fresh, and the
+            // teardown on the way out is what puts the tap and the cursor back.
+            warn("the engine's end of the upcall channel closed; stopping");
+            self.shutdown = true;
+            return;
+        }
         if self.grants_at.elapsed() >= GRANT_POLL {
             self.grants_at = Instant::now();
             let now = (
@@ -1745,6 +1782,7 @@ pub fn create() -> Result<crate::os::Created, Unsupported> {
         mods: AtomicU32::new(0),
         wheel_x: AtomicI32::new(0),
         wheel_y: AtomicI32::new(0),
+        engine_gone: AtomicBool::new(false),
         dropped: AtomicU32::new(0),
     });
     let wake = Arc::new(Wake {
