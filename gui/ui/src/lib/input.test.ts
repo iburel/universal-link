@@ -62,8 +62,15 @@ test("the epic's three sentences are said exactly", () => {
   expect(refusalSentence("SECURE_INPUT")).toBe(
     "Nothing was typed: password fields block synthetic keystrokes on macOS.",
   );
-  // "This computer cannot be driven while it is locked." is the target's own
-  // wording; from the driving side the same fact names the machine.
+  // The third one names the machine instead of saying "this computer", because
+  // it is read on the machine that is DRIVING, and it carries the second cause
+  // the one code covers (a pointer pinned there on purpose).
+  expect(refusalSentence("LOCKED", "Desk")).toContain(
+    "cannot be driven while it is locked",
+  );
+  expect(refusalSentence("LOCKED", "Desk")).toContain("pinned to its own screen");
+  // And the same fact about an injection that did not happen, from the `oops`
+  // half of the vocabulary.
   expect(refusalSentence("SCREEN_LOCKED", "Desk")).toBe(
     "Nothing was typed: Desk is locked.",
   );
@@ -96,6 +103,7 @@ test("every code the engine emits has a sentence, and none of them softens it", 
     // How a session ended.
     "IDLE",
     "TAKEN",
+    "REVOKED",
     "SLOW",
     "GONE",
     // Not ready, and the channel that could not be opened at all.

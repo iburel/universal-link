@@ -1218,6 +1218,13 @@ impl<B: InputBackend> Engine<B> {
                     // The target ended it unilaterally.
                     if let Frame::Ended { code, .. } = frame {
                         self.remember_refusal(node, code, now);
+                        // And said out loud, the way a `no` frame is: the
+                        // standing half of it is that device's `problem`, but
+                        // `IDLE` deliberately sets none (it is nobody's fault),
+                        // so without this the one case where a target lets go of
+                        // a hung source's keyboard would be the one case with no
+                        // sentence at all.
+                        self.emit_refused(node, code, 1);
                     }
                     self.bring_home_quietly(now);
                 }
@@ -1764,6 +1771,17 @@ impl<B: InputBackend> Engine<B> {
         }
         self.apply_capture();
         self.forget_dwell(now);
+        // A session the human did not end gets a sentence. Their keyboard just
+        // came back on its own, which is exactly the kind of silence the epic
+        // forbids, and neither of these two reasons leaves any other trace: the
+        // session simply vanishes from the snapshot and no `problem` is set (the
+        // fault is not the far side's word about itself). `RETURNED` and `MOVED`
+        // are the human's own gesture, and announcing those would be noise.
+        // `announce` coalesces per code per second, so a flapping link cannot
+        // flood an interface with it.
+        if code == stopped::SLOW || code == stopped::GONE {
+            self.announce(&driving.node, code, false, now);
+        }
         self.dirty = true;
     }
 

@@ -98,7 +98,10 @@ const REFUSALS: Record<string, string> = {
   PLANE_STALE:
     "The two computers do not agree on where the screens are yet. Trying again.",
   NO_BACKEND: "<name> cannot be driven: nothing there can type.",
-  LOCKED: "<name>'s pointer is locked to its own screen.",
+  // Two causes, one code, so the sentence names both rather than guessing: a
+  // locked screen is unlocked there, and a pinned pointer is a switch there.
+  LOCKED:
+    "<name> cannot be driven while it is locked, or while its pointer is pinned to its own screen.",
   // The channel could not be opened. `NO_DIRECT_PATH` is the deployment whose
   // relays introduce devices without carrying a session (#88), and it is a
   // property of the PAIR rather than of either device.
@@ -119,6 +122,7 @@ const REFUSALS: Record<string, string> = {
   // How a session ended, when nobody asked it to.
   IDLE: "Your keyboard went quiet, so <name> released it.",
   TAKEN: "Someone is using <name> directly.",
+  REVOKED: "<name> took its permission back, so your keyboard came back.",
   SLOW: "The connection to <name> slowed down, so your keyboard came back.",
   GONE: "Your keyboard came back: the session with <name> ended on its own.",
   // Not a refusal: the channel is not warm yet. Said because a crossing that
