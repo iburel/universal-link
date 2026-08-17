@@ -1223,6 +1223,14 @@ W stuck down, or a Control, for the rest of the session.
    change how the mouse feels" is actually checked. #125 has to choose, and
    name its choice: apply the device's own acceleration profile, or use
    `XI_Motion` deltas against the confining window and accept its clamp.
+
+   **#125 chose the raw valuators, unmodified**, and the reason is the other
+   half of the same fact: on X11 the cooked position is what this backend
+   PINS, so its difference is zero exactly when the hand is moving fastest,
+   which is the failure truth 1 exists to prevent. Reading the device's own
+   acceleration profile out of its XI2 properties and applying it by hand is
+   the third option and is a ticket of its own. Windows needed no such choice
+   and got the better answer for free (truth 7).
 5. **`CGWarpMouseCursorPosition` suppresses local mouse events for about
    250 ms** unless it is followed by
    `CGAssociateMouseAndMouseCursorPosition(true)` (or
@@ -1235,6 +1243,82 @@ W stuck down, or a Control, for the rest of the session.
    `ToUnicodeEx` and its own dead-key state machine. So a Windows `resolve`
    may legitimately answer `None` for a dead-key symbol, and that is covered:
    Windows always has `unicode`, so the fallback types the character.
+
+### Four more #125 measured, which were not in this list because nobody knew
+
+7. **On Windows the relative source is the low level mouse hook itself.** Its
+   `pt` is the position the pointer is ABOUT to take and the cursor has not
+   moved yet when the hook runs, so `pt` minus `GetCursorPos()` is the
+   accelerated delta of that one event. While swallowing, the cursor does not
+   move at all (the hook consumes the move before the system applies it), so
+   the subtraction keeps working and the pin needs no warp per event. Raw
+   input is therefore NOT used: it would arrive as a separate message with no
+   defined ordering against the hook callback, and pairing the two streams
+   would buy an unaccelerated delta, which is the wrong one. `ClipCursor` is
+   kept as the belt to the hook's braces, for a hook Windows drops on its own
+   timeout.
+8. **A Windows session can be one nobody is attached to, and it looks almost
+   exactly like a normal one.** Measured on a real host whose interactive
+   session was a disconnected remote desktop: the process was on
+   `WinSta0\Default`, the input desktop was also named `Default`, 382 windows
+   and the shell window were enumerable, and `GetCursorPos`,
+   `GetForegroundWindow` and `SendInput` were all three denied with
+   `ERROR_ACCESS_DENIED`. A locked machine is the same shape. So the check
+   that decides whether anybody can see what is typed is `GetCursorPos`
+   succeeding, not the window station's name, and it happens BEFORE the
+   injection. The first version compared the two desktop names only, said yes
+   on that host, and would have typed a whole session into nothing while
+   reporting success. This is the sharpest example there is of the difference
+   between "best effort" and "best effort that lies".
+9. **On X11 a grab does not stop the raw events.** Measured with a second
+   client on the same server: a client that has selected `XI_RawKeyPress` on
+   the root keeps receiving keys while another client holds a keyboard grab,
+   which is the opposite of what the obvious reading of the XInput2
+   specification suggests. Two consequences. The swallow has to be proved
+   against a FOCUSED WINDOW, which does stop receiving keys, and that is what
+   #125's live suite does. And an X11 backend hears its own XTEST injections
+   come back, because X11 offers no `dwExtraInfo` to mark them with; v1 does
+   not need it to (rule 3 again), and when something does, a raw event's
+   `source` device is the XTEST virtual device, which a real keyboard's never
+   is.
+10. **The X11 core keyboard mapping cannot be read unambiguously, and XKB
+    can.** The core protocol says the first four keysyms of a keycode are
+    "group 1 levels 1 and 2, group 2 levels 1 and 2", and an XKB server
+    synthesises that list as `width * groups` entries in group-major order.
+    One group of four levels and two groups of two levels are therefore the
+    SAME four numbers with different meanings, and telling them apart decides
+    the one example this document leads with (typing `@` on an AZERTY target
+    is AltGr plus 0, which is group 1 level 3). `xkb::GetMap` answers with the
+    per-key group count and width, so the X11 backend asks XKB and falls back
+    to the ambiguous core reading only when the extension is missing.
+
+### What "logical pixels" turned out to mean, per platform
+
+Section 6 says the plane is in logical pixels and section 10's `Monitor`
+carries logical sizes. Implementing the three backends showed that the seam
+needs something slightly different and stricter, so the contract is now
+stated as what it has to be: **`Monitor`'s rectangle and every `Point` are in
+the machine's own POINTER COORDINATE SPACE, whatever that space is.** They
+have to agree, because the engine converts between them, and no platform
+offers a second space in which both are expressed.
+
+- **X11** has one space and no per-monitor scale at all: RandR reports pixels
+  and millimetres and nothing about what a desktop environment is scaling by,
+  so `scale` is 1000 everywhere and an interface has one fewer label.
+- **macOS** has exactly what the section imagined: the global display space is
+  in points, a Retina display reports half its pixel width, and `scale` is the
+  ratio of the two.
+- **Windows** has neither unless a process chooses. A DPI-unaware process gets
+  every monitor scaled by the PRIMARY monitor's factor, which is right for one
+  screen and wrong for a second one at a different scale; a per-monitor-aware
+  one gets physical pixels throughout. The backend declares per-monitor
+  awareness v2 and reports physical pixels with `scale` saying each monitor's
+  DPI, because one consistent space that is honestly labelled beats a
+  "logical" space that does not exist.
+
+The plane's arithmetic uses the rectangles and not the scale, so the cost of
+the mismatch is a 4K screen drawn twice the size of a Retina one next to it in
+the interface, and nothing about where the pointer goes.
 
 ### Capabilities, and refusals that are detected rather than guessed
 
@@ -1526,6 +1610,25 @@ not switchable mid session. No drag and drop across an edge. No editing the
 crossing graph directly, for arrangements a plane cannot express. Character
 keys are not in the crash guard, only modifiers. No kernel driver, per the
 epic's decision, which is a strategy and not an omission.
+
+And the per-platform gaps #125 found, each of which degrades to a refusal with
+a sentence rather than to something wrong:
+
+- **X11**: a level above the fourth needs `ISO_Level5_Shift`, which the eight
+  canonical modifier bits cannot name, so a symbol that only lives there is
+  `UNRESOLVED`. The Unicode path is a keycode nothing is bound to, remapped
+  for one stroke and restored, so a keyboard whose every keycode is bound has
+  no Unicode path and says so through `unicode: false`. A key a keymap does
+  not bind at all (an `xkeyboard-config` `pc105` leaves F13 to F24 unbound)
+  resolves to nothing rather than to a keystroke that produces nothing.
+- **Windows**: `resolve` answers `None` for a symbol needing a dead key
+  (truth 6), which the Unicode path covers.
+- **macOS**: the media keys are not virtual keycodes at all, they travel as
+  `NSSystemDefined` events, so this backend does not inject them and the
+  engine reports `UNRESOLVED`. There are TWO grants and not one (Input
+  Monitoring for the tap, Accessibility for the injection), so a Mac can be a
+  target and not a source or the other way round, and both halves are
+  reported separately.
 
 ## 16. Settled decisions
 

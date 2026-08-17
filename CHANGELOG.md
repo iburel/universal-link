@@ -8,6 +8,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Your real keyboard and mouse, on all three desktops.** The half of the
+  keyboard and mouse engine that touches the operating system: reading the
+  keyboard and mouse of the computer you are looking at, and typing and
+  clicking on the one you are driving. Windows uses the two low level input
+  hooks and `SendInput`, Linux uses XInput2 and XTEST on an X11 session, macOS
+  uses an event tap and `CGEventPost`. Three things it does that the tools in
+  this category have historically not:
+
+  - **What it cannot do, it says.** A window running as administrator, a
+    locked screen, a password field on a Mac, a permission that has not been
+    granted: each is DETECTED and each has a sentence, rather than a keystroke
+    that goes nowhere in silence. One of those detections is worth naming: a
+    Windows session nobody is attached to looks almost exactly like a normal
+    one from the inside, and a first version of this code would have typed a
+    whole session into a desktop nobody was looking at while reporting
+    success. It now asks whether anybody can see the screen before it types.
+  - **Your own keystrokes stop acting on your own machine while you drive
+    another**, and they start again afterwards, on every path out including a
+    crash. Each platform gives that away differently and each is proved rather
+    than asserted: on Linux against a second X client whose window stops
+    receiving keys, on Windows against the operating system's own key state.
+  - **A permission granted late is believed.** On a Mac the two permissions
+    this needs are given at a dialog, and nothing tells a program when that
+    happens; it now notices within a second and stops saying it cannot type.
+
+  A machine with no platform half still does everything else, exactly as
+  before. What is NOT here: Wayland (its portals are their own piece of work,
+  and a Wayland session says so rather than half working), and the interface
+  that turns all of this into something you can see and switch on.
+
 - **The engine that will share one keyboard and mouse across your
   computers.** A new official component, `1device-input`, and the frozen
   `input.*` vocabulary the interfaces will speak: one plane holding every
