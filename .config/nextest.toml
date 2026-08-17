@@ -107,6 +107,28 @@ test-group = 'serial-ipc'
 # No platform scope needed: each of these binaries is `#![cfg(target_os = ...)]`
 # and simply does not exist off its own OS. Anchored regexes so the `linux`
 # prefix never catches `linux_webdav`.
+#
+# The filter is by BINARY NAME and not by package, so it covers the keyboard and
+# mouse engine's live suites too: `onedevice-input`'s `tests/x11.rs`,
+# `tests/windows.rs` and `tests/macos.rs` compile to binaries with exactly these
+# names. That is deliberate on both sides and it is the right answer, because
+# they contend for the very same per-session globals the clipboard's do (the X
+# server's one keyboard grab and one pointer, the Win32 cursor clip and hook
+# chain, the Mac's event tap) and two of them at once would fight. The group's
+# name is the clipboard's for historical reasons; what it means is "one test at a
+# time per session-wide OS resource".
 [[profile.ci.overrides]]
+filter = 'binary(/^x11$/) | binary(/^linux_files$/) | binary(/^macos$/) | binary(/^windows$/)'
+test-group = 'serial-os-clipboard'
+
+# The same override on the DEFAULT profile, so a suite run by hand serialises too.
+#
+# It was only on `profile.ci` until the keyboard and mouse engine's live X suite went
+# looking: running its ten tests under the default profile, nine runs out of fifteen
+# failed, every one of them because two of them were driving the display's one keyboard
+# grab and one pointer at the same time. CI was green throughout, which is the worst shape
+# a trap can have: the person who runs the suite to check their own change sees failures
+# that are not theirs and cannot reproduce them where it matters.
+[[profile.default.overrides]]
 filter = 'binary(/^x11$/) | binary(/^linux_files$/) | binary(/^macos$/) | binary(/^windows$/)'
 test-group = 'serial-os-clipboard'

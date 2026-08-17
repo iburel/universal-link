@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Iwan Burel <iwan.burel@gmail.com>
 
-//! Per-OS backend construction. The real backends land one per platform in their
-//! own ticket: X11 (XInput2 plus a grab for swallowing, XTEST for injection),
-//! Windows (`WH_KEYBOARD_LL` and `WH_MOUSE_LL`, `SendInput`), macOS (an active
-//! `CGEventTap` under the Accessibility grant, `CGEventPost`). Wayland is a ticket
-//! of its own and says what it cannot do rather than staying silent.
+//! Per-OS backend construction: which platform half this build selected, and the
+//! honest absence of one when the session cannot provide it.
+//!
+//! - X11 ([`crate::x11`]): XInput2 raw events plus a device grab for swallowing,
+//!   XTEST for injection, RandR for the monitors.
+//! - Windows ([`crate::windows`]): `WH_KEYBOARD_LL` and `WH_MOUSE_LL` on a message
+//!   pump, `SendInput` for injection, `ClipCursor` for the pin.
+//! - macOS ([`crate::macos`]): an active `CGEventTap` on a run loop source under
+//!   the Input Monitoring grant, `CGEventPost` under the Accessibility grant.
+//! - Wayland: a ticket of its own (#128). It says what it cannot do rather than
+//!   staying silent, which is the standing decision for Linux.
 //!
 //! # Why this does not fail, unlike the clipboard's equivalent
 //!
@@ -28,16 +34,23 @@
 //!   every install.
 //!
 //! So [`create`] always succeeds. What varies is what the backend it returns says
-//! it can DO: today, on every platform, nothing, with a [`Problem`] naming why.
-//! The engine reads the capabilities and behaves accordingly, which is the same
-//! path it takes on a real backend whose OS grant has been refused.
+//! it can DO: a real platform backend when one could be built, and [`Absent`] with
+//! a [`Problem`] naming why when it could not. The engine reads the capabilities
+//! and behaves accordingly, which is the same path it takes on a real backend whose
+//! OS grant has been refused.
 //!
-//! [`Unsupported`] survives for the platform ticket: a real backend that cannot
-//! be constructed at all (no X server on a machine that claims X11) returns it
-//! internally and falls back to [`Absent`] with the reason, so the failure still
-//! becomes a sentence rather than an exit.
+//! # Why an enum rather than a `#[cfg]` type alias
 //!
-//! # One rule for whoever replaces [`Absent`] with a real backend
+//! `clipboard/src/os.rs` aliases `Created`'s fields to the one platform type per
+//! target, because there a construction failure is the end of the process. Here it
+//! is not: a machine that claims X11 and has no reachable X server has to fall back
+//! to [`Absent`] and keep running, so `create` needs a return type that can hold
+//! EITHER the real backend or the absent one. [`InputBackend`] returns
+//! `impl Future` from three methods and is therefore not object safe, so a boxed
+//! trait object is not available: the enum is what is left, and it costs one match
+//! per downcall on a path that is already crossing a thread boundary.
+//!
+//! # One rule for whoever adds the fourth backend
 //!
 //! **`request_exit` must go through the OS loop, not through
 //! `std::process::exit`.** [`Absent`] exits directly and that is honest for it: it
@@ -83,51 +96,143 @@ pub fn describe(problem: Problem) -> &'static str {
 
 /// The pieces a built backend hands back: the `Clone` handle the engine drives,
 /// the upcall stream it consumes, and the main-thread event loop `main` pumps.
-///
-/// One concrete type rather than a boxed trait object, for a reason the compiler
-/// forces: [`InputBackend`]'s answering methods return `impl Future`, so the trait
-/// is not object safe. The platform ticket replaces `Absent` here with a per-OS
-/// `#[cfg]` alias, exactly as `clipboard/src/os.rs` does.
 pub struct Created {
-    pub handle: Absent,
+    pub handle: Backend,
     pub backend_events: mpsc::Receiver<BackendEvent>,
-    pub event_loop: AbsentLoop,
+    pub event_loop: EventLoop,
+}
+
+/// The platform backend this build selected, or the honest absence of one.
+///
+/// One `Clone` handle the engine drives, whichever arm it is. Every arm's own
+/// handle is two or three `Arc`s and an integer, so cloning this is cheap by
+/// construction, and every downcall costs one match on a path that already crosses
+/// a thread boundary.
+#[derive(Clone, Debug)]
+pub enum Backend {
+    #[cfg(target_os = "linux")]
+    X11(crate::x11::X11Backend),
+    #[cfg(windows)]
+    Windows(crate::windows::WindowsBackend),
+    #[cfg(target_os = "macos")]
+    Mac(crate::macos::MacBackend),
+    Absent(Absent),
+}
+
+/// The main-thread loop of whichever backend was built. `main` pumps it and its
+/// return value is the process exit code.
+///
+/// The platform arms are BOXED, and not for tidiness: a real loop owns the whole of
+/// its platform state (an X connection and a keymap, a window handle and two hook
+/// handles) while the absent one owns nothing at all, so an unboxed enum would be as
+/// large as the largest of them everywhere it is passed. One allocation, made once per
+/// process, buys a handle-sized enum.
+pub enum EventLoop {
+    #[cfg(target_os = "linux")]
+    X11(Box<crate::x11::X11Loop>),
+    #[cfg(windows)]
+    Windows(Box<crate::windows::WindowsLoop>),
+    #[cfg(target_os = "macos")]
+    Mac(Box<crate::macos::MacLoop>),
+    Absent(AbsentLoop),
+}
+
+impl EventLoop {
+    pub fn run(self) -> i32 {
+        match self {
+            #[cfg(target_os = "linux")]
+            EventLoop::X11(l) => (*l).run(),
+            #[cfg(windows)]
+            EventLoop::Windows(l) => (*l).run(),
+            #[cfg(target_os = "macos")]
+            EventLoop::Mac(l) => (*l).run(),
+            EventLoop::Absent(l) => l.run(),
+        }
+    }
 }
 
 /// Builds the platform input backend. Always succeeds; see the module header.
 pub fn create() -> Created {
-    let (events, backend_events) = mpsc::channel(1);
-    let problem = detect();
-    Created {
-        handle: Absent {
-            problem,
-            _events: events,
-        },
-        backend_events,
-        event_loop: AbsentLoop,
+    match build() {
+        Ok(created) => created,
+        Err(Unsupported(problem)) => {
+            eprintln!("[1device-input] {}", describe(problem));
+            absent(problem)
+        }
     }
 }
 
-/// Which problem this session has. Named on Linux, because the difference is a
-/// sentence a person can act on: an X11 session will get a backend from the
-/// platform ticket, a Wayland one waits for the portals ticket.
+/// The one [`Absent`] constructor, so the sender that must stay alive is never
+/// forgotten (see [`Absent::_events`]).
+fn absent(problem: Problem) -> Created {
+    let (events, backend_events) = mpsc::channel(1);
+    Created {
+        handle: Backend::Absent(Absent {
+            problem,
+            _events: events,
+        }),
+        backend_events,
+        event_loop: EventLoop::Absent(AbsentLoop),
+    }
+}
+
+/// Tries to build the real thing for this target.
 #[cfg(target_os = "linux")]
-fn detect() -> Problem {
+fn build() -> Result<Created, Unsupported> {
+    if let Some(problem) = linux_problem() {
+        return Err(Unsupported(problem));
+    }
+    crate::x11::create()
+}
+
+#[cfg(windows)]
+fn build() -> Result<Created, Unsupported> {
+    crate::windows::create()
+}
+
+#[cfg(target_os = "macos")]
+fn build() -> Result<Created, Unsupported> {
+    crate::macos::create()
+}
+
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+fn build() -> Result<Created, Unsupported> {
+    Err(Unsupported(Problem::NoBackend))
+}
+
+/// The environment variable that lets the X11 backend serve a session this
+/// function would otherwise refuse.
+///
+/// It exists for two named readers and no others: the live X suite, which runs
+/// against an Xvfb or an XWayland on a machine whose own session is Wayland, and a
+/// person who knows their session is really X-only and whose environment says
+/// otherwise. It is not a fix for a Wayland desktop, and a session forced this way
+/// half works by construction (see [`problem_for`]), which is exactly why it is not
+/// the default.
+#[cfg(target_os = "linux")]
+pub const FORCE_X11_ENV: &str = "ONEDEVICE_INPUT_FORCE_X11";
+
+/// Why this Linux session cannot have an X11 backend, or `None` when it can try.
+#[cfg(target_os = "linux")]
+fn linux_problem() -> Option<Problem> {
+    if std::env::var_os(FORCE_X11_ENV).is_some_and(|v| !v.is_empty() && v != "0") {
+        return None;
+    }
     // Read as `OsStr`: a display name is not required to be UTF-8, and a session
     // whose variable happened not to be would otherwise read as no session at all.
     let wayland = std::env::var_os("WAYLAND_DISPLAY");
     let session_type = std::env::var_os("XDG_SESSION_TYPE");
     let display = std::env::var_os("DISPLAY");
-    problem_for(
+    match problem_for(
         wayland.as_deref(),
         session_type.as_deref(),
         display.as_deref(),
-    )
-}
-
-#[cfg(not(target_os = "linux"))]
-fn detect() -> Problem {
-    Problem::NoBackend
+    ) {
+        // The one answer that is not a refusal: no evidence of Wayland, so the
+        // backend gets to try and to fail for its own reasons.
+        Problem::NoBackend => None,
+        problem => Some(problem),
+    }
 }
 
 /// The Linux decision, as a pure function of the three variables, so it can be
@@ -143,11 +248,11 @@ fn detect() -> Problem {
 /// portals are a later ticket") was never said to anyone, and they were left
 /// waiting for a ticket that had shipped, reading `no_backend` instead.
 ///
-/// It matters for the platform ticket too, and that is the reason to be firm about
-/// it rather than lenient: an X11 backend running under XWayland can neither
-/// OBSERVE nor INJECT to native Wayland clients, which on a modern desktop is most
-/// of the windows on screen. A session that half works is worse than one that says
-/// what it cannot do, and [`Problem::Wayland`] is the accurate word for it.
+/// It matters for the X11 backend too, and that is the reason to be firm about it
+/// rather than lenient: an X11 backend running under XWayland can neither OBSERVE
+/// nor INJECT to native Wayland clients, which on a modern desktop is most of the
+/// windows on screen. A session that half works is worse than one that says what it
+/// cannot do, and [`Problem::Wayland`] is the accurate word for it.
 ///
 /// # Why both variables, and in this order
 ///
@@ -178,7 +283,7 @@ fn problem_for(
     Problem::NoBackend
 }
 
-/// The backend of a machine whose OS half does not exist yet: it reports what it
+/// The backend of a machine whose OS half could not be built: it reports what it
 /// cannot do and does nothing else.
 ///
 /// Every downcall is a no-op rather than a panic or an `unimplemented!()`, and
@@ -239,9 +344,131 @@ impl InputBackend for Absent {
 
     fn request_exit(&self, code: i32) {
         // No OS loop to ask, so the process ends here. The platform backends
-        // will hand this to their main-thread loop instead, which is why the
-        // method exists at all.
+        // hand this to their main-thread loop instead, which is why the method
+        // exists at all.
         std::process::exit(code);
+    }
+}
+
+impl InputBackend for Backend {
+    fn capabilities(&self) -> Capabilities {
+        match self {
+            #[cfg(target_os = "linux")]
+            Backend::X11(b) => b.capabilities(),
+            #[cfg(windows)]
+            Backend::Windows(b) => b.capabilities(),
+            #[cfg(target_os = "macos")]
+            Backend::Mac(b) => b.capabilities(),
+            Backend::Absent(b) => b.capabilities(),
+        }
+    }
+
+    async fn monitors(&self) -> Vec<Monitor> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Backend::X11(b) => b.monitors().await,
+            #[cfg(windows)]
+            Backend::Windows(b) => b.monitors().await,
+            #[cfg(target_os = "macos")]
+            Backend::Mac(b) => b.monitors().await,
+            Backend::Absent(b) => b.monitors().await,
+        }
+    }
+
+    async fn pointer(&self) -> Option<Point> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Backend::X11(b) => b.pointer().await,
+            #[cfg(windows)]
+            Backend::Windows(b) => b.pointer().await,
+            #[cfg(target_os = "macos")]
+            Backend::Mac(b) => b.pointer().await,
+            Backend::Absent(b) => b.pointer().await,
+        }
+    }
+
+    async fn resolve(&self, want: Want) -> Option<Resolved> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Backend::X11(b) => b.resolve(want).await,
+            #[cfg(windows)]
+            Backend::Windows(b) => b.resolve(want).await,
+            #[cfg(target_os = "macos")]
+            Backend::Mac(b) => b.resolve(want).await,
+            Backend::Absent(b) => b.resolve(want).await,
+        }
+    }
+
+    fn capture(&self, mode: CaptureMode) {
+        match self {
+            #[cfg(target_os = "linux")]
+            Backend::X11(b) => b.capture(mode),
+            #[cfg(windows)]
+            Backend::Windows(b) => b.capture(mode),
+            #[cfg(target_os = "macos")]
+            Backend::Mac(b) => b.capture(mode),
+            Backend::Absent(b) => b.capture(mode),
+        }
+    }
+
+    fn confine(&self, rect: Option<Rect>) {
+        match self {
+            #[cfg(target_os = "linux")]
+            Backend::X11(b) => b.confine(rect),
+            #[cfg(windows)]
+            Backend::Windows(b) => b.confine(rect),
+            #[cfg(target_os = "macos")]
+            Backend::Mac(b) => b.confine(rect),
+            Backend::Absent(b) => b.confine(rect),
+        }
+    }
+
+    fn warp(&self, to: Point) {
+        match self {
+            #[cfg(target_os = "linux")]
+            Backend::X11(b) => b.warp(to),
+            #[cfg(windows)]
+            Backend::Windows(b) => b.warp(to),
+            #[cfg(target_os = "macos")]
+            Backend::Mac(b) => b.warp(to),
+            Backend::Absent(b) => b.warp(to),
+        }
+    }
+
+    fn inject(&self, actions: Vec<Action>) {
+        match self {
+            #[cfg(target_os = "linux")]
+            Backend::X11(b) => b.inject(actions),
+            #[cfg(windows)]
+            Backend::Windows(b) => b.inject(actions),
+            #[cfg(target_os = "macos")]
+            Backend::Mac(b) => b.inject(actions),
+            Backend::Absent(b) => b.inject(actions),
+        }
+    }
+
+    fn release_all(&self, keys: Vec<PlatformKey>) {
+        match self {
+            #[cfg(target_os = "linux")]
+            Backend::X11(b) => b.release_all(keys),
+            #[cfg(windows)]
+            Backend::Windows(b) => b.release_all(keys),
+            #[cfg(target_os = "macos")]
+            Backend::Mac(b) => b.release_all(keys),
+            Backend::Absent(b) => b.release_all(keys),
+        }
+    }
+
+    fn request_exit(&self, code: i32) {
+        match self {
+            #[cfg(target_os = "linux")]
+            Backend::X11(b) => b.request_exit(code),
+            #[cfg(windows)]
+            Backend::Windows(b) => b.request_exit(code),
+            #[cfg(target_os = "macos")]
+            Backend::Mac(b) => b.request_exit(code),
+            Backend::Absent(b) => b.request_exit(code),
+        }
     }
 }
 
@@ -272,14 +499,14 @@ mod tests {
     /// by the supervisor every minute for ever, and could never explain itself.
     #[tokio::test]
     async fn a_machine_with_no_os_half_still_says_what_it_cannot_do() {
-        let created = create();
+        let created = absent(Problem::NoBackend);
         let caps = created.handle.capabilities();
         assert!(!caps.can_drive() && !caps.can_be_driven());
         assert!(!caps.capture && !caps.inject_keys && !caps.inject_pointer && !caps.unicode);
         let problem = caps.problem.expect("a machine with no backend says why");
         assert!(!problem.code().is_empty());
         assert!(!describe(problem).is_empty());
-        assert_eq!(problem, created.handle.problem());
+        assert_eq!(problem, Problem::NoBackend);
     }
 
     /// It publishes NO monitors rather than a plausible one: a fiction on the
@@ -287,7 +514,7 @@ mod tests {
     /// exist.
     #[tokio::test]
     async fn it_publishes_no_screens_and_resolves_no_keys() {
-        let created = create();
+        let created = absent(Problem::NoBackend);
         assert!(created.handle.monitors().await.is_empty());
         assert!(created.handle.pointer().await.is_none());
         assert!(
@@ -305,8 +532,8 @@ mod tests {
     /// `DISPLAY` unset) was false on all of them, so the one sentence a Wayland
     /// user needs was never said and they waited for a ticket that had shipped.
     ///
-    /// It protects the platform ticket as much as the sentence: an X11 backend
-    /// under XWayland can neither observe nor inject to native Wayland clients, so
+    /// It protects the X11 backend as much as the sentence: an X11 backend under
+    /// XWayland can neither observe nor inject to native Wayland clients, so
     /// `wayland` is the accurate word rather than a pessimistic one.
     #[cfg(target_os = "linux")]
     #[test]
@@ -339,8 +566,9 @@ mod tests {
             "and the comparison does not turn on somebody's capitalisation"
         );
 
-        // A real X11 session, and a headless machine: both are the platform
-        // ticket's business rather than the portals ticket's.
+        // A real X11 session, and a headless machine: both are the X11 backend's
+        // business rather than the portals ticket's, and it fails for its own
+        // reasons when there is no server to reach.
         assert_eq!(
             problem_for(None, Some(os("x11")), Some(os(":0"))),
             Problem::NoBackend
@@ -359,7 +587,7 @@ mod tests {
     /// nothing, never to a component that dies holding somebody's keyboard.
     #[test]
     fn every_downcall_is_harmless() {
-        let created = create();
+        let created = absent(Problem::NoBackend);
         let backend = created.handle;
         backend.capture(CaptureMode::Swallow);
         backend.confine(Some(Rect {

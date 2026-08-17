@@ -1141,11 +1141,29 @@ as upcalls instead, coalesced, which is all the interface needs.
 
 `Motion { x, y, dx, dy }`, `Button`, `Wheel`, `Key { u, key, sym, m, lk,
 dn }`, `MonitorsChanged`, `LayoutChanged { layout, group }`,
-`Refused { code }`, `CaptureLost { why }`.
+`CapabilitiesChanged`, `Refused { code }`, `CaptureLost { why }`.
 
 `Key` upcalls carry the same levels the wire carries, because the source's
 job is to read them off the OS and put them in a frame. Reading the symbol
 the local layout produced is part of capture, not a separate lookup.
+
+**`CapabilitiesChanged` was added by #125, and the seam was wrong without
+it.** The engine re-read the capabilities on exactly three occasions: at
+start, on `MonitorsChanged`, and on `CaptureLost`. An OS grant given after
+the component started is none of the three, so a Mac whose Accessibility
+permission a person granted at the prompt kept saying "nothing here can
+type" until something unrelated happened. Reusing `MonitorsChanged` would
+have worked by accident and lied in the log; `CaptureLost` would have ended a
+live session for a permission that had just been GIVEN.
+
+It carries the `resolve` cache with it, which is the half that is not
+obvious: negative answers are cached on purpose, so a backend asked what it
+can produce before its grant or its keymap existed is remembered as able to
+produce nothing for the life of the process. The engine therefore re-learns
+on this event exactly as it does when a session starts, and a withdrawal in
+the other direction ends whatever the machine was in the middle of (a
+`stop` when it was driving, an `end NO_BACKEND` when it was being driven)
+rather than leaving a session that can no longer work.
 
 **`LayoutChanged` carries the active GROUP as well as the identity**, and it
 has to. A stroke whose symbol resolves in another keyboard group switches to
@@ -1167,11 +1185,28 @@ W stuck down, or a Control, for the rest of the session.
 ### rediscover
 
 1. **Under confinement, `dx` and `dy` must come from the OS's own relative
-   source** (raw input on Windows, XI2 raw events on X11, the `CGEvent`
-   delta fields on macOS), never from differencing successive absolute
-   positions. The engine warps the pointer back each event to keep it
-   pinned, so the difference between two absolute positions is zero exactly
-   when the hand is moving fastest.
+   source** (the low level hook's intended point against the real cursor on
+   Windows, XI2 raw events on X11, the `CGEvent` delta fields on macOS),
+   never from differencing successive absolute positions. The BACKEND is what
+   keeps the pointer pinned while a session is live (a clip plus a swallow, a
+   grab plus a warp, a decoupling), so the difference between two absolute
+   positions is zero exactly when the hand is moving fastest.
+
+   Corrected by #125: the first version of this said the ENGINE warps the
+   pointer back on every event, and it does not. It confines once when the
+   peer accepts and integrates the deltas into a virtual cursor in the
+   target's space; nothing local moves for the whole session. The conclusion
+   was right and the mechanism named was not, which matters because a backend
+   author reading the old sentence would have waited for a warp that never
+   comes.
+
+   And it is not only "under confinement". The same is true while merely
+   WATCHING an edge, for a reason that is easy to miss: the OS clamps its own
+   pointer at the boundary of its own desktop, `at_edge` asks whether the
+   pointer went strictly PAST the last pixel, and a pointer already sitting on
+   that pixel generates no further absolute movement at all. Differenced
+   deltas are zero there, which is precisely where a crossing has to fire, so
+   a backend with no relative source can never hand a pointer over.
 2. **A relative mouse move of (0, 0) is discarded by Windows** and reaches
    no hook at all (#123). A backend must not rely on seeing one; the engine
    never emits one.
@@ -1181,13 +1216,34 @@ W stuck down, or a Control, for the rest of the session.
    driven is not capturing (section 4, rule 3). Anything that changes that
    rule owes echo suppression a different mechanism, and this is the note
    that says so.
-4. **On X11 the only OS-native relative source under a confining grab is
-   `XI_RawMotion`, whose valuators are UNACCELERATED device deltas.** So the
-   pointer will feel materially different while driving than while local, on
-   the one platform where "mixing a 4K at 100% with a Retina at 200% does not
-   change how the mouse feels" is actually checked. #125 has to choose, and
-   name its choice: apply the device's own acceleration profile, or use
-   `XI_Motion` deltas against the confining window and accept its clamp.
+4. **On X11 the relative source is not the same one in both modes, and the
+   platform decides which.** The design believed `XI_RawMotion`'s valuators
+   (UNACCELERATED device deltas) were the only OS-native relative source under a
+   confining grab, and asked #125 to choose between them and an accelerated
+   difference of positions. The choice turned out not to be available: under a
+   grab the raw valuators are not delivered to the grabbing client at all (truth
+   9 below, measured), so watching reads the raw deltas and driving reads the
+   difference of the positions the grab reports, which is the ACCELERATED
+   movement and is the same thing Windows gets for free (truth 7). The pointer
+   therefore feels the way the machine's own pointer feels while driving, on the
+   one platform where "mixing a 4K at 100% with a Retina at 200% does not change
+   how the mouse feels" is actually checked.
+
+   Two things about the accelerated half are worth having written down, because
+   both were found by measurement rather than by reading. The difference has to
+   be taken between two REPORTED POSITIONS and never against the anchor: a warp
+   is queued rather than immediate, so two motion events in one turn of the pump
+   would each measure their distance from the anchor and the movement of each
+   would be counted once per event still to come (measured at 360 reported
+   pixels for 80 real ones in a burst of eight). And a `WarpPointer` generates a
+   motion event even when it changes nothing, so the pin has to recognise its own
+   warp arriving, and has to give up on an anchor the server will not accept: a
+   rectangle whose centre lay outside the root window produced eleven thousand
+   upcalls a second with the pointer frozen in a corner. The clamp the original
+   choice was made to avoid is real and bounded: one event carries at most the
+   distance from the anchor at the centre of the screen to its edge. Reading the
+   device's acceleration profile out of its XI2 properties and applying it to
+   the raw valuators is a third option and a ticket of its own.
 5. **`CGWarpMouseCursorPosition` suppresses local mouse events for about
    250 ms** unless it is followed by
    `CGAssociateMouseAndMouseCursorPosition(true)` (or
@@ -1200,6 +1256,114 @@ W stuck down, or a Control, for the rest of the session.
    `ToUnicodeEx` and its own dead-key state machine. So a Windows `resolve`
    may legitimately answer `None` for a dead-key symbol, and that is covered:
    Windows always has `unicode`, so the fallback types the character.
+
+### Four more #125 measured, which were not in this list because nobody knew
+
+7. **On Windows the relative source is the low level mouse hook itself.** Its
+   `pt` is the position the pointer is ABOUT to take and the cursor has not
+   moved yet when the hook runs, so `pt` minus `GetCursorPos()` is the
+   accelerated delta of that one event. While swallowing, the cursor does not
+   move at all (the hook consumes the move before the system applies it), so
+   the subtraction keeps working and the pin needs no warp per event. Raw
+   input is therefore NOT used: it would arrive as a separate message with no
+   defined ordering against the hook callback, and pairing the two streams
+   would buy an unaccelerated delta, which is the wrong one. `ClipCursor` is
+   kept as the belt to the hook's braces, for a hook Windows drops on its own
+   timeout.
+8. **A Windows session can be one nobody is attached to, and it looks almost
+   exactly like a normal one.** Measured on a real host whose interactive
+   session was a disconnected remote desktop: the process was on
+   `WinSta0\Default`, the input desktop was also named `Default`, 382 windows
+   and the shell window were enumerable, and `GetCursorPos`,
+   `GetForegroundWindow` and `SendInput` were all three denied with
+   `ERROR_ACCESS_DENIED`. A locked machine is the same shape. So the check
+   that decides whether anybody can see what is typed is `GetCursorPos`
+   succeeding, not the window station's name, and it happens BEFORE the
+   injection. The first version compared the two desktop names only, said yes
+   on that host, and would have typed a whole session into nothing while
+   reporting success. This is the sharpest example there is of the difference
+   between "best effort" and "best effort that lies".
+9. **On X11 a grab does not stop ANOTHER client's raw events, and it stops the
+   grabbing client's own completely.** Both halves are measured with a second
+   client on the same server, and the second half is the sharpest thing #125
+   found. A client that has selected `XI_RawKeyPress` on the root keeps
+   receiving keys while another client holds a keyboard grab, which is the
+   opposite of what the obvious reading of the XInput2 specification suggests:
+   so the swallow has to be proved against a FOCUSED WINDOW, which does stop
+   receiving keys, and that is what the live suite does. But the GRABBING
+   client receives no raw events at all, because while a device is grabbed the
+   server hands its events to the grab instead of to the ordinary selections
+   and a raw event has no core form to convert into. A backend that grabs and
+   then waits for raw events observes NOTHING for the whole session: measured
+   as zero upcalls from six faked moves and twelve faked keys after a Watch to
+   Swallow transition, which is exactly the sequence a real session takes. So
+   the X11 backend gives its grabs an event mask and reads the CORE events
+   while grabbed, keeping the raw stream for watching, where a core mask would
+   be propagated away instead. That decides truth 4 above on this platform: the
+   delta is unaccelerated while watching and accelerated while driving, because
+   that is what a grab delivers, not because either was preferred. Finally, an
+   X11 backend hears its own XTEST injections come back, because X11 offers no
+   `dwExtraInfo` to mark them with; v1 does not need it to (rule 3 again), and
+   when something does, a raw event's `source` device is the XTEST virtual
+   device, which a real keyboard's never is.
+10. **A wheel notch is a different number on each of the three platforms, and
+    one of them is not a fixed number at all.** Windows delivers the notch in
+    `WHEEL_DELTA` units, which is 120 by definition, and X11 delivers it as a
+    button press and release, which is one notch by definition. macOS delivers
+    BOTH a line count (a detent is exactly 1) and a point delta, which is
+    acceleration-dependent and scaled by `CGEventSourceGetPixelsPerLine`, about
+    10 by default. So the pixel-per-notch constant is per platform and the
+    Windows one is not reusable: applying 120 to a macOS point delta made about
+    twelve notches of a real wheel, or a whole trackpad swipe, travel as one,
+    and made every small scroll travel as nothing. The macOS backend divides
+    the point delta by 10, keeps the remainder, and falls back to the line
+    count per axis when the point delta on that axis is zero.
+11. **The X11 core keyboard mapping cannot be read unambiguously, and XKB
+    can.** The core protocol says the first four keysyms of a keycode are
+    "group 1 levels 1 and 2, group 2 levels 1 and 2", and an XKB server
+    synthesises that list as `width * groups` entries in group-major order.
+    One group of four levels and two groups of two levels are therefore the
+    SAME four numbers with different meanings, and telling them apart decides
+    the one example this document leads with (typing `@` on an AZERTY target
+    is AltGr plus 0, which is group 1 level 3). `xkb::GetMap` answers with the
+    per-key group count and width, so the X11 backend asks XKB and falls back
+    to the ambiguous core reading only when the extension is missing.
+
+### What "logical pixels" turned out to mean, per platform
+
+Section 6 says the plane is in logical pixels and section 10's `Monitor`
+carries logical sizes. Implementing the three backends showed that the seam
+needs something slightly different and stricter, so the contract is now
+stated as what it has to be: **`Monitor`'s rectangle and every `Point` are in
+the machine's own POINTER COORDINATE SPACE, whatever that space is.** They
+have to agree, because the engine converts between them, and no platform
+offers a second space in which both are expressed.
+
+- **X11** has one space and no per-monitor scale at all: RandR reports pixels
+  and millimetres and nothing about what a desktop environment is scaling by,
+  so `scale` is 1000 everywhere and an interface has one fewer label.
+- **macOS** has exactly what the section imagined: the global display space is
+  in points, a Retina display reports half its pixel width, and `scale` is the
+  ratio of the two. The ratio has to come from the display MODE
+  (`CGDisplayModeGetPixelWidth` over `CGDisplayModeGetWidth`): the obvious call,
+  `CGDisplayPixelsWide`, does not return pixels despite its name and its
+  documentation, it returns the same points as the bounds, so the ratio is
+  exactly 1 on every display including every Retina one. In a fractional "More
+  Space" mode the framebuffer can exceed the panel's own pixels and this reports
+  2.0 where the physical ratio is nearer 1.7, which is not an error: it is the
+  same number `NSScreen.backingScaleFactor` gives, and that is the number an
+  interface showing "200%" means.
+- **Windows** has neither unless a process chooses. A DPI-unaware process gets
+  every monitor scaled by the PRIMARY monitor's factor, which is right for one
+  screen and wrong for a second one at a different scale; a per-monitor-aware
+  one gets physical pixels throughout. The backend declares per-monitor
+  awareness v2 and reports physical pixels with `scale` saying each monitor's
+  DPI, because one consistent space that is honestly labelled beats a
+  "logical" space that does not exist.
+
+The plane's arithmetic uses the rectangles and not the scale, so the cost of
+the mismatch is a 4K screen drawn twice the size of a Retina one next to it in
+the interface, and nothing about where the pointer goes.
 
 ### Capabilities, and refusals that are detected rather than guessed
 
@@ -1491,6 +1655,59 @@ not switchable mid session. No drag and drop across an edge. No editing the
 crossing graph directly, for arrangements a plane cannot express. Character
 keys are not in the crash guard, only modifiers. No kernel driver, per the
 epic's decision, which is a strategy and not an omission.
+
+One field was not bounded, and #125 found it by writing arithmetic against it. A
+wheel frame's `dx` and `dy` were carried as whatever `i32` a peer put there, and
+a notch count times the Windows wheel unit overflows, as does the X11 backend's
+own pixel accumulator: both PANIC in a debug build, so a peer chose whether the
+component it was driving stayed alive. They are now clamped to `WHEEL_MAX`
+(4096) on arrival and on the way out, which is more than any device produces in
+one event and is the honest reading of a number no device could mean.
+
+And the per-platform gaps #125 found, each of which degrades to a refusal with
+a sentence rather than to something wrong:
+
+- **X11**: a level above the fourth needs `ISO_Level5_Shift`, which the eight
+  canonical modifier bits cannot name, so a symbol that only lives there is
+  `UNRESOLVED`. The Unicode path is a keycode nothing is bound to, remapped
+  for one stroke and restored, so a keyboard whose every keycode is bound has
+  no Unicode path and says so through `unicode: false`. A key a keymap does
+  not bind at all (an `xkeyboard-config` `pc105` leaves F13 to F24 unbound)
+  resolves to nothing rather than to a keystroke that produces nothing.
+- **Windows**: `resolve` answers `None` for a symbol needing a dead key
+  (truth 6), which the Unicode path covers.
+  A keycode the Unicode path leaves bound survives the client that bound it:
+  every ordinary teardown unbinds it, including an unwinding panic, but a run
+  killed outright during one `Text` injection leaves one keysym on one keycode
+  no physical key produces, and the next start cannot find it (a spare is
+  chosen by being entirely unbound). Clearing that needs the state directory
+  to reach the backend, which this seam does not carry.
+- **Windows**: `resolve` answers `None` for a symbol needing a dead key
+  (truth 6), which the Unicode path covers. And `inject_keys` is
+  unconditionally true, because the lock is reported per injection as
+  `SCREEN_LOCKED` rather than as a capability; the one consequence is that the
+  crash guard of section 8 is drained optimistically on a machine whose input
+  desktop is not ours, where the release cannot land (the other platforms
+  report the inability in `inject_keys` and the guard is kept).
+- **macOS**: the media keys are not virtual keycodes at all, they travel as
+  `NSSystemDefined` events, so this backend does not inject them and the
+  engine reports `UNRESOLVED`. Nor are F21 to F24 (macOS stops at F20). There
+  are TWO grants and not one (Input Monitoring for the tap, Accessibility for
+  the injection), so a Mac can be a target and not a source or the other way
+  round, and both halves are reported separately. A double click is a single
+  click twice: the chain a Mac builds from its own double-click interval and a
+  distance threshold is not synthesised here, because the interval lives in
+  AppKit, which this component does not link. A display's `name` is its
+  position in the active list ("Display 1" is the main one) and not the name a
+  person gave it, which is `NSScreen.localizedName` and therefore AppKit too.
+  Whether an injected Caps Lock toggles a Mac's own lock is unknown and on the
+  live list: the lock is handled below the event system there, so posting the
+  keycode may do nothing, and the capture side (which reports a Mac's own Caps
+  Lock on its transition) is the half that is certainly right.
+  And macOS has no `dwExtraInfo`: nothing marks an injected event as this
+  component's own, so a tap cannot tell its own injection from a hand. Rule 3
+  is what makes that safe in v1 (a machine being driven does not capture), and
+  the day something needs it, `kCGEventSourceUserData` is the field.
 
 ## 16. Settled decisions
 

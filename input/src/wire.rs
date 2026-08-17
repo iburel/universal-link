@@ -113,6 +113,20 @@ pub const PLANE_ID_MAX: usize = 32;
 /// build that does not know it.
 pub const CAPS_MAX: usize = 256;
 
+/// The most a wheel can move in ONE event, in either unit.
+///
+/// Bounded on arrival like every other field a peer chooses (section 3), and this one
+/// was not until three platform backends were written against it. A real device sends
+/// one notch per event, three under acceleration, or a few dozen pixels from a
+/// trackpad; four thousand and ninety six of either is already absurd. What the absence
+/// of a bound cost, on each platform in turn: an `i32` multiplication by the Windows
+/// wheel unit overflowed and PANICKED in a debug build, the same happened to the X11
+/// backend's pixel accumulator, and macOS would have scrolled a document by two
+/// billion. A clamp rather than a refusal, because a frame carrying an impossible
+/// number is not a malformed frame: it is a number no device could mean, and the most a
+/// device could mean is the honest reading of it.
+pub const WHEEL_MAX: i32 = 4096;
+
 /// The lowest and highest mouse button the dialect defines: 1 left, 2 middle,
 /// 3 right, 4 back, 5 forward (section 3).
 ///
@@ -582,7 +596,12 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, EncodeError> {
             dx,
             dy,
             pixels,
-        } => json!({ "t": "w", "s": session, "n": n, "dx": dx, "dy": dy,
+            // Clamped on the way OUT as well, so a local device that reported
+            // something impossible never puts it on the wire: the same rule as
+            // `clip(sym, SYM_MAX)` one field below.
+        } => json!({ "t": "w", "s": session, "n": n,
+                     "dx": dx.clamp(&-WHEEL_MAX, &WHEEL_MAX),
+                     "dy": dy.clamp(&-WHEEL_MAX, &WHEEL_MAX),
                      "u": if *pixels { "px" } else { "line" } }),
         Frame::Key {
             session,
@@ -772,8 +791,8 @@ pub fn decode(bytes: &[u8]) -> Option<Frame> {
         "w" => Some(Frame::Wheel {
             session: s()?,
             n: n()?,
-            dx: i32_of(&v, "dx")?,
-            dy: i32_of(&v, "dy")?,
+            dx: i32_of(&v, "dx")?.clamp(-WHEEL_MAX, WHEEL_MAX),
+            dy: i32_of(&v, "dy")?.clamp(-WHEEL_MAX, WHEEL_MAX),
             pixels: match v.get("u")?.as_str()? {
                 "px" => true,
                 "line" => false,
@@ -1247,6 +1266,46 @@ mod tests {
     /// on them: `by` and the plane id reach the state an interface renders, `m`
     /// reaches the remapping and the modifier dance, and the button number reaches
     /// `SendInput` and XTEST as-is.
+    /// A wheel delta a peer chose is clamped to what a device could mean, in both
+    /// directions and both units.
+    ///
+    /// It is the field that was NOT bounded until three platform backends were written
+    /// against it, and what the absence cost was arithmetic: a notch count times the
+    /// Windows wheel unit, and the X11 pixel accumulator's own multiplication, both
+    /// overflow an `i32` and both PANIC in a debug build. A peer chose the number, so
+    /// that is a peer choosing to crash the component that is being driven.
+    #[test]
+    fn a_wheel_delta_is_clamped_to_what_a_device_could_mean() {
+        for (sent, want) in [
+            (i32::MAX, WHEEL_MAX),
+            (i32::MIN, -WHEEL_MAX),
+            (WHEEL_MAX + 1, WHEEL_MAX),
+            (5, 5),
+            (-3, -3),
+            (0, 0),
+        ] {
+            let frame = json!({ "t": "w", "s": 1, "n": 2, "dx": sent, "dy": sent, "u": "line" });
+            let Some(Frame::Wheel { dx, dy, .. }) =
+                decode(&serde_json::to_vec(&frame).expect("json"))
+            else {
+                panic!("a wheel frame with {sent} still arrives");
+            };
+            assert_eq!((dx, dy), (want, want), "{sent} should clamp to {want}");
+        }
+        // Encoding follows the same rule, so this engine cannot emit one either.
+        let out = encode(&Frame::Wheel {
+            session: 1,
+            n: 2,
+            dx: i32::MAX,
+            dy: i32::MIN,
+            pixels: true,
+        })
+        .expect("encodable");
+        let v: Value = serde_json::from_slice(&out).expect("json");
+        assert_eq!(v["dx"], json!(WHEEL_MAX));
+        assert_eq!(v["dy"], json!(-WHEEL_MAX));
+    }
+
     #[test]
     fn nothing_a_peer_chooses_reaches_the_engine_unbounded_or_undefined() {
         // `by` decorates a refusal, so it is dropped over the bound rather than

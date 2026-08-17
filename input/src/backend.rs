@@ -57,28 +57,39 @@
 //! a truth rediscovered at a desk costs a week and a truth written down costs a
 //! paragraph.
 //!
-//! 4. **A relative delta taken under confinement on X11 is UNACCELERATED.** The
-//!    only OS-native relative source available under a confining grab is
-//!    `XI_RawMotion`, whose valuators are the raw device deltas with no pointer
-//!    acceleration profile applied. Truth 1 says the deltas must come from there;
-//!    the consequence, which truth 1 does not say, is that the pointer will feel
-//!    MATERIALLY DIFFERENT while driving than while local, on the one platform
-//!    where "it does not change how the mouse feels" is a thing anyone checks. A
-//!    backend has two honest choices and must make one on purpose: apply the
-//!    device's own acceleration profile to the raw valuators (correct, and the
-//!    profile has to be read from the device's XI2 properties), or use
-//!    `XI_Motion`'s deltas against the confine window and accept that the deltas
-//!    clamp at the window's edge when the hand outruns the pin. Nothing else on
-//!    this seam has to change either way: the engine consumes [`Motion::dx`] and
-//!    [`Motion::dy`] and asks no questions.
+//! 4. **On X11 the relative source is not the same one in both modes, and the
+//!    platform decides which.** `XI_RawMotion`'s valuators are the raw device
+//!    deltas with no acceleration profile applied, and they are what an X11 backend
+//!    reads while it only watches. Under a GRAB it gets nothing from them: a
+//!    grabbed device's events go to the grab, and a raw event has no core form to
+//!    convert into, so the grabbing client is the one client that stops receiving
+//!    them (measured in #125 as zero upcalls for eighteen faked events, and the
+//!    same measurement is the reason the grabs there carry an event mask). So while
+//!    swallowing, the delta is the difference of two REPORTED POSITIONS: the
+//!    ACCELERATED movement, which is what Windows gets for free from its hook
+//!    (truth 7), bounded by the pin's anchor being at the centre of the screen so
+//!    one event carries up to half a screen. Two traps in that arithmetic cost a
+//!    measurement each and are written up in `input/src/x11.rs`: differencing
+//!    against the ANCHOR rather than against the last position multiplies the
+//!    movement of a burst, and a warp generates a motion event even when it changes
+//!    nothing, so a pin whose anchor the server will not accept warps for ever.
+//!    Applying the device's own acceleration profile to the raw valuators instead is
+//!    a third option and a ticket of its own. Nothing on this seam changes either
+//!    way: the engine consumes [`Motion::dx`] and [`Motion::dy`] and asks no
+//!    questions.
 //! 5. **`CGWarpMouseCursorPosition` suppresses local mouse events for about
 //!    250 ms** unless it is followed by
 //!    `CGAssociateMouseAndMouseCursorPosition(true)`, or unless
 //!    `CGSetLocalEventsSuppressionInterval` is zeroed first. The engine warps on
 //!    the return path and on every teardown, so a macOS backend that omits that
 //!    call gives its own user a quarter of a second of dead mouse at the exact
-//!    moment they asked for their machine back. [`InputBackend::warp`] on macOS is
-//!    therefore two calls, never one.
+//!    moment they asked for their machine back. A macOS backend must therefore do
+//!    ONE of the two, and it cannot always do the re-association: while a session
+//!    holds the pointer, the decoupling IS the confinement, so re-associating there
+//!    would undo the pin. The backend written against this seam zeroes the interval
+//!    on its own event source and re-associates only after the warps that are not
+//!    part of a pin. (This truth is numbered 5 here and 4 in `input/src/macos.rs`,
+//!    which numbers its own list in the order that file needs.)
 //! 6. **`Want::Symbol` on Windows cannot express a dead key through the easy
 //!    API.** `VkKeyScanEx` returns -1 for a character that needs one, and finding
 //!    the pair means walking the virtual keys by modifier state through
@@ -511,6 +522,44 @@ pub enum BackendEvent {
         layout: String,
         group: u32,
     },
+    /// What this backend can do has changed, and nothing else has: the OS grant
+    /// arrived, or was taken away, without a monitor moving and without capture
+    /// being lost. The engine re-reads [`InputBackend::capabilities`], asks what
+    /// this machine can produce all over again, applies the capture mode the new
+    /// answer allows and republishes.
+    ///
+    /// # Why the seam needed one more upcall than the design listed
+    ///
+    /// Added by the platform ticket, because without it a macOS machine whose
+    /// Accessibility grant is given AFTER the component started keeps saying it
+    /// cannot type until something unrelated happens. The engine re-reads the
+    /// capabilities on exactly three occasions: at start, on
+    /// [`BackendEvent::MonitorsChanged`], and on [`BackendEvent::CaptureLost`].
+    /// A grant is none of those. Reusing `MonitorsChanged` would work by accident
+    /// (it does re-read the capabilities) and would lie in the log about what
+    /// happened, and `CaptureLost` would end a live session for a permission that
+    /// had just been GIVEN.
+    ///
+    /// It also closes the trap the seam's `resolve` documents: the resolution cache
+    /// keeps negative answers on purpose, so a backend asked what it can produce
+    /// before its grant exists is remembered as able to produce nothing. A session
+    /// start already re-learns; this makes the moment the grant lands re-learn too,
+    /// so an interface that says "1Device can type on this computer now" is telling
+    /// the truth rather than predicting it.
+    ///
+    /// # What it does NOT mean, and what to send instead
+    ///
+    /// It means the CAPABILITIES moved. The engine throws the resolution cache away only
+    /// when one of the three that decide what this machine can produce has changed
+    /// (`inject_keys`, `unicode`, `inject_pointer`), because throwing it away is five
+    /// round trips plus a fresh resolve on the next press of every distinct symbol, and
+    /// this seam puts no rate limit on the upcall: a backend that emits it for its own
+    /// housekeeping (a rebuilt event tap, a monitor coming back) would otherwise pay that
+    /// on every occurrence. So a backend whose KEYMAP connection was rebuilt, and which
+    /// therefore wants the cache emptied, sends [`BackendEvent::LayoutChanged`], which is
+    /// the upcall that means exactly that. Emitting this one with unchanged capabilities is
+    /// harmless and is meant to be.
+    CapabilitiesChanged,
     /// An injection was refused. Coalesced by the engine into one `oops` frame
     /// per code per second, with a count.
     Refused(Refusal),

@@ -236,10 +236,19 @@ pub fn name_of(usage: u32) -> Option<&'static str> {
 ///
 /// Caps Lock, Num Lock and Scroll Lock report a press only on some keyboards,
 /// and a target that waited for the release would hold the lock down for ever.
+///
+/// Three constants and not three lookups in the named table: this is called from inside a
+/// platform backend's capture callback, once per key event, and the table walk was three linear
+/// scans (plus three `expect`s that can panic where a panic must not happen) for an answer that
+/// is three fixed numbers. The three numbers are asserted against the named table by
+/// [`tests::the_locks_are_the_three_half_duplex_keys_and_nothing_else`], so they cannot drift
+/// away from it.
 pub fn is_lock(usage: u32) -> bool {
-    usage == usage_of("CapsLock").expect("CapsLock is in the table")
-        || usage == usage_of("NumLock").expect("NumLock is in the table")
-        || usage == usage_of("ScrollLock").expect("ScrollLock is in the table")
+    matches!(
+        usage,
+        // Caps Lock, Num Lock, Scroll Lock.
+        0x0007_0039 | 0x0007_0053 | 0x0007_0047
+    )
 }
 
 /// The HID usage of the key that MEANS one canonical modifier bit. `None` for a
@@ -383,6 +392,17 @@ impl Held {
             code,
             bit: modifier,
         });
+    }
+
+    /// Takes on everything ANOTHER set holds, this set's own press order first.
+    ///
+    /// For the crash guard, and for one case in it: a release that could not have reached
+    /// the OS moves the set it failed to release into the record of keys that may still be
+    /// down, and a second failure has to ADD to that record rather than replace it.
+    pub fn absorb(&mut self, other: &Held) {
+        for entry in &other.keys {
+            self.press(entry.code, entry.bit);
+        }
     }
 
     /// Forgets a key. Releasing one that is not held is a no-op rather than an
