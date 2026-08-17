@@ -24,7 +24,10 @@
   either written directly by the Core at the designated locations
   (`transactions.fill`), or streamed via the data channel when the OS surface
   demands it. The clipboard's inline contents (text, image) move over the data
-  channel too: the control plane carries control, never payloads.
+  channel too: the control plane carries control, never payloads. Two
+  deliberate bends, each bounded by its own caps and each saying so:
+  `peers.send`'s payload and `peers.channel`'s frames (see
+  [`peers.*`](#peers)).
 - **Subscription-based notifications**: a component subscribes to topics, the
   Core pushes named notifications. No polling.
 
@@ -79,6 +82,7 @@ only through these two paths, never via the prompt.
 | `clipboard.read` | the `clipboard` topic, `clipboard.current`, and consuming a CLIPBOARD transaction through `transactions.open` / `transactions.fill` (consuming requires the scope of the producer - see [Transactions](#transactions)) |
 | `transactions.publish` | `transactions.publish`, `transactions.revoke`, `transactions.adopt`, and consuming a PUBLISHED transaction through `transactions.open` / `transactions.fill`. No role attached: any component may be a producer |
 | `peers.message` | `peers.send`, and receiving `peer.message` (the scope is the subscription) |
+| `peers.channel` | `peers.channel`, and receiving `peer.channel` / `peer.channel_closed` (the scope is the subscription). Grantable to any component, like `peers.message`, and separate from it: carrying a live flow is not the same right as sending a message |
 | `sync.serve` | answering the routed `sync.*` facade and publishing the `sync` topic (`sync.emit`) - both additionally require the `sync-backend` role |
 | `sync.read` | the `sync` topic and its snapshot method `sync.status` |
 | `sync.manage` | every other `sync.*` gesture |
@@ -579,6 +583,7 @@ the Core carries it, caps it, and interprets nothing.
 | Method | Description |
 |---|---|
 | `peers.send { device_id, payload }` | → `{}`. Delivers `payload` (any JSON value, required, at most 64 KiB serialized - `PAYLOAD_TOO_LARGE` beyond, refused before anything is dialled) to the components holding the SAME role on `device_id`. The sender's role is stamped by the Core from this connection, never chosen; one's own `device_id` is `-32602` |
+| `peers.channel { device_id }` | → `{ channel_token }`. Opens a LIVE duplex pipe to the components holding the same role on `device_id` (below). Same stamping and same `-32602` on one's own device |
 
 Targeting follows `files.send`'s doctrine: `device_id` is resolved by the
 directory, C7 attestation verified before any opening - absent or attested
@@ -607,6 +612,88 @@ carries control, never payloads", bounded by its cap - which is why the cap
 speaks its own code; and `custom` is ONE role, so third-party components
 sharing it share the channel and discriminate their own dialect inside the
 payload.
+
+### `peers.channel`: a live pipe, for a flow
+
+`peers.send` is a bounded, acked, one-shot message: a fresh stream per call,
+a reply awaited, a 10 s budget. That is exactly right for a gesture
+(announcing a layout, proposing a handover, reporting a refusal) and
+unusable for a flow of pointer positions. `peers.channel` is the other
+primitive: a LIVE duplex pipe between the components holding the same role
+on two devices, carrying OPAQUE bytes the Core interprets in no way.
+
+- `peers.channel { device_id }` → `{ channel_token }`: single-use,
+  unguessable, bound to one component, one peer and one direction of
+  opening, exactly like the data channel's token. The bearer opens a
+  **second connection** to the socket, presents it in the same attach frame
+  (`{ "channel_token": … }`), and that connection becomes the pipe.
+- On the target device the Core pushes `peer.channel { device_id,
+  channel_token }` to every active connection holding the sender's role AND
+  the `peers.channel` scope: no topic, no subscription, the scope is the
+  subscription, as for `peer.message`. Each candidate is offered its OWN
+  token (a token is bound to one component, so this fan-out cannot be the
+  single broadcast frame `peer.message` gets away with); the first to attach
+  takes the pipe and the others' tokens are spent.
+- **Framing**: `u32` big-endian length, then exactly that many bytes, on
+  both halves. A frame is capped at **1 KiB**; a zero-length frame is legal
+  and is what a keepalive looks like to a Core that does not know what a
+  keepalive is. Beyond the frame cap there is a **rate cap** (4000 frames
+  per second, either direction) and an **idle sweep** (10 s with no frame in
+  EITHER direction). Any frame resets the idle budget.
+- **Targeting** follows `files.send`'s doctrine, and the whole handshake
+  happens before the call returns, so every refusal is an answer and never a
+  silence to interpret: `DEVICE_UNKNOWN` (absent, or attested under a
+  foreign key: indistinguishable, fail-closed), `DEVICE_OFFLINE` (no route,
+  or nothing usable answered in time), `COMPONENT_ABSENT` (the remote Core's
+  word: nobody there holds the role with the scope, or nobody came to take
+  the channel), `NO_DIRECT_PATH`. `accepted` on the wire therefore means the
+  far end has ATTACHED, not merely that a notification was queued: the token
+  it comes back with opens a pipe that is already alive at both ends.
+- **Relays**: such a session declares no size, so it opens through the sized
+  path (#88) declaring itself above ANY cap. On a deployment whose relays
+  are rendezvous-only above a cap, the open is refused with
+  `NO_DIRECT_PATH` instead of quietly riding relays that said no to exactly
+  that. Where the relays do carry payload it rides them and is genuinely
+  usable there (measured in #123: 32 ms round trip, jitter p99 2.2 ms, no
+  loss at 125 Hz).
+- **One live channel per (role, peer) pair.** A second `peers.channel` on
+  the same pair REPLACES the first, and it does so before it dials: the pair
+  is left with no channel if that open then fails, which is the right
+  outcome for a component that asked to start again.
+- **It dies when the trust does**, and the local component is told which:
+  `peer.channel_closed { device_id, reason }` goes to the connection that
+  owns the local end, and both ends always see a clean end of stream rather
+  than a silent stall. The reasons: `CLOSED` (the local component closed its
+  end), `REPLACED`, `PEER_GONE` (the far end's stream ended: its component
+  left, its Core stopped, it struck this device off, or the path broke),
+  `DEVICE_REVOKED` (the peer is no longer an attested device of the account
+  here: struck off, record gone, or an attestation that stopped verifying,
+  the three collapsed fail-closed as they are behind `DEVICE_UNKNOWN`),
+  `LOGGED_OUT`, `ACCOUNT_LEFT`, `SHUTDOWN`, `FRAME_TOO_LARGE`,
+  `RATE_EXCEEDED`, `IDLE_TIMEOUT`, `NO_DIRECT_PATH` (the direct path died
+  mid-stream under a rendezvous-only relay policy). The end of a channel is
+  worded by the Core that saw the CAUSE: the side that replaced, revoked or
+  logged out names it, and the far side hears `PEER_GONE`, because a closed
+  stream carries no reason and no control frame lives inside an opaque pipe.
+- **What it deliberately is not**: no store and forward, no reconnection
+  logic (the component retries on its own schedule, and the `devices` topic
+  already says when a peer is reachable again), no interpretation, and no
+  logging of payloads.
+
+This payload is the SECOND deliberate bend of "the control plane carries
+control, never payloads", and like `peers.send`'s it is bounded by its caps:
+1 KiB a frame, 4000 frames a second, 10 s of silence. The bytes never touch
+the JSON-RPC layer, which is the point: #123 measured that an ordinary
+notification through a real Core costs 0.225 ms one way at 125 Hz (p99
+0.552, JSON free at this size), so the opaque pipe buys under 0.05 ms and is
+kept for ISOLATION and BACKPRESSURE instead: a 125 Hz flow never shares a
+queue with an approval prompt, and a pipe has natural flow control where a
+bounded notification queue has only the fail-closed close.
+
+| Notification | Emitted when |
+|---|---|
+| `peer.channel { device_id, channel_token }` | a device of the account opened a channel to the components of the sender's role here. Pushed on the scope, with no subscription |
+| `peer.channel_closed { device_id, reason }` | the channel ended, with the reason above. Emitted once, to the connection that owned the local end |
 
 ## Transactions
 
@@ -890,7 +977,7 @@ themselves (Explorer via IStream, FUSE, NFS, FSKit — and later the GUI's
 drag & drop, which will consume the same primitive).
 
 A `channel_token` is unguessable (CSPRNG — like `tx_id`, possession is the
-authorization), single-use, short-lived, and bound to one transaction, one
+authorization), single-use, short-lived, and bound to one thing to serve, one
 component and one direction: the Core accepts it only from a connection whose
 peer credentials match the component it was minted for, and closes anything
 else. The bearer opens a **second connection** to the socket, presents the
@@ -919,6 +1006,11 @@ implementation time):
   the backend writes the requested blob: `DATA*` then `EOF`, or `ERROR { code }`
   (`CLIP_STALE`); the `clipboard.get_data` reply follows `EOF` — the RPC
   response is the completion signal.
+- **Peer channel** (token minted by `peers.channel`): the same second
+  connection and the same attach frame, but the connection then speaks its
+  own grammar (`u32` length + opaque bytes, both ways) and is joined to
+  another device's, not to a transaction. See
+  [`peers.channel`](#peerschannel-a-live-pipe-for-a-flow).
 
 Contractual properties: optimized sequential reads (read-ahead on the Core
 side), `seek` supported (an arbitrary range is valid, at the cost of reopening
@@ -960,7 +1052,7 @@ Standard JSON-RPC codes + application codes in `error.data.code`:
 | `PAIRING_UNKNOWN` / `PAIRING_STATE` / `PAIRING_LIMIT` | relayed from the server as-is: unknown/expired/spent session, wrong moment (confirming before anyone scanned, or from the joining side), too many sessions at once. `PAIRING_STATE` is also the local answer for a pairing that is out of step: a code whose window is no longer the one on screen, a device that answers a dial with something other than the protocol's next frame, and confirming a pairing whose stream is gone |
 | `DEVICE_UNKNOWN` / `DEVICE_OFFLINE` | target unknown / unreachable (`pairing.accept` of a `1D2` code: the device that displayed it is not on this network) |
 | `DEVICE_REVOKED` | `pairing.accept` of a `1D2` code shown by a `node_id` the account struck off: a tombstone is permanent, and that device can only come back under a fresh identity |
-| `COMPONENT_ABSENT` | the component the call needs is not connected: no `sync-backend` holding `sync.serve` for a `sync.*` forward (also on a mid-request death or the proxy timeout), or - `peers.send` - the target device's word that nothing there holds the sender's role with `peers.message` |
+| `COMPONENT_ABSENT` | the component the call needs is not connected: no `sync-backend` holding `sync.serve` for a `sync.*` forward (also on a mid-request death or the proxy timeout), or - `peers.send` - the target device's word that nothing there holds the sender's role with `peers.message`, or - `peers.channel` - the same word for `peers.channel`, which also covers a holder there that never came to take the channel |
 | `PAYLOAD_TOO_LARGE` | `peers.send`: the serialized `payload` exceeds the cap (64 KiB), refused before anything is dialled |
 | `TRANSFER_UNKNOWN` | unknown `transfer_id` |
 | `FORMAT_UNKNOWN` | format not present in the transaction |
@@ -970,7 +1062,7 @@ Standard JSON-RPC codes + application codes in `error.data.code`:
 | `FILE_CHANGED` | the file behind a manifest entry is no longer the frozen one (size, identity, or mtime): the read is refused rather than serving different bytes |
 | `MANIFEST_TOO_LARGE` | announce refused: the copy exceeds the v1 manifest cap |
 | `PEER_GONE` | data channel: the source device vanished mid-stream (`DEVICE_OFFLINE` is its control-plane twin, at `transactions.open`) |
-| `NO_DIRECT_PATH` | the deployment's relays are rendezvous-only above a cap (#88, announced with the relay list) and hole punching produced no direct path for an over-cap payload. Carried in `transfer.failed.error` (sends and fills) and as a data-channel error code (paste pipe). The PAIR fails, not one device: the same network or a VPN between the two restores the path |
+| `NO_DIRECT_PATH` | the deployment's relays are rendezvous-only above a cap (#88, announced with the relay list) and hole punching produced no direct path for an over-cap payload. Carried in `transfer.failed.error` (sends and fills), as a data-channel error code (paste pipe), and - `peers.channel`, which declares itself above any cap - as the RPC error of the open and as a `peer.channel_closed` reason when the direct path dies mid-stream. The PAIR fails, not one device: the same network or a VPN between the two restores the path |
 | `TIMEOUT` | data channel: stall timeout on the Core side |
 
 ## Versioning
