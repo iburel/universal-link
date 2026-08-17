@@ -49,6 +49,96 @@ hex = "0.4"
 # iroh: no new package version enters with this line.
 blake3 = "1"
 
+# X11 keyboard and mouse backend (Linux only): XInput2 raw events for the
+# relative source, an XI2 device grab for swallowing, XTEST for injection, XKB for
+# the keymap and the active group, RandR for the monitors, XFixes to hide the
+# cursor while this machine is driving another. `xcb` is the same crate and the
+# same version the clipboard backend already uses, so no package enters the lock:
+# what is new is five cargo FEATURES, and they cost no system library either. The
+# crate links ONLY libxcb (one `link:` declaration in the whole of it) and
+# generates every extension's requests itself from the protocol XML, resolving the
+# extension opcode at runtime through `xcb_get_extension_data`. So
+# `libxcb1-dev` remains the entire build requirement on Linux, and a server
+# missing an extension is a capability this backend reports it does not have
+# rather than a link error. `mio` pumps the X socket fd and the command queue on
+# the main thread, exactly as the clipboard's X11 loop does. Non-Linux targets
+# never pull these.
+[target.'cfg(target_os = "linux")'.dependencies]
+xcb = { version = "1", features = [
+    "xtest",
+    "xinput",
+    "xkb",
+    "randr",
+    "xfixes",
+] }
+mio = { version = "1", features = ["os-poll", "os-ext"] }
+
+# Windows keyboard and mouse backend (Windows only): `SendInput` for injection,
+# `WH_KEYBOARD_LL` and `WH_MOUSE_LL` on a message-only window's pump for capture
+# and swallowing, `ClipCursor` for the pin. One crate, `windows-sys` (raw FFI, no
+# system library to install), at the version the clipboard backend already pins.
+# Nothing here implements a COM interface, so neither `windows` nor `windows-core`
+# is needed and the lockstep rule between those two does not apply.
+#
+# Two of the features are gates rather than surfaces, and dropping either compiles
+# and then fails to find a function: `GetDpiForMonitor` is declared under
+# `#[cfg(feature = "Win32_Graphics_Gdi")]` inside the HiDpi module, and
+# `OpenProcessToken` under `#[cfg(feature = "Win32_Security")]` inside the
+# Threading module.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",                 # HWND/RECT/POINT/HANDLE, CloseHandle
+    "Win32_Graphics_Gdi",               # EnumDisplayMonitors, MONITORINFOEXW, EnumDisplayDevicesW
+    "Win32_Security",                   # the integrity level of the foreground window's token
+    "Win32_System_LibraryLoader",       # GetModuleHandleW, for the window class
+    "Win32_System_StationsAndDesktops", # OpenInputDesktop: is the input desktop still ours
+    "Win32_System_Threading",           # OpenProcess/OpenProcessToken for that token
+    "Win32_UI_HiDpi",                   # per-monitor awareness, and each monitor's DPI
+    "Win32_UI_Input_KeyboardAndMouse",  # SendInput, the virtual keys, VkKeyScanExW, MapVirtualKeyExW
+    "Win32_UI_WindowsAndMessaging",     # the pump, the two low level hooks, ClipCursor, GetSystemMetrics
+] }
+
+# macOS keyboard and mouse backend (macOS only): an active `CGEventTap` on a run
+# loop source for capture, `CGEventPost` for injection,
+# `CGAssociateMouseAndMouseCursorPosition` plus `CGWarpMouseCursorPosition` for the
+# confine. `objc2-core-graphics` and `objc2-core-foundation` are ALREADY in the
+# workspace lock at 0.3.2, as dependencies of the `objc2-app-kit` the clipboard
+# backend names directly, so these lines add no package and no version. Features
+# hand-picked, like every sibling: `CGEvent`/`CGEventTypes`/`CGEventSource` are the
+# tap, the event constructors and the synthetic source; `CGRemoteOperation` is
+# required BY `new_keyboard_event` and also carries the warp and the association;
+# `CGDirectDisplay` plus `CGGeometry` plus `CGError` enumerate and measure the
+# monitors; `libc` gates the association call. `objc2-core-foundation`'s `CFRunLoop`
+# and `CFMachPort` turn the tap's mach port into a run loop source and give the loop
+# the `wake_up` a downcall needs to reach the pump inside one frame at 125 Hz, which
+# the clipboard backend's 200 ms poll would not.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+    "std",
+    "CGEvent",
+    "CGEventTypes",
+    "CGEventSource",
+    "CGRemoteOperation",
+    "CGDirectDisplay",
+    "CGGeometry",
+    "CGError",
+    "CGSession",
+    "libc",
+] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "CFRunLoop",
+    "CFMachPort",
+    "CFCGTypes",
+    "CFData",
+    "CFDate",
+    "CFArray",
+    "CFDictionary",
+    "CFNumber",
+    "CFString",
+    "CFUUID",
+] }
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
@@ -61,3 +151,23 @@ onedevice-core = { path = "../core" }
 # same reason and since the same ticket).
 onedevice-server = { path = "../server" }
 onedevice-test-support = { path = "../test-support" }
+
+# The live X suite (tests/x11.rs) drives a SECOND X client against the real backend:
+# it fakes input as another application would, and it watches the same root window for
+# the same raw events, which is what makes "the grab swallowed it" provable rather than
+# asserted. Same crate and features as the backend, so no package and no feature enters
+# the lock for the test side alone.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+xcb = { version = "1", features = ["xtest", "xinput"] }
+
+# The live Windows suite (tests/windows.rs) plays a foreign application against the real
+# backend, injecting input WITHOUT this backend's own marker so the hooks see a real
+# keystroke rather than their own echo, and reading the operating system's key state,
+# cursor and clip back. All `#[ignore]`d and skipped when the session's input desktop
+# cannot be reached.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }

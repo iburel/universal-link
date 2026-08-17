@@ -4171,6 +4171,7 @@ checksum = "e022c9d066895efa1345f8e33e584b9f958da2fd4cd116792e15e07e4720a807"
 dependencies = [
  "bitflags 2.13.0",
  "dispatch2",
+ "libc",
  "objc2",
  "objc2-core-foundation",
  "objc2-io-surface",
@@ -4496,6 +4497,9 @@ dependencies = [
  "blake3",
  "ed25519-dalek 3.0.0",
  "hex",
+ "mio",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
  "onedevice-core",
  "onedevice-ipc-client",
  "onedevice-paths",
@@ -4505,6 +4509,8 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "windows-sys 0.61.2",
+ "xcb",
 ]
 
 [[package]]

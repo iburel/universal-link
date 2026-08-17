@@ -36,6 +36,17 @@ pub mod settings;
 pub mod store;
 pub mod wire;
 
+// The platform halves, one per OS, selected at compile time by [`os::create`]
+// exactly as `clipboard/src/os.rs` selects its own. Each one is the OS event loop
+// for its platform plus a `Clone` handle over the seam; none of them is reachable
+// from another platform's build.
+#[cfg(target_os = "macos")]
+pub mod macos;
+#[cfg(windows)]
+pub mod windows;
+#[cfg(target_os = "linux")]
+pub mod x11;
+
 pub use backend::{Capabilities, InputBackend, Monitor, Problem};
 pub use orchestrator::{Outcome, SERVED_METHODS, run, supervised};
 pub use store::Store;
