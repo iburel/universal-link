@@ -477,7 +477,17 @@ pub const MAX_PEER_FRAME: usize = 1024;
 /// network) into a bare [`crate::RequestError::Timeout`], which is a lie about
 /// whose fault it is. `doc/core-api.md` ("`peers.channel`: a live pipe, for a
 /// flow") states the duty; this constant is that duty in code.
-pub const PEER_CHANNEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
+///
+/// **Thirty seconds, not twenty-five, and the five are the point.** The Core's
+/// two budgets are SEQUENTIAL: a dial that completes at 14.9 s inside its 15 s,
+/// then an exchange that runs its full 10 s because the far end never answers,
+/// puts the honest `DEVICE_OFFLINE` at about 24.9 s, plus resolving the peer,
+/// superseding the pair, minting the token and two IPC hops. A 25 s timer started
+/// before the request was even written always fires first in that combination, so
+/// the exact sum is the one value that guarantees the lie it was chosen to
+/// prevent. 15 plus 10 is the floor; this is the floor plus room for the work
+/// around it.
+pub const PEER_CHANNEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Frames buffered between a peer channel's reader task and
 /// [`PeerChannel::recv`].
@@ -575,6 +585,13 @@ pub struct PeerChannel {
     writer: Box<dyn AsyncWrite + Send + Unpin>,
     frames: mpsc::Receiver<std::io::Result<Vec<u8>>>,
     reader: tokio::task::JoinHandle<()>,
+    /// The pipe's grammar can no longer be trusted, so nothing more is written
+    /// into it. Set by a [`PeerChannel::send`] whose future was dropped mid-write
+    /// (which may have left half a frame behind) and by a
+    /// [`PeerChannel::recv`] that saw the pipe end or fail. Never cleared: a
+    /// framed pipe with an unknown amount of a frame in it has no way back, and
+    /// the caller's remedy is a fresh channel.
+    torn: bool,
 }
 
 impl Drop for PeerChannel {
@@ -610,6 +627,7 @@ impl PeerChannel {
             writer: Box::new(writer),
             frames,
             reader,
+            torn: false,
         })
     }
 
@@ -618,13 +636,36 @@ impl PeerChannel {
     ///
     /// Above [`MAX_PEER_FRAME`] the frame is refused without being written
     /// ([`PeerSendError::TooLarge`]) and the channel stays usable.
+    ///
+    /// **This future must be driven to completion.** It is NOT cancel-safe, and
+    /// it cannot be made so: `write_all` loops on `poll_write`, so a socket that
+    /// has filled (which is exactly what the backpressure this primitive is
+    /// prized for looks like) takes a partial write, and a future dropped there
+    /// leaves half a frame in the pipe. The next frame's length prefix would then
+    /// be read as the tail of the abandoned body, and the Core would relay
+    /// garbage to the peer as a valid frame or cut the channel with
+    /// `FRAME_TOO_LARGE`.
+    ///
+    /// So a dropped `send` POISONS this channel: the tear is recorded and every
+    /// later `send` fails at once with [`PeerSendError::Io`] rather than writing
+    /// behind it. A caller that races a `send` in a `select!` loses the channel,
+    /// which is a great deal better than losing the pipe's grammar, and the
+    /// remedy is not to race it: put the writing end in one task that owns it.
     pub async fn send(&mut self, bytes: &[u8]) -> Result<(), PeerSendError> {
         if bytes.len() > MAX_PEER_FRAME {
             return Err(PeerSendError::TooLarge { len: bytes.len() });
         }
-        write_peer_frame(&mut self.writer, bytes)
-            .await
-            .map_err(PeerSendError::Io)
+        if self.torn {
+            return Err(PeerSendError::Io(invalid(
+                "this peer channel was left with half a frame in it by a dropped send",
+            )));
+        }
+        // Set BEFORE the write and cleared only when it has completed: if this
+        // future is dropped anywhere in between, the flag stays and says so.
+        self.torn = true;
+        let out = write_peer_frame(&mut self.writer, bytes).await;
+        self.torn = false;
+        out.map_err(PeerSendError::Io)
     }
 
     /// The next frame. `None` = the pipe ENDED (cleanly or not: the reason is on
@@ -633,8 +674,18 @@ impl PeerChannel {
     /// above the cap, which is a Core or a peer not speaking this primitive.
     ///
     /// Cancel-safe: a `recv` dropped in a lost `select!` race loses no frame.
+    ///
+    /// Either of those two ends the channel for writing as well. Nothing else
+    /// could be true: the reader owns the read half, and once it is gone the
+    /// socket is a place to write into that nobody will ever answer from. Without
+    /// this a write-only component (the driving side of a session sends and never
+    /// receives) would keep getting `Ok` from a pipe that had already failed.
     pub async fn recv(&mut self) -> Option<Result<Vec<u8>, std::io::Error>> {
-        self.frames.recv().await
+        let frame = self.frames.recv().await;
+        if !matches!(frame, Some(Ok(_))) {
+            self.torn = true;
+        }
+        frame
     }
 }
 
@@ -663,9 +714,13 @@ async fn peer_read_loop<R: tokio::io::AsyncBufRead + Unpin>(
 }
 
 /// `[u32 BE length][exactly that many bytes]`, one buffer and one `write_all`.
-/// The Core writes the two halves separately (measured as free in #123), but on
-/// this side a single write is what keeps a cancellation from tearing a frame in
-/// two: the length and the body always go out together or not at all.
+/// The Core writes the two halves separately (measured as free in #123); one
+/// buffer here means the kernel is handed the whole frame at once, so an ordinary
+/// completed write cannot interleave with anything.
+///
+/// It does NOT make the write cancel-safe: `write_all` loops on `poll_write` and
+/// a full socket takes a partial write. That is what
+/// [`PeerChannel::send`]'s poison flag is for.
 async fn write_peer_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     bytes: &[u8],
@@ -680,14 +735,27 @@ async fn write_peer_frame<W: AsyncWrite + Unpin>(
 
 /// `Ok(None)` = the pipe ended. Bounds the announced length against the cap
 /// BEFORE allocating: the Core is semi-trusted, and the far end is a peer.
+///
+/// **Every read error is the pipe ending**, and enumerating error kinds here
+/// would be a bug waiting for a platform. On this type they all carry the same
+/// amount of information: none. What ended the channel is a
+/// `peer.channel_closed` reason on the control plane, and a caller that reads it
+/// there is told the same thing whichever error the socket happened to produce. A
+/// closed Unix socket reads as `UnexpectedEof`, or as `ConnectionReset` when it
+/// was reset; a closed Windows named pipe as `BrokenPipe`, and sometimes as
+/// `ERROR_PIPE_NOT_CONNECTED`, which maps to no `ErrorKind` at all. A list of
+/// three kinds would have called that last one a protocol failure and reported "a
+/// Core not speaking this primitive" for a perfectly ordinary end.
+///
+/// The one failure this side raises ITSELF, a frame announced above the cap, is
+/// therefore the ONLY `Err` this function can return, which is exactly the one
+/// thing a caller can act on.
 async fn read_peer_frame<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
 ) -> std::io::Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
-    match reader.read_exact(&mut len_buf).await {
-        Ok(_) => {}
-        Err(e) if is_end_of_pipe(&e) => return Ok(None),
-        Err(e) => return Err(e),
+    if reader.read_exact(&mut len_buf).await.is_err() {
+        return Ok(None);
     }
     let len = u32::from_be_bytes(len_buf) as usize;
     // A zero length is a legal frame (the keepalive); above the cap is not a
@@ -696,30 +764,13 @@ async fn read_peer_frame<R: tokio::io::AsyncRead + Unpin>(
         return Err(invalid("peer-channel frame above the cap"));
     }
     let mut frame = vec![0u8; len];
-    match reader.read_exact(&mut frame).await {
-        Ok(_) => Ok(Some(frame)),
-        // An end of stream in the MIDDLE of a frame is a close, not a violation:
-        // the length and the body are two writes on the Core's side, so a
-        // channel cut between them legitimately looks exactly like this.
-        Err(e) if is_end_of_pipe(&e) => Ok(None),
-        Err(e) => Err(e),
+    // An end in the MIDDLE of a frame is a close, not a violation: the length and
+    // the body are two writes on the Core's side, so a channel cut between them
+    // legitimately looks exactly like this.
+    if reader.read_exact(&mut frame).await.is_err() {
+        return Ok(None);
     }
-}
-
-/// Does this read error mean "the pipe ended" rather than "something failed"? A
-/// closed Unix socket reads as `UnexpectedEof` (or `ConnectionReset` when it was
-/// reset), a closed Windows named pipe as `BrokenPipe`. The three collapse
-/// because on this type they carry the same amount of information: none. What
-/// ended the channel is a `peer.channel_closed` reason on the control plane, and
-/// a caller that reads it there is told the same thing whichever of these the
-/// socket happened to produce.
-fn is_end_of_pipe(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::UnexpectedEof
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::BrokenPipe
-    )
+    Ok(Some(frame))
 }
 
 fn invalid(what: &str) -> std::io::Error {

@@ -40,12 +40,12 @@ async fn the_facade_forwards_a_gesture_and_relays_the_reply() {
 
     let ask = ui.request(
         "input.take",
-        json!({ "device_id": "d_far", "mode": "screen" }),
+        json!({ "device_id": "d_far", "mode": "keys" }),
     );
     let serve = async {
         // The params cross untouched: the Core adds nothing and drops nothing.
         let (id, params) = eng.expect_request("input.take").await;
-        assert_eq!(params, json!({ "device_id": "d_far", "mode": "screen" }));
+        assert_eq!(params, json!({ "device_id": "d_far", "mode": "keys" }));
         eng.respond(id, json!({ "driving": "d_far" })).await;
     };
     let (reply, ()) = tokio::join!(ask, serve);
@@ -287,10 +287,31 @@ async fn input_emit_is_the_engines_privilege_and_checks_its_shape() {
     let core = TestCore::start().await;
     let mut eng = engine(&core).await;
 
-    // An interface holding every facade scope still cannot publish the topic:
-    // it could otherwise fabricate a crossing or a refusal nobody made.
+    // An interface holding both facade scopes cannot publish the topic: it could
+    // otherwise fabricate a crossing or a refusal nobody made.
     let mut ui = interface(&core).await;
     let err = ui
+        .request(
+            "input.emit",
+            json!({ "method": "input.updated", "params": {} }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.app_code(), "SCOPE_DENIED");
+
+    // And neither can a component holding `input.serve` ITSELF under another
+    // role. That is the half of the guard the scope check alone cannot cover:
+    // without the role conjunct this call would succeed, and "a connection
+    // missing either is not the engine, whatever its name" would be prose with
+    // nothing behind it.
+    let mut impostor = spawn_component(
+        &core,
+        "impostor",
+        "custom",
+        &["input.serve", "input.read", "input.manage"],
+    )
+    .await;
+    let err = impostor
         .request(
             "input.emit",
             json!({ "method": "input.updated", "params": {} }),

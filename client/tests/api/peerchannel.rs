@@ -44,17 +44,21 @@ const MANAGER_SCOPES: &[&str] = &["session.manage", "session.read"];
 /// Two Cores of one account, each with a `custom`-role channeller that already
 /// sees the other as reachable. `custom` because it is the role a third-party
 /// engine gets, and one the Core does not treat as exclusive.
+/// Field order is the DROP order, and it matters here: every client goes before
+/// its Core, so a client never starts a reconnection loop against a socket whose
+/// temp directory is already being deleted. The other way round each test's
+/// teardown spends its last moments hammering a dead path.
 struct Pair {
-    a: TestCore,
     ca: Client,
     ea: Events,
-    b: TestCore,
     /// The far end's client. HELD and never spoken to: it is what makes B a
     /// device where the role and the scope are present, and no channel outlives
     /// it (the grant is bound to that control connection, so dropping it is a
     /// `PEER_GONE`). Underscored because holding it is its whole job.
     _cb: Client,
     eb: Events,
+    a: TestCore,
+    b: TestCore,
 }
 
 impl Pair {
@@ -416,6 +420,16 @@ async fn a_peer_core_stopping_is_surfaced_as_peer_gone() {
         closed_reason(&mut pair.ea, CONVERGENCE_TIMEOUT).await,
         "PEER_GONE",
         "a peer whose Core stopped is worded PEER_GONE, not left as a mute pipe"
+    );
+
+    // And the pipe is dead for WRITING too, which is not obvious: only the read
+    // half is owned by the reader task, so without saying so a component that
+    // sends and never receives (the driving side of an input session is exactly
+    // that) would keep being told `Ok` by a socket nobody will ever answer from.
+    let sent = near.send(b"into a pipe with nobody at the far end").await;
+    assert!(
+        matches!(sent, Err(PeerSendError::Io(_))),
+        "a channel whose pipe has ended refuses to be written to, got {sent:?}"
     );
 }
 

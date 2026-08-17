@@ -407,6 +407,11 @@ fn stage_core_copy(src: &Path, data_home: &Path) -> std::io::Result<PathBuf> {
 /// supervisor won't find them once we run from the copy. This list grows as
 /// components are added; nothing cross-checks it against `official_components`, and
 /// a sidecar missing from it is simply never launched on a real Linux install.
+///
+/// The guard test below catches a name being DELETED from this list and nothing
+/// else: `gui` does not depend on `onedevice-daemon`, even for tests, so there is
+/// no mechanical way to notice a component added to `official_components` and
+/// forgotten here. That one stays a human duty.
 #[cfg(target_os = "linux")]
 const STAGED_SIDECARS: &[&str] = &[
     "1device-tray",

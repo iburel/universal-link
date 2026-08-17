@@ -1031,8 +1031,10 @@ published BY the engine through `input.emit { method, params }`, gated exactly
 like `sync.emit` (the `input-backend` role AND `input.serve`, a `method` that
 is an `input.*` name other than `input.emit`, `params` an object), and relayed
 verbatim. Two of them: `input.updated { state }` when anything in the snapshot
-changes, and `input.refused { device_id, code, count }` when this computer
-turns a driver away. Their vocabulary, like the methods', is frozen in
+changes, and `input.refused { device_id, code, count }` for a refusal that is a
+sentence rather than a state, whichever direction it came from (a driver turned
+away here, or something the far machine would not let us type). Their
+vocabulary, like the methods', is frozen in
 [input-sharing.md](input-sharing.md), section 12.
 
 ## `components.*`

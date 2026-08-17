@@ -69,14 +69,18 @@ const SCOPES: Record<string, string> = {
   "sync.serve": "Act as the folder-sync engine",
   "sync.read": "Read the synced folders and their state",
   "sync.manage": "Create synced folders, invite devices, resolve conflicts",
-  // The keyboard and mouse engine's three. `input.serve` is what makes a
-  // component THE engine (it captures this machine's keyboard and mouse, and
-  // types on it for another computer); `input.manage` hands another computer the
-  // right to drive this one, which is the strongest of the three and has to say
-  // so in the prompt.
-  "input.serve": "Act as the keyboard and mouse engine",
+  // The keyboard and mouse engine's three, and `input.serve` is the strongest
+  // right in the whole product: it is what makes a component THE engine, which
+  // means READING every keystroke on this machine and typing on it. "Act as the
+  // engine" would be a keylogger worded as a job title, and this prompt is the
+  // only place the user is ever told. `sync.serve`'s terseness is no precedent:
+  // folder sync does not read keystrokes.
+  "input.serve": "Read this computer's keyboard and mouse, and type on it",
   "input.read": "Read the screen layout and who may drive this computer",
-  "input.manage": "Arrange the screens, and allow or refuse a computer to drive this one",
+  // `input.manage` is both halves: it opens the door on this machine, and it
+  // takes control of another one.
+  "input.manage":
+    "Arrange the screens, allow or refuse a computer to drive this one, and take control of another",
   "system.shutdown": "Stop 1Device",
   "components.approve": "Approve other components",
 };

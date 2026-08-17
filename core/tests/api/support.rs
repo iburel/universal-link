@@ -1912,8 +1912,21 @@ impl PeerPipe {
     }
 
     /// Asserts the channel ends (rather than a frame arriving).
+    ///
+    /// Its own budget, wider than [`RESPONSE_TIMEOUT`], and the difference is the
+    /// point rather than a fudge: everywhere else that constant bounds a reply the
+    /// Core OWES, so a slow one is a defect worth failing on. Here nothing is
+    /// owed. What is being waited for is a teardown becoming observable through
+    /// two schedulers (the Core's connection task noticing, and this process being
+    /// woken on the socket), which on a loaded runner is not a promise anybody
+    /// made about latency. Five seconds made this a flake at a few percent under
+    /// a full-workspace run, and the failure it produced was "still open", which
+    /// reads like a real leak and is not one.
     pub async fn expect_closed(&mut self) {
-        assert_eq!(self.recv().await, None, "the peer channel is still open");
+        let ended = timeout(DATA_CHANNEL_TIMEOUT, self.read_frame())
+            .await
+            .expect("the peer channel never ended");
+        assert_eq!(ended, None, "the peer channel is still open");
     }
 
     async fn read_frame(&mut self) -> Option<Vec<u8>> {
