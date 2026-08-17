@@ -171,9 +171,7 @@ const USAGE_VK: &[(u32, u16)] = &[
     (0x3A, 122), (0x3B, 120), (0x3C, 99), (0x3D, 118), (0x3E, 96), (0x3F, 97),
     (0x40, 98),  (0x41, 100), (0x42, 101), (0x43, 109), // F1 to F10
     (0x44, 103), (0x45, 111), // F11, F12
-    (0x47, 107), // Scroll Lock, which macOS calls F14
-    (0x48, 113), // Pause, which macOS calls F15
-    (0x49, 114), // Help, which is where Insert lives
+    (0x49, 114), // Insert, which is the Help key's position
     (0x4A, 115), // Home
     (0x4B, 116), // Page Up
     (0x4C, 117), // Forward Delete
@@ -197,7 +195,6 @@ const USAGE_VK: &[(u32, u16)] = &[
     (0x67, 81),  // keypad equals
     (0x68, 105), (0x69, 107), (0x6A, 113), (0x6B, 106), (0x6C, 64), (0x6D, 79),
     (0x6E, 80), (0x6F, 90), // F13 to F20
-    (0x75, 114), // Help
     (0x7F, 74),  // Mute
     (0x80, 72),  // Volume Up
     (0x81, 73),  // Volume Down
@@ -205,10 +202,7 @@ const USAGE_VK: &[(u32, u16)] = &[
     (0x87, 94),  // international 1, the JIS underscore
     (0x88, 104), // international 2, the JIS kana
     (0x89, 93),  // international 3, the JIS yen
-    (0x8A, 104), // international 4, which macOS folds into kana
     (0x8B, 102), // international 5, the JIS eisu
-    (0x90, 104), // language 1
-    (0x91, 102), // language 2
     (0xE0, 59),  // left Control
     (0xE1, 56),  // left Shift
     (0xE2, 58),  // left Option, which is the Alt key
@@ -219,13 +213,39 @@ const USAGE_VK: &[(u32, u16)] = &[
     (0xE7, 54),  // right Command
 ];
 
+/// The keys a Mac keyboard does not have, mapped to the key that sits where a PC
+/// keyboard would put them.
+///
+/// ONE DIRECTION ONLY (usage to keycode), and that is the whole point of it being a
+/// second table. An Apple extended keyboard has F13, F14 and F15 exactly where a PC
+/// keyboard has Print Screen, Scroll Lock and Pause, so a Print Screen arriving from
+/// another computer should press that key; but a key PRESSED on the Mac should be
+/// reported as the F13 that is printed on it, not as a Print Screen nobody can see.
+/// Putting these in [`USAGE_VK`] made the first match win and got that backwards. The
+/// Japanese folds and Help are here for the same reason: several HID usages land on one
+/// Mac key, and only one of them is what the key says.
+#[rustfmt::skip]
+const USAGE_VK_ALIAS: &[(u32, u16)] = &[
+    (0x46, 105), // Print Screen sits where an extended keyboard puts F13
+    (0x47, 107), // Scroll Lock, where F14 is
+    (0x48, 113), // Pause, where F15 is
+    (0x75, 114), // Help, which is the Insert key's position
+    (0x8A, 104), // international 4, which macOS folds onto the kana key
+    (0x90, 104), // language 1, the same
+    (0x91, 102), // language 2, onto the eisu key
+];
+
 /// The macOS virtual keycode a wire usage means.
 fn vk_of_usage(usage: u32) -> Option<u16> {
     if usage >> 16 != keys::PAGE_KEYBOARD {
         return None;
     }
     let id = usage & 0xFFFF;
-    USAGE_VK.iter().find(|(u, _)| *u == id).map(|(_, vk)| *vk)
+    USAGE_VK
+        .iter()
+        .chain(USAGE_VK_ALIAS)
+        .find(|(u, _)| *u == id)
+        .map(|(_, vk)| *vk)
 }
 
 /// The wire usage a virtual keycode means. The inverse of [`vk_of_usage`], first match
@@ -1856,7 +1876,11 @@ mod tests {
 
     #[test]
     fn the_usage_table_is_a_function_both_ways_except_where_it_says_so() {
-        let mut usages: Vec<u32> = USAGE_VK.iter().map(|(u, _)| *u).collect();
+        let mut usages: Vec<u32> = USAGE_VK
+            .iter()
+            .chain(USAGE_VK_ALIAS)
+            .map(|(u, _)| *u)
+            .collect();
         usages.sort_unstable();
         let before = usages.len();
         usages.dedup();
@@ -1865,36 +1889,62 @@ mod tests {
             let usage = keys::usage(keys::PAGE_KEYBOARD, *id);
             assert_eq!(vk_of_usage(usage), Some(*vk));
             let back = usage_of_vk(*vk).expect("every keycode names a usage");
-            // The keys several usages share, each named here so a NEW collision shows
-            // up as a failure rather than as a silent second meaning: the backslash and
-            // the non-US hash are one key, several Japanese usages fold onto the kana
-            // and eisu keys, Help is both Insert and Help, and macOS gives Scroll Lock
-            // and Pause the F14 and F15 positions.
-            let shared = [0x32, 0x8A, 0x90, 0x91, 0x69, 0x6A, 0x75];
-            if !shared.contains(id) {
+            // The one key two usages really do share: the backslash and the non-US hash
+            // are one key. Everything else that used to be here has moved to
+            // `USAGE_VK_ALIAS`, which is one directional precisely so that this holds.
+            if *id != 0x32 {
                 assert_eq!(back, usage, "usage {id:#04x} did not round trip");
             }
+        }
+        // The alias table is one directional: the usage presses the key, and the key
+        // reports what is printed on it rather than the alias.
+        for (id, vk) in USAGE_VK_ALIAS {
+            let usage = keys::usage(keys::PAGE_KEYBOARD, *id);
+            assert_eq!(vk_of_usage(usage), Some(*vk), "{id:#04x} presses its key");
+            assert_ne!(
+                usage_of_vk(*vk),
+                Some(usage),
+                "and {id:#04x} is not what that key reports"
+            );
         }
         assert_eq!(vk_of_usage(keys::usage(keys::PAGE_CONSUMER, 0xCD)), None);
     }
 
-    /// Every canonical name the dialect defines has a key on this platform, or the
-    /// interface would say a Mac cannot type Enter.
+    /// Every canonical name the dialect defines has a key on this platform, EXCEPT the
+    /// ones a Mac keyboard genuinely does not have, which are named here.
+    ///
+    /// The exception list is the point of the test: a Mac has no Application key and its
+    /// virtual keycodes stop at F20, so answering `None` for those is the truth and the
+    /// engine turns it into "that key does not exist on the other computer's keyboard".
+    /// A key going missing for any OTHER reason fails here.
     #[test]
-    fn every_named_key_of_the_dialect_has_a_keycode() {
+    fn every_named_key_of_the_dialect_has_a_keycode_or_is_a_key_a_mac_lacks() {
+        // The media keys are not virtual keycodes on a Mac at all: they travel as
+        // `NSSystemDefined` events, which this backend does not inject.
+        let absent = [
+            "Menu", // the Application key, which no Apple keyboard has ever had
+            "F21", "F22", "F23", "F24", // macOS stops at F20
+        ];
+        let mut missing: Vec<&str> = Vec::new();
         for (name, usage) in keys::NAMED {
             if usage >> 16 == keys::PAGE_CONSUMER {
-                // The media keys are not virtual keycodes on a Mac: they travel as
-                // `NSSystemDefined` events, which this backend does not inject. Said
-                // here rather than left to be discovered, and the engine's answer is
-                // `UNRESOLVED`, which is the truth.
+                assert!(
+                    vk_of_usage(*usage).is_none(),
+                    "{name} is a media key and has no virtual keycode"
+                );
                 continue;
             }
-            assert!(
-                vk_of_usage(*usage).is_some(),
-                "{name} ({usage:#x}) has no keycode on macOS"
-            );
+            if vk_of_usage(*usage).is_none() {
+                missing.push(name);
+            }
         }
+        missing.sort_unstable();
+        let mut expected = absent.to_vec();
+        expected.sort_unstable();
+        assert_eq!(
+            missing, expected,
+            "the keys a Mac has no key for are exactly the ones named here"
+        );
     }
 
     #[test]

@@ -1625,10 +1625,11 @@ a sentence rather than to something wrong:
   (truth 6), which the Unicode path covers.
 - **macOS**: the media keys are not virtual keycodes at all, they travel as
   `NSSystemDefined` events, so this backend does not inject them and the
-  engine reports `UNRESOLVED`. There are TWO grants and not one (Input
-  Monitoring for the tap, Accessibility for the injection), so a Mac can be a
-  target and not a source or the other way round, and both halves are
-  reported separately.
+  engine reports `UNRESOLVED`. Nor are the Application key (which no Apple
+  keyboard has ever had) or F21 to F24 (macOS stops at F20). And there are TWO
+  grants and not one (Input Monitoring for the tap, Accessibility for the
+  injection), so a Mac can be a target and not a source or the other way
+  round, and both halves are reported separately.
 
 ## 16. Settled decisions
 
