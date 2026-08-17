@@ -146,7 +146,9 @@ const TRUST_POLL: Duration = Duration::from_millis(500);
 pub(crate) mod reason {
     /// The local component closed its end (or its process died).
     pub(crate) const CLOSED: &str = "CLOSED";
-    /// A newer channel on the same (role, device) pair took its place.
+    /// The offer or the channel is no longer this component's: a newer channel
+    /// on the same (role, device) pair took its place, or a sibling of the same
+    /// role took the offer this one came for (or that offer expired first).
     pub(crate) const REPLACED: &str = "REPLACED";
     /// The far end ended the stream: its component left, its Core stopped, it
     /// struck this device off, or the path broke.
@@ -638,6 +640,18 @@ pub(crate) async fn recv(
         }
     }
     let Some(attached) = arrival else {
+        // One straggler is possible: a candidate whose attach landed in the
+        // instant the grace ran out, whose halves are sitting in a channel about
+        // to be dropped. The tokens are already reclaimed, so no other can
+        // arrive; this one is told rather than left to discover a connection
+        // that simply closed.
+        if let Ok(late) = arrivals.try_recv() {
+            state.registry.lock().expect("lock registry").notify_conn(
+                late.conn_id,
+                "peer.channel_closed",
+                &json!({ "device_id": device_id, "reason": reason::REPLACED }),
+            );
+        }
         let _ = answer(&mut stream, false).await;
         return;
     };

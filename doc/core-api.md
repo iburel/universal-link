@@ -676,8 +676,10 @@ on two devices, carrying OPAQUE bytes the Core interprets in no way.
   `peer.channel_closed { device_id, reason }` goes to the connection that
   owns the local end, and both ends always see a clean end of stream rather
   than a silent stall. The reasons: `CLOSED` (the local component closed its
-  end), `REPLACED`, `PEER_GONE` (the far end's stream ended: its component
-  left, its Core stopped, it struck this device off, or the path broke),
+  end), `REPLACED` (a newer channel on the pair took its place, or the offer
+  this component came for went to a sibling of its role), `PEER_GONE` (the far
+  end's stream ended: its component left, its Core stopped, it struck this
+  device off, or the path broke),
   `DEVICE_REVOKED` (the peer is no longer an attested device of the account
   here: struck off, record gone, or an attestation that stopped verifying,
   the three collapsed fail-closed as they are behind `DEVICE_UNKNOWN`),
