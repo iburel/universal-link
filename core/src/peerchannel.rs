@@ -162,9 +162,10 @@ pub(crate) mod reason {
     pub(crate) const LOGGED_OUT: &str = "LOGGED_OUT";
     /// This device was struck off the account it was speaking for.
     pub(crate) const ACCOUNT_LEFT: &str = "ACCOUNT_LEFT";
-    /// The Core is stopping. Best-effort, and honestly so: the same teardown
-    /// closes the component's control connection, so this word usually loses
-    /// the race with the close that says the same thing.
+    /// The Core is stopping. Said BEFORE the teardown closes the component's
+    /// control connection ([`announce_stop`]), because a queue is drained only
+    /// up to its close: queued after it, this word would never be written at
+    /// all.
     pub(crate) const SHUTDOWN: &str = "SHUTDOWN";
     /// A frame above the 1 KiB cap, in either direction.
     pub(crate) const FRAME_TOO_LARGE: &str = "FRAME_TOO_LARGE";
@@ -184,7 +185,8 @@ pub(crate) mod reason {
 /// leaking pipes. The key ignores WHICH side opened, because the pipe is
 /// duplex and a second one in the other direction would carry nothing the
 /// first cannot: if both ends open at once, the later open wins on both devices
-/// and the earlier is closed with `REPLACED`.
+/// and the earlier is closed (`REPLACED` where the open happened, and the far
+/// end of it hears its stream end, which is all a closed stream can say).
 ///
 /// LEAF lock: taken alone, never across an await, never while holding
 /// `registry` or `session`.
