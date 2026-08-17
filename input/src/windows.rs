@@ -268,7 +268,13 @@ const USAGE_SCANCODE: &[(u32, u16)] = &[
     (0x44, 0x57), (0x45, 0x58), // F11, F12
     (0x46, 0xE037), // Print Screen
     (0x47, 0x46),   // Scroll Lock
-    (0x48, 0x45),   // Pause (the E1 1D 45 sequence collapses to this)
+    // Pause is NOT here, and Num Lock's 0x45 is why. Measured on a real host:
+    // `MapVirtualKeyExW(0x45, MAPVK_VSC_TO_VK_EX)` is `VK_NUMLOCK`, and
+    // `MapVirtualKeyExW(VK_PAUSE, MAPVK_VK_TO_VSC_EX)` is `0xE11D`, which is a PREFIX
+    // and not a scancode: Pause is the three byte sequence E1 1D 45 and no single
+    // `INPUT` with `KEYEVENTF_SCANCODE` can express it. So Pause travels by virtual key
+    // (see `USAGE_VK`) and 0x45 belongs to Num Lock alone, which is what keeps a
+    // captured Num Lock from being reported as a Pause.
     (0x49, 0xE052), // Insert
     (0x4A, 0xE047), // Home
     (0x4B, 0xE049), // Page Up
@@ -322,6 +328,9 @@ const USAGE_SCANCODE: &[(u32, u16)] = &[
 /// and what a layout cannot move, so [`USAGE_SCANCODE`] leads and this fills in.
 #[rustfmt::skip]
 const USAGE_VK: &[(u32, u16)] = &[
+    // Pause, whose scancode is a three byte sequence no single `INPUT` can carry (see
+    // the note in `USAGE_SCANCODE`).
+    (keys::usage(keys::PAGE_KEYBOARD, 0x48), 0x13), // VK_PAUSE
     (keys::usage(keys::PAGE_CONSUMER, 0xB5), 0xB0), // VK_MEDIA_NEXT_TRACK
     (keys::usage(keys::PAGE_CONSUMER, 0xB6), 0xB1), // VK_MEDIA_PREV_TRACK
     (keys::usage(keys::PAGE_CONSUMER, 0xB7), 0xB2), // VK_MEDIA_STOP
@@ -329,6 +338,17 @@ const USAGE_VK: &[(u32, u16)] = &[
     (keys::usage(keys::PAGE_CONSUMER, 0xE2), 0xAD), // VK_VOLUME_MUTE
     (keys::usage(keys::PAGE_CONSUMER, 0xE9), 0xAF), // VK_VOLUME_UP
     (keys::usage(keys::PAGE_CONSUMER, 0xEA), 0xAE), // VK_VOLUME_DOWN
+];
+
+/// The usages whose VIRTUAL KEY is the truth and whose scancode is not.
+///
+/// Two keys share scancode 0x45 as far as a captured event is concerned (Pause is the
+/// sequence E1 1D 45 and Windows reports its tail), so a hook that read the scancode
+/// alone would report one of them as the other. The virtual key tells them apart, and
+/// it is already in the event, so it is consulted first for exactly these two.
+const AMBIGUOUS_VK: &[(u16, u32)] = &[
+    (0x13, keys::usage(keys::PAGE_KEYBOARD, 0x48)), // VK_PAUSE
+    (0x90, keys::usage(keys::PAGE_KEYBOARD, 0x53)), // VK_NUMLOCK
 ];
 
 /// The scancode (with its `0xE0` prefix, if any) for a keyboard-page usage.
@@ -850,7 +870,14 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
                     mods &= !bit;
                 }
             }
-            let usage = usage_of_scancode(scancode).unwrap_or(0);
+            // The virtual key first for the two keys whose scancode is shared, then the
+            // scancode, which is what a layout cannot move and what a game reads.
+            let usage = AMBIGUOUS_VK
+                .iter()
+                .find(|(v, _)| *v == vk)
+                .map(|(_, usage)| *usage)
+                .or_else(|| usage_of_scancode(scancode))
+                .unwrap_or(0);
             let is_lock = usage != 0 && keys::is_lock(usage);
             if is_lock && down {
                 // A lock toggles on the press. Tracked rather than read back, for the
@@ -1359,7 +1386,10 @@ fn mouse_input(dx: i32, dy: i32, data: u32, flags: u32) -> INPUT {
 /// [`PlatformKey::detail`] becomes [`KEYEVENTF_EXTENDEDKEY`].
 fn key_input(code: PlatformKey, down: bool) -> INPUT {
     let scancode = (code.detail & 0xFF) as u16;
-    let extended = code.detail & 0xFF00 != 0;
+    // Only 0xE0 is the extended prefix. Anything else in the high byte is not a single
+    // scancode at all and `canonical_key` has already zeroed it, so this is the second
+    // half of the same rule.
+    let extended = code.detail >> 8 == 0xE0;
     let mut flags = 0u32;
     if !down {
         flags |= KEYEVENTF_KEYUP;
@@ -1523,9 +1553,14 @@ fn canonical_key(
 ) -> PlatformKey {
     // SAFETY: a virtual key and a layout handle.
     let scancode = unsafe { MapVirtualKeyExW(u32::from(vk), MAPVK_VK_TO_VSC_EX, layout) };
+    // A high byte that is not 0xE0 is not a prefix a single `INPUT` can carry: `VK_PAUSE`
+    // answers 0xE11D here, and injecting 0x1D as an extended key would press the RIGHT
+    // CONTROL instead. A zero detail is the signal to inject by virtual key, which is
+    // exactly what such a key needs.
+    let usable = matches!(scancode >> 8, 0 | 0xE0);
     PlatformKey {
         code: u32::from(vk),
-        detail: scancode,
+        detail: if usable { scancode } else { 0 },
     }
 }
 
@@ -2214,9 +2249,34 @@ mod tests {
         collisions.sort_unstable();
         assert_eq!(
             collisions,
-            vec![0x2B, 0x45],
-            "the only two keys that share a scancode are the backslash with the \
-             non-US hash, and Pause with Num Lock"
+            vec![0x2B],
+            "the only two usages that share a scancode are the backslash and the non-US \
+             hash, which really are one key"
+        );
+        // Pause is deliberately absent, and Num Lock has 0x45 to itself: the two shared
+        // it until a real host said `MapVirtualKeyExW(0x45)` means Num Lock and
+        // `VK_PAUSE` means the prefix 0xE11D, which is not a scancode.
+        assert_eq!(scancode_of(keys::usage(keys::PAGE_KEYBOARD, 0x48)), None);
+        assert_eq!(
+            usage_of_scancode(0x45),
+            Some(keys::usage(keys::PAGE_KEYBOARD, 0x53)),
+            "0x45 is Num Lock and nothing else"
+        );
+        assert!(
+            USAGE_VK
+                .iter()
+                .any(|(u, vk)| *u == keys::usage(keys::PAGE_KEYBOARD, 0x48) && *vk == 0x13),
+            "so Pause travels by virtual key"
+        );
+        // And the two keys a captured event tells apart by virtual key are exactly those.
+        let mut ambiguous: Vec<u32> = AMBIGUOUS_VK.iter().map(|(_, u)| *u).collect();
+        ambiguous.sort_unstable();
+        assert_eq!(
+            ambiguous,
+            vec![
+                keys::usage(keys::PAGE_KEYBOARD, 0x48),
+                keys::usage(keys::PAGE_KEYBOARD, 0x53)
+            ]
         );
     }
 
@@ -2249,7 +2309,7 @@ mod tests {
         for (usage, scancode) in USAGE_SCANCODE {
             let wire = keys::usage(keys::PAGE_KEYBOARD, *usage);
             let back = usage_of_scancode(*scancode).expect("the table is complete both ways");
-            if *scancode != 0x2B && *scancode != 0x45 {
+            if *scancode != 0x2B {
                 assert_eq!(back, wire, "{scancode:#x} did not round trip");
             }
         }
@@ -2362,7 +2422,7 @@ mod tests {
             (0x50, 0x25), // Left
             (0x51, 0x28), // Down
             (0x52, 0x26), // Up
-            (0x53, 0x90), // Num Lock, VK_NUMLOCK
+            (0x53, 0x90), // Num Lock, VK_NUMLOCK, which owns 0x45 alone
             (0x54, 0x6F), // keypad slash, VK_DIVIDE
             (0x55, 0x6A), // keypad asterisk, VK_MULTIPLY
             (0x56, 0x6D), // keypad minus, VK_SUBTRACT
@@ -2410,6 +2470,29 @@ mod tests {
                  virtual key {vk:#04x} and the table says means {want_vk:#04x}"
             );
         }
+    }
+
+    /// A key whose scancode is a multi byte sequence resolves to a virtual key with NO
+    /// scancode, so it is injected by virtual key instead of as the tail of its own
+    /// prefix.
+    ///
+    /// Pause is the case: `MapVirtualKeyExW(VK_PAUSE, MAPVK_VK_TO_VSC_EX)` answers
+    /// 0xE11D, and injecting 0x1D as an extended key would press the right Control.
+    #[test]
+    fn a_key_with_no_single_scancode_is_injected_by_its_virtual_key() {
+        // SAFETY: the calling thread's layout.
+        let layout = unsafe { GetKeyboardLayout(0) };
+        let pause = platform_key(keys::usage(keys::PAGE_KEYBOARD, 0x48), layout)
+            .expect("Pause has a virtual key");
+        assert_eq!(pause.code, 0x13, "and it is VK_PAUSE");
+        assert_eq!(
+            pause.detail, 0,
+            "with no scancode, so `key_input` uses the virtual key path"
+        );
+        // Num Lock, by contrast, has a real one.
+        let numlock = platform_key(keys::usage(keys::PAGE_KEYBOARD, 0x53), layout)
+            .expect("Num Lock has a scancode");
+        assert_eq!(numlock.detail, 0x45);
     }
 
     /// The other direction, on the real OS: the virtual key a modifier resolves to
