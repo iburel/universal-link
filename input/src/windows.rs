@@ -91,7 +91,7 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -125,19 +125,20 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE,
     MAPVK_VK_TO_VSC_EX, MAPVK_VSC_TO_VK_EX, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
     MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
-    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
-    MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyExW, SendInput,
-    ToUnicodeEx, VK_CAPITAL, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU,
-    VK_NUMLOCK, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SCROLL, VK_SHIFT, VkKeyScanExW,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_MOVE_NOCOALESCE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+    MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
+    MapVirtualKeyExW, SendInput, ToUnicodeEx, VK_CAPITAL, VK_CONTROL, VK_LCONTROL, VK_LMENU,
+    VK_LSHIFT, VK_LWIN, VK_MENU, VK_NUMLOCK, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SCROLL,
+    VK_SHIFT, VkKeyScanExW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, ClipCursor, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GWLP_USERDATA, GetClipCursor, GetCursorPos, GetForegroundWindow, GetSystemMetrics,
     GetWindowLongPtrW, GetWindowThreadProcessId, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_UP,
     MSG, MSLLHOOKSTRUCT, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_REMOVE, PeekMessageW,
-    PostMessageW, QS_ALLINPUT, RegisterClassW, SM_CMONITORS, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetCursorPos, SetWindowLongPtrW,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP,
+    PostMessageW, QS_ALLINPUT, RegisterClassW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetCursorPos, SetWindowLongPtrW, SetWindowsHookExW,
+    TranslateMessage, UnhookWindowsHookEx, UnregisterClassW, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP,
     WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
     WNDCLASSW, XBUTTON1,
@@ -176,15 +177,13 @@ const BACKEND_EVENT_CAPACITY: usize = 256;
 /// cannot cover.
 const MARKER: usize = 0x3144_3235;
 
-/// `SECURITY_MANDATORY_HIGH_RID`, documented by the API. The typed constant lives
-/// behind the `Win32_System_SystemServices` feature; hard-coding the one integer we
-/// compare against avoids pulling that whole module in for it, which is the
-/// precedent `clipboard/src/windows.rs` set for the `CF_*` ids.
-const SECURITY_MANDATORY_HIGH_RID: u32 = 0x3000;
-
 /// `HC_ACTION`, the hook code that means "this is a real event". Hard-coded for the
 /// same reason as above.
 const HC_ACTION: i32 = 0;
+
+/// `ERROR_ACCESS_DENIED`, which is the one denial that proves a window is out of reach
+/// (see [`refusal_for`]). Hard-coded for the same reason as above.
+const ERROR_ACCESS_DENIED: u32 = 5;
 
 /// `MONITORINFOF_PRIMARY`, the one flag `MONITORINFO::dwFlags` can carry. Not
 /// exported by `windows-sys` 0.61 under any of the features this crate enables, and
@@ -379,24 +378,6 @@ fn usage_of_scancode(scancode: u16) -> Option<u32> {
         .map(|(u, _)| keys::usage(keys::PAGE_KEYBOARD, *u))
 }
 
-/// The canonical modifier bit a virtual key means, for the state this backend keeps
-/// while it swallows.
-///
-/// It has to keep its own: a swallowed key never reaches the OS's keyboard state, so
-/// `GetAsyncKeyState` would report a Shift the user is holding as up, and every
-/// symbol read off the layout would come out lower case.
-fn mod_of_vk(vk: u16) -> Option<u16> {
-    match vk {
-        v if v == VK_LSHIFT || v == VK_RSHIFT || v == VK_SHIFT => Some(keys::mods::SHIFT),
-        v if v == VK_LCONTROL || v == VK_CONTROL => Some(keys::mods::CTRL),
-        v if v == VK_RCONTROL => Some(keys::mods::CTRL),
-        v if v == VK_LMENU || v == VK_MENU => Some(keys::mods::ALT),
-        v if v == VK_RMENU => Some(keys::mods::ALTGR),
-        v if v == VK_LWIN || v == VK_RWIN => Some(keys::mods::META),
-        _ => None,
-    }
-}
-
 // -------------------------------------------------------------- the commands
 
 /// A downcall that has to happen on the pump thread. There are only two: see the
@@ -425,14 +406,39 @@ struct Shared {
     /// [`MODE_OFF`], [`MODE_WATCH`] or [`MODE_SWALLOW`].
     mode: AtomicU8,
     events_tx: mpsc::Sender<BackendEvent>,
-    /// Where the pointer is pinned while confined, and whether it is.
-    anchor_x: AtomicI32,
-    anchor_y: AtomicI32,
+    /// Where the pointer is pinned while confined, packed into one value, and whether it
+    /// is.
+    ///
+    /// ONE atomic for the pair, so a callback that has seen `confined` cannot then read
+    /// half of one anchor and half of another. Two independent `Relaxed` loads happen to
+    /// be ordered on x86 and are not on ARM64, which Windows also runs on, and the failure
+    /// there is a pointer put back on the wrong monitor.
+    anchor: AtomicU64,
     confined: AtomicBool,
-    /// The canonical modifier bits, tracked from the hook's own stream because a
-    /// swallowed modifier never reaches the OS state (see [`mod_of_vk`]). The three
-    /// lock bits live in here too.
-    mods: AtomicU32,
+    /// The warp this backend asked for and has not yet seen arrive, packed the same way,
+    /// or [`NO_WARP`].
+    ///
+    /// The hook needs it because a move this backend made is not a hand on the mouse, and
+    /// it cannot be told by the `dwExtraInfo` marker (`SetCursorPos` carries none). It is
+    /// told by its POSITION instead, which is exact and needs no marker. What that
+    /// prevents: the engine tears a session down by lifting the pin and then warping the
+    /// pointer home, in that order, and `apply_capture` runs AFTER both, so the mode is
+    /// still Swallow when the warp happens. Without this the hook would either swallow the
+    /// warp (the pointer never comes home) or report it as a hand travelling the whole
+    /// distance back to the edge it just left (the keyboard leaves again seconds after its
+    /// owner asked for it back).
+    warp: AtomicU64,
+    /// Which modifier KEYS are down, one bit per virtual key rather than one per canonical
+    /// modifier (see [`MOD_VKS`]).
+    ///
+    /// Per key, because a person holding both Shifts and letting one go would otherwise
+    /// clear the SHIFT bit while the other is still down, and every symbol read off the
+    /// layout afterwards comes out lower case while a Shift is visibly held. Tracked here
+    /// at all because a swallowed modifier never reaches the OS's own state.
+    mod_keys: AtomicU32,
+    /// The three lock STATES, which are toggles rather than keys and cannot live in the set
+    /// above.
+    locks: AtomicU32,
     /// Wheel movement below one notch, kept so a high resolution wheel is not
     /// rounded to nothing event after event.
     wheel_x: AtomicI32,
@@ -451,9 +457,9 @@ struct Shared {
     /// the life of the process, and a process nobody is talking to that swallows every
     /// keystroke is exactly the dead keyboard this component exists to avoid.
     engine_gone: AtomicBool,
-    /// The layout the last resolution used, as an identity string. Owned by the
-    /// pump, read by nobody else, and here rather than on [`Backend`] so
-    /// [`Shared::emit`] is the only way an upcall leaves this file.
+    /// Upcalls a full queue turned away since the pump last said so. Counted here and
+    /// reported from the pump, because saying it in the hook would mean writing to a pipe
+    /// from a callback that must not block (see [`Shared::emit`]).
     dropped: AtomicU32,
 }
 
@@ -469,10 +475,13 @@ impl Shared {
                 self.engine_gone.store(true, Ordering::Relaxed);
             }
             Err(TrySendError::Full(_)) => {
-                let n = self.dropped.fetch_add(1, Ordering::Relaxed);
-                if n.is_multiple_of(128) {
-                    warn("the engine is not draining input events; dropping some");
-                }
+                // COUNTED and not said, because this runs inside a hook callback: an
+                // `eprintln!` takes the stderr lock and writes to a pipe, and a pipe nobody
+                // is draining blocks. A blocked callback is exactly the
+                // `LowLevelHooksTimeout` that has Windows remove the hook, which is the one
+                // failure this structure's atomics-only rule exists to avoid. The pump says
+                // it instead, on its own thread (see [`Backend::periodic`]).
+                self.dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -481,10 +490,91 @@ impl Shared {
         self.mode.load(Ordering::Relaxed)
     }
 
+    /// The canonical modifier bits: the keys that are down, plus the lock states.
     fn mods(&self) -> u16 {
-        self.mods.load(Ordering::Relaxed) as u16
+        let keys = self.mod_keys.load(Ordering::Relaxed);
+        let mut bits = 0u16;
+        for (index, (_, bit)) in MOD_VKS.iter().enumerate() {
+            if keys & (1 << index) != 0 {
+                bits |= bit;
+            }
+        }
+        bits | self.locks.load(Ordering::Relaxed) as u16
+    }
+
+    /// Records a modifier key going down or coming up, and answers with the canonical bits
+    /// after the change.
+    fn track_mod_key(&self, vk: u16, down: bool) -> u16 {
+        if let Some(index) = MOD_VKS.iter().position(|(v, _)| *v == vk) {
+            let mask = 1u32 << index;
+            if down {
+                self.mod_keys.fetch_or(mask, Ordering::Relaxed);
+            } else {
+                self.mod_keys.fetch_and(!mask, Ordering::Relaxed);
+            }
+        }
+        self.mods()
+    }
+
+    /// Toggles a lock, and answers with the canonical bits after the change.
+    fn toggle_lock(&self, bit: u16, mods: u16) -> u16 {
+        let locks = (self.locks.load(Ordering::Relaxed) as u16) ^ bit;
+        self.locks.store(u32::from(locks), Ordering::Relaxed);
+        let all = keys::mods::CAPS | keys::mods::NUM | keys::mods::SCROLL;
+        (mods & !all) | locks
+    }
+
+    fn set_anchor(&self, at: Point) {
+        self.anchor.store(pack(at), Ordering::Relaxed);
+    }
+
+    fn anchor(&self) -> Point {
+        unpack(self.anchor.load(Ordering::Relaxed))
     }
 }
+
+/// Every modifier virtual key, with the canonical bit it means. The INDEX in this list is
+/// the bit position in [`Shared::mod_keys`].
+///
+/// Both hands of each pair, which is the point: one bit per key means letting go of one of
+/// two held Shifts does not clear a modifier the other is still holding. The right Alt
+/// means ALTGR and the right Control means CTRL, matching `keys::mod_of_usage` so a round
+/// trip through the two cannot lose a key.
+#[rustfmt::skip]
+const MOD_VKS: &[(u16, u16)] = &[
+    (VK_LSHIFT,   keys::mods::SHIFT),
+    (VK_RSHIFT,   keys::mods::SHIFT),
+    (VK_LCONTROL, keys::mods::CTRL),
+    (VK_RCONTROL, keys::mods::CTRL),
+    (VK_LMENU,    keys::mods::ALT),
+    (VK_RMENU,    keys::mods::ALTGR),
+    (VK_LWIN,     keys::mods::META),
+    (VK_RWIN,     keys::mods::META),
+];
+
+/// A position packed into one integer, so a pair can be read atomically.
+fn pack(at: Point) -> u64 {
+    ((at.x as u32 as u64) << 32) | at.y as u32 as u64
+}
+
+fn unpack(packed: u64) -> Point {
+    Point {
+        x: (packed >> 32) as u32 as i32,
+        y: packed as u32 as i32,
+    }
+}
+
+/// The value [`Shared::warp`] holds when this backend is not waiting for one. Not a
+/// position anything could ask for: both coordinates would have to be `i32::MIN`.
+const NO_WARP: u64 = 0x8000_0000_8000_0000;
+
+/// How far the pointer may drift from its anchor before it is put back.
+///
+/// Not zero, because a repair fires on every event when it is: a move can land a pixel off
+/// its target and a repair that fought that would put the pointer back for ever. A hundred
+/// pixels is far more than any accident and far less than the half monitor of room the
+/// anchor exists to leave (see [`centre`]).
+const DRIFT_SLACK: i32 = 100;
 
 thread_local! {
     /// The hooks' way back to [`Shared`].
@@ -694,7 +784,13 @@ unsafe fn token_integrity(process: HANDLE) -> Option<u32> {
         unsafe { CloseHandle(token) };
         return None;
     }
-    let mut buf = vec![0u8; needed as usize];
+    // A `Vec<u64>` and not a `Vec<u8>`, because the buffer is then cast to a
+    // `TOKEN_MANDATORY_LABEL` and dereferenced: that structure holds a pointer and needs
+    // eight byte alignment, which a byte vector only has by the allocator's kindness. The
+    // load is formally undefined otherwise, and it is the sort of thing that works until a
+    // compiler decides it does not.
+    let words = (needed as usize).div_ceil(8);
+    let mut buf = vec![0u64; words];
     let ok = unsafe {
         windows_sys::Win32::Security::GetTokenInformation(
             token,
@@ -757,17 +853,34 @@ fn refusal_for(desktop_ours: bool) -> Option<Refusal> {
         (hwnd, pid)
     };
     if hwnd.is_null() || pid == 0 {
-        // No foreground window at all is what the secure desktop looks like from
-        // here, and it is the honest reading: there is nothing on this desktop to
-        // type into.
-        return Some(Refusal::ScreenLocked);
+        // NOT a locked screen, and an earlier version said it was. `GetForegroundWindow`
+        // legitimately answers null on an unlocked desktop: while a window is losing
+        // activation, when the foreground window belongs to another desktop, and in the
+        // moment after the last window closes. Section 13's sentence for that code is
+        // "Nothing was typed: that computer is locked", and showing it to somebody whose
+        // machine is not locked is the kind of confident wrongness this feature is built to
+        // avoid. The desktop check above is the one that proves a lock.
+        return None;
     }
-    let ours = own_integrity().unwrap_or(SECURITY_MANDATORY_HIGH_RID);
+    // A guess UPWARD here would suppress a real detection (everything looks equal to a
+    // High integrity process), so an unreadable own token means this comparison cannot be
+    // made at all rather than that it is made against a guess.
+    let ours = own_integrity()?;
     match integrity_of(pid) {
         Some(level) if level > ours => Some(Refusal::ElevatedWindow),
-        // The denial is the evidence: see the doc comment.
-        None => Some(Refusal::ElevatedWindow),
         Some(_) => None,
+        None => {
+            // The denial IS the evidence, but only the right denial.
+            // `PROCESS_QUERY_LIMITED_INFORMATION` is granted to a process of equal or lower
+            // integrity and refused by a higher one, so `ERROR_ACCESS_DENIED` proves the
+            // window is out of reach. Anything else does not: `ERROR_INVALID_PARAMETER`
+            // means the process died between being named and being opened, which is a very
+            // live possibility when a crashing foreground application is WHY the injection
+            // came up short.
+            // SAFETY: reading the thread's last error.
+            let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            (err == ERROR_ACCESS_DENIED).then_some(Refusal::ElevatedWindow)
+        }
     }
 }
 
@@ -799,7 +912,11 @@ fn virtual_screen() -> RECT {
 /// through raw input.
 fn normalise(value: i32, origin: i32, span: i32) -> i32 {
     let span = span.max(2);
-    let offset = i64::from(value - origin).clamp(0, i64::from(span - 1));
+    // The subtraction in `i64`, not in `i32`: `value` comes off a peer's frame and `origin`
+    // is negative whenever a second monitor sits to the left, so `i32::MIN` minus a
+    // negative number overflows, which is a panic in a debug build and a pointer on the
+    // wrong edge in a release one.
+    let offset = (i64::from(value) - i64::from(origin)).clamp(0, i64::from(span - 1));
     let scaled = (offset * 65535 + i64::from(span - 1) / 2) / i64::from(span - 1);
     scaled.clamp(0, 65535) as i32
 }
@@ -860,16 +977,12 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
                 info.scanCode as u16 & 0xFF
             };
 
-            // The modifier state, kept here because a swallowed modifier never reaches
-            // the OS's own keyboard state.
-            let mut mods = shared.mods();
-            if let Some(bit) = mod_of_vk(vk) {
-                if down {
-                    mods |= bit;
-                } else {
-                    mods &= !bit;
-                }
-            }
+            // The modifier state, kept here because a swallowed modifier never reaches the
+            // OS's own keyboard state. Per KEY and not per canonical bit, so letting go of
+            // one of two held Shifts does not clear a modifier the other is still holding:
+            // that phantom un-Shift made every symbol read off the layout come out lower
+            // case while a Shift was visibly down.
+            let mut mods = shared.track_mod_key(vk, down);
             // The virtual key first for the two keys whose scancode is shared, then the
             // scancode, which is what a layout cannot move and what a game reads.
             let usage = AMBIGUOUS_VK
@@ -887,9 +1000,8 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
                     0x53 => keys::mods::NUM,
                     _ => keys::mods::SCROLL,
                 };
-                mods ^= bit;
+                mods = shared.toggle_lock(bit, mods);
             }
-            shared.mods.store(u32::from(mods), Ordering::Relaxed);
 
             // A half duplex lock reports only its press: a target that waited for the
             // release would hold the lock down for ever, and one that replayed the
@@ -928,6 +1040,10 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
 /// messages, so its own key state is whatever it was when the thread started. The
 /// `0x04` flag is what keeps the call from disturbing the kernel's dead key state,
 /// which a person composing an accent on this very machine would otherwise lose.
+///
+/// That flag arrived in Windows 10 1607 and is ignored before it, where the call does
+/// mutate the dead key state. Named here rather than guarded, because 1607 predates every
+/// version this project supports.
 fn symbol_for(vk: u16, scancode: u16, mods: u16) -> Option<String> {
     let layout = foreground_layout();
     let mut state = [0u8; 256];
@@ -1020,6 +1136,19 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
             let swallow = mode == MODE_SWALLOW;
             match wparam as u32 {
                 WM_MOUSEMOVE => {
+                    // Our own warp, recognised by where it was going. PASSED THROUGH rather
+                    // than swallowed (a swallowed warp is a pointer that never comes home)
+                    // and not reported (a reported one is a phantom delta the engine reads
+                    // as a hand). See `Shared::warp`.
+                    let armed = shared.warp.load(Ordering::Acquire);
+                    let at = Point {
+                        x: info.pt.x,
+                        y: info.pt.y,
+                    };
+                    if armed != NO_WARP && pack(at) == armed {
+                        shared.warp.store(NO_WARP, Ordering::Release);
+                        return false;
+                    }
                     // Truth 1: the cursor has NOT moved yet, so this subtraction is the
                     // accelerated delta of this one event. `at` is where the pointer
                     // actually is, which keeps it inside this machine's desktop even
@@ -1042,14 +1171,14 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
                     // (an injection by another tool, or a hook Windows dropped), because
                     // a swallowed move never reaches the cursor. So this is a no-op in
                     // the ordinary case and the repair in the case that matters.
-                    if shared.confined.load(Ordering::Relaxed) {
-                        let (ax, ay) = (
-                            shared.anchor_x.load(Ordering::Relaxed),
-                            shared.anchor_y.load(Ordering::Relaxed),
-                        );
-                        if cur.x != ax || cur.y != ay {
+                    if shared.confined.load(Ordering::Acquire) {
+                        let anchor = shared.anchor();
+                        let far = (cur.x - anchor.x).saturating_abs() > DRIFT_SLACK
+                            || (cur.y - anchor.y).saturating_abs() > DRIFT_SLACK;
+                        if far {
+                            shared.warp.store(pack(anchor), Ordering::Release);
                             // SAFETY: a coordinate pair.
-                            unsafe { SetCursorPos(ax, ay) };
+                            unsafe { SetCursorPos(anchor.x, anchor.y) };
                         }
                     }
                 }
@@ -1060,8 +1189,16 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
                 WM_RBUTTONDOWN => shared.emit(button(3, true)),
                 WM_RBUTTONUP => shared.emit(button(3, false)),
                 WM_XBUTTONDOWN | WM_XBUTTONUP => {
+                    // Exactly the two the dialect has a number for. A gaming mouse's third
+                    // or fourth side button reports 0x0004 or 0x0008 here, and calling one
+                    // of those "forward" would have the target navigate forward when nobody
+                    // asked it to.
                     let which = (info.mouseData >> 16) as u16;
-                    let n = if which == XBUTTON1 { 4 } else { 5 };
+                    let n = match which {
+                        w if w == XBUTTON1 => 4,
+                        w if w == XBUTTON2_ID => 5,
+                        _ => return swallow,
+                    };
                     shared.emit(button(n, wparam as u32 == WM_XBUTTONDOWN));
                 }
                 WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
@@ -1126,7 +1263,10 @@ impl InputBackend for WindowsBackend {
             // `None` costs nothing here (truth 6 of the seam).
             unicode: true,
             monitors_stable: self.shared.monitors_stable.load(Ordering::Relaxed),
-            problem: (!capture).then_some(Problem::NoPermission),
+            // `NoBackend` and not `NoPermission`: Windows has no grant to ask for here, and
+            // a low level hook that will not install means this window station has no
+            // desktop to hook rather than that somebody said no.
+            problem: (!capture).then_some(Problem::NoBackend),
         }
     }
 
@@ -1159,32 +1299,41 @@ impl InputBackend for WindowsBackend {
     }
 
     fn confine(&self, rect: Option<Rect>) {
+        // The `clip` mutex is held across the whole of it, and that is not bookkeeping: the
+        // pump re-applies a clip Windows dropped, and it has to do so under the same lock
+        // or the two race. The lost race was this: the pump reads the wanted rectangle,
+        // this thread runs the whole of `confine(None)`, and the pump then finds the OS
+        // clip no longer matches the rectangle it is still holding and puts it BACK. The
+        // pointer is then trapped in the rectangle of a session that has ended, and nothing
+        // ever looks again, because `confined` is false. The window was one syscall wide and
+        // the pump enters it four times a second.
+        let mut clip = match self.clip.lock() {
+            Ok(guard) => guard,
+            Err(p) => p.into_inner(),
+        };
         match rect {
             Some(rect) => {
                 let anchor = centre(&rect);
-                self.shared.anchor_x.store(anchor.x, Ordering::Relaxed);
-                self.shared.anchor_y.store(anchor.y, Ordering::Relaxed);
-                self.shared.confined.store(true, Ordering::Relaxed);
-                if let Ok(mut clip) = self.clip.lock() {
-                    *clip = Some(rect);
-                }
+                self.shared.set_anchor(anchor);
+                *clip = Some(rect);
                 apply_clip(Some(rect));
-                // SAFETY: a coordinate pair. The pointer starts at the anchor so
-                // there is a whole half monitor of room in every direction before
-                // Windows clips a single event's movement.
-                unsafe { SetCursorPos(anchor.x, anchor.y) };
+                self.shared.confined.store(true, Ordering::Release);
+                // The pointer starts at the anchor, so there is a whole half monitor of
+                // room in every direction before Windows clips a single event's movement.
+                self.warp(anchor);
             }
             None => {
-                self.shared.confined.store(false, Ordering::Relaxed);
-                if let Ok(mut clip) = self.clip.lock() {
-                    *clip = None;
-                }
+                self.shared.confined.store(false, Ordering::Release);
+                *clip = None;
                 apply_clip(None);
             }
         }
     }
 
     fn warp(&self, to: Point) {
+        // Armed BEFORE the move, or the hook could see the event first and read it as a
+        // hand on the mouse (see [`Shared::warp`]).
+        self.shared.warp.store(pack(to), Ordering::Release);
         // SAFETY: a coordinate pair.
         unsafe { SetCursorPos(to.x, to.y) };
     }
@@ -1242,14 +1391,26 @@ impl WindowsBackend {
             return;
         }
         // SAFETY: a slice we built, with the size the API asks for.
-        let sent = unsafe {
+        let send = |batch: &[INPUT]| unsafe {
             SendInput(
-                inputs.len() as u32,
-                inputs.as_ptr(),
+                batch.len() as u32,
+                batch.as_ptr(),
                 std::mem::size_of::<INPUT>() as i32,
-            )
+            ) as usize
         };
-        if sent as usize == inputs.len() {
+        let mut sent = send(&inputs);
+        if sent < inputs.len() {
+            // `SendInput` inserts events until one is blocked and answers with the count,
+            // so a short return means the FIRST HALF of the batch landed and the rest did
+            // not. On a Control plus C that is a Control physically down on the target with
+            // its release discarded, which is the stuck modifier this whole component
+            // exists to avoid, and the engine is fire and forget so nothing else will
+            // repair it. So the remainder is offered once more: whatever blocked it may
+            // have been a window losing activation, and if it blocks again the refusal
+            // below is the honest answer.
+            sent += send(&inputs[sent..]);
+        }
+        if sent == inputs.len() {
             return;
         }
         // Detected, not guessed: the desktop is re-checked (it may have changed
@@ -1302,14 +1463,25 @@ fn push_input(out: &mut Vec<INPUT>, action: &Action, vs: &RECT) {
                 nx,
                 ny,
                 0,
-                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                MOUSEEVENTF_MOVE
+                    | MOUSEEVENTF_ABSOLUTE
+                    | MOUSEEVENTF_VIRTUALDESK
+                    | MOUSEEVENTF_MOVE_NOCOALESCE,
             ));
         }
         Action::MoveBy { dx, dy } => {
             // Truth 3: Windows discards a relative move of (0, 0), so it is not sent
             // rather than sent and lost.
             if *dx != 0 || *dy != 0 {
-                out.push(mouse_input(*dx, *dy, 0, MOUSEEVENTF_MOVE));
+                // `MOVE_NOCOALESCE`, so Windows does not merge a run of injected moves into
+                // one: a drawing stroke or a drag on the target would otherwise lose its
+                // intermediate points and arrive as a straight line.
+                out.push(mouse_input(
+                    *dx,
+                    *dy,
+                    0,
+                    MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE,
+                ));
             }
         }
         Action::Button { button, down } => {
@@ -1495,6 +1667,14 @@ fn resolve_now(want: &Want) -> Option<Resolved> {
             }
             let vk = (scan as u16) & 0xFF;
             let shift_state = ((scan as u16) >> 8) & 0xFF;
+            // Bit 3 is Hankaku and bits 4 and 5 are reserved to the layout driver, so a
+            // shift state carrying any of them is a stroke this seam cannot describe. And a
+            // virtual key of zero is not a key. `None` costs nothing here (Windows always
+            // has the Unicode path, truth 6 of the seam) while a wrong answer types the
+            // wrong character, so anything unrecognised is refused rather than approximated.
+            if vk == 0 || shift_state & !0x07 != 0 {
+                return None;
+            }
             let mut mods = 0u16;
             if shift_state & 0x01 != 0 {
                 mods |= keys::mods::SHIFT;
@@ -1720,6 +1900,10 @@ unsafe fn display_identity(device: &str) -> (String, String) {
 /// thread that installed it, which is the one fact that pins this whole structure.
 struct Backend {
     hwnd: HWND,
+    /// The window class this backend registered, kept so `Drop` can unregister it: each one
+    /// is uniquely named, so a process that builds several would otherwise leak one per
+    /// backend.
+    class: Vec<u16>,
     cmds: Arc<Mutex<VecDeque<Cmd>>>,
     shared: Arc<Shared>,
     clip: Arc<Mutex<Option<Rect>>>,
@@ -1731,10 +1915,10 @@ struct Backend {
     gone_seen: bool,
     /// The layout the last poll saw, so a change is reported once.
     layout: usize,
-    /// A cheap fingerprint of the monitor set, for the same reason: a message-only
-    /// window is not a top level window and receives no `WM_DISPLAYCHANGE`
-    /// broadcast, so the set has to be watched rather than waited for.
-    monitors: (i32, RECT),
+    /// A fingerprint of the monitor set, for the same reason: a message-only window is not
+    /// a top level window and receives no `WM_DISPLAYCHANGE` broadcast, so the set has to be
+    /// watched rather than waited for.
+    monitors: u64,
 }
 
 impl Backend {
@@ -1786,6 +1970,7 @@ impl Backend {
             }
             Ok(Backend {
                 hwnd,
+                class: class_name,
                 cmds,
                 shared,
                 clip,
@@ -1795,7 +1980,7 @@ impl Backend {
                 exit_code: None,
                 gone_seen: false,
                 layout: 0,
-                monitors: (0, virtual_screen()),
+                monitors: 0,
             })
         }
     }
@@ -1808,7 +1993,17 @@ impl Backend {
         // The hooks' way back to the shared state. Set before any hook can be
         // installed, and only ever on this thread.
         HOOK_SHARED.with(|cell| {
-            let _ = cell.set(Arc::clone(&self.shared));
+            if cell.set(Arc::clone(&self.shared)).is_err() {
+                // A second loop on one thread. Nothing prevents it (`run` takes `self` by
+                // value, so two can run in sequence) and the hooks would then read the
+                // FIRST backend's mode and push into the first backend's channel: capture
+                // would appear to do nothing and no upcall would reach the live engine.
+                // Said out loud rather than left as a mystery.
+                warn(
+                    "a second input backend is pumping on this thread; its hooks will \
+                     report to the first one",
+                );
+            }
         });
         // Driven through a raw self pointer, never a live `&mut self` held across
         // `DispatchMessageW`: that call re-enters `wndproc`, which re-derives
@@ -1897,15 +2092,26 @@ impl Backend {
             return;
         }
         if self.keyboard.is_null() && self.mouse.is_null() {
-            // Coming back from Off, so the modifier state this backend keeps has
-            // been blind for however long that lasted: a person who pressed and let
-            // go of Shift in between would leave a Shift bit set for ever. While
-            // nothing is hooked the OS's own state IS authoritative (nothing was
-            // swallowed), so this is the one moment it can be trusted, and it is the
-            // only moment it is read.
+            // Coming back from Off, so the set of modifier KEYS this backend keeps has been
+            // blind for however long that lasted: a person who pressed and let go of Shift
+            // in between would leave that key's bit set for ever.
+            //
+            // The keys are reseeded from the OS and the LOCKS are deliberately not, and the
+            // difference is which source can be trusted. `GetAsyncKeyState` is the live
+            // physical state, so it is right about anything nobody swallowed; the one thing
+            // it cannot know is a key whose press a previous session ATE and which is still
+            // held, which reads as up until its owner presses it again (a documented v1
+            // limit, and the lesser of the two errors: a phantom modifier held for ever is
+            // worse than one missed until the next press). `GetKeyState` cannot be trusted
+            // here at all: it answers about the CALLING thread's copy of the keyboard state,
+            // which Windows seeds when the thread's queue is created and updates only as
+            // that thread retrieves key messages, and this pump owns a message-only window
+            // and retrieves none. It is frozen at whatever it was when the process started,
+            // so reseeding the locks from it would put Caps Lock back to that value on every
+            // session start, which is how every letter comes to arrive in the wrong case.
             self.shared
-                .mods
-                .store(u32::from(live_mods() | initial_locks()), Ordering::Relaxed);
+                .mod_keys
+                .store(live_mod_keys(), Ordering::Relaxed);
         }
         self.shared.mode.store(want, Ordering::Relaxed);
         if !self.keyboard.is_null() && !self.mouse.is_null() {
@@ -1926,9 +2132,20 @@ impl Backend {
             warn("the low level input hooks could not be installed");
             self.shared.mode.store(MODE_OFF, Ordering::Relaxed);
             self.unhook();
-            self.shared.capture_ok.store(false, Ordering::Relaxed);
+            if self.shared.capture_ok.swap(false, Ordering::Relaxed) {
+                // The interface is told, once, that this machine can no longer drive.
+                self.shared.emit(BackendEvent::CapabilitiesChanged);
+            }
             self.shared
                 .emit(BackendEvent::CaptureLost(CaptureLoss::Broken));
+            return;
+        }
+        // And the other way: a session on a station where the hooks would not install
+        // before can install them now (a remote desktop that was disconnected and is not
+        // any more), so the latch is not one way. Without this, one failure said this
+        // machine could never drive again until the supervisor restarted the component.
+        if !self.shared.capture_ok.swap(true, Ordering::Relaxed) {
+            self.shared.emit(BackendEvent::CapabilitiesChanged);
         }
     }
 
@@ -1989,12 +2206,13 @@ impl Backend {
             }
         }
 
-        // SAFETY: one system metric and one virtual screen read.
-        let count = unsafe { GetSystemMetrics(SM_CMONITORS) };
-        let vs = virtual_screen();
-        let fingerprint = (count, vs);
-        if fingerprint.0 != self.monitors.0 || !same_rect(&fingerprint.1, &self.monitors.1) {
-            let first = self.monitors.0 == 0;
+        // A hash of the whole enumerated list, and not the count plus the bounding box: two
+        // identical monitors swapped left for right, or a scale changed without the box
+        // moving, are both real changes that leave those two numbers alone, and the plane
+        // would keep the old geometry while the pointer crossed to the wrong screen.
+        let fingerprint = monitor_fingerprint();
+        if fingerprint != self.monitors {
+            let first = self.monitors == 0;
             self.monitors = fingerprint;
             if !first {
                 self.shared.emit(BackendEvent::MonitorsChanged);
@@ -2005,12 +2223,15 @@ impl Backend {
         // whenever another process clips. A session whose pin quietly went away is a
         // pointer that walks off this machine while its owner is looking at another
         // one, so it is put back.
-        if self.shared.confined.load(Ordering::Relaxed) {
-            let wanted = match self.clip.lock() {
-                Ok(g) => *g,
-                Err(p) => *p.into_inner(),
+        // Under the SAME lock `confine` takes, for the whole compare-and-apply: see
+        // `confine` for the race that costs. The rectangle being present is the condition,
+        // rather than the `confined` flag, so the two cannot disagree.
+        {
+            let clip = match self.clip.lock() {
+                Ok(guard) => guard,
+                Err(p) => p.into_inner(),
             };
-            if let Some(rect) = wanted {
+            if let Some(rect) = *clip {
                 let mut current = RECT {
                     left: 0,
                     top: 0,
@@ -2030,6 +2251,13 @@ impl Backend {
                 }
             }
         }
+        // What the hook counted and could not say (see `Shared::emit`).
+        let dropped = self.shared.dropped.swap(0, Ordering::Relaxed);
+        if dropped > 0 {
+            warn(&format!(
+                "the engine is not draining input events: {dropped} dropped"
+            ));
+        }
     }
 
     /// The last thing this loop does, whatever ended it, and the moment a keyboard is
@@ -2043,6 +2271,23 @@ impl Backend {
         self.shared.confined.store(false, Ordering::Relaxed);
         apply_clip(None);
     }
+}
+
+/// A hash over every monitor's identity, place, size and scale.
+///
+/// Cheap enough for the pump's turn (one enumeration and a few field reads) and complete
+/// enough that anything the plane cares about changes it.
+fn monitor_fingerprint() -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    for m in enumerate_monitors() {
+        hasher.update(m.id.as_bytes());
+        for value in [m.w, m.h, m.x, m.y, m.scale] {
+            hasher.update(&value.to_be_bytes());
+        }
+        hasher.update(&[u8::from(m.primary)]);
+    }
+    let bytes = hasher.finalize();
+    u64::from_be_bytes(bytes.as_bytes()[..8].try_into().unwrap_or([0; 8]))
 }
 
 fn same_rect(a: &RECT, b: &RECT) -> bool {
@@ -2060,6 +2305,10 @@ impl Drop for Backend {
             self.release_everything();
             SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
             DestroyWindow(self.hwnd);
+            // The class too, or each backend built in one process leaks its uniquely named
+            // one. It can only be unregistered once its last window is gone, which is the
+            // line above.
+            UnregisterClassW(self.class.as_ptr(), std::ptr::null_mut());
         }
     }
 }
@@ -2154,10 +2403,11 @@ pub fn create() -> Result<crate::os::Created, Unsupported> {
     let shared = Arc::new(Shared {
         mode: AtomicU8::new(MODE_OFF),
         events_tx,
-        anchor_x: AtomicI32::new(0),
-        anchor_y: AtomicI32::new(0),
+        anchor: AtomicU64::new(0),
         confined: AtomicBool::new(false),
-        mods: AtomicU32::new(u32::from(initial_locks())),
+        warp: AtomicU64::new(NO_WARP),
+        mod_keys: AtomicU32::new(live_mod_keys()),
+        locks: AtomicU32::new(u32::from(initial_locks())),
         wheel_x: AtomicI32::new(0),
         wheel_y: AtomicI32::new(0),
         capture_ok: AtomicBool::new(true),
@@ -2184,39 +2434,21 @@ pub fn create() -> Result<crate::os::Created, Unsupported> {
     })
 }
 
-/// The holdable modifiers the OS believes are down right now.
+/// Which modifier KEYS the OS believes are down right now, as a [`MOD_VKS`] bit set.
 ///
-/// Only ever read while nothing is hooked (see [`Backend::set_capture`]): once this
-/// backend swallows, a modifier the user is holding never reaches the state
-/// `GetAsyncKeyState` reports, and believing it then would type every symbol in the
-/// wrong case.
-fn live_mods() -> u16 {
-    // SAFETY: five reads of a virtual key's asynchronous state.
+/// Only ever read while nothing is hooked (see [`Backend::set_capture`]): once this backend
+/// swallows, a key the user is holding never reaches the state `GetAsyncKeyState` reports,
+/// and believing it then would type every symbol in the wrong case.
+fn live_mod_keys() -> u32 {
+    // SAFETY: eight reads of a virtual key's asynchronous state.
     unsafe {
-        let down = |vk: u16| GetAsyncKeyState(vk as i32) as u16 & 0x8000 != 0;
-        let mut bits = 0u16;
-        if down(VK_LSHIFT) || down(VK_RSHIFT) {
-            bits |= keys::mods::SHIFT;
+        let mut set = 0u32;
+        for (index, (vk, _)) in MOD_VKS.iter().enumerate() {
+            if GetAsyncKeyState(*vk as i32) as u16 & 0x8000 != 0 {
+                set |= 1 << index;
+            }
         }
-        if down(VK_LCONTROL) {
-            bits |= keys::mods::CTRL;
-        }
-        if down(VK_LMENU) {
-            bits |= keys::mods::ALT;
-        }
-        if down(VK_RMENU) {
-            bits |= keys::mods::ALTGR;
-        }
-        if down(VK_LWIN) || down(VK_RWIN) {
-            bits |= keys::mods::META;
-        }
-        // The right Control is deliberately folded into CTRL and the right Alt into
-        // ALTGR, matching `mod_of_vk` and `keys::mod_of_usage`: a disagreement
-        // between the two would have the engine holding a bit it never sees released.
-        if down(VK_RCONTROL) {
-            bits |= keys::mods::CTRL;
-        }
-        bits
+        set
     }
 }
 
@@ -2533,13 +2765,14 @@ mod tests {
             let layout = unsafe { GetKeyboardLayout(0) };
             let from_usage = platform_key(usage, layout).expect("a modifier has a key");
             let from_vk = canonical_key(from_usage.code as u16, layout);
+            // The WHOLE pair, because that is what the engine compares to decide whether an
+            // incoming release is a key it is holding. An earlier version of this test
+            // masked the high byte away, which is exactly the byte `key_input` branches on:
+            // a `0xE01D` and a `0x1D` are two different keys and it would have passed.
             assert_eq!(
-                from_usage.detail & 0xFF,
-                from_vk.detail & 0xFF,
-                "the two routes to {bit:#x} disagree about its scancode: \
-                 {from_usage:?} against {from_vk:?}"
+                from_usage, from_vk,
+                "the two routes to {bit:#x} disagree about the key"
             );
-            assert_eq!(from_usage.code, from_vk.code);
         }
     }
 }
