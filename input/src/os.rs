@@ -135,6 +135,8 @@ pub struct Created {
 pub enum Backend {
     #[cfg(target_os = "linux")]
     X11(crate::x11::X11Backend),
+    #[cfg(target_os = "linux")]
+    Wayland(crate::wayland::WaylandBackend),
     #[cfg(windows)]
     Windows(crate::windows::WindowsBackend),
     #[cfg(target_os = "macos")]
@@ -153,6 +155,8 @@ pub enum Backend {
 pub enum EventLoop {
     #[cfg(target_os = "linux")]
     X11(Box<crate::x11::X11Loop>),
+    #[cfg(target_os = "linux")]
+    Wayland(Box<crate::wayland::WaylandLoop>),
     #[cfg(windows)]
     Windows(Box<crate::windows::WindowsLoop>),
     #[cfg(target_os = "macos")]
@@ -165,6 +169,8 @@ impl EventLoop {
         match self {
             #[cfg(target_os = "linux")]
             EventLoop::X11(l) => (*l).run(),
+            #[cfg(target_os = "linux")]
+            EventLoop::Wayland(l) => (*l).run(),
             #[cfg(windows)]
             EventLoop::Windows(l) => (*l).run(),
             #[cfg(target_os = "macos")]
@@ -217,15 +223,18 @@ fn absent(problem: Problem) -> Created {
 ///   rather than silently claiming everything.
 #[cfg(target_os = "linux")]
 fn build() -> Result<Created, Unsupported> {
+    // FIRST, before anything is probed. The escape hatch is what a person reaches for
+    // when the detection is wrong about their machine, so it must not be hostage to
+    // the detection: an earlier version asked `session_kind()` first, and since that
+    // opens an X connection, a forced session with a black-holed `DISPLAY` hung in the
+    // probe whose answer it was about to throw away.
+    if forced_x11() {
+        eprintln!("[1device-input] forced to X11");
+        return crate::x11::create();
+    }
     let kind = session_kind();
-    let forced = forced_x11();
-    eprintln!(
-        "[1device-input] session: {kind:?}{}",
-        if forced { ", forced to X11" } else { "" }
-    );
+    eprintln!("[1device-input] session: {kind:?}");
     match kind {
-        // Forced: whatever this session is, the X server is what gets served.
-        _ if forced => crate::x11::create(),
         SessionKind::X11 => crate::x11::create(),
         SessionKind::XWayland | SessionKind::Wayland => crate::wayland::create(kind),
         // No compositor and no X server. Asked anyway rather than refused here,
@@ -332,8 +341,49 @@ pub fn session_kind() -> SessionKind {
     session_kind_for(
         wayland_socket_present(),
         std::env::var_os("XDG_SESSION_TYPE").as_deref(),
-        crate::x11::server_kind(),
+        local_x_server(),
     )
+}
+
+/// The X server on `DISPLAY`, asked about itself, but **only when `DISPLAY` names a
+/// local one**.
+///
+/// # Why the remote case is refused rather than probed
+///
+/// Two reasons, and either alone would be enough.
+///
+/// It is correct: a display on another host is not the desk this person is sitting at.
+/// A `DISPLAY` left behind by an `ssh -X`, or handed to a container, names somebody
+/// else's screen, and capturing a keyboard there or typing into it is not what anybody
+/// asked for.
+///
+/// And it is the only way to bound this call. `xcb::Connection::connect` blocks through
+/// the whole handshake with no timeout of its own, so a host that is up and then
+/// black-holed costs the kernel's full TCP connect budget, about two minutes, at
+/// component start-up: `os::create` would not return, nothing would answer
+/// `input.status`, and the supervisor would restart into the same wait for ever. The
+/// version of this function that probed unconditionally introduced that on Wayland
+/// desktops, which had never connected to an X server at all before.
+///
+/// The residual exposure is a LOCAL server that accepts and then goes quiet (a
+/// suspended virtual machine, a half-dead `Xvfb`). That one is not new: the X11 backend
+/// has always connected the same way on every X11 session, and bounding it means a
+/// timeout inside `crate::x11`. It is on the deferred list under its own name.
+#[cfg(target_os = "linux")]
+fn local_x_server() -> XServer {
+    let Some(display) = std::env::var_os("DISPLAY") else {
+        return XServer::Unreachable;
+    };
+    // Lossy on purpose: a display name that is not UTF-8 is not one of the three local
+    // shapes either way, and the comparison is about the first character.
+    let display = display.to_string_lossy();
+    let local =
+        display.starts_with(':') || display.starts_with("unix:") || display.starts_with('/');
+    if !local {
+        eprintln!("[1device-input] DISPLAY={display} is not local, so it is not this session's");
+        return XServer::Unreachable;
+    }
+    crate::x11::server_kind()
 }
 
 /// Is there a Wayland socket we could actually connect to?
@@ -397,8 +447,11 @@ fn socket_present(name: Option<&std::ffi::OsStr>, runtime_dir: Option<&std::ffi:
 /// is announcing a fact about itself, and there is no environment in which that is
 /// a leftover.
 ///
-/// So: the server's word first, then the socket, then logind's word as the last
-/// chance.
+/// So: the server's word first, then the socket, then the server's word again for a
+/// plain one, and logind only when no server answers at all. That last ordering was got
+/// wrong first time round and a review caught it: a stale `XDG_SESSION_TYPE=wayland`
+/// vetoed a live, plain, fully drivable X server, which is the one case where the
+/// server's evidence is strongest.
 ///
 /// # Why `DISPLAY` is never allowed to veto a Wayland session
 ///
@@ -431,17 +484,31 @@ pub fn session_kind_for(
     if x == XServer::XWayland {
         return SessionKind::XWayland;
     }
+    if wayland_socket {
+        return SessionKind::Wayland;
+    }
+    // A plain X server that is really there outranks logind, exactly as an XWayland
+    // does above, and for the same reason: `XDG_SESSION_TYPE` is inherited by every
+    // child of the login session, so it survives its own session. Somebody logged into
+    // Wayland who drops to a tty and runs `startx`, or whose compositor died and who
+    // started an Xorg, carries `XDG_SESSION_TYPE=wayland` into a session where X11
+    // capture and XTEST both work; believing it there left them with no backend at all.
+    // The rule is one sentence: the display server's own word beats what the login
+    // manager remembers, and the login manager only speaks when no server answers.
+    if x == XServer::Plain {
+        return SessionKind::X11;
+    }
     let named_wayland = session_type
         .and_then(std::ffi::OsStr::to_str)
         .is_some_and(|kind| kind.eq_ignore_ascii_case("wayland"));
-    if wayland_socket || named_wayland {
+    if named_wayland {
         return SessionKind::Wayland;
     }
     match x {
-        XServer::Plain => SessionKind::X11,
         XServer::Unreachable => SessionKind::None,
-        // Handled above, and matched rather than left to a catch-all so that adding a
-        // fifth kind of server is a compile error here.
+        // Both handled above, and matched rather than left to a catch-all so that
+        // adding a fifth kind of server is a compile error here.
+        XServer::Plain => SessionKind::X11,
         XServer::XWayland => SessionKind::XWayland,
     }
 }
@@ -518,6 +585,8 @@ impl InputBackend for Backend {
         match self {
             #[cfg(target_os = "linux")]
             Backend::X11(b) => b.capabilities(),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(b) => b.capabilities(),
             #[cfg(windows)]
             Backend::Windows(b) => b.capabilities(),
             #[cfg(target_os = "macos")]
@@ -530,6 +599,8 @@ impl InputBackend for Backend {
         match self {
             #[cfg(target_os = "linux")]
             Backend::X11(b) => b.monitors().await,
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(b) => b.monitors().await,
             #[cfg(windows)]
             Backend::Windows(b) => b.monitors().await,
             #[cfg(target_os = "macos")]
@@ -542,6 +613,8 @@ impl InputBackend for Backend {
         match self {
             #[cfg(target_os = "linux")]
             Backend::X11(b) => b.pointer().await,
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(b) => b.pointer().await,
             #[cfg(windows)]
             Backend::Windows(b) => b.pointer().await,
             #[cfg(target_os = "macos")]
@@ -554,6 +627,8 @@ impl InputBackend for Backend {
         match self {
             #[cfg(target_os = "linux")]
             Backend::X11(b) => b.resolve(want).await,
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(b) => b.resolve(want).await,
             #[cfg(windows)]
             Backend::Windows(b) => b.resolve(want).await,
             #[cfg(target_os = "macos")]
@@ -566,6 +641,8 @@ impl InputBackend for Backend {
         match self {
             #[cfg(target_os = "linux")]
             Backend::X11(b) => b.capture(mode),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(b) => b.capture(mode),
             #[cfg(windows)]
             Backend::Windows(b) => b.capture(mode),
             #[cfg(target_os = "macos")]
@@ -578,6 +655,8 @@ impl InputBackend for Backend {
         match self {
             #[cfg(target_os = "linux")]
             Backend::X11(b) => b.confine(rect),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(b) => b.confine(rect),
             #[cfg(windows)]
             Backend::Windows(b) => b.confine(rect),
             #[cfg(target_os = "macos")]
@@ -590,6 +669,8 @@ impl InputBackend for Backend {
         match self {
             #[cfg(target_os = "linux")]
             Backend::X11(b) => b.warp(to),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(b) => b.warp(to),
             #[cfg(windows)]
             Backend::Windows(b) => b.warp(to),
             #[cfg(target_os = "macos")]
@@ -602,6 +683,8 @@ impl InputBackend for Backend {
         match self {
             #[cfg(target_os = "linux")]
             Backend::X11(b) => b.inject(actions),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(b) => b.inject(actions),
             #[cfg(windows)]
             Backend::Windows(b) => b.inject(actions),
             #[cfg(target_os = "macos")]
@@ -614,6 +697,8 @@ impl InputBackend for Backend {
         match self {
             #[cfg(target_os = "linux")]
             Backend::X11(b) => b.release_all(keys),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(b) => b.release_all(keys),
             #[cfg(windows)]
             Backend::Windows(b) => b.release_all(keys),
             #[cfg(target_os = "macos")]
@@ -626,6 +711,8 @@ impl InputBackend for Backend {
         match self {
             #[cfg(target_os = "linux")]
             Backend::X11(b) => b.request_exit(code),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(b) => b.request_exit(code),
             #[cfg(windows)]
             Backend::Windows(b) => b.request_exit(code),
             #[cfg(target_os = "macos")]
@@ -742,7 +829,15 @@ mod tests {
         assert_eq!(
             session_kind_for(false, Some(os("wayland")), XServer::Unreachable),
             SessionKind::Wayland,
-            "logind's word is the last chance, for an environment with no socket name"
+            "logind's word is the last chance, and only when no server answers"
+        );
+        // The one a review caught: logind remembers a Wayland login, the compositor is
+        // gone, and a plain X server is right there and fully drivable. Believing
+        // logind left that session with no backend at all.
+        assert_eq!(
+            session_kind_for(false, Some(os("wayland")), XServer::Plain),
+            SessionKind::X11,
+            "a plain server that is really there outranks what logind remembers"
         );
         assert_eq!(
             session_kind_for(false, Some(os("Wayland")), XServer::Unreachable),
@@ -851,7 +946,11 @@ mod tests {
                 SessionKind::XWayland,
                 "an X server announcing XWAYLAND is an XWayland whatever else is true"
             ),
-            (XServer::Plain, false) => assert_eq!(kind, SessionKind::X11),
+            (XServer::Plain, false) => assert_eq!(
+                kind,
+                SessionKind::X11,
+                "a plain server that is really there outranks what logind remembers"
+            ),
             (XServer::Plain, true) => assert_eq!(
                 kind,
                 SessionKind::Wayland,
@@ -864,14 +963,18 @@ mod tests {
             ),
         }
 
-        // And the link that makes the XWAYLAND probe worth trusting: a server can
-        // only be an XWayland if a compositor is there. A failure here is either a
-        // compositor that died between the two probes or a server lying about
-        // itself, and both are worth hearing about.
+        // The link that makes the XWAYLAND probe worth trusting: an XWayland exists
+        // only underneath a compositor. Asserted only when there is a socket to
+        // corroborate it, because the interesting third case is real and healthy: an
+        // `ssh -X` into a machine whose desktop is Wayland forwards the XWayland's own
+        // extension list, and the ssh session has neither the variable nor the socket.
+        // That session's `DISPLAY` is not local, so `local_x_server` refuses to probe
+        // it and `x` is `Unreachable` here, which is why this arm reads as it does
+        // rather than demanding a compositor from every XWayland.
         if x == XServer::XWayland {
             assert!(
-                socket || std::env::var_os("WAYLAND_DISPLAY").is_some(),
-                "an XWayland with no trace of a compositor anywhere"
+                local_x_server() == XServer::XWayland,
+                "the probe must be stable across two calls a moment apart"
             );
         }
     }

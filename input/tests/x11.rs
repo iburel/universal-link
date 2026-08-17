@@ -1412,3 +1412,73 @@ fn wait_until(within: Duration, mut done: impl FnMut() -> bool) -> bool {
     }
     done()
 }
+
+/// **The two Linux backends really do read one table, and it differs by exactly 8.**
+///
+/// This test began life claiming much more than that, and the claim was false. It was
+/// written when the Wayland backend had a HAND-WRITTEN copy of the HID-to-evdev table,
+/// and it compared that copy with the X11 backend's by way of the `evdev + 8` relation,
+/// describing the result as "checked against this X server". It was not: `Want::Usage`
+/// resolution on X11 is `USAGE_EVDEV[usage] + 8`, so subtracting 8 recovers the X11
+/// table's own entry by construction and the server was consulted only for the skip
+/// filter. An adversarial review said so, and it also counted the copies: they agreed
+/// on every shared entry and the copy was twenty-six entries short, missing the whole
+/// international and language block. So there is now ONE table, in this file's own
+/// backend, and the Wayland side delegates to it.
+///
+/// What is left here is worth keeping and is stated honestly: the delegation works
+/// against a real server's keymap, and the two platforms' numbers differ by 8 for every
+/// key this keymap has. The table's CONTENT is proved by
+/// `the_usage_table_names_the_keys_the_server_names` in this same file, which really
+/// does ask the server which key produces which keysym; the assumption this one pins is
+/// the plus 8, which holds for every X server on the `evdev` keycode set (every Linux X
+/// server and every XWayland) and which would fail loudly here on one that is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_two_linux_backends_read_one_table_and_it_differs_by_exactly_eight() {
+    let _guard = X_LOCK.lock().await;
+    let (mut session, _events) = skip_if_no_x!(spawn_backend!());
+    let handle = session.handle();
+
+    let mut checked = 0usize;
+    let mut skipped = 0usize;
+    let pages = [
+        (keys::PAGE_KEYBOARD, 0x00u32..=0xE7u32),
+        (keys::PAGE_CONSUMER, 0x00..=0xFF),
+    ];
+    for (page, ids) in pages {
+        for id in ids {
+            let usage = keys::usage(page, id);
+            let Some(evdev) = onedevice_input::wayland::evdev_of_usage(usage) else {
+                continue;
+            };
+            match handle.resolve(Want::Usage(usage)).await {
+                Some(resolved) => {
+                    assert_eq!(
+                        resolved.code.code as i64 - 8,
+                        i64::from(evdev),
+                        "usage {usage:#x} ({:?}): the Wayland side says evdev {evdev} and this \
+                         server's keycode is {}",
+                        keys::name_of(usage),
+                        resolved.code.code
+                    );
+                    checked += 1;
+                }
+                // The X11 backend refuses a keycode with no keysym at all, which is the
+                // right answer for a key this keyboard does not have.
+                None => skipped += 1,
+            }
+        }
+    }
+
+    // A floor rather than an exact number: the floor is about the table and an exact
+    // number would be about whichever keymap the runner happens to have. The letters,
+    // the digits and the main block are on every keyboard there is.
+    assert!(
+        checked >= 80,
+        "only {checked} entries could be checked against this keymap ({skipped} skipped), \
+         which is too few to call this a check"
+    );
+    eprintln!("shared evdev table: {checked} entries agreed, {skipped} not on this keymap");
+
+    session.close();
+}

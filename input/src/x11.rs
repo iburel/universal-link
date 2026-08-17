@@ -307,8 +307,17 @@ const USAGE_EVDEV_CONSUMER: &[(u32, u8)] = &[
     (0xEA, 114), // volume down
 ];
 
-/// The X keycode a wire usage means, by truth 7.
-fn keycode_of(usage: u32) -> Option<u8> {
+/// The Linux evdev keycode a wire usage means.
+///
+/// **Shared with the Wayland backend** ([`crate::wayland::evdev_of_usage`]), which
+/// needs the evdev number itself rather than the X one: `RemoteDesktop`'s
+/// `NotifyKeyboardKeycode` takes an evdev code, and there is no keymap on that
+/// platform to derive one from. It lives here rather than there because this is where
+/// the table is, and a second copy of a hundred and forty-six numbers is a second
+/// place for one of them to be wrong. It is also where the table is PROVED: the live
+/// X suite asks a real server which key produces which keysym and checks these
+/// entries against the answer, which is evidence no Wayland machine could give.
+pub(crate) fn evdev_of_usage(usage: u32) -> Option<u8> {
     let page = usage >> 16;
     let id = usage & 0xFFFF;
     let table = match page {
@@ -319,7 +328,12 @@ fn keycode_of(usage: u32) -> Option<u8> {
     table
         .iter()
         .find(|(u, _)| *u == id)
-        .and_then(|(_, evdev)| evdev.checked_add(8))
+        .map(|(_, evdev)| *evdev)
+}
+
+/// The X keycode a wire usage means, by truth 7.
+fn keycode_of(usage: u32) -> Option<u8> {
+    evdev_of_usage(usage).and_then(|evdev| evdev.checked_add(8))
 }
 
 /// The wire usage an X keycode means. The inverse of [`keycode_of`].
@@ -329,13 +343,19 @@ fn keycode_of(usage: u32) -> Option<u8> {
 /// FIRST match wins and the keyboard page is searched before the consumer page: the
 /// answer is then the usage a person would name for that physical key.
 fn usage_of_keycode(keycode: u8) -> Option<u32> {
-    let evdev = keycode.checked_sub(8)?;
-    // The CONSUMER page first, and it matters for exactly three keys. Mute and the two
-    // volume keys exist on both HID pages, and `keys::NAMED` names them on the consumer
-    // page: reported on the keyboard page they would arrive with `key: None`, which is the
-    // very fallback a target with an incomplete usage table relies on, and they would be
-    // `UNRESOLVED` on a Windows target whose table has the consumer page only. No other
-    // evdev code appears in both tables, so this order costs nothing else.
+    usage_of_evdev(keycode.checked_sub(8)?)
+}
+
+/// The wire usage an evdev keycode means. **Shared with the Wayland backend**
+/// ([`crate::wayland::usage_of_evdev`]), which reads evdev codes off the EI stream.
+///
+/// The CONSUMER page is searched first, and it matters for exactly three keys. Mute and
+/// the two volume keys exist on both HID pages, and `keys::NAMED` names them on the
+/// consumer page: reported on the keyboard page they would arrive with `key: None`,
+/// which is the very fallback a target with an incomplete usage table relies on, and
+/// they would be `UNRESOLVED` on a Windows target whose table has the consumer page
+/// only. No other evdev code appears in both tables, so this order costs nothing else.
+pub(crate) fn usage_of_evdev(evdev: u8) -> Option<u32> {
     if let Some((id, _)) = USAGE_EVDEV_CONSUMER.iter().find(|(_, e)| *e == evdev) {
         return Some(keys::usage(keys::PAGE_CONSUMER, *id));
     }

@@ -1396,6 +1396,328 @@ integrity level says why), `SECURE_INPUT` (`IsSecureEventInputEnabled`),
 that lies is not, and that is the whole differentiator against the prior art
 in this category.
 
+## 10bis. Linux: X11, XWayland, and the two portals
+
+Linux is the one platform where what works depends on which desktop the person
+runs, so this section exists to let the interface say **which parts this desktop
+supports**, and to be honest about which parts of the code have ever been run.
+
+**Nothing in the Wayland transport has been executed against a real compositor.**
+It is written, compiled, clippy-clean and unit tested against scripted doubles.
+No machine available while it was written implemented either portal, so it is
+switched off unless `ONEDEVICE_INPUT_WAYLAND` is set, and a desktop that has
+everything reports `wayland_untested` rather than claiming a capability nobody
+has demonstrated. Delete that gate in the commit that records a real run, and
+not before.
+
+### Which session is this, decided rather than assumed
+
+Four states, and none of them is read out of a single environment variable:
+
+| state | how it is established |
+|---|---|
+| `X11` | an X server answers on `DISPLAY` and does not announce the `XWAYLAND` extension |
+| `XWayland` | the X server on `DISPLAY` announces the `XWAYLAND` extension. Only an XWayland does |
+| `Wayland` | a Wayland socket exists, or logind says `wayland` and no X server answers at all |
+| `None` | neither |
+
+Three things about that table cost a measurement each and are worth writing down:
+
+- **The X server's own word leads**, because it is the only evidence here that
+  cannot be inherited, stale or missing. Asking it costs one round trip through
+  the crate the X11 backend already links. It is asked **only about a local
+  display**: a `DISPLAY` naming another host is not this desk's screen, and it is
+  also the one shape that can turn this probe into a two-minute wait, since an X
+  connect has no timeout of its own and a black-holed host costs the kernel's whole
+  TCP budget at component start-up.
+- **The vendor string cannot be used.** An XWayland reports `The X.Org
+  Foundation`, exactly as an Xorg does. That was the first thing tried.
+- **`XDG_SESSION_TYPE` is EMPTY** on the machine this was developed on, under a
+  genuine Wayland session, so a detector leaning on it is wrong about the one
+  Wayland session there is to test against. It is kept as a last chance, for an
+  environment that lost the socket name, and it decides nothing on its own.
+- **`WAYLAND_DISPLAY` is checked as a socket, not as a name.** The variable is
+  inherited like any other, so a shell that outlived its compositor carries one
+  pointing at nothing, and believing it there sends a live X11 session down the
+  portal path.
+
+A Wayland socket AND a plain X server on `DISPLAY` is not a contradiction: it is a
+nested server (an `Xvfb`, an `Xephyr`), which is real and drivable and is not the
+desk anybody is sitting at. The compositor wins, and `ONEDEVICE_INPUT_FORCE_X11`
+is the deliberate way to say otherwise.
+
+### What happens under XWayland, which is most Linux desktops
+
+The X11 backend is **not** built for an XWayland session by default. It would
+work, for X11 windows, and not at all for native Wayland ones, which on a modern
+desktop is most of the windows on screen. A session that half works is worse than
+one that says what it cannot do.
+
+`ONEDEVICE_INPUT_FORCE_X11` builds it anyway, for the live X suite and for a
+person who knows what they are doing, and **that backend then reports `xwayland`
+for as long as it serves one**. Before that code existed it reported
+`monitors_unstable` (XWayland's RandR output carries no EDID, so the identities
+are not stable) and said nothing whatever about XWayland: a true sentence in place
+of the one that mattered. The single `problem` slot therefore has a precedence,
+argued rather than accidental: nothing works, then most windows are out of reach,
+then the screens may swap places.
+
+### Capture: the `InputCapture` portal, and libei is not optional
+
+The portal manages **when** input is captured and nothing else. Its own words:
+"The transport of actual input events is delegated to a transport layer,
+specifically libei." Four signals (`Activated`, `Deactivated`, `Disabled`,
+`ZonesChanged`), not one of which carries a keystroke, and no method that returns
+events. `ConnectToEIS` hands over a file descriptor and the events arrive on it or
+they do not arrive. So an EI client is a hard requirement of the capture half.
+
+The sequence is: `CreateSession` (this is the call that raises the consent
+dialog), `ConnectToEIS` (before `Enable`, which the interface requires),
+`GetZones`, `SetPointerBarriers`, `Enable`. Then an `Activated` signal each time
+the pointer crosses a barrier, and `Release` to give it back.
+
+Five rules of that interface are encoded in the session state machine, and each
+costs a session when it is missed:
+
+1. **`SetPointerBarriers` suspends the session**, so every barrier change is
+   followed by an `Enable`, unconditionally.
+2. **The zone serial must be the one the compositor last handed out**, so
+   `GetZones` and `SetPointerBarriers` are one step and never two.
+3. **`ZonesChanged` may carry a serial this side has never seen**, and the serial
+   always increases and wraps, so the one already held needs no round trip and
+   anything else does.
+4. **A stale `Deactivated` can arrive after a `Disable` or a `Release`**, so one
+   for an activation that is not the current one changes nothing.
+5. **`activation_id` wraps** and its increment is unspecified, so every comparison
+   is equality and there is no arithmetic on it anywhere.
+
+And one rule that spans both sockets: the portal's `activation_id` and the EI
+stream's `start_emulating` sequence carry the same number, and **nothing is
+reported until the two agree**. They arrive on different sockets, so they arrive
+out of order, and a fast hand crosses an edge twice before either has settled;
+without the gate the previous crossing's queued movement lands on the new one and
+sends the pointer to the wrong machine.
+
+**The barriers are placed on every outer edge**, not only on the edges that lead
+somewhere. A barrier must sit on the outside boundary of the union of the zones
+and be fully contained within one zone, so it is per zone, per edge, and clipped
+to the stretches with nothing of this machine's own across them: two screens side
+by side get six barriers and not eight, and an L-shaped arrangement gets an edge
+that splits in two.
+
+The test for "is there anything across this boundary" is about the **pixel across
+it**, not about a neighbour's edge meeting this one exactly. That distinction was
+got wrong first and a review caught it: an exact-abutment test is blind to zones
+that OVERLAP, and a compositor reports overlapping zones for real (one pixel of
+fractional-scale rounding, a mirrored pair reported twice, a small screen entirely
+inside a large one). Each of those produced barriers in the interior of the union,
+which is either a pointer taken away in the middle of somebody's desktop or, on a
+compositor that validates, every barrier refused and the session dying with "no
+pointer barrier could be placed".
+
+**One assumption in there has never been checked against a compositor** and is the
+largest single one in this work: a horizontal barrier sits on the top edge of its
+pixels, so a zone's bottom boundary is at `y + h`, one pixel outside its own pixel
+rectangle. A compositor reading "fully contained within one zone" as containment of
+the barrier's own pixels would refuse all four barriers of a one-screen desktop.
+The symptom is unmistakable and worth knowing in advance: "no pointer barrier could
+be placed" everywhere, on every compositor. The remedy is `y + h - 1` and
+`x + w - 1`, in one place. The engine's own crossing graph then decides whether a
+crossing was wanted, and releases at once if it was not. The alternative was a new
+downcall on the platform seam carrying the edges that lead somewhere, which four
+backends and a fake would have to implement for the benefit of one. What the
+choice costs is a brief pause at a dead edge, and whether that is perceptible is a
+question for a real desk.
+
+### Injection: the `RemoteDesktop` portal, over plain D-Bus
+
+The reverse of the capture half: `NotifyKeyboardKeycode`, `NotifyKeyboardKeysym`,
+`NotifyPointerMotion`, `NotifyPointerButton` and both axis calls are all plain
+D-Bus, none of them is deprecated (the XML carries a deprecation annotation on
+`InputCapture.CreateSession` and on none of these), and both mutter and KDE's
+portal implement every one today. So this build types over D-Bus and opens no EI
+connection for injection. That is one fewer never-run protocol, and it is also
+forced: the two are mutually exclusive by specification, and a session that has
+connected to EIS gets an error from every `Notify*`.
+
+Two facts about it that are easy to get wrong and expensive to debug:
+
+- **Keycodes are evdev, not X11.** They differ by 8, and getting it wrong types a
+  key eight positions along. There is no keymap to ask (the portal offers none and
+  `RemoteDesktop` has no equivalent of the X server's Xkb tables), so the
+  positional half of key resolution is a table of about a hundred and fifty
+  numbers, and **there is exactly one of it**: it lives in the X11 backend and the
+  Wayland side delegates. That took a review. The first version had its own
+  hand-written copy, the two agreed on every entry they shared, and the copy was
+  twenty-six entries short: Execute, Help, Menu, Select, Stop, Again, Undo, Cut,
+  Copy, Paste, Find, the keypad comma and the whole international and language
+  block (Henkan, Muhenkan, Hangul, Hanja, Katakana, Hiragana). Which is to say a
+  Japanese or Korean keyboard would have driven a Wayland target with a hole in
+  the middle of its layout, silently. Sharing it also puts the table where it is
+  PROVED: the X11 live suite asks a real server which key produces which keysym
+  and checks these entries against the answer, which is evidence no Wayland
+  machine here could give, and the relation between the two platforms is then one
+  documented fact rather than two tables to keep in step.
+- **A symbol never resolves, and that is better than a guess.** With no keymap,
+  "which key produces an at sign on this machine's layout" is unanswerable, so
+  every symbol falls through to `NotifyKeyboardKeysym`, which takes a keysym and
+  therefore types any character there is on any layout with nothing to bind. This
+  is the one place Wayland is better off than X11, which needs a spare keycode for
+  the same job and does not always have one.
+
+### The one capability a Wayland target genuinely does not have
+
+**Absolute pointer positions.** `NotifyPointerMotionAbsolute` takes a `stream`
+argument, "the PipeWire stream node the coordinate is relative to", and there is
+no stream without an `org.freedesktop.portal.ScreenCast` session sharing the same
+session handle: mutter fails the call with "No screen cast active" when there is
+none. This engine sends absolute positions by default, because a lost update must
+not make the pointer drift (section 5).
+
+So a Wayland machine is a **keyboard-only target**, `inject_pointer` is `false`
+there, and the interface says so before anybody tries rather than discovering it
+one refusal at a time. Lifting it needs a product decision (pair a screen cast,
+which means asking for a screen-recording permission to move a mouse) or an engine
+change (a relative-only target mode). Neither is a line of code in the backend.
+
+`warp` is `false` for the same kind of reason: no call in either portal puts the
+pointer anywhere. `Release`'s `cursor_position` is a suggestion the compositor may
+ignore, and it applies only at the moment a capture ends, so it is used on that
+one path and the capability still says false.
+
+### The screens have no identity, and the interface says so
+
+`monitors_stable` is **false** on Wayland, always. A zone carries a size and a
+position and nothing else: no name, no EDID, no identity. So the identity is
+synthesised from the geometry, and unplugging a 1920x1080 screen and plugging a
+different 1920x1080 screen into the same place produces the same identity, which is
+the exact silent swap that bit exists to warn about.
+
+Nothing in the interface renders that bit on its own, so the `problem` slot has to
+carry it: a Wayland session with everything present and the path switched on reports
+`monitors_unstable`, which already has its sentence. Anything worse outranks it, and
+that includes a refusal from either portal.
+
+### Half a desktop is a desktop
+
+The backend is built when **either** half is usable, not both. Hyprland has the
+capture portal and no injection one, so it can drive and cannot be driven, and the
+capability bits are what say which: they only exist if a backend exists to report
+them. The first version refused unless both were present, which turned the whole
+"which parts does this desktop support" promise into a single absent backend.
+
+### The screens come from the capture portal, so consent comes first
+
+`GetZones` is an `InputCapture` call and needs a live session, and a session needs a
+person's consent. So a Wayland machine publishes **no** monitors until it has been
+armed to drive at least once, and the layout shows nothing of it.
+
+That is coherent rather than broken, and the reason is the paragraph above: a Wayland
+machine is a keyboard-only target, and a keyboard-only session needs no plane at all
+(there is no pointer to cross towards it). A Wayland machine that wants to DRIVE
+consents anyway, and its screens arrive with the session. What is genuinely missing
+is a way to put a Wayland machine's screens on the plane without consenting to
+capture, and the answer to that is `xdg-output` rather than the portal, which is the
+same brick as the names and the scales.
+
+### What a source cannot report, and the way out
+
+**The character its own layout produced.** The EI stream carries an evdev keycode,
+and libei's keymap arrives as an XKB blob on a file descriptor: reading it needs an
+XKB parser, which means a native library this build deliberately does not link.
+So a Wayland source sends the POSITION and the modifiers, which is level one of
+section 8's typing table and the level a target prefers anyway. What is lost is
+typing text between two machines on different layouts.
+
+The way out for whoever picks it up: under XWayland the X server's keymap **is**
+the compositor's, so the X11 backend's own Xkb reading would fill this in for the
+common case with no new dependency at all.
+
+### Per compositor, as of August 2026
+
+Every row is from a portal manifest, a backend's own source, or a release note.
+**Not one row is from a run**, except the last, which is this repository's own
+development machine.
+
+| desktop | `InputCapture` | `RemoteDesktop` | libei / EIS | what to know |
+|---|---|---|---|---|
+| GNOME (mutter, `xdg-desktop-portal-gnome`) | yes, since GNOME 45 | yes | yes, mutter 45 | consent is not persistable before GNOME 51; absolute pointer needs a paired screen cast |
+| KDE Plasma (kwin, `xdg-desktop-portal-kde`) | yes, since Plasma 6.1 | yes | yes, kwin 6.1 | portal version 2 (persistence) from Plasma 6.7; kwin registers its own shortcut to break a capture |
+| Hyprland (`xdg-desktop-portal-hyprland`) | yes, since its portal 1.4.0 (July 2026) | **no** | yes, for capture | can drive and cannot be driven: no injection portal at all. Keyboard and pointer only, no persistence |
+| wlroots based: sway, river, Wayfire (`xdg-desktop-portal-wlr`) | **no** | **no** | **no** | that portal declares Screenshot and ScreenCast only. Injection would need the wlroots-specific virtual pointer and keyboard protocols, and there is no capture equivalent |
+| Weston, and WSLg's Weston-derived compositor | **no** | **no** | **no** | ships no portal backend at all |
+| any desktop with only `xdg-desktop-portal-gtk` | **no** | **no** | n/a | that backend declares neither, and cannot stand in for one. **Running `xdg-desktop-portal` is not evidence that these portals exist** |
+
+The last row is the one that was measured: `xdg-desktop-portal` 1.18.4 with
+`xdg-desktop-portal-gtk` 1.15.1 exports nineteen portal interfaces and neither of
+these two. That is why the detection asks the bus rather than asking whether a
+portal is installed, and it is where the classification trap below was found.
+
+### The trap in classifying a portal's refusal
+
+**Asking for a property of an interface that is not there answers
+`org.freedesktop.DBus.Error.InvalidArgs`, not `UnknownInterface`.** Measured, not
+read:
+
+```text
+Properties.Get(org.freedesktop.portal.InputCapture, "version")
+  -> org.freedesktop.DBus.Error.InvalidArgs: No such interface "..."
+InputCapture.CreateSession(...)
+  -> org.freedesktop.DBus.Error.UnknownMethod: No such interface "..." on object ...
+Properties.GetAll(org.freedesktop.portal.InputCapture)
+  -> org.freedesktop.DBus.Error.InvalidArgs: No such interface "..."
+```
+
+Two ways of asking, two different error names for one fact, and neither is the
+name the specification would suggest. A classifier keyed on the name alone reports
+a refusal for a desktop that simply has no portal, and then tells its owner to
+allow a dialog that will never appear. The rule that survives all three, and any
+fourth spelling: **if the message says the interface is not there, the interface is
+not there**, whatever the name on the envelope.
+
+`RemoteDesktop`'s `version` property must not be used for anything beyond "the
+interface exists": the portal frontend hardcodes it to 2 whatever the desktop
+backend implements, so it says nothing about whether `ConnectToEIS` is there.
+
+### The reason codes, and their remedies
+
+| code | what it means | the remedy |
+|---|---|---|
+| `xwayland` | serving a Wayland session through its XWayland | an X11 session works completely |
+| `wayland_no_bus` | a Wayland session with no D-Bus session bus | start the session the way the desktop normally starts one |
+| `wayland_no_portal` | this desktop's portal does not offer the input portals | a desktop that has them (see the table), or an X11 session |
+| `wayland_portal_old` | they are there, at a version this build cannot speak | a newer `xdg-desktop-portal` and a newer backend |
+| `wayland_portal_refused` | there, current, and refused: the dialog was dismissed, or the compositor said no | switch the feature on again and allow it |
+| `wayland_untested` | everything is present and this path has never been run | `ONEDEVICE_INPUT_WAYLAND=1` to try it, at your own risk |
+| `wayland` | a Wayland session with nothing more precise to say | kept for a peer on an older build, and as the honest word for a state a later compositor invents |
+
+One slot, so a precedence: no bus outranks no portal, which outranks too old,
+which outranks refused, which outranks unproven. There is no point telling
+somebody to allow a dialog on a machine with no bus to carry it.
+
+### What the Wayland clipboard (#78) inherits from this
+
+This landed before #78, which is the reverse of the order the tickets were
+written in and was a deliberate decision: whether an input session can say what it
+cannot do has no bearing on the clipboard. What #78 can take as it stands:
+
+- **The session detection**, `os::session_kind` and `os::session_kind_for`, with
+  the `XWAYLAND` extension probe and the socket-not-the-name rule. The clipboard
+  has the same question to answer and today answers it by not asking.
+- **The `xwayland` reason code and its sentence.** The clipboard is in exactly
+  the same position: it works for X11 clients through XWayland and is blind to
+  native Wayland ones, which is what #78 is about, and it currently says nothing.
+- **The portal error classification**, `wayland::classify` and `PortalError`,
+  including the `InvalidArgs` trap. Any portal the clipboard reaches will answer
+  the same way. `#78` may not need a portal at all (`ext-data-control-v1` is a
+  Wayland protocol rather than a portal), in which case what it inherits is the
+  detection and the vocabulary rather than the D-Bus.
+- **The consent explanation and the reason-code-to-sentence discipline**: the
+  `Problem::ALL` list and the two tests that walk it across the language boundary,
+  so a new code cannot arrive in the engine without a sentence in the interface.
+- **The per compositor table above**, which is the same survey #78's notes ask
+  for, one protocol along.
+
 ## 11. Persistence
 
 All under `data_dir()/input`, all JSON, all written with the store's
@@ -1512,8 +1834,17 @@ Shapes:
 ```json
 State = { "here": { "device_id", "name",       // this computer, so the plane
                                               // can say "you are here"
-                    "monitors": [Monitor], "problem": null | "no_backend"
-                    | "no_permission" | "monitors_unstable" | "wayland",
+                    "monitors": [Monitor],
+                    // Ten codes, seven of them about Linux, because Linux is the
+                    // one platform where the answer depends on which desktop the
+                    // person runs (section 10bis). Every one has a sentence in
+                    // the interface, and a test on each side of that language
+                    // boundary keeps it so.
+                    "problem": null | "no_backend" | "no_permission"
+                    | "monitors_unstable" | "wayland" | "xwayland"
+                    | "wayland_no_bus" | "wayland_no_portal"
+                    | "wayland_portal_old" | "wayland_portal_refused"
+                    | "wayland_untested",
                     "can_drive": <bool>,      // this machine could take the
                     "can_be_driven": <bool> },// keyboard away, or accept it
           "plane": { "id": "<32 hex>", "spots": [Spot], "by": "<device_id>" },
@@ -1665,8 +1996,10 @@ first estimate before a channel exists, and nothing else.
 Computers only (a phone is neither a source nor a target: `INJECT_EVENTS` is
 signature level on Android, and being a source is a different feature). One
 source and one target per machine, and never both at once (section 4, rule
-3), so no chaining. X11 only on Linux, with Wayland saying what it cannot do
-rather than staying silent (#128). No preemption of a live session. No local
+3), so no chaining. On Linux, X11 is the proven path and the Wayland portals
+are written, unit tested and never once run against a compositor, so they are
+switched off by default and a Wayland session says precisely which piece it is
+missing (section 10bis). No preemption of a live session. No local
 input detection on the target (a machine being driven does not notice its own
 user reaching for the keyboard; `end TAKEN` exists on the wire for the day it
 does). Absolute positions by default and relative as a per session mode, but

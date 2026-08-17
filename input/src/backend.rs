@@ -319,14 +319,14 @@ impl Capabilities {
 /// Because Linux is the one platform where the answer depends on which desktop
 /// the person runs, and the epic's promise is that the interface can say WHICH
 /// PARTS this desktop supports. On Windows and macOS a refusal is a permission
-/// or nothing; on Linux the same build meets a session with no compositor, a
-/// session whose compositor is the whole story, a session reached through its
-/// XWayland, a desktop portal that does not offer the input portals at all, one
-/// that offers a version this build cannot speak, and one that offers everything
-/// and then has its consent dialog dismissed. Collapsing those into one
-/// `wayland` was what the first version did, and the sentence it produced ("this
-/// is a Wayland session, X11 only for now") is wrong for five of the six: it
-/// names no remedy, and on a desktop where everything IS present it is simply
+/// or nothing. On Linux the same build meets: a session reached through its
+/// XWayland; a Wayland session with no D-Bus session bus to ask; a desktop portal
+/// that does not offer the input portals at all; one that offers a version this
+/// build cannot speak; one that offers everything and then has its consent dialog
+/// dismissed; and one that offers everything and would work, on a path nobody has
+/// yet run. Collapsing those six into one `wayland` was what the first version
+/// did, and the sentence it produced ("this is a Wayland session, X11 only for
+/// now") names no remedy for any of them, and on the last two it is simply
 /// false.
 ///
 /// Every variant here has a sentence in `gui/ui/src/lib/input.ts`, and
@@ -354,12 +354,27 @@ pub enum Problem {
     /// neither observed nor injected to. Most windows on a modern desktop are
     /// the second kind, which is why this is a problem and not a footnote.
     ///
-    /// Only ever reported by a session that was FORCED to X11
-    /// ([`crate::os::FORCE_X11_ENV`]): the default refuses to build the backend
-    /// at all rather than half work. Before this code existed a forced session
-    /// reported `monitors_unstable` (XWayland's RandR outputs carry no EDID) and
-    /// nothing at all about XWayland, which is a true sentence in place of the
-    /// one that mattered.
+    /// Reported by a session that was FORCED to X11
+    /// ([`crate::os::FORCE_X11_ENV`]), which is the ordinary route, and by one more
+    /// that a review found: a session with no evidence of anything graphical is
+    /// handed to the X11 backend anyway (the probe is advice and the backend is the
+    /// authority), and an XWayland whose socket had not yet appeared when the probe
+    /// ran arrives there. So it is reachable without anybody forcing anything, by a
+    /// start-up race, which is exactly why the code exists rather than being an
+    /// assertion that this cannot happen.
+    ///
+    /// Before this code existed a forced session reported `monitors_unstable`
+    /// (XWayland's RandR outputs carry no EDID) and nothing at all about XWayland,
+    /// which is a true sentence in place of the one that mattered.
+    ///
+    /// **What it still does not do**, named because a review named it: the
+    /// capability bits are unchanged under XWayland, so a peer being driven through
+    /// one is offered with no problem of its own. The local sentence is right and
+    /// the far side's is missing. Closing it means a new member in the frozen peer
+    /// vocabulary of doc/input-sharing.md section 12, which is a decision above this
+    /// ticket's pay grade; it is on the deferred list, and until then
+    /// `FORCE_X11_ENV` is an opt-in whose limits are documented where it is
+    /// defined.
     XWayland,
     /// A Wayland session with no D-Bus session bus, so the portals cannot even
     /// be asked. A compositor started from a tty without `dbus-run-session` is
@@ -404,6 +419,14 @@ impl Problem {
     /// `InputProblem` union, and neither the Rust compiler nor `tsc` can see the
     /// other side. The test in this module reads that file and checks every code
     /// against it, which is the only bridge available and is cheap.
+    ///
+    /// **A new variant cannot be left out of it**, and that took a review to arrange.
+    /// The first version was a hand-written array, so adding a variant broke `code()`
+    /// and `os::describe` (both exhaustive matches) and left this list quietly short,
+    /// which made every test that walks it pass while a person hit "this version does
+    /// not know why". [`Problem::position`] is the exhaustive match that closes it: a
+    /// new variant fails to compile there, and the test below fails if it is not in
+    /// this array at that position.
     pub const ALL: &'static [Problem] = &[
         Problem::NoBackend,
         Problem::NoPermission,
@@ -416,6 +439,30 @@ impl Problem {
         Problem::WaylandPortalRefused,
         Problem::WaylandUntested,
     ];
+
+    /// Where this problem sits in [`Problem::ALL`].
+    ///
+    /// Exists ONLY to make that list exhaustive by construction: it is an exhaustive
+    /// match, so a variant added to this enum is a compile error here until somebody
+    /// gives it a position, and the test then checks that the array really holds it
+    /// there. Nothing else calls it, which is why it is test-only: `cargo clippy
+    /// --all-targets` and CI both compile the tests, so the compile error still lands
+    /// on whoever adds a variant.
+    #[cfg(test)]
+    const fn position(self) -> usize {
+        match self {
+            Problem::NoBackend => 0,
+            Problem::NoPermission => 1,
+            Problem::MonitorsUnstable => 2,
+            Problem::Wayland => 3,
+            Problem::XWayland => 4,
+            Problem::WaylandNoBus => 5,
+            Problem::WaylandNoPortal => 6,
+            Problem::WaylandPortalOld => 7,
+            Problem::WaylandPortalRefused => 8,
+            Problem::WaylandUntested => 9,
+        }
+    }
 
     /// The wire and snapshot spelling (`input.status`'s `problem`).
     pub fn code(self) -> &'static str {
@@ -948,6 +995,25 @@ mod tests {
         codes.sort_unstable();
         codes.dedup();
         assert_eq!(before, codes.len(), "two problems share a code");
+
+        // **And the list holds every variant, which is what makes every other test
+        // that walks it worth anything.** `position` is an exhaustive match, so a new
+        // variant cannot compile without one; this is the half that checks the array
+        // agrees. A variant with a position and no entry fails here, and so does an
+        // array somebody has shortened.
+        for (index, problem) in Problem::ALL.iter().enumerate() {
+            assert_eq!(
+                problem.position(),
+                index,
+                "{problem:?} sits at {index} in Problem::ALL and says it belongs at {}",
+                problem.position()
+            );
+        }
+        assert_eq!(
+            Problem::ALL.len(),
+            Problem::WaylandUntested.position() + 1,
+            "the array is shorter than the positions the enum defines"
+        );
     }
 
     /// **Every problem this build can report has a sentence in the interface.**

@@ -294,17 +294,27 @@ export function hereProblemSentence(
     // because "this is a Wayland session" on its own is advice nobody can act on:
     // it names no remedy, and on a desktop that has everything it is simply false.
     case "xwayland":
-      return "This is a Wayland session and 1Device is going through its X11 half. Windows that are X11 programs can be read and typed into; windows that speak Wayland directly, which on most desktops is nearly all of them, cannot. A real X11 session is what works completely today.";
+      // The last sentence is not decoration. This code outranks `monitors_unstable`
+      // in the engine's single problem slot, and XWayland's screens NEVER have a
+      // stable identity (its RandR output carries no EDID), so without saying it
+      // here the warning would be silently deleted for every session this code
+      // covers. `monitors_stable` reaches no other part of this interface.
+      return "This is a Wayland session and 1Device is going through its X11 half. Windows that are X11 programs can be read and typed into; windows that speak Wayland directly, which on most desktops is nearly all of them, cannot. A real X11 session is what works completely today. This kind of session also cannot tell its screens apart for certain, so they may swap places on the plane after one is unplugged.";
     case "wayland_no_bus":
       return "This Wayland session has no D-Bus session bus, so 1Device cannot ask the desktop for permission to share the keyboard and mouse. A session started the way your desktop normally starts one has that bus.";
-    case "wayland_no_portal": {
-      // Which half is missing is in the capability bits, not in the code: one
-      // desktop can offer the capture portal and not the injection one (Hyprland
-      // does exactly that today), and sending somebody to look for the wrong
-      // package is worse than saying nothing.
-      const half = !here.can_drive && !here.can_be_driven ? "neither half" : !here.can_drive ? "the half that reads your keyboard" : "the half that types on this computer";
-      return `This desktop does not offer ${half} of what 1Device needs to share a keyboard and mouse on Wayland (the input portals). GNOME 45 and later, and KDE Plasma 6.1 and later, have them. An X11 session works today on any desktop.`;
-    }
+    case "wayland_no_portal":
+      // **This deliberately does NOT try to name which half is missing**, and the
+      // first version did. It read the capability bits, which are all false while
+      // the Wayland path is switched off, so the branch that said "neither half" was
+      // the only reachable one: a person on a desktop whose capture portal works
+      // perfectly (Hyprland is exactly that today) was told to change desktop. The
+      // sentence also read "does not offer neither half", which is worse than
+      // uninformative. Two lessons in one line: a sentence must not branch on a
+      // signal that is constant in the shipped build, and it must be read aloud.
+      //
+      // What names the halves instead is the log line the engine writes, which
+      // carries each interface and its own answer.
+      return "This desktop does not offer the permission dialogs 1Device needs to share a keyboard and mouse on Wayland (the input portals). Some desktops offer the half that reads your keyboard without the half that types on this computer, or the other way round. GNOME 45 and later, and KDE Plasma 6.1 and later, have both. An X11 session works today on any desktop.";
     case "wayland_portal_old":
       return "This desktop's keyboard and mouse portals are older than 1Device can talk to. A newer xdg-desktop-portal, together with a newer portal for your own desktop, is what fixes it.";
     case "wayland_portal_refused":

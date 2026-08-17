@@ -8,6 +8,55 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Linux: a Wayland session now says which parts of keyboard and mouse sharing
+  this desktop supports, instead of one sentence for six different problems.**
+  This is the one platform where the answer depends on which desktop you run, so
+  the app can now name the piece that is missing and what would fix it.
+
+  - **The session is worked out rather than assumed.** X11, XWayland on top of
+    Wayland, Wayland with no X server, and nothing graphical are four different
+    situations. The X server is asked about itself (only an XWayland announces
+    the `XWAYLAND` extension), the Wayland socket is checked as a file and not
+    as an environment variable a dead compositor left behind, and
+    `XDG_SESSION_TYPE` is only a last resort because it is empty on real Wayland
+    sessions.
+  - **A session driven through XWayland now says so.** X11 windows can be read
+    and typed into; windows that speak Wayland directly, which on most desktops
+    is nearly all of them, cannot. Before this it said your screens might swap
+    places, which was true and was not the thing you needed to know.
+  - **Six reasons where there was one**, each with its own sentence and its own
+    remedy: no D-Bus session bus, this desktop has no input portals, they are
+    too old, the permission was refused, and the honest one, everything is
+    present and this path has never been run.
+  - **A Wayland login you left for an X11 one now works again.** The variable the
+    login manager sets outlives the session it describes, and believing it left a
+    real, working X11 session with no keyboard sharing at all.
+  - **The per desktop table is written down** in `doc/input-sharing.md`: GNOME 45
+    and later and KDE Plasma 6.1 and later have both halves, Hyprland can drive
+    and cannot be driven, sway and its family have neither, and running
+    `xdg-desktop-portal` is not evidence that any of it exists.
+
+  - **A desktop with only one of the two halves is served with that half.** Some
+    desktops let a computer read your keyboard without letting anything type on
+    it. Such a computer can now drive another and says plainly that it cannot be
+    driven, instead of doing neither.
+  - **Wayland screens cannot be told apart**, and the app says so rather than
+    letting the plane quietly put a different screen where the old one was: the
+    desktop hands over a size and a position and no identity of any kind.
+
+  **Not proven, and deliberately switched off.** The portal and libei code is
+  written, compiled and unit tested, and no machine that implements those portals
+  was available to run a single line of it against. So a Wayland desktop with
+  everything present reports that it is unproven and claims nothing, and the path
+  turns on only with `ONEDEVICE_INPUT_WAYLAND=1`. What has run is the detection
+  and the portal probe, on a real Wayland session whose portal has neither
+  interface. Two known limits when it is switched on: a Wayland computer is a
+  keyboard-only target (moving its pointer to an exact position needs a screen
+  capture permission, which this feature has no business asking for), and a
+  Wayland computer that is driving sends the physical key you pressed rather than
+  the character it printed, so typing between two different keyboard layouts is
+  not covered yet.
+
 - **The Input tab: the plane you drag, the switches, and where your keyboard
   is.** A fifth section in the app, and the part of keyboard and mouse sharing
   a person actually touches. It invents nothing: every rectangle, every switch

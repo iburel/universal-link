@@ -80,6 +80,32 @@ zbus = "5"
 # because relying on a re-export would make a `zbus` minor bump a compile error in
 # a file that has nothing to do with the change. Also already in the lock.
 zvariant = "5"
+# The EI protocol client, which the capture half cannot do without: the
+# `InputCapture` portal transports not one keystroke of its own, it hands back a
+# socket and says "the transport of actual input events is delegated to a
+# transport layer, specifically libei". So an EI client is a requirement of that
+# portal rather than a choice of this crate's.
+#
+# `reis` and not libei's own bindings, and the reason is decisive rather than
+# aesthetic: `reis` is a PURE RUST implementation of the same protocol (tracking
+# libei 1.6.0) and links no C library at all. Its manifest carries `build = false`,
+# no `links` key and no `-sys` dependency, which matters because libei is NOT
+# installed on this development machine and is not on the CI runners either, so a
+# binding crate would have turned "the Wayland backend is compiled" into "the
+# Wayland backend cannot be built here". It is also `#![forbid(unsafe_code)]`, which
+# for a crate that parses a socket a compositor writes to is worth more than its
+# ergonomics.
+#
+# MIT licensed, which is `deny.toml`'s first allowed entry, and it adds exactly ONE
+# package to the lock: its three dependencies (`enumflags2` 0.7.12, `log` 0.4.33 and
+# `rustix` 1.1.4) are all already there.
+#
+# NO features. The default set is empty, `tokio` and `async-io` and `calloop` are
+# each an executor this file does not want: the EI socket is polled by the same
+# `mio` the X11 backend already uses, on the Wayland backend's own thread, with a
+# BOUNDED budget per turn. An async source would have put a second executor inside
+# a component whose whole event loop is one blocking thread.
+reis = "0.7"
 xcb = { version = "1", features = [
     "xtest",
     "xinput",
