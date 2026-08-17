@@ -659,6 +659,7 @@ pub async fn supervised<B: InputBackend>(
         role: ROLE.into(),
         scopes: SCOPES.iter().map(|s| (*s).to_string()).collect(),
         topics: TOPICS.iter().map(|t| (*t).to_string()).collect(),
+        optional_scopes: Vec::new(),
         optional_topics: Vec::new(),
         served_methods: SERVED_METHODS.iter().map(|m| (*m).to_string()).collect(),
         reconnect_base_delay: RECONNECT_BASE_DELAY,

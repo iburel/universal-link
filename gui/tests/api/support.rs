@@ -190,8 +190,13 @@ pub fn gui_config(core: &TestCore) -> ClientConfig {
             .iter()
             .map(|s| s.to_string())
             .collect(),
+        optional_scopes: onedevice_gui::GUI_INPUT_SCOPES
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         optional_topics: onedevice_gui::GUI_OPTIONAL_TOPICS
             .iter()
+            .chain(onedevice_gui::GUI_INPUT_TOPICS.iter())
             .map(|s| s.to_string())
             .collect(),
         served_methods: vec![],

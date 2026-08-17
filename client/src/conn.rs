@@ -366,24 +366,25 @@ async fn establish(config: &ClientConfig, next_id: &mut u64) -> Result<Link, Est
         pending_requests: Vec::new(),
     };
 
-    *next_id += 1;
-    let hello_id = *next_id;
-    let hello = json!({
-        "jsonrpc": "2.0",
-        "id": hello_id,
-        "method": "hello",
-        "params": {
-            "name": config.name,
-            "version": config.version,
-            "role": config.role,
-            "scopes": config.scopes,
-            "token": token,
-        },
-    });
-    write_frame(&mut link.writer, &hello.to_string())
-        .await
-        .map_err(|_| EstablishError::Failed)?;
-    let result = wait_response(&mut link, hello_id, &config.served_methods).await?;
+    // The scopes we would LIKE, then the ones we cannot do without. A Core that
+    // does not know one of the optional names refuses the whole hello (it checks
+    // membership, `invalid params`), and that must not be the end of the
+    // connection: the phase is untouched by a refused hello on the Core's side,
+    // so the same stream takes a second one. What the feature behind an optional
+    // scope must gate on is `granted_scopes`, never the mere fact of connecting.
+    let wanted: Vec<&String> = config
+        .scopes
+        .iter()
+        .chain(config.optional_scopes.iter())
+        .collect();
+    let result = match hello(&mut link, next_id, config, &token, &wanted).await {
+        Ok(result) => result,
+        Err(e) if config.optional_scopes.is_empty() => return Err(e),
+        Err(_) => {
+            let required: Vec<&String> = config.scopes.iter().collect();
+            hello(&mut link, next_id, config, &token, &required).await?
+        }
+    };
 
     // `pending` (interactive third-party enrollment): not supported in v1 —
     // for an official component it means a missing token, hence a failure.
@@ -406,29 +407,77 @@ async fn establish(config: &ClientConfig, next_id: &mut u64) -> Result<Link, Est
 
     // One call for every topic: the Core subscribes all or nothing, on purpose
     // (no silent partial subscription). A topic declared OPTIONAL may be one
-    // this Core has never heard of — it is older than the topic — and its
+    // this Core has never heard of (it is older than the topic), and its
     // refusal takes the whole call down with it. That must not cost the
-    // connection: we ask for everything, and fall back to the required set
-    // alone. What is then lost is the events of a topic this Core would never
-    // have sent anyway.
+    // connection: we ask for everything, and degrade from there. What is then
+    // lost is the events of a topic this Core would never have sent anyway.
     let required: Vec<&str> = config.topics.iter().map(String::as_str).collect();
-    let wanted: Vec<&str> = required
-        .iter()
-        .copied()
-        .chain(config.optional_topics.iter().map(String::as_str))
-        .collect();
+    let optional: Vec<&str> = config.optional_topics.iter().map(String::as_str).collect();
+    let wanted: Vec<&str> = required.iter().copied().chain(optional.clone()).collect();
     if !wanted.is_empty()
         && subscribe(&mut link, next_id, &wanted, &config.served_methods)
             .await
             .is_err()
     {
-        if config.optional_topics.is_empty() {
+        if optional.is_empty() {
             return Err(EstablishError::Failed);
         }
-        subscribe(&mut link, next_id, &required, &config.served_methods).await?;
+        // Which of the optional ones this Core will not have is per topic (an
+        // unknown name, or a scope this connection was not granted), so it is
+        // found per topic. With only one there is nothing to find: the call
+        // above already named it, and asking again would be a round trip whose
+        // answer we hold.
+        let mut accepted: Vec<&str> = Vec::new();
+        if optional.len() > 1 {
+            for topic in &optional {
+                let probe: Vec<&str> = required.iter().copied().chain([*topic]).collect();
+                if subscribe(&mut link, next_id, &probe, &config.served_methods)
+                    .await
+                    .is_ok()
+                {
+                    accepted.push(topic);
+                }
+            }
+        }
+        // The LAST call is the one the connection ends subscribed to: the Core
+        // replaces the set on every `events.subscribe`, it does not add to it.
+        // So this call is not redundant with the probes above even when it asks
+        // for exactly what the last accepted probe asked for.
+        let keep: Vec<&str> = required.iter().copied().chain(accepted).collect();
+        subscribe(&mut link, next_id, &keep, &config.served_methods).await?;
     }
 
     Ok(link)
+}
+
+/// One hello, with the scope list it is given. Errors are not distinguished on
+/// purpose: a refused hello and a dead socket both make the cycle fail, and the
+/// caller's one retry costs a write that fails immediately on a dead socket.
+async fn hello(
+    link: &mut Link,
+    next_id: &mut u64,
+    config: &ClientConfig,
+    token: &str,
+    scopes: &[&String],
+) -> Result<Value, EstablishError> {
+    *next_id += 1;
+    let id = *next_id;
+    let hello = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "hello",
+        "params": {
+            "name": config.name,
+            "version": config.version,
+            "role": config.role,
+            "scopes": scopes,
+            "token": token,
+        },
+    });
+    write_frame(&mut link.writer, &hello.to_string())
+        .await
+        .map_err(|_| EstablishError::Failed)?;
+    wait_response(link, id, &config.served_methods).await
 }
 
 async fn subscribe(

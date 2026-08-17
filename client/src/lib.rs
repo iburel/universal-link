@@ -59,6 +59,18 @@ pub struct ClientConfig {
     pub version: String,
     pub role: String,
     pub scopes: Vec<String>,
+    /// Scopes asked for ALONGSIDE [`ClientConfig::scopes`], whose refusal must
+    /// not cost the connection. The hello's scope list is checked for
+    /// MEMBERSHIP by the Core (an unknown name is `invalid params` for the
+    /// whole hello), so a component that has grown a scope would never connect
+    /// at all to a Core that predates that scope: not a lost feature, a dead
+    /// interface, on a machine where the old Core is merely still running from
+    /// the previous session. Asked for here instead, the hello is retried
+    /// without them and the component then sees the scope missing from
+    /// `Event::Connected`'s `granted_scopes`, which is what it must gate the
+    /// feature on. Same promotion rule as [`ClientConfig::optional_topics`]:
+    /// moved into `scopes` once no such Core is in the field.
+    pub optional_scopes: Vec<String>,
     /// `events.subscribe` topics, subscribed on every (re)connection before
     /// `Event::Connected`. Empty: no subscription. A topic the Core does not
     /// know fails the whole subscription, and with it the connection — see
@@ -67,10 +79,16 @@ pub struct ClientConfig {
     /// Topics asked for ALONGSIDE [`ClientConfig::topics`], whose refusal must
     /// not cost the connection: a Core older than the topic answers `invalid
     /// params` for the whole list (it subscribes all or nothing), and the client
-    /// then subscribes to the required topics alone. This is what lets a
-    /// component that has grown a topic keep working against a Core that has
-    /// not — it loses that topic's events, which such a Core would never send.
-    /// A topic can be promoted to `topics` once no such Core is in the field.
+    /// then falls back. This is what lets a component that has grown a topic
+    /// keep working against a Core that has not: it loses that topic's events,
+    /// which such a Core would never send. A topic can be promoted to `topics`
+    /// once no such Core is in the field.
+    ///
+    /// With TWO of them the fallback cannot be "the required set alone": that
+    /// would drop a topic this Core does know because of one it does not, and
+    /// the second optional topic's arrival would silently break the first's
+    /// feature. So each is then tried on its own and the connection ends
+    /// subscribed to the required set plus those that were accepted.
     pub optional_topics: Vec<String>,
     /// Core→component request methods this component serves (e.g.
     /// `clipboard.get_data` for the clipboard backend). A served method is

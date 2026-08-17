@@ -261,6 +261,7 @@ async fn boot_core(data_dir: &Path) -> anyhow::Result<ClientConfig> {
         role: "gui".into(),
         scopes: GUI_SCOPES.iter().map(|s| s.to_string()).collect(),
         topics: GUI_TOPICS.iter().map(|s| s.to_string()).collect(),
+        optional_scopes: Vec::new(),
         optional_topics: GUI_OPTIONAL_TOPICS.iter().map(|s| s.to_string()).collect(),
         served_methods: vec![],
         reconnect_base_delay: Duration::from_secs(1),
