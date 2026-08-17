@@ -59,7 +59,7 @@ fn exclusive_role_taken(reg: &crate::state::Registry, role: &str) -> bool {
     EXCLUSIVE_ROLES.contains(&role) && reg.role_taken(role)
 }
 
-const SCOPES: [&str; 15] = [
+const SCOPES: [&str; 16] = [
     "session.read",
     "session.manage",
     "devices.read",
@@ -70,6 +70,7 @@ const SCOPES: [&str; 15] = [
     "clipboard.write",
     "transactions.publish",
     "peers.message",
+    "peers.channel",
     "sync.serve",
     "sync.read",
     "sync.manage",
@@ -399,6 +400,7 @@ impl Conn {
             "transactions.revoke" => self.transactions_revoke(params),
             "transactions.adopt" => self.transactions_adopt(params).await,
             "peers.send" => self.peers_send(params).await,
+            "peers.channel" => self.peers_channel(params).await,
             "system.shutdown" => self.system_shutdown(),
             // The backend's own method first; every other `sync.*` name is the
             // routed facade, forwarded to the exclusive sync backend.
@@ -849,6 +851,10 @@ impl Conn {
             .expect("lock clipboard")
             .clear_all();
         self.state.clipboard_reset.notify_waiters();
+        // And the live peer channels with them (#124): what an account's
+        // components say to each other across its devices belongs to the
+        // session that made them peers.
+        crate::peerchannel::cut_all(&self.state, crate::peerchannel::reason::LOGGED_OUT);
         Ok(json!({}))
     }
 
@@ -1543,11 +1549,9 @@ impl Conn {
             .lock()
             .expect("lock registry")
             .mint_channel_token(crate::state::ChannelGrant {
-                tx_id,
-                kind: crate::state::ChannelKind::Consumer,
+                kind: crate::state::ChannelKind::Consumer { tx_id },
                 pid: self.peer.pid,
                 conn_id: self.conn_id,
-                sink: None,
             });
         Ok(json!({ "channel_token": token }))
     }
@@ -1609,22 +1613,47 @@ impl Conn {
     /// One bounded round-trip, so `COMPONENT_ABSENT` is the remote Core's word;
     /// delivery stays best-effort (the sender retries on its own schedule).
     async fn peers_send(&self, params: &Value) -> Result<Value, RpcErr> {
-        let role = {
-            let reg = self.state.registry.lock().expect("lock registry");
-            match &reg.conns.get(&self.conn_id).expect("live connection").phase {
-                Phase::Fresh => return Err(RpcErr::app("NOT_ENROLLED")),
-                Phase::Pending(_) => return Err(RpcErr::app("PENDING_APPROVAL")),
-                Phase::Active(a) if a.has_scope("peers.message") => a.role.clone(),
-                Phase::Active(_) => return Err(RpcErr::app("SCOPE_DENIED")),
-            }
-        };
+        let role = self.peer_role("peers.message")?;
         let device_id = rpc::required_str(params, "device_id")?;
         let payload = params
             .get("payload")
             .cloned()
             .ok_or_else(|| RpcErr::invalid_params("payload"))?;
-        // Messaging one's own device is a loopback nothing needs: refused
-        // rather than dialled.
+        self.reject_own_device(&device_id)?;
+        crate::peers::send(&self.state, &role, &device_id, payload).await
+    }
+
+    /// Opens a live channel to the components holding the SAME role on another
+    /// device (doc/core-api.md, "peers.*"; #124) and returns the
+    /// `channel_token` for its local end. The whole targeting happens before
+    /// this returns, so every refusal is an answer rather than a silence:
+    /// `DEVICE_UNKNOWN`, `DEVICE_OFFLINE`, `COMPONENT_ABSENT` (the remote
+    /// Core's word), `NO_DIRECT_PATH` (the deployment's relays are
+    /// rendezvous-only and no direct path formed). The role is stamped HERE
+    /// like `peers.send`'s: a role talks to itself across devices.
+    async fn peers_channel(&self, params: &Value) -> Result<Value, RpcErr> {
+        let role = self.peer_role(crate::peerchannel::SCOPE)?;
+        let device_id = rpc::required_str(params, "device_id")?;
+        self.reject_own_device(&device_id)?;
+        crate::peerchannel::open(&self.state, &role, &device_id, self.conn_id, self.peer.pid).await
+    }
+
+    /// This connection's role, once `scope` is verified: what stamps a peer
+    /// gesture as coming from a role rather than from a caller's choice. Phase
+    /// before scope (an unenrolled connection learns nothing).
+    fn peer_role(&self, scope: &str) -> Result<String, RpcErr> {
+        let reg = self.state.registry.lock().expect("lock registry");
+        match &reg.conns.get(&self.conn_id).expect("live connection").phase {
+            Phase::Fresh => Err(RpcErr::app("NOT_ENROLLED")),
+            Phase::Pending(_) => Err(RpcErr::app("PENDING_APPROVAL")),
+            Phase::Active(a) if a.has_scope(scope) => Ok(a.role.clone()),
+            Phase::Active(_) => Err(RpcErr::app("SCOPE_DENIED")),
+        }
+    }
+
+    /// Aiming a peer gesture at one's own device is a loopback nothing needs:
+    /// refused rather than dialled.
+    fn reject_own_device(&self, device_id: &str) -> Result<(), RpcErr> {
         let own = self
             .state
             .session
@@ -1632,10 +1661,10 @@ impl Conn {
             .expect("lock session")
             .own_device_id
             .clone();
-        if own.as_deref() == Some(device_id.as_str()) {
+        if own.as_deref() == Some(device_id) {
             return Err(RpcErr::invalid_params("device_id"));
         }
-        crate::peers::send(&self.state, &role, &device_id, payload).await
+        Ok(())
     }
 
     // -- The sync facade ----------------------------------------------------

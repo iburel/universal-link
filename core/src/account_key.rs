@@ -487,6 +487,11 @@ pub(crate) fn leave(state: &std::sync::Arc<crate::state::AppState>) {
         );
         abort
     };
+    // FIRST of the teardowns, because the reason has to beat a vigil: the block
+    // above emptied the directory, and a live channel's own trust check would
+    // then report its peer as struck off, which is the symptom rather than the
+    // cause. Cutting here names the cause (#124).
+    crate::peerchannel::cut_all(state, crate::peerchannel::reason::ACCOUNT_LEFT);
     if let Some(abort) = abort {
         abort.abort();
     }
@@ -498,7 +503,8 @@ pub(crate) fn leave(state: &std::sync::Arc<crate::state::AppState>) {
     // has no account to sponsor into and no standing to join with. `no_account`
     // is the truth of the matter, said in the vocabulary the interface knows.
     crate::pairing::fail_current(state, "no_account");
-    // The account's read grants do not outlive it (same as the logout).
+    // The account's read grants do not outlive it (same as the logout). The live
+    // peer channels went first, above.
     state.clipboard.lock().expect("lock clipboard").clear_all();
     state.clipboard_reset.notify_waiters();
 }

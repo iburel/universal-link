@@ -82,8 +82,10 @@ pub(crate) async fn run<R, W>(
     peer: PeerInfo,
     token: String,
 ) where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
+    // `Send + 'static`: a peer channel (#124) hands these halves to another
+    // task, because the connection has to outlive this call.
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
     let grant = state
         .registry
@@ -103,15 +105,23 @@ pub(crate) async fn run<R, W>(
     {
         return;
     }
+    // The connection the token was minted for: the control connection, never
+    // this one (a data connection is not registered at all).
+    let owner = grant.conn_id;
     match grant.kind {
-        ChannelKind::Consumer => serve_consumer(&state, reader, write, grant.tx_id).await,
+        ChannelKind::Consumer { tx_id } => serve_consumer(&state, reader, write, tx_id).await,
         // Provider: the backend pushes the inline blob it was asked for; we
         // forward it to the consumer that is waiting on the sink.
-        ChannelKind::Provider => {
-            if let Some(sink) = grant.sink {
-                serve_provider(reader, sink).await;
-            }
+        ChannelKind::Provider { sink } => serve_provider(reader, sink).await,
+        // A peer channel this device opened: the peer stream was parked at
+        // `peers.channel`; take it and become the pipe (#124).
+        ChannelKind::PeerOpen(parked) => {
+            crate::peerchannel::serve_opened(state, parked, owner, reader, write).await;
         }
+        // A peer channel a peer opened: its handler holds the peer stream and is
+        // waiting for these halves. Handing them over ends this task, and the
+        // connection stays open because the handler now owns both of its halves.
+        ChannelKind::PeerJoin(joining) => joining.hand_over(&state, owner, reader, write),
     }
 }
 
@@ -387,11 +397,9 @@ where
         // token is bound to its opener.
         let announcer_pid = reg.conns.get(&announcer).and_then(|e| e.pid);
         let token = reg.mint_channel_token(ChannelGrant {
-            tx_id: tx_id.to_string(),
-            kind: ChannelKind::Provider,
+            kind: ChannelKind::Provider { sink },
             pid: announcer_pid,
             conn_id: announcer,
-            sink: Some(sink),
         });
         let issued = reg.issue_request(
             announcer,

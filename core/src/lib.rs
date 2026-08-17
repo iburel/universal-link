@@ -22,6 +22,7 @@ mod http;
 mod identity;
 mod login;
 mod pairing;
+mod peerchannel;
 mod peers;
 mod relays;
 mod rpc;
@@ -230,6 +231,11 @@ impl Drop for CoreHandle {
         // `shutdown` is set under the same lock as the sweep: a connection
         // accepted but not yet registered will give up on its own by reading it
         // at registration.
+        // BEFORE that sweep: a live peer channel's component is told why its
+        // channel is about to end. A connection's write queue is drained in
+        // order and the drain stops at the close enqueued below, so this is the
+        // only moment at which the word can still be written (#124).
+        crate::peerchannel::announce_stop(&self.state);
         let mut reg = self.state.registry.lock().expect("lock registry");
         reg.shutdown = true;
         for entry in reg.conns.values() {
@@ -257,6 +263,23 @@ impl Drop for CoreHandle {
             .expect("lock clipboard")
             .clear_all();
         self.state.clipboard_reset.notify_waiters();
+        // Same reasoning for the live peer channels (#124), whose pipes are not
+        // in `conns` either. This matters for a Core dropped inside a LIVING
+        // process (the phone embeds one, and every in-process test does): a pipe
+        // task holds an `Arc<AppState>` and polls a vigil of its own, so it must
+        // be told to stop rather than left to outlive the Core that owns its
+        // state.
+        //
+        // Belt AND braces, deliberately: each pipe's vigil also watches whether
+        // its owning component is still connected, and the sweep above closes
+        // every one of those connections, so a pipe would end within one poll
+        // anyway. This makes it immediate instead, which is what shuts the peer
+        // streams now and lets the far ends see an end rather than a wait. The
+        // reason it carries here is a duplicate of what `announce_stop` already
+        // said, and it lands in a queue nobody drains: harmless, and simpler
+        // than teaching the pipe that it has already been announced.
+        crate::peerchannel::cut_all(&self.state, crate::peerchannel::reason::SHUTDOWN);
+
         // The session and login tasks are held by the state (logout and flow
         // replacement go through it): stopped via their handles.
         if let Some(abort) = self
@@ -349,6 +372,7 @@ pub async fn spawn(config: Config) -> Result<CoreHandle, SpawnError> {
         transfers: Mutex::new(Transfers::new()),
         clipboard: Mutex::new(crate::clipboard::ClipboardState::new()),
         clipboard_reset: tokio::sync::Notify::new(),
+        peer_channels: Mutex::new(crate::peerchannel::PeerChannels::default()),
         dirsync_wake: tokio::sync::Notify::new(),
         reach_wake: tokio::sync::Notify::new(),
         reconnect_base_delay: config.reconnect_base_delay,

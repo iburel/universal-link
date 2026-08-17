@@ -8,6 +8,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The Core grew a live channel between two of your computers**, the
+  primitive the coming keyboard and mouse sharing rides on. `peers.send`
+  already carried a message between the components of one role across the
+  account's devices; it opens a stream and waits for an acknowledgment per
+  message, which is right for a gesture and hopeless for a flow of pointer
+  positions. `peers.channel` is the other half: a component asks for a
+  channel to another device, opens a second connection to the local socket
+  the way a paste already does, and the two devices' components have a live
+  duplex pipe. The Core carries the frames and reads none of them, so it
+  learns nothing about keyboards, screens or permissions: it enforces who may
+  talk to whom, the caps, and the moment the channel must die. It dies
+  properly, which is the whole point: revoke the far device, log out, leave
+  the account, stop the Core, let the component crash or the peer vanish, and
+  both ends see a clean end with a reason the interface can say, never a pipe
+  that goes quiet. One channel between a given kind of component and a given
+  device, so a retry replaces its predecessor instead of leaking pipes. And a
+  deployment whose relays are
+  rendezvous-only (the setting below) refuses such a channel by its own code
+  rather than quietly carrying a live flow it said it would not: a live
+  session names no size, so it asks for a direct path. Nothing of this shows
+  in the interfaces yet, and no component uses it yet: it is the contract the
+  input component, and any third-party replacement, will speak
+  ([doc/core-api.md](doc/core-api.md), `peers.*`).
+
 - **Folders now stay identical across your computers, by themselves** (the
   sync engine). A new official component, `1device-sync`, keeps chosen
   folders in step over the generic primitives the Core already had: control

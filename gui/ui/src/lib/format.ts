@@ -57,6 +57,11 @@ const SCOPES: Record<string, string> = {
   // since the prompt is the only place the user is ever told.
   "transactions.publish": "Offer files of this device to your other devices",
   "peers.message": "Exchange messages with itself on your other devices",
+  // A live channel is a standing pipe, not an occasional message: whatever the
+  // component sends flows continuously to its twin on the other machine for as
+  // long as the channel is open. Said plainly, since the prompt is the only
+  // place the user is ever told.
+  "peers.channel": "Open a live channel to itself on your other devices",
   // The sync engine's own three. `sync.serve` is what makes a component THE
   // engine (it answers every interface's sync gesture); `sync.manage` can
   // create sets, invite devices and resolve conflicts, which moves files.

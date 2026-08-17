@@ -364,7 +364,10 @@ Security).
   maximize the ease of writing third-party components.
 - No payload on the control plane: inline clipboard blobs (text/image) and
   consumer-driven file reads (IStream, FUSE…) both go through a dedicated
-  **data channel** (binary, range reads).
+  **data channel** (binary, range reads). The same second connection carries a
+  third thing since #124: a **peer channel**, a live duplex pipe of opaque
+  frames between the components holding one role on two devices of the account
+  (`peers.channel`), for the flows an acked message per event cannot serve.
 - The API is defined as a **versioned formal spec** — see
   [core-api.md](core-api.md): it is the project's extensibility product.
 

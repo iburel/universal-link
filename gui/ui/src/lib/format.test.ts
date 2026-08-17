@@ -51,6 +51,14 @@ test("the scope that can give the account away says so", () => {
   expect(scopeLabel("session.manage")).toMatch(/link new devices/);
 });
 
+// Every scope the Core can grant needs a sentence here, or the prompt shows the
+// bare identifier and the user is told nothing. The two cross-device primitives
+// are the ones that carry data off this machine.
+test("the cross-device primitives are spelled out, one message and one flow", () => {
+  expect(scopeLabel("peers.message")).toMatch(/messages/);
+  expect(scopeLabel("peers.channel")).toMatch(/live channel/);
+});
+
 // The phone runs the SAME view as the desktop, so the self label has to follow
 // the platform rather than the build it is displayed on.
 test("a device names itself after what it is", () => {
