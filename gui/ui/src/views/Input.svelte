@@ -415,6 +415,16 @@
     if (!(await act(wanted))) box.checked = !wanted;
   }
 
+  /** The same for a menu of choices: `was` is what the engine had. */
+  async function choose(
+    event: Event,
+    was: string,
+    act: (wanted: string) => Promise<boolean>,
+  ) {
+    const menu = event.currentTarget as HTMLSelectElement;
+    if (!(await act(menu.value))) menu.value = was;
+  }
+
   const HOTKEYS: readonly { keys: string[]; label: string }[] = [
     { keys: ["ctrl", "alt", "Escape"], label: "Ctrl + Alt + Escape" },
     { keys: ["ctrl", "shift", "Home"], label: "Ctrl + Shift + Home" },
@@ -671,11 +681,11 @@
                     aria-label="When the pointer crosses to {peer.name}"
                     value={String(stored?.dwell_ms ?? GUARD_DEFAULTS.dwell_ms)}
                     onchange={(e) =>
-                      guard(peer, {
-                        dwell_ms: Number(
-                          (e.currentTarget as HTMLSelectElement).value,
-                        ),
-                      })}
+                      choose(
+                        e,
+                        String(stored?.dwell_ms ?? GUARD_DEFAULTS.dwell_ms),
+                        (wanted) => guard(peer, { dwell_ms: Number(wanted) }),
+                      )}
                   >
                     {#if !DWELL_CHOICES.some((c) => c.ms === (stored?.dwell_ms ?? GUARD_DEFAULTS.dwell_ms))}
                       <option value={String(stored?.dwell_ms)}>
@@ -696,11 +706,9 @@
                     aria-label="The key to hold to cross to {peer.name}"
                     value={String(stored?.require_mods ?? 0)}
                     onchange={(e) =>
-                      guard(peer, {
-                        require_mods: Number(
-                          (e.currentTarget as HTMLSelectElement).value,
-                        ),
-                      })}
+                      choose(e, String(stored?.require_mods ?? 0), (wanted) =>
+                        guard(peer, { require_mods: Number(wanted) }),
+                      )}
                   >
                     <option value="0">nothing</option>
                     <option value={String(MODS.ctrl)}>Ctrl</option>
@@ -783,11 +791,13 @@
         {disabled}
         aria-label="The key that brings your keyboard back"
         value={hotkeyLabel(state.hotkey)}
-        onchange={(e) => {
-          const label = (e.currentTarget as HTMLSelectElement).value;
-          const chosen = HOTKEYS.find((chord) => chord.label === label);
-          if (chosen) void store.setHotkey(chosen.keys);
-        }}
+        onchange={(e) =>
+          choose(e, hotkeyLabel(state.hotkey), async (label) => {
+            const chosen = HOTKEYS.find((chord) => chord.label === label);
+            // A chord this build does not offer is not a refusal: it is the one
+            // already in force, listed so it can be seen.
+            return chosen ? await store.setHotkey(chosen.keys) : true;
+          })}
       >
         <!-- A chord set from somewhere else (a third-party interface) is listed
              as it is rather than silently replaced by one of these three. -->

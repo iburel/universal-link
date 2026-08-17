@@ -852,10 +852,8 @@ test("a refused switch goes back to what the engine says", async () => {
   expect(box.checked).toBe(false);
   box.click();
   expect(box.checked).toBe(true);
-  await Promise.resolve();
-  await Promise.resolve();
 
-  expect(box.checked).toBe(false);
+  await vi.waitFor(() => expect(box.checked).toBe(false));
 });
 
 test("a switch the engine took goes on waiting for the engine's word", async () => {
@@ -1034,4 +1032,34 @@ test("a drag that outlives the plane sends nothing at all", async () => {
   await Promise.resolve();
 
   expect(place).not.toHaveBeenCalled();
+});
+
+// The same rule as the checkboxes, for the menus: a choice the engine refused
+// must not be left standing as though it had taken.
+test("a refused choice goes back to what the engine says", async () => {
+  vi.spyOn(store, "setGuards").mockResolvedValue(false);
+  const view = render(Input, { store });
+
+  const select = byLabel(
+    view,
+    "When the pointer crosses to Desk",
+  ) as HTMLSelectElement;
+  select.value = "600";
+  select.dispatchEvent(new Event("change", { bubbles: true }));
+
+  await vi.waitFor(() => expect(select.value).toBe("250"));
+});
+
+test("a refused hotkey goes back to the one in force", async () => {
+  vi.spyOn(store, "setHotkey").mockResolvedValue(false);
+  const view = render(Input, { store });
+
+  const select = byLabel(
+    view,
+    "The key that brings your keyboard back",
+  ) as HTMLSelectElement;
+  select.value = "Ctrl + Shift + Home";
+  select.dispatchEvent(new Event("change", { bubbles: true }));
+
+  await vi.waitFor(() => expect(select.value).toBe("Ctrl + Alt + Escape"));
 });
