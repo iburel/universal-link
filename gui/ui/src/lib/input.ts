@@ -466,10 +466,10 @@ export function reimportBlock(
   spots: readonly InputSpot[],
   device_id: string,
   own: readonly { id: string; x: number; y: number }[],
-): PlacedSpot[] {
+): DropOutcome {
   const mine = spots.filter((s) => s.device_id === device_id);
   if (mine.length === 0 || own.length === 0) {
-    return spots.map((s) => ({ monitor: s.monitor, x: s.x, y: s.y }));
+    return { ok: true, spots: spots.map((s) => ({ monitor: s.monitor, x: s.x, y: s.y })) };
   }
   const corner = {
     x: Math.min(...mine.map((s) => s.x)),
@@ -485,10 +485,18 @@ export function reimportBlock(
       { x: corner.x + (m.x - origin.x), y: corner.y + (m.y - origin.y) },
     ]),
   );
-  return spots.map((s) => {
-    const back = s.device_id === device_id ? at.get(monitorOfSpot(s.monitor)) : undefined;
-    return { monitor: s.monitor, x: back?.x ?? s.x, y: back?.y ?? s.y };
-  });
+  // Through the same door as a drag, deliberately: a block put back can land on
+  // top of a screen that moved in while it was scattered, and an overlap is an
+  // overlap however it was made.
+  return settle(
+    spots,
+    new Map(
+      spots.flatMap((s) => {
+        const back = s.device_id === device_id ? at.get(monitorOfSpot(s.monitor)) : undefined;
+        return back ? [[s.monitor, back] as const] : [];
+      }),
+    ),
+  );
 }
 
 /**
@@ -602,6 +610,12 @@ export function dropSpots(
   dx: number,
   dy: number,
 ): DropOutcome {
+  // A delta that is not a number cannot be reasoned about, and `Math.abs(NaN)`
+  // passes every bound below: it would reach the engine as a JSON `null` and come
+  // back as a shape error, which is a lie about what happened.
+  if (!Number.isFinite(dx) || !Number.isFinite(dy)) {
+    return { ok: false, reason: "off_plane" };
+  }
   const moving = new Set(keys);
   const moved = spots.filter((s) => moving.has(s.monitor));
   const still = spots.filter((s) => !moving.has(s.monitor));
@@ -637,10 +651,46 @@ export function dropSpots(
   };
   const ax = snap("x", "w", "y", "h");
   const ay = snap("y", "h", "x", "w");
-  const placed = shifted.map((s) => ({ ...s, x: s.x + ax, y: s.y + ay }));
+  return settle(
+    spots,
+    new Map(shifted.map((s) => [s.monitor, { x: s.x + ax, y: s.y + ay }])),
+  );
+}
 
+/**
+ * The one door every arrangement this interface produces goes through: the moved
+ * screens at their new corners, checked, and the WHOLE set returned in the
+ * snapshot's own order.
+ *
+ * Two refusals, and they are the same two whether a human dragged a screen or
+ * asked for a block to be put back:
+ *
+ * - an **overlap**, because the engine derives no crossing from overlapping
+ *   rectangles (section 7), so the result would silently take away the crossing
+ *   the person was making and nothing on screen would say why;
+ * - a spot **off the plane**, which the engine answers with `-32602`.
+ *
+ * The whole set, because `input.place` REPLACES the placement: a spot left out
+ * would lose its place, and a ghost's place is exactly what must not be lost.
+ */
+function settle(
+  spots: readonly InputSpot[],
+  moved: ReadonlyMap<string, { x: number; y: number }>,
+): DropOutcome {
+  const placed = spots.map((s) => {
+    const at = moved.get(s.monitor);
+    return { ...s, x: at?.x ?? s.x, y: at?.y ?? s.y };
+  });
+  const before = new Map(spots.map((s) => [s.monitor, s]));
+  // Only what this gesture MOVED is judged. A plane that arrived already
+  // overlapping (dragged on another computer, or written by another interface)
+  // must stay draggable, or the one gesture that could repair it would be the one
+  // gesture refused.
   for (const a of placed) {
+    if (!moved.has(a.monitor)) continue;
     if (
+      !Number.isFinite(a.x) ||
+      !Number.isFinite(a.y) ||
       Math.abs(a.x) > PLANE_EXTENT ||
       Math.abs(a.y) > PLANE_EXTENT ||
       Math.abs(a.x + a.w) > PLANE_EXTENT ||
@@ -648,20 +698,20 @@ export function dropSpots(
     ) {
       return { ok: false, reason: "off_plane" };
     }
-    for (const b of still) {
-      if (overlaps(a, b)) return { ok: false, reason: "overlap" };
+    for (const b of placed) {
+      if (a.monitor === b.monitor || !overlaps(a, b)) continue;
+      // An overlap that was already there is not this gesture's doing: a rigid
+      // block keeps its own shape, so its internal pairs are exactly as they
+      // arrived, while a block being put back really does rearrange itself and is
+      // judged on the result.
+      const was = { a: before.get(a.monitor), b: before.get(b.monitor) };
+      if (was.a && was.b && overlaps(was.a, was.b)) continue;
+      return { ok: false, reason: "overlap" };
     }
   }
-
-  const byKey = new Map(placed.map((s) => [s.monitor, s]));
   return {
     ok: true,
-    // Every spot, in the snapshot's own order, so the result is a function of
-    // the plane and not of which screen was dragged.
-    spots: spots.map((s) => {
-      const at = byKey.get(s.monitor) ?? s;
-      return { monitor: s.monitor, x: at.x, y: at.y };
-    }),
+    spots: placed.map((s) => ({ monitor: s.monitor, x: s.x, y: s.y })),
   };
 }
 

@@ -622,7 +622,9 @@ test("a machine's own arrangement can be put back, keeping the block's corner", 
     { id: "B1", x: 0, y: 0 },
     { id: "B2", x: 1920, y: 0 },
   ];
-  const back = reimportBlock(spots, "d_b", own);
+  const outcome = reimportBlock(spots, "d_b", own);
+  expect(outcome.ok).toBe(true);
+  const back = outcome.ok ? outcome.spots : [];
   expect(back).toEqual([
     { monitor: `${A}/A1`, x: 0, y: 0 },
     { monitor: `${B}/B1`, x: 4000, y: 0 },
@@ -632,14 +634,47 @@ test("a machine's own arrangement can be put back, keeping the block's corner", 
 
 test("putting a block back leaves every other screen exactly where it was", () => {
   const spots = [spot(`${A}/A1`, -100, -200), spot(`${B}/B1`, 4000, 0)];
-  expect(reimportBlock(spots, "d_b", [])).toEqual([
+  const untouched = [
     { monitor: `${A}/A1`, x: -100, y: -200 },
     { monitor: `${B}/B1`, x: 4000, y: 0 },
-  ]);
-  expect(reimportBlock(spots, "d_nobody", [{ id: "X", x: 0, y: 0 }])).toEqual([
-    { monitor: `${A}/A1`, x: -100, y: -200 },
-    { monitor: `${B}/B1`, x: 4000, y: 0 },
-  ]);
+  ];
+  expect(reimportBlock(spots, "d_b", [])).toEqual({ ok: true, spots: untouched });
+  expect(reimportBlock(spots, "d_nobody", [{ id: "X", x: 0, y: 0 }])).toEqual({
+    ok: true,
+    spots: untouched,
+  });
+});
+
+// A block put back can land on a screen that moved in while it was scattered, and
+// an overlap is an overlap however it was made: the same door as a drag.
+test("putting a block back is refused when it would land on another screen", () => {
+  const spots = [
+    // A's screen sits exactly where B's second screen wants to come back to.
+    spot(`${A}/A1`, 5920, 0),
+    { ...spot(`${B}/B1`, 4000, 0), device_id: "d_b" },
+    { ...spot(`${B}/B2`, 4000, 2000), device_id: "d_b" },
+  ];
+  const own = [
+    { id: "B1", x: 0, y: 0 },
+    { id: "B2", x: 1920, y: 0 },
+  ];
+  expect(reimportBlock(spots, "d_b", own)).toEqual({
+    ok: false,
+    reason: "overlap",
+  });
+});
+
+// A plane that arrived already overlapping (dragged on another computer, or
+// written by another interface) must stay draggable: refusing the one gesture
+// that could repair it would leave nothing to do at all.
+test("an overlap that was already there does not block the drag that repairs it", () => {
+  const spots = [spot(`${A}/A1`, 0, 0), spot(`${B}/B1`, 500, 0)];
+  // Nudged a little, still overlapping: not this drag's doing.
+  const nudged = dropSpots(spots, [`${B}/B1`], 40, 0);
+  expect(nudged.ok).toBe(true);
+  // And dragged clear of it, which is the repair.
+  const clear = dropSpots(spots, [`${B}/B1`], 1420, 0);
+  expect(clear.ok).toBe(true);
 });
 
 // A monitor id may itself contain a slash, so the key splits at the first one.
@@ -653,6 +688,14 @@ test("a drag of nothing changes nothing", () => {
   const spots = [spot(`${A}/A1`, 0, 0)];
   const out = dropSpots(spots, [], 100, 100);
   expect(out).toEqual({ ok: true, spots: [{ monitor: `${A}/A1`, x: 0, y: 0 }] });
+});
+
+// A delta that is not a number passes every bound (`Math.abs(NaN) > n` is false)
+// and would reach the engine as a JSON null.
+test("a drag of something that is not a number moves nothing", () => {
+  const spots = [spot(`${A}/A1`, 0, 0)];
+  expect(dropSpots(spots, [`${A}/A1`], Number.NaN, 0).ok).toBe(false);
+  expect(dropSpots(spots, [`${A}/A1`], 0, Number.POSITIVE_INFINITY).ok).toBe(false);
 });
 
 // The plane is integers: the engine signs this document, and a float on a signed

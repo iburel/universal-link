@@ -200,8 +200,13 @@
 
   /** Put a machine's screens back the way that machine itself has them. */
   async function reimport(peer: InputPeer) {
+    const outcome = reimportBlock(spots, peer.device_id, peer.monitors);
+    if (!outcome.ok) {
+      refused = dropRefusal(outcome.reason);
+      return;
+    }
     refused = null;
-    await store.placeScreens(reimportBlock(spots, peer.device_id, peer.monitors));
+    await store.placeScreens(outcome.spots);
   }
 
   /** The machines that have a spot on the plane, in the order they are drawn. */
