@@ -259,16 +259,22 @@ impl Drop for CoreHandle {
             .clear_all();
         self.state.clipboard_reset.notify_waiters();
         // Same reasoning for the live peer channels (#124), whose pipes are not
-        // in `conns` either. What this call is really for is a Core dropped
-        // inside a LIVING process (the phone embeds one, and every in-process
-        // test does): a pipe task is detached and polls a vigil of its own, so
-        // without this it would outlive the Core that owns its state. It also
-        // shuts each peer stream, so the far ends see an end rather than a
-        // timeout. The reason it carries is best-effort: the sweep above already
-        // queued a close on those very components' connections, so most of the
-        // time a component learns by its own connection ending, which says the
-        // same thing.
+        // in `conns` either. This matters for a Core dropped inside a LIVING
+        // process (the phone embeds one, and every in-process test does): a pipe
+        // task holds an `Arc<AppState>` and polls a vigil of its own, so it must
+        // be told to stop rather than left to outlive the Core that owns its
+        // state.
+        //
+        // Belt AND braces, deliberately: each pipe's vigil also watches whether
+        // its owning component is still connected, and the sweep above closes
+        // every one of those connections, so a pipe would end within one poll
+        // anyway. This makes it immediate instead, which is what shuts the peer
+        // streams now and lets the far ends see an end rather than a wait. The
+        // reason it carries is best-effort for the same reason: the component's
+        // own connection is closing in this very breath, and that says the same
+        // thing.
         crate::peerchannel::cut_all(&self.state, crate::peerchannel::reason::SHUTDOWN);
+
         // The session and login tasks are held by the state (logout and flow
         // replacement go through it): stopped via their handles.
         if let Some(abort) = self

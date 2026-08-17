@@ -570,6 +570,33 @@ async fn the_local_end_closing_ends_the_channel_at_both_ends() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_core_stopping_ends_the_channel_at_the_far_end() {
+    let server = TestServer::start().await;
+    let (a, mut ca, b, mut cb) = channel_pair(&server).await;
+    let (mut pa, mut pb) = joined(&a, &mut ca, &b, &mut cb).await;
+    pa.send(b"before the stop").await;
+    assert_eq!(pb.recv().await.as_deref(), Some(&b"before the stop"[..]));
+
+    // A's Core stops. Its pipe is NOT one of the connections the teardown
+    // sweeps (a second connection is never registered as one), so the pipe has
+    // to be ended on purpose: two mechanisms do it, the mass cut immediately and
+    // each vigil's owner check within a poll. What is pinned here is the
+    // OUTCOME, not which of the two fired.
+    drop(a);
+
+    // The far end hears the end rather than waiting on a mute pipe, and the
+    // local half is closed too. What this side's own component is TOLD is
+    // deliberately not asserted: the same teardown is closing its control
+    // connection, which says the same thing and usually says it first.
+    assert_eq!(
+        closed_reason(&mut cb, CONVERGENCE_TIMEOUT).await,
+        "PEER_GONE"
+    );
+    pa.expect_closed().await;
+    pb.expect_closed().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_component_dying_whole_ends_the_channel_at_the_far_end() {
     let server = TestServer::start().await;
     let (a, mut ca, b, mut cb) = channel_pair(&server).await;
