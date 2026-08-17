@@ -67,6 +67,25 @@
 //!    `IsSecureEventInputEnabled` is the one way to know. It is checked before typing,
 //!    so the refusal reaches the interface as a sentence rather than as a password
 //!    field that does nothing (doc/input-sharing.md, section 13).
+//! 9. **A positive horizontal scroll means LEFT on this platform**, where the dialect
+//!    says positive is right (`backend.rs`'s `Wheel`). So the sign is flipped on the way
+//!    in and on the way out. It cancels out between two Macs, which is exactly why it
+//!    would have gone unnoticed: only a Mac driving a PC, or a PC driving a Mac, scrolls
+//!    sideways backwards. Wine's `winemac.drv` carries the same note ("Mac: negative is
+//!    right or down, positive is left or up. Win32: the other way. So, negate the X
+//!    scroll value"), and Chromium negates it in Blink for the same reason.
+//! 10. **A synthetic click needs an event NUMBER, and on macOS 27 it stops being
+//!     optional.** So every mouse event this backend posts carries one, from a counter
+//!     seeded off the window server's own, and a click state of one. Without it a Mac on
+//!     that release refuses synthetic clicks and drags outright, which reads as "1Device
+//!     does nothing" with no refusal to explain it.
+//! 11. **A tap can be inert with no disable event at all.** The documented failure is
+//!     `kCGEventTapDisabledByTimeout`, which arrives through the callback and is re-enabled
+//!     from the loop; the undocumented one follows a code signing or permission identity
+//!     change, where the tap simply stops delivering and says nothing.
+//!     `CGEventTapIsEnabled` is the only way to see it, so the loop asks once a second and
+//!     recreates the tap when enabling it does not take. This project re-signs and
+//!     redeploys test builds constantly, which is precisely the trigger.
 //! 8. **The tap can be turned off by the system**, either because a callback took too
 //!    long (`kCGEventTapDisabledByTimeout`) or because a person pressed a key
 //!    (`kCGEventTapDisabledByUserInput`). Both arrive AS EVENTS through the tap's own
@@ -105,6 +124,11 @@ use crate::os::Unsupported;
 /// late a `shutdown` is noticed and how late the grant poll runs, and nothing else: a
 /// downcall signals a run loop source, which returns from the wait at once.
 const IDLE_TURN: Duration = Duration::from_millis(250);
+
+/// How often the tap is asked whether it is still alive (truth 11). A second, like the
+/// grants: a tap that has gone inert has gone inert until something notices, so the cost of
+/// noticing late is a second of a session that is not working and says so.
+const TAP_POLL: Duration = Duration::from_secs(1);
 
 /// How often the two TCC grants are re-read (truth 3). A person granting a permission
 /// is a human action, so a second is fast enough, and each preflight is a query to
@@ -590,6 +614,21 @@ struct Shared {
     /// event after event.
     wheel_x: AtomicI32,
     wheel_y: AtomicI32,
+    /// Which mouse buttons this backend has pressed and not released, one bit per dialect
+    /// button number.
+    ///
+    /// It decides whether a move is posted as a `MouseMoved` or as a `...MouseDragged`,
+    /// which is not cosmetic: an application tracking a drag ignores a plain move, so a
+    /// drag injected as one lets go of whatever was being dragged half way across the
+    /// screen.
+    buttons: AtomicU32,
+    /// The event number the next mouse event will carry (truth 10), seeded off the window
+    /// server's own count so it does not collide with the numbers a real mouse is using.
+    event_number: AtomicU32,
+    /// Set by the tap callback when the system turned the tap off, so the loop can turn it
+    /// back on: nothing else can, and a tap that stays off is a source whose keystrokes
+    /// quietly start acting locally again (truth 8).
+    tap_disabled: AtomicBool,
     /// True once the engine's end of the upcall channel has closed.
     ///
     /// It is the only way this backend can learn that the engine has GONE without asking
@@ -621,6 +660,29 @@ impl Shared {
 
     fn mode(&self) -> u8 {
         self.mode.load(Ordering::Relaxed)
+    }
+
+    /// The next event number, for the mouse event about to be posted (truth 10).
+    fn next_event_number(&self) -> i64 {
+        i64::from(self.event_number.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Records a button this backend pressed or released, and answers with whether any is
+    /// still down.
+    fn track_button(&self, button: u8, down: bool) -> bool {
+        let mask = 1u32 << u32::from(button.min(31));
+        let held = if down {
+            self.buttons.fetch_or(mask, Ordering::Relaxed) | mask
+        } else {
+            self.buttons.fetch_and(!mask, Ordering::Relaxed) & !mask
+        };
+        held != 0
+    }
+
+    /// Which of the dialect's buttons this backend is holding, or `None`.
+    fn held_button(&self) -> Option<u8> {
+        let held = self.buttons.load(Ordering::Relaxed);
+        (1u8..=5).find(|b| held & (1 << u32::from(*b)) != 0)
     }
 }
 
@@ -832,6 +894,13 @@ impl MacBackend {
             }
         }
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState);
+        if let Some(source) = &source {
+            // The non-deprecated half of truth 4's cure, on this backend's own source. The
+            // global `CGSetLocalEventsSuppressionInterval` is zeroed once at construction and
+            // is deprecated; whether it still has any effect is not documented either way,
+            // so both are done, which is what Wine's own comment on this says it settled on.
+            CGEventSource::set_local_events_suppression_interval(Some(source), 0.0);
+        }
         for action in &actions {
             self.post(source.as_deref(), action);
         }
@@ -894,17 +963,27 @@ impl MacBackend {
                 }
             }
             Action::MoveTo(to) => {
+                let from = cursor_position().unwrap_or(*to);
                 let at = objc2_core_foundation::CGPoint {
                     x: f64::from(to.x),
                     y: f64::from(to.y),
                 };
-                if let Some(event) = CGEvent::new_mouse_event(
-                    source,
-                    CGEventType::MouseMoved,
-                    at,
-                    CGMouseButton::Left,
-                ) {
-                    CGEvent::set_flags(Some(&event), flags);
+                let (kind, button) = self.move_kind();
+                if let Some(event) = CGEvent::new_mouse_event(source, kind, at, button) {
+                    // The deltas, even on an absolute move: a program that reads raw pointer
+                    // movement (a 3D view, a game) looks at these fields and not at the
+                    // position, and an event with none reads as no movement at all.
+                    CGEvent::set_integer_value_field(
+                        Some(&event),
+                        CGEventField::MouseEventDeltaX,
+                        i64::from(to.x.saturating_sub(from.x)),
+                    );
+                    CGEvent::set_integer_value_field(
+                        Some(&event),
+                        CGEventField::MouseEventDeltaY,
+                        i64::from(to.y.saturating_sub(from.y)),
+                    );
+                    self.stamp_mouse(&event, flags);
                     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
                 }
             }
@@ -922,12 +1001,8 @@ impl MacBackend {
                     x: f64::from(from.x.saturating_add(*dx)),
                     y: f64::from(from.y.saturating_add(*dy)),
                 };
-                if let Some(event) = CGEvent::new_mouse_event(
-                    source,
-                    CGEventType::MouseMoved,
-                    at,
-                    CGMouseButton::Left,
-                ) {
+                let (kind, button) = self.move_kind();
+                if let Some(event) = CGEvent::new_mouse_event(source, kind, at, button) {
                     CGEvent::set_integer_value_field(
                         Some(&event),
                         CGEventField::MouseEventDeltaX,
@@ -938,7 +1013,7 @@ impl MacBackend {
                         CGEventField::MouseEventDeltaY,
                         i64::from(*dy),
                     );
-                    CGEvent::set_flags(Some(&event), flags);
+                    self.stamp_mouse(&event, flags);
                     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
                 }
             }
@@ -957,9 +1032,12 @@ impl MacBackend {
                         CGEventField::MouseEventButtonNumber,
                         number,
                     );
-                    CGEvent::set_flags(Some(&event), flags);
+                    self.stamp_mouse(&event, flags);
                     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
                 }
+                // Recorded AFTER the event, so a press's own event is a press and the move
+                // that follows it is a drag.
+                self.shared.track_button(*button, *down);
             }
             Action::Wheel { dx, dy, pixels } => {
                 let unit = if *pixels {
@@ -972,7 +1050,9 @@ impl MacBackend {
                 // ([`crate::wire::WHEEL_MAX`]); this is the second bound.
                 let cap = crate::wire::WHEEL_MAX;
                 let (dx, dy) = ((*dx).clamp(-cap, cap), (*dy).clamp(-cap, cap));
-                if let Some(event) = CGEvent::new_scroll_wheel_event2(source, unit, 2, dy, dx, 0) {
+                // Negated on the way out for the same reason as on the way in (truth 9):
+                // the dialect's positive is right and this platform's is left.
+                if let Some(event) = CGEvent::new_scroll_wheel_event2(source, unit, 2, dy, -dx, 0) {
                     CGEvent::set_flags(Some(&event), flags);
                     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
                 }
@@ -984,6 +1064,40 @@ impl MacBackend {
                 // A no-op and not a panic, deliberately: the seam says so.
             }
         }
+    }
+}
+
+impl MacBackend {
+    /// Which event a pointer move should be posted as.
+    ///
+    /// A `...MouseDragged` while this backend is holding a button, and a `MouseMoved`
+    /// otherwise. An application tracking a drag ignores a plain move, so a drag injected as
+    /// one lets go of whatever was being dragged half way across the screen.
+    fn move_kind(&self) -> (CGEventType, CGMouseButton) {
+        match self.shared.held_button() {
+            Some(1) => (CGEventType::LeftMouseDragged, CGMouseButton::Left),
+            Some(3) => (CGEventType::RightMouseDragged, CGMouseButton::Right),
+            Some(_) => (CGEventType::OtherMouseDragged, CGMouseButton::Center),
+            None => (CGEventType::MouseMoved, CGMouseButton::Left),
+        }
+    }
+
+    /// Everything every mouse event this backend posts has to carry.
+    ///
+    /// The flags are truth 6. The event NUMBER and the click state are truth 10: a synthetic
+    /// click without them is refused outright on macOS 27, which reads as this feature doing
+    /// nothing at all with no refusal to explain it. A click state of one is a single click;
+    /// the chain that makes a double click is a separate piece of work (it needs the
+    /// system's own double click interval, which lives in AppKit) and is on the live
+    /// validation list.
+    fn stamp_mouse(&self, event: &CGEvent, flags: CGEventFlags) {
+        CGEvent::set_flags(Some(event), flags);
+        CGEvent::set_integer_value_field(
+            Some(event),
+            CGEventField::MouseEventNumber,
+            self.shared.next_event_number(),
+        );
+        CGEvent::set_integer_value_field(Some(event), CGEventField::MouseEventClickState, 1);
     }
 }
 
@@ -1239,6 +1353,12 @@ unsafe extern "C-unwind" fn tap_callback(
     // Truth 8: the system turned the tap off. Nothing else can turn it back on, and
     // this is the only place the fact arrives.
     if kind == CGEventType::TapDisabledByTimeout || kind == CGEventType::TapDisabledByUserInput {
+        // Flagged for the loop, which is the only place that can turn it back on: this
+        // callback has no reference to the tap's mach port, and a tap left off is a source
+        // whose keystrokes quietly start acting locally again while the engine believes it
+        // owns the keyboard. The engine is told as well, so a live session ends with a
+        // reason rather than going deaf.
+        shared.tap_disabled.store(true, Ordering::Release);
         shared.emit(BackendEvent::CaptureLost(CaptureLoss::Broken));
         return pass;
     }
@@ -1334,7 +1454,11 @@ unsafe extern "C-unwind" fn tap_callback(
                 CGEventField::ScrollWheelEventPointDeltaAxis2,
             ) as i32;
             let ny = notches(&shared.wheel_y, py);
-            let nx = notches(&shared.wheel_x, px);
+            // NEGATED, and this is truth 9: on macOS a positive horizontal scroll means
+            // LEFT, and the dialect says positive is right. Mac to Mac cancelled the error
+            // out on both sides, so only a Mac driving anything else showed it, scrolling
+            // sideways backwards.
+            let nx = -notches(&shared.wheel_x, px);
             if nx != 0 || ny != 0 {
                 shared.emit(BackendEvent::Wheel {
                     dx: nx,
@@ -1431,6 +1555,8 @@ struct Backend {
     grants: (bool, bool),
     grants_at: Instant,
     layout_at: Instant,
+    /// When the tap was last asked whether it is still alive (truth 11).
+    tap_at: Instant,
     shutdown: bool,
     exit_code: Option<i32>,
     /// Whether the engine's departure has been seen once already (see `periodic`).
@@ -1520,6 +1646,36 @@ impl Backend {
                     self.mode = CaptureMode::Off;
                     self.set_capture(mode);
                 }
+            }
+        }
+        // Truth 11, and truth 8's repair. Two failures, one answer: the tap the system
+        // turned off (which arrives through the callback) and the tap that went inert with
+        // no event at all (which follows a code signing or permission identity change and is
+        // only visible through `CGEventTapIsEnabled`). Enabling it is tried first, and a tap
+        // that will not enable is rebuilt.
+        if self.mode != CaptureMode::Off && self.tap_at.elapsed() >= TAP_POLL {
+            self.tap_at = Instant::now();
+            let flagged = self.shared.tap_disabled.swap(false, Ordering::Acquire);
+            let dead = self
+                .tap
+                .as_ref()
+                .is_some_and(|tap| !CGEvent::tap_is_enabled(tap));
+            if flagged || dead {
+                if let Some(tap) = &self.tap {
+                    CGEvent::tap_enable(tap, true);
+                }
+                let still_dead = self
+                    .tap
+                    .as_ref()
+                    .is_none_or(|tap| !CGEvent::tap_is_enabled(tap));
+                if still_dead {
+                    warn("the event tap will not enable; rebuilding it");
+                    self.destroy_tap();
+                    self.create_tap();
+                }
+                // Either way the engine hears about it, so a session that lost its capture
+                // for a moment is told rather than left believing it still has one.
+                self.shared.emit(BackendEvent::CapabilitiesChanged);
             }
         }
         if self.layout_at.elapsed() >= GRANT_POLL {
@@ -1816,6 +1972,17 @@ pub fn create() -> Result<crate::os::Created, Unsupported> {
         mods: AtomicU32::new(0),
         wheel_x: AtomicI32::new(0),
         wheel_y: AtomicI32::new(0),
+        buttons: AtomicU32::new(0),
+        // Seeded off the window server's own count for this event type, so the numbers this
+        // backend uses do not collide with the ones a real mouse is making.
+        event_number: AtomicU32::new(
+            CGEventSource::counter_for_event_type(
+                CGEventSourceStateID::CombinedSessionState,
+                CGEventType::LeftMouseDown,
+            )
+            .saturating_add(1),
+        ),
+        tap_disabled: AtomicBool::new(false),
         engine_gone: AtomicBool::new(false),
         dropped: AtomicU32::new(0),
     });
@@ -1861,6 +2028,7 @@ pub fn create() -> Result<crate::os::Created, Unsupported> {
         grants,
         grants_at: Instant::now(),
         layout_at: Instant::now(),
+        tap_at: Instant::now(),
         shutdown: false,
         exit_code: None,
         gone_seen: false,
@@ -2019,6 +2187,85 @@ mod tests {
         // renumbered.
         assert_eq!(button_of_event(CGEventType::OtherMouseDown, 9), None);
         assert_eq!(button_of_event(CGEventType::MouseMoved, 0), None);
+    }
+
+    /// The horizontal scroll sign, which is the one thing about this platform that cancels
+    /// out between two Macs and is therefore invisible until a Mac drives a PC.
+    ///
+    /// The dialect says positive is right; macOS says positive is left. The test is on the
+    /// two constants rather than on a live event, because the flip lives at two call sites
+    /// and what has to hold is that they agree with each other and with the dialect.
+    #[test]
+    fn the_horizontal_scroll_sign_is_flipped_the_same_way_in_both_directions() {
+        // Capture: a macOS delta of +N (left) has to become a dialect dx of -N.
+        let acc = AtomicI32::new(0);
+        let mac_left = 240;
+        assert_eq!(
+            -notches(&acc, mac_left),
+            -2,
+            "left on a Mac is left in the dialect"
+        );
+        let acc = AtomicI32::new(0);
+        assert_eq!(-notches(&acc, -mac_left), 2, "and right is right");
+        // Injection: the dialect's dx is negated on the way out, which is what makes the two
+        // agree. Expressed as the identity the two call sites have to satisfy.
+        for dx in [-3i32, -1, 0, 1, 3] {
+            assert_eq!(-(-dx), dx, "the two flips compose to the identity");
+        }
+    }
+
+    /// The buttons this backend is holding decide whether a move is a move or a DRAG, and an
+    /// application tracking a drag ignores a plain move.
+    #[test]
+    fn a_move_while_a_button_is_held_is_a_drag() {
+        let shared = test_shared();
+        assert_eq!(shared.held_button(), None, "nothing held to begin with");
+        assert!(shared.track_button(1, true), "the left button goes down");
+        assert_eq!(shared.held_button(), Some(1));
+        assert!(shared.track_button(3, true), "and the right one too");
+        assert_eq!(
+            shared.held_button(),
+            Some(1),
+            "the lowest held button decides, deterministically"
+        );
+        assert!(shared.track_button(1, false));
+        assert_eq!(shared.held_button(), Some(3));
+        assert!(!shared.track_button(3, false), "and now nothing is held");
+        assert_eq!(shared.held_button(), None);
+        // A button number outside the dialect's five cannot corrupt the set.
+        assert!(shared.track_button(200, true));
+        assert_eq!(shared.held_button(), None, "and it is not one of the five");
+    }
+
+    /// The event numbers this backend stamps are monotonic, which is what makes a click and
+    /// its release one click rather than two halves of nothing (truth 10).
+    #[test]
+    fn every_mouse_event_gets_its_own_number() {
+        let shared = test_shared();
+        let first = shared.next_event_number();
+        let second = shared.next_event_number();
+        assert_eq!(second, first + 1);
+        assert!(first > 0, "seeded past zero");
+    }
+
+    /// A `Shared` with no window server behind it, for the pure tests above.
+    fn test_shared() -> Shared {
+        let (events_tx, _rx) = mpsc::channel(1);
+        Shared {
+            mode: AtomicU8::new(MODE_OFF),
+            events_tx,
+            anchor_x: AtomicI32::new(0),
+            anchor_y: AtomicI32::new(0),
+            confined: AtomicBool::new(false),
+            mods: AtomicU32::new(0),
+            wheel_x: AtomicI32::new(0),
+            wheel_y: AtomicI32::new(0),
+            buttons: AtomicU32::new(0),
+            event_number: AtomicU32::new(1),
+            tap_disabled: AtomicBool::new(false),
+            engine_gone: AtomicBool::new(false),
+            dropped: AtomicU32::new(0),
+        }
     }
 
     /// The pixel accumulator, which is what keeps a trackpad from scrolling nothing.
