@@ -4511,6 +4511,8 @@ dependencies = [
  "tokio",
  "windows-sys 0.61.2",
  "xcb",
+ "zbus",
+ "zvariant",
 ]
 
 [[package]]

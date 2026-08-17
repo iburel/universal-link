@@ -3,7 +3,7 @@
 
 import { expect, test } from "vitest";
 
-import type { InputGuards, InputSpot } from "./api";
+import type { InputGuards, InputProblem, InputSpot } from "./api";
 import {
   DWELL_CHOICES,
   GHOST_SENTENCE,
@@ -226,7 +226,24 @@ test("a Wayland session is told what does not work, and what still does", () => 
   expect(said).toContain("keeps working");
 });
 
-test("this computer's other problems have sentences, and none is invented", () => {
+// Every problem the engine can report, so a new reason code cannot arrive without
+// a sentence. The engine has the mirror of this test: it walks its own `Problem`
+// enum and reads this file, which closes the loop from the other side. Neither the
+// Rust compiler nor tsc can see across the boundary, so this pair is the bridge.
+const EVERY_PROBLEM: readonly InputProblem[] = [
+  "no_backend",
+  "no_permission",
+  "monitors_unstable",
+  "wayland",
+  "xwayland",
+  "wayland_no_bus",
+  "wayland_no_portal",
+  "wayland_portal_old",
+  "wayland_portal_refused",
+  "wayland_untested",
+];
+
+test("every problem the engine can report has a real sentence, on every platform", () => {
   expect(
     hereProblemSentence({
       problem: null,
@@ -234,11 +251,64 @@ test("this computer's other problems have sentences, and none is invented", () =
       can_be_driven: true,
     }),
   ).toBeNull();
-  for (const problem of ["no_backend", "monitors_unstable"] as const) {
-    expect(
-      hereProblemSentence({ problem, can_drive: false, can_be_driven: false }),
-    ).toBeTruthy();
+  // Both platform wordings and all four capability combinations, because two of
+  // these sentences branch on them and a branch with no test is a branch that says
+  // the wrong thing to somebody.
+  for (const problem of EVERY_PROBLEM) {
+    for (const platform of ["linux", "macos", "windows", undefined]) {
+      for (const can_drive of [true, false]) {
+        for (const can_be_driven of [true, false]) {
+          const said = hereProblemSentence(
+            { problem, can_drive, can_be_driven },
+            platform,
+          );
+          expect(said, `${problem} on ${platform}`).toBeTruthy();
+          expect(said, `${problem} on ${platform}`).not.toContain(
+            "does not know",
+          );
+          // The code itself never reaches a person: a sentence that leaked its
+          // own reason code would mean the `default` arm had been taken.
+          expect(said, `${problem} on ${platform}`).not.toContain(problem);
+        }
+      }
+    }
   }
+});
+
+test("a code the engine invents later still says something a person can repeat", () => {
+  const said = hereProblemSentence({
+    problem: "wayland_something_new" as InputProblem,
+    can_drive: false,
+    can_be_driven: false,
+  });
+  expect(said).toContain("does not know");
+  expect(said).toContain("wayland_something_new");
+});
+
+// The one this ticket exists for: a Wayland desktop is told which piece is missing
+// and what would fix it, never just "this is Wayland".
+test("each Wayland reason names its own remedy", () => {
+  const say = (problem: InputProblem, can_drive = false, can_be_driven = false) =>
+    hereProblemSentence({ problem, can_drive, can_be_driven }, "linux") ?? "";
+
+  expect(say("xwayland")).toContain("X11");
+  expect(say("xwayland")).toContain("Wayland directly");
+  expect(say("wayland_no_bus")).toContain("D-Bus");
+  expect(say("wayland_portal_old")).toContain("xdg-desktop-portal");
+  expect(say("wayland_portal_refused")).toContain("again");
+  expect(say("wayland_untested")).toContain("ONEDEVICE_INPUT_WAYLAND");
+  expect(say("wayland_untested")).toContain("never been run");
+
+  // A missing portal names the half that is missing, from the capability bits: one
+  // desktop really does offer capture and not injection.
+  expect(say("wayland_no_portal", false, false)).toContain("neither half");
+  expect(say("wayland_no_portal", false, true)).toContain(
+    "reads your keyboard",
+  );
+  expect(say("wayland_no_portal", true, false)).toContain(
+    "types on this computer",
+  );
+  expect(say("wayland_no_portal")).toContain("GNOME 45");
 });
 
 test("a gesture's own refusals are sentences, and a malformed call is not", () => {

@@ -715,12 +715,68 @@ struct Ext {
     xfixes: bool,
 }
 
+/// The name of the extension an XWayland announces and no other X server does.
+///
+/// Asked for by name through [`x::QueryExtension`], which answers `present: false`
+/// for an extension the server does not have rather than erroring, so the question
+/// is one round trip and cannot fail in an interesting way. Verified against this
+/// repository's own development machine (an XWayland under a Weston-derived
+/// compositor): `present` is true, its major opcode is real, and a name nothing
+/// implements comes back false.
+///
+/// **The vendor string is not a substitute.** An XWayland reports
+/// `The X.Org Foundation`, exactly as an Xorg does, so the setup's `vendor` cannot
+/// tell them apart. That was the first thing tried and it is why this uses an
+/// extension name instead.
+pub(crate) const XWAYLAND_EXTENSION: &[u8] = b"XWAYLAND";
+
+/// Does the X server on `DISPLAY` announce itself as an XWayland?
+///
+/// Opens a connection of its own and drops it, because it is asked BEFORE
+/// [`create`] decides whether this session gets an X11 backend at all
+/// ([`crate::os::session_kind`]): one connection and one round trip, once per
+/// process, against a decision that must not be guessed. [`create`] asks the same
+/// question again on the connection it keeps, and the duplication is deliberate:
+/// each answer is used by a different decision (whether to build, and what to
+/// report) and neither should depend on the other having been asked.
+///
+/// A server that cannot be reached is [`crate::os::XServer::Unreachable`], which
+/// is not the same as "not XWayland": the difference is what stops a headless
+/// machine from being called an X11 session.
+pub fn server_kind() -> crate::os::XServer {
+    let Ok((conn, _screen)) = xcb::Connection::connect(None) else {
+        return crate::os::XServer::Unreachable;
+    };
+    if queries_xwayland(&conn) {
+        crate::os::XServer::XWayland
+    } else {
+        crate::os::XServer::Plain
+    }
+}
+
+/// The one round trip, shared by [`server_kind`] and [`create`].
+///
+/// A failed round trip reads as "not an XWayland", which is the direction that
+/// costs least: an X server we cannot ask a simple question of has bigger problems,
+/// and every one of them shows up in [`Capabilities`] on its own.
+fn queries_xwayland(conn: &xcb::Connection) -> bool {
+    let cookie = conn.send_request(&x::QueryExtension {
+        name: XWAYLAND_EXTENSION,
+    });
+    conn.wait_for_reply(cookie)
+        .is_ok_and(|reply| reply.present())
+}
+
 /// Backend state, living on the pump thread. It owns the connection, which is where
 /// every X call in this file happens.
 struct Backend {
     conn: xcb::Connection,
     root: x::Window,
     ext: Ext,
+    /// This server is an XWayland, so everything here works for X11 windows and
+    /// nothing here reaches a native Wayland one. Read once at construction: a
+    /// server does not become an XWayland halfway through its life.
+    xwayland: bool,
     poll: Poll,
     cmds: Arc<Mutex<VecDeque<Cmd>>>,
     events_tx: mpsc::Sender<BackendEvent>,
@@ -2228,8 +2284,27 @@ impl Backend {
     fn compute_caps(&self) -> Capabilities {
         let inject = self.ext.test;
         let observe = self.ext.xi;
+        // One slot, so a precedence, and this is the argued order rather than the
+        // order the conditions happened to be written in.
+        //
+        // 1. `NoBackend`: nothing works. Nothing else is worth saying.
+        // 2. `XWayland`: everything works, for the minority of windows that are X11
+        //    clients, and not at all for the rest. That is the biggest thing true of
+        //    this session and it outranks the next one, which was the bug: on this
+        //    repository's own XWayland a forced session reported `monitors_unstable`
+        //    (XWayland's RandR output carries no EDID, so the identities are not
+        //    stable) and said nothing whatever about XWayland. "Your screens may swap
+        //    places" is true and is not the sentence that person needed.
+        // 3. `MonitorsUnstable`: the screens may swap places on the plane.
+        //
+        // A session only ever gets here as an XWayland by being FORCED
+        // ([`crate::os::FORCE_X11_ENV`]): `os::create` refuses to build this backend
+        // for one otherwise, on the standing decision that a session which half works
+        // is worse than one which says what it cannot do.
         let problem = if !inject && !observe {
             Some(Problem::NoBackend)
+        } else if self.xwayland {
+            Some(Problem::XWayland)
         } else if !self.monitors_stable {
             Some(Problem::MonitorsUnstable)
         } else {
@@ -2545,10 +2620,22 @@ pub fn create() -> Result<crate::os::Created, Unsupported> {
     let cmds: Arc<Mutex<VecDeque<Cmd>>> = Arc::new(Mutex::new(VecDeque::new()));
     let (events_tx, backend_events) = mpsc::channel(BACKEND_EVENT_CAPACITY);
     let caps = Arc::new(Mutex::new(Capabilities::none(Some(Problem::NoBackend))));
+    // Asked on the connection this backend keeps, and asked before the first
+    // `publish_caps` below, so the very first `capabilities()` the engine reads
+    // already says XWayland rather than saying it one upcall later.
+    let xwayland = queries_xwayland(&conn);
+    if xwayland {
+        warn(
+            "this X server is an XWayland: X11 windows can be observed and typed into, \
+             native Wayland windows cannot",
+        );
+    }
+
     let mut backend = Backend {
         conn,
         root,
         ext,
+        xwayland,
         poll,
         cmds: Arc::clone(&cmds),
         events_tx,

@@ -64,6 +64,22 @@ blake3 = "1"
 # the main thread, exactly as the clipboard's X11 loop does. Non-Linux targets
 # never pull these.
 [target.'cfg(target_os = "linux")'.dependencies]
+# The Wayland half's D-Bus (doc/input-sharing.md, section 10): the desktop portal
+# is asked what it offers, and the two input portals are driven over it.
+# `zbus` 5.17.0 is ALREADY in this workspace's lock, twice over: `keyring` pulls it
+# for the daemon's secret store and two Tauri plugins pull it for the GUI. So this
+# line adds a dependency EDGE and neither a package nor a version, exactly as the
+# three lines below it do for their own platforms. Its default features are taken
+# unchanged and deliberately, so that the feature set the rest of the workspace
+# already resolves is not moved by this crate: the blocking API this backend uses
+# comes from the default `blocking-api`, and the default `async-io` executor is the
+# one the daemon already links.
+zbus = "5"
+# The `u32` inside the variant a `Properties.Get` answers with. Re-exported by
+# `zbus` and named here as well because this crate uses the type directly, and
+# because relying on a re-export would make a `zbus` minor bump a compile error in
+# a file that has nothing to do with the change. Also already in the lock.
+zvariant = "5"
 xcb = { version = "1", features = [
     "xtest",
     "xinput",

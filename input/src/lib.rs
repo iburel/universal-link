@@ -42,6 +42,10 @@ pub mod wire;
 // from another platform's build.
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(target_os = "linux")]
+pub mod wayland;
+#[cfg(target_os = "linux")]
+pub mod wayland_portal;
 #[cfg(windows)]
 pub mod windows;
 #[cfg(target_os = "linux")]

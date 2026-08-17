@@ -313,6 +313,25 @@ impl Capabilities {
 
 /// Something a human can fix, or at least be told about. Codes, not sentences:
 /// the interface owns the wording (doc/input-sharing.md, section 13).
+///
+/// # Why Linux has seven of these and the other two platforms share three
+///
+/// Because Linux is the one platform where the answer depends on which desktop
+/// the person runs, and the epic's promise is that the interface can say WHICH
+/// PARTS this desktop supports. On Windows and macOS a refusal is a permission
+/// or nothing; on Linux the same build meets a session with no compositor, a
+/// session whose compositor is the whole story, a session reached through its
+/// XWayland, a desktop portal that does not offer the input portals at all, one
+/// that offers a version this build cannot speak, and one that offers everything
+/// and then has its consent dialog dismissed. Collapsing those into one
+/// `wayland` was what the first version did, and the sentence it produced ("this
+/// is a Wayland session, X11 only for now") is wrong for five of the six: it
+/// names no remedy, and on a desktop where everything IS present it is simply
+/// false.
+///
+/// Every variant here has a sentence in `gui/ui/src/lib/input.ts`, and
+/// [`Problem::ALL`] plus the test that walks it are what keep a new code from
+/// arriving without one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Problem {
     /// No backend for this platform, or the session cannot provide one.
@@ -324,13 +343,80 @@ pub enum Problem {
     NoPermission,
     /// Monitor identities are not stable here, so the plane may swap screens.
     MonitorsUnstable,
-    /// A Wayland session, where the portals are the way in and this build has
-    /// no Wayland backend yet. Said out loud rather than staying silent, which
-    /// is the standing decision for Linux.
+    /// A Wayland session this build has no native path for, and nothing more
+    /// precise could be established. The catch-all rather than the usual answer:
+    /// the six below are what a Wayland session normally gets, and this one is
+    /// kept because it is on the frozen wire (a peer on an older build sends it)
+    /// and as the honest word for a state a later compositor invents.
     Wayland,
+    /// A Wayland session being served through its XWayland: the X11 backend is
+    /// real and works, for X11 windows, and native Wayland windows can be
+    /// neither observed nor injected to. Most windows on a modern desktop are
+    /// the second kind, which is why this is a problem and not a footnote.
+    ///
+    /// Only ever reported by a session that was FORCED to X11
+    /// ([`crate::os::FORCE_X11_ENV`]): the default refuses to build the backend
+    /// at all rather than half work. Before this code existed a forced session
+    /// reported `monitors_unstable` (XWayland's RandR outputs carry no EDID) and
+    /// nothing at all about XWayland, which is a true sentence in place of the
+    /// one that mattered.
+    XWayland,
+    /// A Wayland session with no D-Bus session bus, so the portals cannot even
+    /// be asked. A compositor started from a tty without `dbus-run-session` is
+    /// the real case.
+    WaylandNoBus,
+    /// A Wayland session whose desktop portal does not export the input portals.
+    /// The capability bits say which half is missing: `InputCapture` is the
+    /// source half, `RemoteDesktop` the target half, and a desktop can have one
+    /// without the other.
+    ///
+    /// **`xdg-desktop-portal` running is not evidence that these exist.** Both
+    /// are proxied to an `org.freedesktop.impl.portal.*` backend, and a portal
+    /// with only the GTK backend installed exports neither: verified on
+    /// `xdg-desktop-portal` 1.18.4 with `xdg-desktop-portal-gtk` 1.15.1, whose
+    /// bus carries nineteen portal interfaces and none of these two.
+    WaylandNoPortal,
+    /// The input portals are there at a version older than this build can speak.
+    /// Its own number is in the log; the remedy is a newer
+    /// `xdg-desktop-portal` and a newer backend for the desktop.
+    WaylandPortalOld,
+    /// The portal is there, new enough, and refused: the consent dialog was
+    /// dismissed, or the compositor said no. Distinct from the three above
+    /// because nothing is missing and nothing needs installing: the remedy is to
+    /// switch the feature on again and allow it.
+    WaylandPortalRefused,
+    /// Every piece the Wayland path needs is present, and that path has never
+    /// been run against a real compositor, so it stays off unless it is switched
+    /// on deliberately ([`crate::os::WAYLAND_ENV`]).
+    ///
+    /// The honest state rather than a missing one, and the reason it is a
+    /// `Problem` at all: a backend that claimed `capture` and `inject_keys` on
+    /// the strength of code nobody has executed would be exactly the lie this
+    /// whole component is built not to tell.
+    WaylandUntested,
 }
 
 impl Problem {
+    /// Every problem this build knows, so a test can walk them.
+    ///
+    /// The list exists because the codes cross a language boundary: each one
+    /// needs a sentence in `gui/ui/src/lib/input.ts` and a name in that file's
+    /// `InputProblem` union, and neither the Rust compiler nor `tsc` can see the
+    /// other side. The test in this module reads that file and checks every code
+    /// against it, which is the only bridge available and is cheap.
+    pub const ALL: &'static [Problem] = &[
+        Problem::NoBackend,
+        Problem::NoPermission,
+        Problem::MonitorsUnstable,
+        Problem::Wayland,
+        Problem::XWayland,
+        Problem::WaylandNoBus,
+        Problem::WaylandNoPortal,
+        Problem::WaylandPortalOld,
+        Problem::WaylandPortalRefused,
+        Problem::WaylandUntested,
+    ];
+
     /// The wire and snapshot spelling (`input.status`'s `problem`).
     pub fn code(self) -> &'static str {
         match self {
@@ -338,6 +424,12 @@ impl Problem {
             Problem::NoPermission => "no_permission",
             Problem::MonitorsUnstable => "monitors_unstable",
             Problem::Wayland => "wayland",
+            Problem::XWayland => "xwayland",
+            Problem::WaylandNoBus => "wayland_no_bus",
+            Problem::WaylandNoPortal => "wayland_no_portal",
+            Problem::WaylandPortalOld => "wayland_portal_old",
+            Problem::WaylandPortalRefused => "wayland_portal_refused",
+            Problem::WaylandUntested => "wayland_untested",
         }
     }
 
@@ -345,13 +437,7 @@ impl Problem {
     /// this build does not know, which is the fail-closed answer: a problem we
     /// cannot name is one we do not repeat to the interface as peer-chosen prose.
     pub fn parse(code: &str) -> Option<Problem> {
-        match code {
-            "no_backend" => Some(Problem::NoBackend),
-            "no_permission" => Some(Problem::NoPermission),
-            "monitors_unstable" => Some(Problem::MonitorsUnstable),
-            "wayland" => Some(Problem::Wayland),
-            _ => None,
-        }
+        Problem::ALL.iter().copied().find(|p| p.code() == code)
     }
 }
 
@@ -848,16 +934,73 @@ mod tests {
     /// peer-chosen string reaching the interface.
     #[test]
     fn every_problem_code_round_trips_and_an_unknown_one_is_dropped() {
-        for problem in [
-            Problem::NoBackend,
-            Problem::NoPermission,
-            Problem::MonitorsUnstable,
-            Problem::Wayland,
-        ] {
+        for &problem in Problem::ALL {
             assert_eq!(Problem::parse(problem.code()), Some(problem));
         }
         assert_eq!(Problem::parse("no_backend_at_all"), None);
         assert_eq!(Problem::parse(""), None);
+
+        // Two codes for one problem, or one code for two, would both be a
+        // vocabulary with a bug waiting: the snapshot carries the code and the
+        // interface matches on it.
+        let mut codes: Vec<&str> = Problem::ALL.iter().map(|p| p.code()).collect();
+        let before = codes.len();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(before, codes.len(), "two problems share a code");
+    }
+
+    /// **Every problem this build can report has a sentence in the interface.**
+    ///
+    /// A reason code with no sentence is the defect this test exists to catch, and
+    /// it is a defect a compiler cannot see: the codes are produced in Rust and
+    /// worded in TypeScript, and the two halves are checked by different tools. So
+    /// this reads the interface's own source and looks for each code in it. It is a
+    /// coarse check (a code in a comment would satisfy it) and it is the right
+    /// coarseness: the expensive failure is a code that reaches a person as "this
+    /// version does not know the reason", and a code mentioned nowhere in that file
+    /// is guaranteed to do exactly that.
+    ///
+    /// The companion check is on the other side, in `input.test.ts`, which walks its
+    /// own `InputProblem` union and asserts each member gets a real sentence rather
+    /// than the fallback. Together they close the loop in both directions.
+    #[test]
+    fn every_problem_this_build_can_report_has_a_sentence_in_the_interface() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../gui/ui/src/lib/input.ts")
+            .canonicalize()
+            .expect("the interface's input module is where this crate's sibling GUI keeps it");
+        let source = std::fs::read_to_string(&path).expect("read the interface's input module");
+        for &problem in Problem::ALL {
+            let quoted = format!("\"{}\"", problem.code());
+            assert!(
+                source.contains(&quoted),
+                "{problem:?} is reported by this build and {} says nothing about it, \
+                 so a person hitting it is told this version does not know why",
+                path.display()
+            );
+        }
+
+        // And the union the interface types its snapshot with, which is what makes
+        // the sentence reachable rather than dead code behind a `default:` arm.
+        let types = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../gui/ui/src/lib/api.ts")
+            .canonicalize()
+            .expect("the interface's api module");
+        let types = std::fs::read_to_string(&types).expect("read the interface's api module");
+        let union = types
+            .split_once("export type InputProblem =")
+            .expect("the InputProblem union")
+            .1
+            .split_once(';')
+            .expect("the union ends")
+            .0;
+        for &problem in Problem::ALL {
+            assert!(
+                union.contains(&format!("\"{}\"", problem.code())),
+                "{problem:?} is missing from the interface's InputProblem union"
+            );
+        }
     }
 
     /// The `oops` codes have ONE spelling, the dialect's. Four of the five are
