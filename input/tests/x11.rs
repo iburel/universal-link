@@ -14,6 +14,14 @@
 //! `Xvfb :99` and exports `DISPLAY`, and this machine's XWayland answers the same
 //! requests.
 //!
+//! **One at a time, and that is enforced by `.config/nextest.toml` rather than by the
+//! `X_LOCK` below.** nextest runs every test in its own process, so a process-global
+//! `Mutex` serialises nothing; the `serial-os-clipboard` group is what does, and it is
+//! declared for both profiles precisely because it was on `ci` alone at first and a suite
+//! run by hand failed nine times out of fifteen with two tests fighting over the display's
+//! one keyboard grab. The lock stays as the guard for a `cargo test` run, which does share
+//! a process.
+//!
 //! # What an XWayland or an Xvfb can and cannot witness
 //!
 //! Both are real X servers with XTEST, XInput2, XKB, RandR and XFixes, so everything
@@ -98,13 +106,65 @@ macro_rules! spawn_backend {
             }
         });
         match ready_rx.recv() {
-            Ok(Some((handle, events))) => Some((handle, events, loop_thread)),
+            Ok(Some((handle, events))) => Some((Session::new(handle, loop_thread), events)),
             _ => {
                 let _ = loop_thread.join();
                 None
             }
         }
     }};
+}
+
+/// A backend and its loop, torn down by `Drop`.
+///
+/// The whole reason it exists is a FAILING assertion. Every wait in this file is bounded,
+/// so a failure is a panic, and a panic unwinds past whatever teardown was written after
+/// it: the loop would keep the keyboard grabbed, the pointer pinned, the cursor hidden and
+/// (in the Unicode test) a keycode remapped for every client on the display, until the
+/// test PROCESS exited. Under one process per file that is a cascade in which every
+/// failure after the first is meaningless, and on a developer's own display it is exactly
+/// the dead keyboard this component exists to avoid, caused by the test that went looking
+/// for it.
+struct Session {
+    handle: Option<os::Backend>,
+    loop_thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Session {
+    fn new(handle: os::Backend, loop_thread: thread::JoinHandle<()>) -> Session {
+        Session {
+            handle: Some(handle),
+            loop_thread: Some(loop_thread),
+        }
+    }
+
+    fn handle(&self) -> &os::Backend {
+        self.handle.as_ref().expect("the session is still open")
+    }
+
+    /// Stops the loop and waits for it, so a test can assert about what the teardown did.
+    /// `Drop` does the same for every path that does not reach this.
+    fn close(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.capture(CaptureMode::Off);
+            handle.confine(None);
+            handle.request_exit(0);
+        }
+        if let Some(thread) = self.loop_thread.take() {
+            // `join` rather than `join().unwrap()`: a panicked loop thread would otherwise
+            // panic HERE and hide the assertion that was the real failure.
+            if thread.join().is_err() {
+                eprintln!("note: the backend's loop thread panicked");
+            }
+        }
+        self.handle = None;
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.close();
+    }
 }
 
 macro_rules! skip_if_no_x {
@@ -371,7 +431,8 @@ async fn keycode_for(handle: &os::Backend, usage: u32) -> Option<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_usage_table_names_the_keys_the_server_names() {
     let _guard = X_LOCK.lock().await;
-    let (handle, _events, loop_thread) = skip_if_no_x!(spawn_backend!());
+    let (mut session, _events) = skip_if_no_x!(spawn_backend!());
+    let handle = session.handle().clone();
     let peer = Peer::new().expect("a second connection to the same server");
 
     // Usage, expected keysym. Only the keys a keymap cannot move: a letter's position
@@ -425,8 +486,7 @@ async fn the_usage_table_names_the_keys_the_server_names() {
     }
     assert!(checked > 20, "the table was barely checked");
 
-    handle.request_exit(0);
-    loop_thread.join().unwrap();
+    session.close();
 }
 
 /// Injection and capture, proved against each other in one round trip: a key this
@@ -439,7 +499,8 @@ async fn the_usage_table_names_the_keys_the_server_names() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_key_this_backend_injects_comes_back_through_its_own_capture() {
     let _guard = X_LOCK.lock().await;
-    let (handle, mut events, loop_thread) = skip_if_no_x!(spawn_backend!());
+    let (mut session, mut events) = skip_if_no_x!(spawn_backend!());
+    let handle = session.handle().clone();
     let caps = handle.capabilities();
     assert!(
         caps.capture && caps.inject_keys,
@@ -448,8 +509,6 @@ async fn a_key_this_backend_injects_comes_back_through_its_own_capture() {
 
     let Some((name, usage, _)) = a_key_nothing_binds(&handle).await else {
         eprintln!("skipping: this keymap has none of the keys this test is willing to press");
-        handle.request_exit(0);
-        loop_thread.join().unwrap();
         return;
     };
     let resolved = handle
@@ -494,9 +553,7 @@ async fn a_key_this_backend_injects_comes_back_through_its_own_capture() {
         "{name} produces no character, and claiming one would have the far side type it"
     );
 
-    handle.capture(CaptureMode::Off);
-    handle.request_exit(0);
-    loop_thread.join().unwrap();
+    session.close();
 }
 
 /// The swallow, proved against a witness rather than asserted: a second X client whose
@@ -514,19 +571,16 @@ async fn a_key_this_backend_injects_comes_back_through_its_own_capture() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn watching_lets_a_focused_window_see_the_key_and_swallowing_does_not() {
     let _guard = X_LOCK.lock().await;
-    let (handle, mut events, loop_thread) = skip_if_no_x!(spawn_backend!());
+    let (mut session, mut events) = skip_if_no_x!(spawn_backend!());
+    let handle = session.handle().clone();
     let caps = handle.capabilities();
     if !caps.swallow || !caps.inject_keys {
         eprintln!("skipping: this server cannot both grab and fake input: {caps:?}");
-        handle.request_exit(0);
-        loop_thread.join().unwrap();
         return;
     }
     let mut peer = Peer::new().expect("a second connection to the same server");
     let Some((_, _, keycode)) = a_key_nothing_binds(&handle).await else {
         eprintln!("skipping: this keymap has none of the keys this test is willing to press");
-        handle.request_exit(0);
-        loop_thread.join().unwrap();
         return;
     };
     if !peer.focus_a_window() {
@@ -534,8 +588,6 @@ async fn watching_lets_a_focused_window_see_the_key_and_swallowing_does_not() {
             "skipping: this client could not take the keyboard focus, so there is no \
              witness a grab could silence (a window manager owns it here)"
         );
-        handle.request_exit(0);
-        loop_thread.join().unwrap();
         return;
     }
 
@@ -603,9 +655,7 @@ async fn watching_lets_a_focused_window_see_the_key_and_swallowing_does_not() {
 
     // Torn down before asserting: a grab left behind is a display with a dead
     // keyboard, and a failing assertion must not be the thing that causes it.
-    handle.capture(CaptureMode::Off);
-    handle.request_exit(0);
-    loop_thread.join().unwrap();
+    session.close();
     assert!(
         !leaked,
         "while swallowing, the focused window must not receive the keystroke"
@@ -641,12 +691,11 @@ async fn watching_lets_a_focused_window_see_the_key_and_swallowing_does_not() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_confined_pointer_reports_a_delta_and_comes_back_to_its_anchor() {
     let _guard = X_LOCK.lock().await;
-    let (handle, mut events, loop_thread) = skip_if_no_x!(spawn_backend!());
+    let (mut session, mut events) = skip_if_no_x!(spawn_backend!());
+    let handle = session.handle().clone();
     let caps = handle.capabilities();
     if !caps.confine || !caps.inject_pointer {
         eprintln!("skipping: this server cannot both grab and fake input: {caps:?}");
-        handle.request_exit(0);
-        loop_thread.join().unwrap();
         return;
     }
     let peer = Peer::new().expect("a second connection to the same server");
@@ -725,8 +774,7 @@ async fn a_confined_pointer_reports_a_delta_and_comes_back_to_its_anchor() {
         "after the release the pointer must move again"
     );
 
-    handle.request_exit(0);
-    loop_thread.join().unwrap();
+    session.close();
 }
 
 /// The crash guard's whole claim on this platform, proved on the mechanism it rests
@@ -798,12 +846,11 @@ fn grab_keyboard(peer: &Peer) -> Option<x::GrabStatus> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_monitors_are_real_and_their_identities_differ() {
     let _guard = X_LOCK.lock().await;
-    let (handle, _events, loop_thread) = skip_if_no_x!(spawn_backend!());
+    let (mut session, _events) = skip_if_no_x!(spawn_backend!());
+    let handle = session.handle().clone();
     let monitors = handle.monitors().await;
     if monitors.is_empty() {
         eprintln!("skipping the monitor assertions: this server has no RandR outputs");
-        handle.request_exit(0);
-        loop_thread.join().unwrap();
         return;
     }
     assert_eq!(
@@ -835,8 +882,7 @@ async fn the_monitors_are_real_and_their_identities_differ() {
         "the capability and the identities must agree: {monitors:?}"
     );
 
-    handle.request_exit(0);
-    loop_thread.join().unwrap();
+    session.close();
 }
 
 /// The layout queries against the server's real keymap: a letter, its capital, and the
@@ -849,7 +895,8 @@ async fn the_monitors_are_real_and_their_identities_differ() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_symbol_its_capital_and_a_position_resolve_consistently() {
     let _guard = X_LOCK.lock().await;
-    let (handle, _events, loop_thread) = skip_if_no_x!(spawn_backend!());
+    let (mut session, _events) = skip_if_no_x!(spawn_backend!());
+    let handle = session.handle().clone();
 
     let lower = handle
         .resolve(Want::Symbol("a".into()))
@@ -902,8 +949,7 @@ async fn a_symbol_its_capital_and_a_position_resolve_consistently() {
         "and a name from a later version resolves to nothing rather than to a wrong key"
     );
 
-    handle.request_exit(0);
-    loop_thread.join().unwrap();
+    session.close();
 }
 
 /// The five modifier keys the engine learns at every session start, each resolving to
@@ -915,7 +961,8 @@ async fn a_symbol_its_capital_and_a_position_resolve_consistently() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_modifier_resolves_to_its_own_key_on_the_real_keymap() {
     let _guard = X_LOCK.lock().await;
-    let (handle, _events, loop_thread) = skip_if_no_x!(spawn_backend!());
+    let (mut session, _events) = skip_if_no_x!(spawn_backend!());
+    let handle = session.handle().clone();
 
     let mut seen: Vec<PlatformKey> = Vec::new();
     for bit in keys::mods::holdable_bits(keys::mods::HOLDABLE) {
@@ -932,8 +979,7 @@ async fn every_modifier_resolves_to_its_own_key_on_the_real_keymap() {
         seen.push(resolved.code);
     }
 
-    handle.request_exit(0);
-    loop_thread.join().unwrap();
+    session.close();
 }
 
 /// The Unicode path, which on X11 is a keycode nothing is bound to, remapped for one
@@ -947,11 +993,10 @@ async fn every_modifier_resolves_to_its_own_key_on_the_real_keymap() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn typing_a_character_no_key_has_leaves_the_keymap_exactly_as_it_was() {
     let _guard = X_LOCK.lock().await;
-    let (handle, mut events, loop_thread) = skip_if_no_x!(spawn_backend!());
+    let (mut session, mut events) = skip_if_no_x!(spawn_backend!());
+    let handle = session.handle().clone();
     if !handle.capabilities().unicode {
         eprintln!("skipping: this keyboard has no spare keycode for the Unicode path");
-        handle.request_exit(0);
-        loop_thread.join().unwrap();
         return;
     }
     let peer = Peer::new().expect("a second connection to the same server");
@@ -999,8 +1044,7 @@ async fn typing_a_character_no_key_has_leaves_the_keymap_exactly_as_it_was() {
         "and its own churn must not look like a layout change"
     );
 
-    handle.request_exit(0);
-    loop_thread.join().unwrap();
+    session.close();
 }
 
 fn whole_keymap(peer: &Peer) -> Vec<u32> {
@@ -1022,11 +1066,10 @@ fn whole_keymap(peer: &Peer) -> Vec<u32> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_wheel_notch_travels_as_a_notch_and_not_as_a_button() {
     let _guard = X_LOCK.lock().await;
-    let (handle, mut events, loop_thread) = skip_if_no_x!(spawn_backend!());
+    let (mut session, mut events) = skip_if_no_x!(spawn_backend!());
+    let handle = session.handle().clone();
     if !handle.capabilities().capture {
         eprintln!("skipping: this server has no XInput2");
-        handle.request_exit(0);
-        loop_thread.join().unwrap();
         return;
     }
     let peer = Peer::new().expect("a second connection to the same server");
@@ -1079,9 +1122,7 @@ async fn a_wheel_notch_travels_as_a_notch_and_not_as_a_button() {
         "and it is never also a button press, or every scroll would click"
     );
 
-    handle.capture(CaptureMode::Off);
-    handle.request_exit(0);
-    loop_thread.join().unwrap();
+    session.close();
 }
 
 /// Waits for a condition the server answers, bounded.

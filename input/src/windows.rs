@@ -1727,6 +1727,8 @@ struct Backend {
     mouse: HHOOK,
     shutdown: bool,
     exit_code: Option<i32>,
+    /// Whether the engine's departure has been seen once already (see `periodic`).
+    gone_seen: bool,
     /// The layout the last poll saw, so a change is reported once.
     layout: usize,
     /// A cheap fingerprint of the monitor set, for the same reason: a message-only
@@ -1791,6 +1793,7 @@ impl Backend {
                 mouse: std::ptr::null_mut(),
                 shutdown: false,
                 exit_code: None,
+                gone_seen: false,
                 layout: 0,
                 monitors: (0, virtual_screen()),
             })
@@ -1950,12 +1953,20 @@ impl Backend {
     /// SAFETY: called from `run` with no other borrow of `self` live.
     unsafe fn periodic(&mut self) {
         if self.shared.engine_gone.load(Ordering::Relaxed) {
-            // The engine has gone without asking to stop, which means its thread died.
-            // Stopping non-zero has the supervisor restart the component fresh, and the
-            // teardown on the way out is what puts the keyboard and the cursor back.
-            warn("the engine's end of the upcall channel closed; stopping");
-            self.shutdown = true;
-            return;
+            // ONE more turn before acting on it, and only then. `main` drops the receiver
+            // when the engine returns and only then calls `request_exit`, so at a clean
+            // stop this flag can be set a moment before the exit code arrives: acting at
+            // once would exit 1, which is the supervisor's signal to restart, for a
+            // component that stopped exactly as it was asked to. A turn begins by draining
+            // the command queue, so one is enough.
+            if self.gone_seen || self.exit_code.is_some() {
+                if self.exit_code.is_none() {
+                    warn("the engine's end of the upcall channel closed; stopping");
+                }
+                self.shutdown = true;
+                return;
+            }
+            self.gone_seen = true;
         }
         // The layout belongs to the foreground thread (truth 5), so it changes by
         // alt-tabbing as well as by a person switching one, and both are real: the

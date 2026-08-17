@@ -971,7 +971,7 @@ impl MacBackend {
                 // lines is not a scroll anybody meant. The dialect bounds it too
                 // ([`crate::wire::WHEEL_MAX`]); this is the second bound.
                 let cap = crate::wire::WHEEL_MAX;
-                let (dx, dy) = (dx.clamp(-cap, cap), dy.clamp(-cap, cap));
+                let (dx, dy) = ((*dx).clamp(-cap, cap), (*dy).clamp(-cap, cap));
                 if let Some(event) = CGEvent::new_scroll_wheel_event2(source, unit, 2, dy, dx, 0) {
                     CGEvent::set_flags(Some(&event), flags);
                     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
@@ -1433,6 +1433,8 @@ struct Backend {
     layout_at: Instant,
     shutdown: bool,
     exit_code: Option<i32>,
+    /// Whether the engine's departure has been seen once already (see `periodic`).
+    gone_seen: bool,
 }
 
 impl Backend {
@@ -1484,12 +1486,20 @@ impl Backend {
     /// the keyboard layout.
     fn periodic(&mut self) {
         if self.shared.engine_gone.load(Ordering::Relaxed) {
-            // The engine has gone without asking to stop, which means its thread died.
-            // Stopping non-zero has the supervisor restart the component fresh, and the
-            // teardown on the way out is what puts the tap and the cursor back.
-            warn("the engine's end of the upcall channel closed; stopping");
-            self.shutdown = true;
-            return;
+            // ONE more turn before acting on it, and only then. `main` drops the receiver
+            // when the engine returns and only then calls `request_exit`, so at a clean
+            // stop this flag can be set a moment before the exit code arrives: acting at
+            // once would exit 1, which is the supervisor's signal to restart, for a
+            // component that stopped exactly as it was asked to. A turn begins by draining
+            // the command queue, so one is enough.
+            if self.gone_seen || self.exit_code.is_some() {
+                if self.exit_code.is_none() {
+                    warn("the engine's end of the upcall channel closed; stopping");
+                }
+                self.shutdown = true;
+                return;
+            }
+            self.gone_seen = true;
         }
         if self.grants_at.elapsed() >= GRANT_POLL {
             self.grants_at = Instant::now();
@@ -1853,6 +1863,7 @@ pub fn create() -> Result<crate::os::Created, Unsupported> {
         layout_at: Instant::now(),
         shutdown: false,
         exit_code: None,
+        gone_seen: false,
     };
     let handle = MacBackend {
         cmds,

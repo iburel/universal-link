@@ -120,3 +120,15 @@ test-group = 'serial-ipc'
 [[profile.ci.overrides]]
 filter = 'binary(/^x11$/) | binary(/^linux_files$/) | binary(/^macos$/) | binary(/^windows$/)'
 test-group = 'serial-os-clipboard'
+
+# The same override on the DEFAULT profile, so a suite run by hand serialises too.
+#
+# It was only on `profile.ci` until the keyboard and mouse engine's live X suite went
+# looking: running its ten tests under the default profile, nine runs out of fifteen
+# failed, every one of them because two of them were driving the display's one keyboard
+# grab and one pointer at the same time. CI was green throughout, which is the worst shape
+# a trap can have: the person who runs the suite to check their own change sees failures
+# that are not theirs and cannot reproduce them where it matters.
+[[profile.default.overrides]]
+filter = 'binary(/^x11$/) | binary(/^linux_files$/) | binary(/^macos$/) | binary(/^windows$/)'
+test-group = 'serial-os-clipboard'

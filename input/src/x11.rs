@@ -31,7 +31,7 @@
 //! opposite. Only the connection itself is required, and its absence is the
 //! `Unsupported` that becomes [`crate::os::Absent`].
 //!
-//! # Seven X11 truths this backend is built on
+//! # Eight X11 truths this backend is built on
 //!
 //! 1. **Raw XI2 events are the only observation channel that works.** A core event
 //!    mask on the root window is subject to propagation, so an application window that
@@ -77,6 +77,13 @@
 //!    as 1000 on every monitor here. The plane's arithmetic uses the sizes and not the
 //!    scale, so this costs an interface a label rather than costing the pointer its
 //!    place.
+//! 7. **The X keycode of a HID usage is the Linux evdev code plus 8.** That is a
+//!    convention rather than a protocol rule, and it is the convention every X server
+//!    with the evdev or libinput driver has used for two decades, XWayland included.
+//!    It is what makes positional mode work at all, and the live suite checks it
+//!    against the server's own keymap rather than trusting it: every usage in the table
+//!    is resolved and the keysym the server reports for the resulting keycode is
+//!    compared with the one the usage means.
 //! 8. **A grab does not stop the raw events, and it does not hide an injection
 //!    either.** Measured with a second client on the same server: a client that has
 //!    selected `XI_RawKeyPress` on the root keeps receiving keys while another client
@@ -88,13 +95,6 @@
 //!    (a machine being driven is not capturing, D15), and there IS a mechanism when
 //!    something does: a raw event's `source` device is the XTEST virtual device, which
 //!    a real keyboard's never is.
-//! 7. **The X keycode of a HID usage is the Linux evdev code plus 8.** That is a
-//!    convention rather than a protocol rule, and it is the convention every X server
-//!    with the evdev or libinput driver has used for two decades, XWayland included.
-//!    It is what makes positional mode work at all, and the live suite checks it
-//!    against the server's own keymap rather than trusting it: every usage in the table
-//!    is resolved and the keysym the server reports for the resulting keycode is
-//!    compared with the one the usage means.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -288,13 +288,19 @@ fn keycode_of(usage: u32) -> Option<u8> {
 /// answer is then the usage a person would name for that physical key.
 fn usage_of_keycode(keycode: u8) -> Option<u32> {
     let evdev = keycode.checked_sub(8)?;
-    if let Some((id, _)) = USAGE_EVDEV.iter().find(|(_, e)| *e == evdev) {
-        return Some(keys::usage(keys::PAGE_KEYBOARD, *id));
+    // The CONSUMER page first, and it matters for exactly three keys. Mute and the two
+    // volume keys exist on both HID pages, and `keys::NAMED` names them on the consumer
+    // page: reported on the keyboard page they would arrive with `key: None`, which is the
+    // very fallback a target with an incomplete usage table relies on, and they would be
+    // `UNRESOLVED` on a Windows target whose table has the consumer page only. No other
+    // evdev code appears in both tables, so this order costs nothing else.
+    if let Some((id, _)) = USAGE_EVDEV_CONSUMER.iter().find(|(_, e)| *e == evdev) {
+        return Some(keys::usage(keys::PAGE_CONSUMER, *id));
     }
-    USAGE_EVDEV_CONSUMER
+    USAGE_EVDEV
         .iter()
         .find(|(_, e)| *e == evdev)
-        .map(|(id, _)| keys::usage(keys::PAGE_CONSUMER, *id))
+        .map(|(id, _)| keys::usage(keys::PAGE_KEYBOARD, *id))
 }
 
 /// The keysym a canonical key name means, for the names the dialect defines that
@@ -422,6 +428,10 @@ impl Keymap {
             .and_then(|i| self.entries.get(usize::from(i)))
     }
 
+    /// The keysym at one exact place. Kept for the tests, which is where the level
+    /// arithmetic is pinned: the capture path goes through [`level_of_stroke`], which needs
+    /// the whole entry rather than one level of it.
+    #[cfg(test)]
     fn sym(&self, keycode: u8, group: u32, level: u32) -> Option<u32> {
         self.entry(keycode).and_then(|e| e.sym(group, level))
     }
@@ -432,7 +442,13 @@ impl Keymap {
     fn find(&self, keysym: u32, active: u32) -> Option<(u8, u32, u32)> {
         let mut best: Option<(u8, u32, u32)> = None;
         for (index, entry) in self.entries.iter().enumerate() {
-            let keycode = self.first.saturating_add(index as u8);
+            // `checked_add` and not `saturating_add`: past 255 there is no keycode, and
+            // saturating would make every entry beyond it answer as keycode 255, which is
+            // a wrong key rather than no key. Unreachable (both readers are bounded by the
+            // server's own `u8` range) and worth not depending on.
+            let Some(keycode) = self.first.checked_add(index as u8) else {
+                break;
+            };
             for group in 0..u32::from(entry.groups) {
                 for level in 0..u32::from(entry.width) {
                     if entry.sym(group, level) != Some(keysym) {
@@ -440,8 +456,11 @@ impl Keymap {
                     }
                     // A level above the fourth needs `ISO_Level5_Shift`, which the
                     // dialect's eight canonical modifier bits cannot name, so it is
-                    // not an answer this seam can carry.
-                    if level > 3 {
+                    // not an answer this seam can carry. A group above the fourth is
+                    // refused for the mirror reason: `XkbLatchLockState` carries a group
+                    // of one to four, so a resolution naming a fifth would have the
+                    // engine switch to the fourth and press the key on the wrong one.
+                    if level > 3 || group > 3 {
                         continue;
                     }
                     let candidate = (keycode, group, level);
@@ -481,6 +500,41 @@ fn level_for_mods(mods: u16) -> u32 {
         (true, false) => 2,
         (true, true) => 3,
     }
+}
+
+/// Is this pair of keysyms a letter and its own capital?
+///
+/// XKB calls a key type with this shape `ALPHABETIC`, and it is the one type Caps Lock
+/// acts on: the lock inverts the shift level for a letter and does nothing at all for a
+/// digit or a punctuation mark. Answered from the KEYSYMS rather than from a table of key
+/// types, because the two keysyms are what this backend has and they say it exactly.
+fn is_alphabetic(lower: Option<u32>, upper: Option<u32>) -> bool {
+    let (Some(lower), Some(upper)) = (
+        lower.and_then(text_of_keysym),
+        upper.and_then(text_of_keysym),
+    ) else {
+        return false;
+    };
+    lower != upper && lower.to_uppercase() == upper && upper.to_lowercase() == lower
+}
+
+/// The level a stroke really produced, with the locks applied.
+///
+/// Caps Lock is why this exists and not `level_for_mods` alone. With the lock on, a
+/// person presses the `a` key and X produces `A`; a backend that read the unshifted level
+/// would report `sym: "a"`, and the target would type a lower case letter for every
+/// capital its owner could see on their own screen. The lock INVERTS the shift level, and
+/// only for a key whose two levels are a letter and its capital, which is XKB's own rule.
+fn level_of_stroke(entry: &KeyEntry, group: u32, mods: u16) -> u32 {
+    let level = level_for_mods(mods);
+    if mods & keys::mods::CAPS == 0 {
+        return level;
+    }
+    let base = level & !1;
+    if !is_alphabetic(entry.sym(group, base), entry.sym(group, base | 1)) {
+        return level;
+    }
+    level ^ 1
 }
 
 // -------------------------------------------------------------- the commands
@@ -634,6 +688,17 @@ struct Backend {
     keysyms_per: u8,
     /// A keycode nothing is bound to, for the Unicode path (truth 5).
     spare: Option<u8>,
+    /// Whether that keycode is bound RIGHT NOW, which it is only during a `Text`
+    /// injection.
+    ///
+    /// A keymap change is the one thing this backend does that does NOT belong to its X
+    /// client: the server undoes a grab, a cursor hide and an event selection when the
+    /// connection closes, and it keeps a `ChangeKeyboardMapping` for ever. So a death
+    /// between the remap and the restore would leave a stray keysym on a keycode for
+    /// every application on the display, for the rest of the X session, and the next
+    /// start would pick a different spare and strand another one. This flag is what lets
+    /// every ordinary path out put it back.
+    spare_bound: bool,
     /// The active keyboard group, from XKB.
     group: u32,
     /// The canonical modifier bits, tracked from the captured stream because a
@@ -661,23 +726,78 @@ struct Backend {
     wheel_y: i64,
 
     monitors_stable: bool,
+    /// The control upcalls a full queue turned away, retried next turn (see
+    /// [`Backend::emit`]).
+    deferred: Vec<BackendEvent>,
     shutdown: bool,
     exit_code: Option<i32>,
     dropped: u64,
+    /// Protocol errors seen, so the log says how many rather than saying each.
+    errors: u64,
+    /// The engine's end of the upcall channel has closed.
+    ///
+    /// It means the engine has gone, and it is worth ONE more turn before acting on it.
+    /// `main` drops the receiver when the engine returns and only then calls
+    /// `request_exit`, so at a clean stop this flag can be set a moment before the exit
+    /// code arrives: shutting down on the spot would exit 1 (the supervisor's signal to
+    /// restart) for a component that stopped exactly as it was asked to. One turn is
+    /// enough, because a turn begins by draining the command queue.
+    engine_gone: bool,
+    /// Whether that has already been seen once.
+    gone_seen: bool,
 }
 
 impl Backend {
+    /// Pushes an upcall, and NEVER blocks the loop.
+    ///
+    /// A full queue is treated differently depending on what is in the event, and that
+    /// distinction is the whole of this function. A motion, a button, a wheel notch or a
+    /// keystroke is a moment: dropping one costs a frame nobody will notice, and the
+    /// design already says positions are coalesced and superseded ones thrown away. The
+    /// four CONTROL events are not moments, they are facts that change what everything
+    /// afterwards means, and dropping one is a bug with a long tail: a `LayoutChanged`
+    /// lost behind a key repeat burst leaves the engine holding a resolution cache about
+    /// a keymap that is gone and a held set it will never release, which is the stuck
+    /// Control this whole component is built to avoid. So those are kept and retried on
+    /// the next turn.
     fn emit(&mut self, event: BackendEvent) {
         use mpsc::error::TrySendError;
+        let control = matches!(
+            event,
+            BackendEvent::LayoutChanged { .. }
+                | BackendEvent::CapabilitiesChanged
+                | BackendEvent::MonitorsChanged
+                | BackendEvent::CaptureLost(_)
+        );
         match self.events_tx.try_send(event) {
             Ok(()) => {}
-            Err(TrySendError::Closed(_)) => self.shutdown = true,
-            Err(TrySendError::Full(_)) => {
+            // Not a shutdown on the spot: see `Backend::engine_gone`.
+            Err(TrySendError::Closed(_)) => self.engine_gone = true,
+            Err(TrySendError::Full(event)) => {
+                if control {
+                    // Bounded: the four control events are few and idempotent enough that
+                    // a queue of them cannot grow without the engine having stopped
+                    // draining entirely, which the closed arm above catches.
+                    if self.deferred.len() < 32 {
+                        self.deferred.push(event);
+                    }
+                    return;
+                }
                 self.dropped += 1;
                 if self.dropped.is_multiple_of(128) {
                     warn("the engine is not draining input events; dropping some");
                 }
             }
+        }
+    }
+
+    /// Tries the control upcalls a full queue turned away.
+    fn retry_deferred(&mut self) {
+        if self.deferred.is_empty() {
+            return;
+        }
+        for event in std::mem::take(&mut self.deferred) {
+            self.emit(event);
         }
     }
 
@@ -703,7 +823,18 @@ impl Backend {
             // Under edge triggered epoll a readiness can be consumed without the work
             // being done (a command queued while a reply was awaited, X events libxcb
             // buffered during that read), so it would not fire again.
+            self.retry_deferred();
             self.process_cmds();
+            if self.engine_gone {
+                if self.gone_seen || self.exit_code.is_some() {
+                    if self.exit_code.is_none() {
+                        warn("the engine's end of the upcall channel closed; stopping");
+                    }
+                    self.shutdown = true;
+                } else {
+                    self.gone_seen = true;
+                }
+            }
             self.drain_x();
             self.flush_motion();
             if self.shutdown {
@@ -760,7 +891,18 @@ impl Backend {
                     // Recoverable: a request we fired unchecked was refused (a grab
                     // on a device that went away, a property on an output that did).
                     // The connection is fine, so keep draining.
-                    warn(&format!("X protocol error (ignored): {e:?}"));
+                    //
+                    // Counted and only occasionally said out loud. This repository has
+                    // already paid once for an unthrottled line per event (the Android
+                    // log flood, PR #74), and the requests that can produce one here are
+                    // on the injection path, so one error can mean one per keystroke.
+                    self.errors += 1;
+                    if self.errors.is_multiple_of(64) {
+                        warn(&format!(
+                            "X protocol errors, {} so far, latest: {e:?}",
+                            self.errors
+                        ));
+                    }
                 }
                 Err(xcb::Error::Connection(e)) => {
                     warn(&format!("X connection lost, stopping: {e:?}"));
@@ -792,7 +934,15 @@ impl Backend {
             xcb::Event::Xkb(xkb::Event::MapNotify(_))
             | xcb::Event::Xkb(xkb::Event::NewKeyboardNotify(_)) => self.reload_keymap(),
             xcb::Event::X(x::Event::MappingNotify(ev)) => {
-                if ev.request() != x::Mapping::Pointer {
+                // Our OWN remap for the Unicode path is not a keymap change worth
+                // reading the whole keyboard for: the fingerprint excludes that keycode,
+                // so the reload would compute the same answer, and a thirty two character
+                // string would have paid for thirty three of them (two more round trips
+                // each) while the command queue waited.
+                let ours = ev.request() == x::Mapping::Keyboard
+                    && ev.count() == 1
+                    && self.spare == Some(ev.first_keycode());
+                if ev.request() != x::Mapping::Pointer && !ours {
                     self.reload_keymap();
                 }
             }
@@ -871,7 +1021,8 @@ impl Backend {
         }
         let sym = self
             .keymap
-            .sym(keycode, self.group, level_for_mods(self.mods))
+            .entry(keycode)
+            .and_then(|entry| entry.sym(self.group, level_of_stroke(entry, self.group, self.mods)))
             .and_then(text_of_keysym);
         let key = (usage != 0).then(|| keys::name_of(usage)).flatten();
         let event = BackendEvent::Key(KeyEvent {
@@ -935,6 +1086,10 @@ impl Backend {
             CaptureMode::Off => {
                 self.ungrab();
                 self.select_raw(false);
+                // The pin goes with it. The engine always releases it first, so this is
+                // belt rather than braces: a confinement left behind would have the next
+                // Watch pinning the pointer with no session asking for it.
+                self.confine = None;
             }
             CaptureMode::Watch | CaptureMode::Swallow => {
                 if was_off {
@@ -1041,9 +1196,16 @@ impl Backend {
             ));
             // Half a grab is worse than none: the keyboard would be consumed and the
             // pointer would not, or the other way round. So whichever half succeeded is
-            // undone and the engine is told, which ends the session with a reason.
+            // undone (ungrabbing one this client does not hold is a no-op, which is why
+            // it can be done without knowing which half it was) and the engine is told,
+            // which ends the session with a reason.
             self.grabbed = true;
             self.ungrab();
+            // And the mode is put BACK to what is actually installed. Leaving it saying
+            // Swallow would make the next `capture(Swallow)` a no-op ("already in that
+            // mode") and this machine would report that it is swallowing while every
+            // keystroke acted locally and remotely at once.
+            self.mode = CaptureMode::Watch;
             self.emit(BackendEvent::CaptureLost(CaptureLoss::Broken));
             return;
         }
@@ -1212,11 +1374,17 @@ impl Backend {
     /// bound to, remapped for one stroke and restored (truth 5).
     fn type_text(&mut self, text: &str) {
         let Some(spare) = self.spare else {
+            // Should be unreachable: the engine only emits `Text` when the capabilities
+            // say `unicode`, which says `spare.is_some()`. Said out loud rather than
+            // dropped, because a character that vanishes with nobody told is the one
+            // behaviour this whole feature exists not to have.
+            warn("a character cannot be typed: this keyboard has no spare keycode");
             return;
         };
         for ch in text.chars() {
             let keysym = keysym_of_char(ch);
             let syms = vec![keysym; usize::from(self.keysyms_per.max(1))];
+            self.spare_bound = true;
             self.conn.send_request(&x::ChangeKeyboardMapping {
                 keycode_count: 1,
                 first_keycode: spare,
@@ -1231,6 +1399,21 @@ impl Backend {
             self.fake(FAKE_KEY_RELEASE, spare, 0, 0);
             self.sync();
         }
+        self.unbind_spare();
+    }
+
+    /// Puts the spare keycode back to nothing.
+    ///
+    /// Called at the end of a `Text` and again from every teardown, because a keymap
+    /// change outlives the client that made it (see [`Backend::spare_bound`]).
+    fn unbind_spare(&mut self) {
+        if !self.spare_bound {
+            return;
+        }
+        let Some(spare) = self.spare else {
+            self.spare_bound = false;
+            return;
+        };
         // Restored to nothing, so the keymap is exactly what it was. The fingerprint
         // excludes this keycode, so none of this looked like a layout change.
         let empty = vec![x::NO_SYMBOL; usize::from(self.keysyms_per.max(1))];
@@ -1240,6 +1423,7 @@ impl Backend {
             keysyms_per_keycode: self.keysyms_per.max(1),
             keysyms: &empty,
         });
+        self.spare_bound = false;
         self.sync();
     }
 
@@ -1301,7 +1485,7 @@ impl Backend {
                         },
                         mods: mods_for_level(level),
                         prefix: None,
-                        group: (group != self.group).then_some(group),
+                        group: self.switch_to(group),
                     });
                 }
                 // A name this keymap does not carry is still a POSITION every keyboard
@@ -1324,10 +1508,22 @@ impl Backend {
                     },
                     mods: mods_for_level(level),
                     prefix: None,
-                    group: (group != self.group).then_some(group),
+                    group: self.switch_to(group),
                 })
             }
         }
+    }
+
+    /// The group a resolution should ask the engine to switch to, or `None` when it
+    /// should not ask at all.
+    ///
+    /// `None` when it is the active group already, and `None` when this server has no
+    /// XKB: without the extension there is nothing to switch WITH ([`Backend::lock_group`]
+    /// returns early), so promising a switch would have the engine press the key on the
+    /// wrong group and type the wrong character rather than fall through to the Unicode
+    /// path.
+    fn switch_to(&self, group: u32) -> Option<u32> {
+        (self.ext.xkb && group != self.group && group < 4).then_some(group)
     }
 
     /// The physical key a usage means, checked against the keymap so a keycode the
@@ -1435,8 +1631,14 @@ impl Backend {
         if !out.is_empty() && !out.iter().any(|m| m.primary) {
             out[0].primary = true;
         }
-        self.monitors_stable = stable;
-        self.publish_caps();
+        if stable != self.monitors_stable {
+            self.monitors_stable = stable;
+            self.publish_caps();
+            // Nothing else would tell the engine: it reads the capabilities BEFORE it asks
+            // for the monitors, so a change discovered here would otherwise wait for the
+            // next unrelated reason to re-read them.
+            self.emit(BackendEvent::CapabilitiesChanged);
+        }
         out
     }
 
@@ -1560,12 +1762,20 @@ impl Backend {
             .keysyms()
             .chunks(per)
             .map(|chunk| KeyEntry {
-                // The documented reading of the first four: two groups of two levels.
-                // A single group of four levels is the same four numbers, and the core
-                // protocol gives nothing that tells them apart, which is exactly why
-                // XKB is asked first.
-                groups: (per / 2).clamp(1, 4) as u8,
-                width: 2,
+                // ONE group of however many levels, and that is a deliberate choice
+                // rather than the documented reading. The core protocol says the first
+                // four keysyms are two groups of two levels, and it gives nothing that
+                // tells that apart from one group of four (truth 4). Claiming two groups
+                // is the dangerous half of the ambiguity: a resolution would answer
+                // "that character is on group 2 level 1", the engine would switch group
+                // and press the key with NO modifier, and the character produced would be
+                // the unshifted one. Claiming one group of four levels makes the same key
+                // resolve as "level 3", which is AltGr, which is what a four level key
+                // actually is on every layout `xkeyboard-config` produces. And a server
+                // with no XKB cannot switch groups anyway, so the group half was never
+                // reachable.
+                groups: 1,
+                width: (per.min(4)) as u8,
                 syms: chunk.to_vec(),
             })
             .collect();
@@ -1575,11 +1785,19 @@ impl Backend {
     /// Wraps a keysym table in an identity, excluding the spare keycode (truth 5).
     fn fingerprinted(&self, first: u8, entries: Vec<KeyEntry>) -> Keymap {
         let mut hasher = blake3::Hasher::new();
+        // The SHAPE as well as the keysyms, and truth 4 is why: one group of four levels
+        // and two groups of two are the same four keysyms with different meanings, so a
+        // fingerprint over the keysyms alone calls that keymap change no change at all,
+        // keeps a resolution cache whose levels now mean something else, and never
+        // releases what is held. The first keycode is in there too, for a
+        // `NewKeyboardNotify` that shifts the range without touching a symbol.
+        hasher.update(&[first]);
         for (index, entry) in entries.iter().enumerate() {
-            let keycode = first.saturating_add(index as u8);
-            if Some(keycode) == self.spare {
+            let keycode = first.checked_add(index as u8);
+            if keycode.is_none() || keycode == self.spare {
                 continue;
             }
+            hasher.update(&[entry.groups, entry.width]);
             for sym in &entry.syms {
                 hasher.update(&sym.to_be_bytes());
             }
@@ -1615,6 +1833,9 @@ impl Backend {
         });
         let Ok(reply) = self.conn.wait_for_reply(cookie) else {
             self.spare = None;
+            // Republished, or the capabilities would keep claiming `unicode` while
+            // `type_text` silently dropped every character.
+            self.publish_caps();
             return;
         };
         self.keysyms_per = reply.keysyms_per_keycode().max(1);
@@ -1686,9 +1907,25 @@ impl Backend {
             mods |= keys::mods::ALTGR;
         }
         self.mods = mods;
+        // Announced from here as well as from `reload_keymap`, because this is the other
+        // place the group can change: capture starting again after a spell of Off is the
+        // one moment the server's state is worth re-reading, and a group that moved in
+        // between has to reach the engine or its cached resolutions are about the wrong
+        // layout. `announce_layout` says nothing when the identity has not moved.
+        self.announce_layout();
     }
 
     fn announce_layout(&mut self) {
+        if self.keymap.fingerprint.is_empty() {
+            // No keymap has been read yet, so there is nothing to name. It happens once,
+            // at construction, where the STATE is read before the keymap (so the first
+            // identity carries the right group) and this is what keeps that from
+            // announcing a layout with no fingerprint and then announcing the real one a
+            // moment later. Two `LayoutChanged` at start would cost the engine two
+            // relearns and would tell a reader of the log that something changed when
+            // nothing had.
+            return;
+        }
         let layout = format!("x11:{}:{}", self.group, self.keymap.fingerprint);
         if layout == self.layout {
             return;
@@ -1747,6 +1984,22 @@ impl Backend {
         self.ungrab();
         self.select_raw(false);
         self.confine = None;
+        // A fraction of a notch left over from this session must not spend itself as a
+        // phantom scroll in the next one.
+        self.wheel_x = 0;
+        self.wheel_y = 0;
+        // The one thing the server will not undo for us.
+        self.unbind_spare();
+        // And the commands nobody will ever answer: an answering downcall's reply
+        // travels INSIDE its queued command, so a `monitors` or a `resolve` pushed after
+        // the last turn would leave its sender in the queue and its caller awaiting a
+        // future that can never resolve. Dropping them here resolves each one to the
+        // neutral answer its own documentation promises.
+        if let Ok(mut queue) = self.cmds.lock() {
+            queue.clear();
+        } else if let Err(p) = self.cmds.lock() {
+            p.into_inner().clear();
+        }
         let _ = self.conn.flush();
     }
 }
@@ -1928,7 +2181,15 @@ pub fn create() -> Result<crate::os::Created, Unsupported> {
     if ext.xkb {
         conn.send_request(&xkb::SelectEvents {
             device_spec: xkb::Id::UseCoreKbd as u32 as xkb::DeviceSpec,
-            affect_which: xkb::EventType::NEW_KEYBOARD_NOTIFY | xkb::EventType::STATE_NOTIFY,
+            // `MAP_NOTIFY` belongs in `affect_which` too: the `affect_map` and `map`
+            // fields below are only consulted for the event types named here, so without
+            // it the map notify was never selected and its arm in `on_event` was dead
+            // code. Nothing was lost while it was (the core `MappingNotify` reaches every
+            // client on any keysym change and is handled), which is exactly why it went
+            // unnoticed.
+            affect_which: xkb::EventType::NEW_KEYBOARD_NOTIFY
+                | xkb::EventType::STATE_NOTIFY
+                | xkb::EventType::MAP_NOTIFY,
             clear: xkb::EventType::empty(),
             select_all: xkb::EventType::empty(),
             affect_map: xkb::MapPart::KEY_SYMS,
@@ -1993,6 +2254,7 @@ pub fn create() -> Result<crate::os::Created, Unsupported> {
         keymap: Keymap::default(),
         keysyms_per: 1,
         spare: None,
+        spare_bound: false,
         group: 0,
         mods: 0,
         layout: String::new(),
@@ -2006,14 +2268,31 @@ pub fn create() -> Result<crate::os::Created, Unsupported> {
         wheel_x: 0,
         wheel_y: 0,
         monitors_stable: true,
+        deferred: Vec::new(),
         shutdown: false,
         exit_code: None,
         dropped: 0,
+        errors: 0,
+        engine_gone: false,
+        gone_seen: false,
     };
     // Read before the handle is handed over, so the first `capabilities()` the engine
     // asks for is the truth rather than the pessimistic placeholder above.
-    backend.reload_keymap();
+    //
+    // The STATE first, and the order is not cosmetic. `reload_keymap` announces the
+    // layout, and a layout identity carries the group; announcing before the group was
+    // read told the engine it was in group 0 whatever group its owner was actually in.
+    // What that cost: the engine switches BACK to the group it believes the machine was
+    // in, so a person typing Russian had their keyboard left in the Latin group by the
+    // very code written to prevent exactly that. And it hid the repair, because the real
+    // switch to group 0 later produced the identity that had already been announced, so
+    // `announce_layout` said nothing and the resolution cache was never dropped.
     backend.read_state();
+    backend.reload_keymap();
+    // The screens too, for the same reason: `monitors_stable` is only computed here, and
+    // the engine reads the capabilities BEFORE it asks for the monitors, so without this
+    // the first answer claimed every screen had a stable identity.
+    let _ = backend.read_monitors();
     backend.publish_caps();
 
     let handle = X11Backend { cmds, waker, caps };
@@ -2831,6 +3110,34 @@ mod tests {
         );
     }
 
+    /// The three keys that exist on both HID pages travel as the usage the frozen table
+    /// NAMES, which is the consumer one.
+    ///
+    /// Reported on the keyboard page they arrived with no canonical name, which is the
+    /// fallback a target with an incomplete usage table relies on, and they were
+    /// unresolvable on a Windows target whose own table has the consumer page only.
+    #[test]
+    fn a_media_key_travels_as_the_page_the_dialect_names_it_on() {
+        for (name, evdev) in [
+            ("VolumeMute", 113u8),
+            ("VolumeDown", 114),
+            ("VolumeUp", 115),
+        ] {
+            let usage = usage_of_keycode(evdev + 8).expect("a key");
+            assert_eq!(
+                keys::name_of(usage),
+                Some(name),
+                "evdev {evdev} must be the usage the frozen table calls {name}"
+            );
+        }
+        // And nothing else moved: the ordinary keys are still the keyboard page.
+        assert_eq!(
+            usage_of_keycode(36),
+            Some(keys::usage(keys::PAGE_KEYBOARD, 0x28)),
+            "Enter"
+        );
+    }
+
     /// The X keycode of a usage is the evdev code plus 8 (truth 7), and the round trip
     /// has to give the usage back or a captured key would travel as another one.
     #[test]
@@ -2842,7 +3149,11 @@ mod tests {
             let usage = keys::usage(keys::PAGE_KEYBOARD, *id);
             let keycode = keycode_of(usage).expect("every entry has a keycode");
             let back = usage_of_keycode(keycode).expect("and the keycode names a usage");
-            if *id != 0x32 {
+            // The exceptions, each a key two usages really do share: the backslash and the
+            // non-US hash are one key, and mute and the two volume keys exist on both HID
+            // pages, where the CONSUMER one is the page the frozen table names them on and
+            // therefore the one a captured key travels as.
+            if ![0x32, 0x7F, 0x80, 0x81].contains(id) {
                 assert_eq!(back, usage, "usage {id:#04x} did not round trip");
             }
         }
@@ -3061,6 +3372,128 @@ mod tests {
         assert_eq!(spend_pixels(&mut acc), 24);
         let mut acc = i64::MAX;
         assert!(spend_pixels(&mut acc) > 0);
+    }
+
+    /// Caps Lock inverts the shift level of a LETTER and of nothing else, which is
+    /// XKB's own rule and the reason a capital typed with the lock on arrives as a
+    /// capital.
+    ///
+    /// Without it the backend reported the unshifted level, so a person with Caps Lock on
+    /// saw capitals on their own screen and the other computer typed lower case for every
+    /// one of them.
+    #[test]
+    fn caps_lock_changes_the_level_of_a_letter_and_of_nothing_else() {
+        // A letter (a, A), a digit whose shifted level is punctuation (1, exclam), and a
+        // four level letter (a, A, ae, AE).
+        let letter = KeyEntry {
+            groups: 1,
+            width: 2,
+            syms: vec![0x61, 0x41],
+        };
+        let digit = KeyEntry {
+            groups: 1,
+            width: 2,
+            syms: vec![0x31, 0x21],
+        };
+        let four = KeyEntry {
+            groups: 1,
+            width: 4,
+            syms: vec![0x61, 0x41, 0x00E6, 0x00C6],
+        };
+        let caps = keys::mods::CAPS;
+        let shift = keys::mods::SHIFT;
+        let altgr = keys::mods::ALTGR;
+
+        assert_eq!(level_of_stroke(&letter, 0, 0), 0, "no lock, no shift");
+        assert_eq!(
+            level_of_stroke(&letter, 0, caps),
+            1,
+            "the lock is a shift here"
+        );
+        assert_eq!(
+            level_of_stroke(&letter, 0, caps | shift),
+            0,
+            "and a shift with the lock on is the unshifted level again"
+        );
+        assert_eq!(
+            level_of_stroke(&digit, 0, caps),
+            0,
+            "a digit is not a letter: the lock does nothing to it"
+        );
+        assert_eq!(level_of_stroke(&digit, 0, shift), 1);
+        // The AltGr pair of a four level key is its own two levels, and the lock inverts
+        // within the pair rather than across it.
+        assert_eq!(level_of_stroke(&four, 0, altgr), 2);
+        assert_eq!(
+            level_of_stroke(&four, 0, altgr | caps),
+            3,
+            "the AltGr pair of this key is ae and AE, which IS a case pair, so the lock \
+             inverts within it: XKB's rule, and not an accident of this key"
+        );
+        assert_eq!(
+            level_of_stroke(&letter, 0, altgr),
+            2,
+            "and a level the key does not have is asked for as it is, so the caller finds \
+             nothing rather than the wrong thing"
+        );
+    }
+
+    /// The letter test's other half: what counts as a case pair.
+    #[test]
+    fn only_a_letter_and_its_own_capital_are_a_case_pair() {
+        assert!(is_alphabetic(Some(0x61), Some(0x41)), "a and A");
+        assert!(
+            is_alphabetic(Some(0x00E9), Some(0x00C9)),
+            "e acute and its capital"
+        );
+        assert!(!is_alphabetic(Some(0x31), Some(0x21)), "1 and exclam");
+        assert!(
+            !is_alphabetic(Some(0x61), Some(0x61)),
+            "a key with one level twice"
+        );
+        assert!(
+            !is_alphabetic(Some(0x61), None),
+            "and half a pair is no pair"
+        );
+        assert!(!is_alphabetic(None, None));
+        // A keysym with no text at all is not a letter, whatever else it is.
+        assert!(!is_alphabetic(Some(0xFFE1), Some(0xFFE2)), "two Shifts");
+    }
+
+    /// The fingerprint has to change when the SHAPE of the keymap changes, not only its
+    /// keysyms: truth 4's own example is a change that leaves the keysyms alone.
+    #[test]
+    fn the_fingerprint_notices_a_change_of_shape() {
+        let flat = vec![0x61, 0x41, 0x00E6, 0x00C6];
+        let one_group_of_four = KeyEntry {
+            groups: 1,
+            width: 4,
+            syms: flat.clone(),
+        };
+        let two_groups_of_two = KeyEntry {
+            groups: 2,
+            width: 2,
+            syms: flat,
+        };
+        let hash = |entry: &KeyEntry, first: u8| {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&[first]);
+            hasher.update(&[entry.groups, entry.width]);
+            for sym in &entry.syms {
+                hasher.update(&sym.to_be_bytes());
+            }
+            hex::encode(&hasher.finalize().as_bytes()[..8])
+        };
+        assert_ne!(
+            hash(&one_group_of_four, 8),
+            hash(&two_groups_of_two, 8),
+            "the same four keysyms with two different meanings are two keymaps"
+        );
+        assert_ne!(
+            hash(&one_group_of_four, 8),
+            hash(&one_group_of_four, 9),
+            "and a keycode range that moved is a keymap that moved"
+        );
     }
 
     /// A coordinate that does not fit the wire is clamped rather than wrapped: an X
