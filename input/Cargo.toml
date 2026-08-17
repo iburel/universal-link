@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[package]
+name = "onedevice-input"
+version = "0.6.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+# The official keyboard and mouse engine (doc/input-sharing.md): the exclusive
+# `input-backend` component behind the Core's routed `input.*` facade. It speaks
+# ONLY the public Core API - the layout rides `peers.send`, the live flow rides
+# `peers.channel` - and owns all of its persistence under the platform data dir.
+# The OS-agnostic engine lives in the lib, frozen by tests/api/ against a fake
+# platform backend; the binary is wiring, and the real capture and injection
+# backends land behind `backend.rs`'s seam in their own ticket.
+
+[[bin]]
+name = "1device-input"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+# Hand-picked features, like the sibling components: the runtime, stdin (the
+# supervisor's stop signal), and the primitives the engine uses. `time` carries
+# the one timer this engine owns (the trailing-edge flush of a coalesced
+# position, doc/input-sharing.md D5) and the layout round's rate limit.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-std",
+    "io-util",
+    "sync",
+    "time",
+] }
+onedevice-ipc-client = { path = "../client" }
+# Resolves the platform data directory the engine persists under.
+onedevice-paths = { path = "../paths" }
+# The engine keypair that signs the layout document (doc/input-sharing.md,
+# section 6). Aligned with core/Cargo.toml and the sync engine, for the same
+# reason both give: the seed is PERSISTED (identity.json) and its public half is
+# what peers pin, so a change in `to_bytes`/`from_bytes` semantics would unpin
+# this device from every plane it takes part in.
+ed25519-dalek = { version = "3", features = ["rand_core"] }
+rand = "0.10"
+hex = "0.4"
+# The plane id: one hash over the signed bytes of the layout document, so two
+# devices holding the same records compute the same id. Already in the lock via
+# iroh: no new package version enters with this line.
+blake3 = "1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+onedevice-core = { path = "../core" }
+# The integration suite runs TWO real Cores of one account in one process, so
+# that a session, a layout round and every one of the live channel's ten deaths
+# are proven against the real primitives rather than against a double. Two Cores
+# of one account have to be enrolled on a server to know each other, which is
+# why this crate's dev-dependencies carry one (the IPC client's do too, for the
+# same reason and since the same ticket).
+onedevice-server = { path = "../server" }
+onedevice-test-support = { path = "../test-support" }

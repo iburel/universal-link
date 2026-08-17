@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["client", "clipboard", "core", "daemon", "gui", "menu", "paths", "server", "server-daemon", "sync", "test-support", "tray"]
+members = ["client", "clipboard", "core", "daemon", "gui", "input", "menu", "paths", "server", "server-daemon", "sync", "test-support", "tray"]
 # The Android client's Rust cdylib (`gui-mobile`: the Tauri-mobile shell — the
 # desktop Svelte UI + an embedded Core). Excluded from the workspace: built only
 # for aarch64-linux-android via the Tauri Android tooling (cargo-ndk under the

@@ -271,6 +271,24 @@ what makes that provably safe. A position is applied only if `n` is greater
 than the last one applied, so no reordering, no replay and no future
 unreliable transport can walk the pointer backwards.
 
+### Every field a peer chooses is bounded on arrival
+
+Not one of these is theoretical: a peer holding the same role is another
+implementation, possibly an older or a stranger one, and these values reach
+the OS, the snapshot an interface renders, and this engine's memory.
+
+| Field | Bound on arrival | Over it |
+|---|---|---|
+| `i` (button) | 1 to 5, the five this dialect defines | the frame is dropped. Not clamped: a clamp would be us choosing a different action on the peer's behalf, and an undefined button number is a real `MOUSEEVENTF_X*` value on Windows and a real XTEST button on X11 |
+| `c` (a code) | the closed set of its frame kind (section 13) | mapped to `UNKNOWN`, so a later version's word degrades to one an interface can still say something about, instead of reaching the snapshot as peer-chosen prose |
+| `by` | 64 bytes, the length of a node_id | dropped. A refusal with no name is still a refusal |
+| `plane` | exactly 32 hex characters | the frame is dropped. A plane id is the whole reason a coordinate means anything |
+| `m` (modifiers) | masked to the eight defined bits | the undefined bits are discarded |
+| `sym` | 32 bytes of UTF-8 | dropped, keeping the usage (the same rule as on the way out) |
+| `l` (layout) | 64 bytes | dropped |
+| `key` | 32 bytes | dropped |
+| `caps` | 256 bytes, and an object | replaced by `{}`, which reads as a peer that can do nothing. `hi` is the one frame that must always be sent, so refusing it would make the session impossible where degrading it makes the session honestly refused |
+
 ## 4. The session state machine, exclusion, and the teardown matrix
 
 ### The warm channel
@@ -462,6 +480,8 @@ account. Not one box per machine: the epic's decision, from the first day.
 ```json
 {
   "d": "1device-input/1",
+  "t": "layout",
+  "key": "<the sender's own engine public key, 64 hex>",
   "monitors": {
     "<node_id>": {
       "seq": 7,
@@ -497,6 +517,12 @@ account. Not one box per machine: the epic's decision, from the first day.
 - `at` is informational, for the interface. It is never compared: clocks
   across machines are not comparable, and a design that quietly relies on
   them is a design that fails at the worst moment.
+- `key` is the SENDER's own engine public key, and it is what creates every
+  pin: the message arrives named by the receiving Core's directory, so the
+  key inside it is that device's word about itself. It is the sender's own
+  and never the author's, so a relayed document pins the courier and nobody
+  else. It is part of the frozen shape rather than of D11's prose alone,
+  because every pin in this section depends on it travelling.
 
 ### Two authorities, and they do not overlap
 
@@ -508,16 +534,54 @@ until that node is pinned by direct contact (which the warm channel and the
 layout rounds produce for every reachable pair).
 
 **Last writer wins on the whole plane for the arrangement a human drags.**
-`placement` is one object, compared by `(seq, by)`: the greater `seq` wins,
-a tie is broken by the greater `by` (lexicographic on the hex node_id), and
-that is a total order, so every device converges on the same plane from the
-same set of messages, in any order, with no coordination. A human who drags
-writes `seq = max(seen) + 1`.
+`placement` is one object, compared by `(seq, by, sig)`: the greater `seq`
+wins, a tie is broken by the greater `by` (lexicographic on the hex node_id),
+and a tie there by the greater `sig`, so every device converges on the same
+plane from the same set of messages, in any order, with no coordination. A
+human who drags writes `seq = max(seen) + 1`.
+
+**The signature is in the order and it has to be**, which is easy to get
+wrong and was: `(seq, by)` is a total order on the PAIR and not on
+placements, so two DIFFERENT arrangements from the same author at the same
+seq can never displace each other and the first to arrive wins. Two devices
+that saw them in opposite orders then hold different planes with different
+plane ids for ever, every session between them refused `PLANE_STALE` with
+nothing to repair it, because each keeps re-offering a document the other
+ignores. `sig` is a function of the content, so it makes the order total on
+the thing being ordered. Nothing device-local is ever in it (in particular
+not `verified`), because an order that depended on which peers a device has
+met is exactly the order that makes two planes diverge.
 
 Bounds, so a peer cannot grow the document: at most 16 devices in
-`monitors`, at most 16 monitors each, at most 64 entries in `spots`, and a
-`spots` key whose node_id is in no directory entry of this account is
-dropped on merge. A document that breaks a bound is refused whole.
+`monitors`, at most 16 monitors each, at most 256 entries in `spots` (16
+devices of 16 monitors can legitimately fill it, and a smaller bound would
+drop the spots of screens that are away, which keep their place), at most 256
+bytes of monitor `id` and 128 of `name`, and at most 32 KiB of `placement`
+(which a full 256 spots of ordinary monitor ids fits inside; 256 spots of
+MAXIMAL ids is the one combination no bound could fit a 64 KiB transport).
+A document that breaks a bound is refused whole, monitors and placement
+together: refusing half a document would let a peer over the bound slip its
+arrangement in while its monitors were refused, and the arrangement is the
+half that decides where the pointer goes.
+
+The bounds are all functions of the CONTENT, deliberately, so every device
+refuses the same document. Two further limits are therefore expressed as
+budgets on what is SENT rather than as refusals at the door: the stored
+`monitors` map keeps at most 16 devices (an unverified entry may be displaced
+by a smaller node_id, a verified one never is, since only unverified entries
+are outside the plane and the plane id), and what a device offers carries its
+OWN entry first and then as much of the rest as fits one `peers.send`. Being
+unable to announce its own screens is the one failure nobody else can repair
+for a machine; relaying somebody else's word is a convenience the epidemic
+does not depend on.
+
+A draft of this section had a `spots` key whose node_id is in no directory
+entry of this account "dropped on merge". It must NOT be, and the code never
+did it: dropping against the LOCAL directory would make the signed bytes, and
+so `plane_id`, depend on which devices each machine currently knows, which is
+permanent `PLANE_STALE` between two machines that disagree about the account
+for a second. The drop happens at LAY-OUT time instead (section 7): a spot no
+verified record claims is not placed, and the document keeps it.
 
 **A `placement` whose signer is unknown here is still adopted, marked
 unverified.** This is a deliberate divergence from the sync engine's
@@ -533,24 +597,30 @@ refused `PLANE_STALE`). Signing `placement` remains worth it for attribution
 have) and because a device that IS pinned cannot then be impersonated: a
 signature that is present and WRONG is refused outright.
 
-Two rules close the loop that adoption opens:
+**A pin re-examines the arrangement, every time, and that flatness is the
+rule.** When a key arrives for the author of the arrangement this device
+holds, the arrangement is verified against it: a forgery adopted on faith is
+thrown out, and so is a genuine one whose author has since replaced its key.
+The plane then falls back to the derived arrangement, which one drag replaces.
 
-- **A pin re-examines what was adopted on faith.** When the author's own key
-  finally arrives, an arrangement attributed to it that does not verify under
-  that key was a forgery, and it is thrown out. The plane falls back to the
-  derived arrangement, which one drag replaces.
-- **An arrangement already verified survives a key replacement.** It was
-  proven genuine under the key that was current when it arrived, so a
-  reinstall on the far side must not wipe an arrangement a human really did
-  drag. Only what was never proven is re-examined.
+A draft had it kinder, keeping an arrangement this device had ALREADY proven
+across a key replacement, on the reasoning that it had been proven under the
+key that was current when it arrived. That is where the rule stopped being a
+function of the records: whether an arrangement was verified depends on
+whether this device held the author's OLD key when it arrived, so a device
+reinstalling split the account into the machines that had verified its
+arrangement and kept it and the machines that had adopted it on faith and
+threw it out, with two plane ids, every session across the split refused
+`PLANE_STALE`, and nothing to repair it. Convergence is the property
+everything else here rests on, and the kindness was only ever a comfort.
 
-An earlier draft of this section also required the message to come from a
-peer this device had already pinned. Implementation showed that condition is
-vacuous and it was removed: a peer's engine key travels in the peer's own
-message, so any device of the account makes itself pinned by the act of
-speaking, and the check could never refuse anybody. The real bound on who may
-say anything here is that every sender is an attested device of the account,
-which the Core guarantees before a byte reaches this engine.
+A draft also required the message to come from a peer this device had already
+pinned. Implementation showed that condition is vacuous and it was removed: a
+peer's engine key travels in the peer's own message, so any device of the
+account makes itself pinned by the act of speaking, and the check could never
+refuse anybody. The real bound on who may say anything here is that every
+sender is an attested device of the account, which the Core guarantees before
+a byte reaches this engine.
 
 `monitors` entries are never adopted unverified: a device's own word about
 its own screens must be its own, and an unverified entry is held, shown as
@@ -589,12 +659,21 @@ meaningful.
 
 ### Replication: one message, merged idempotently
 
-One `peers.send` message, `{ "d": ..., "t": "layout", "doc": <the whole
-document> }`, and the receiver merges it. No head, no need queue, no delta
-protocol: the document is bounded at a few kilobytes by construction (16
-devices of 16 monitors is the cap, and a realistic desk is 3 devices of 2),
-so a delta protocol would be complexity bought with nothing. `peers.send`
-carries 64 KiB, an order of magnitude more than the cap allows.
+One `peers.send` message, and it is the document itself: `{ "d", "t":
+"layout", "key", "monitors", "placement" }`, exactly the shape at the top of
+this section, with no `doc` wrapper around it. (An earlier draft of this
+paragraph nested the document under a `"doc"` key, which contradicted the
+JSON block a few lines above it and the merge that reads the top level.) The
+receiver merges it. No head, no need queue, no delta protocol: a realistic
+desk is 3 devices of 2 monitors, a few hundred bytes, so a delta protocol
+would be complexity bought with nothing.
+
+`peers.send` carries 64 KiB, and the caps of this section do NOT by
+themselves fit inside it: 16 devices of 16 monitors with identities of the
+length Windows really produces is over 100 KiB of JSON. That is why the
+offered document has a byte budget as well as counts (above): a device always
+announces its own entry and relays what fits, so the message is inside the
+transport by construction rather than by hope.
 
 A round happens when there is something to converge: at start, when a peer
 becomes reachable, when our own monitors change, when a human drags, when a
@@ -613,6 +692,24 @@ is a wall. "This screen is not connected right now. Its place is kept." A
 ghost between two live monitors makes the far one unreachable, and that is
 the correct outcome: the pointer stops at a wall instead of being swallowed
 by a screen that is not there.
+
+**A ghost needs a spot, so only a screen a human placed can keep its place.**
+On a plane nobody has ever dragged, an unplugged screen simply leaves, and the
+remaining blocks are re-derived without it. That is a real limit and it is not
+an oversight: the derived arrangement is a function of the `monitors` records
+ALONE, which is what makes two devices compute the same plane from the same
+messages, and remembering a screen that is no longer in any record would mean
+remembering something outside them. Two devices would then disagree the moment
+one of them had met a screen the other never saw, which is the one failure this
+document cannot afford (the plane id would agree while the layouts differed,
+so nothing would even notice).
+
+Worth knowing which way the discomfort points: the person who never opened the
+Input tab is exactly the person who unplugs a screen, so the case is real. What
+they get is a plane that rearranges itself rather than one that keeps a gap,
+which is visible and self-correcting, where the alternative is two machines
+silently disagreeing about where the pointer goes. One drag fixes it for good,
+and the interface has every reason to invite one.
 
 ### Monitors with no spot
 
@@ -671,8 +768,12 @@ reports.
 
 1. **Locked to screen.** `input.lock` pins the pointer where it is, for
    games and virtual machines. Nothing crosses. A global toggle.
-2. **Wall.** No crossing segment at this point, or the segment leads to a
-   ghost.
+2. **Wall.** No crossing segment at this point, the segment leads to a
+   ghost, or a human made this neighbour a wall (`wall`). All three are one
+   guard and one rank in the chain: they differ in the sentence the interface
+   says, not in when they are asked. A candidate whose stretch does not cover
+   this point contributes no sentence at all, so a wall on one neighbour never
+   explains a refusal against another.
 3. **Dead corner.** Within `dead_corner = 16` logical pixels of either end
    of the segment. Corners hold the Start menu and the macOS hot corners,
    and a feature that steals them is a feature people turn off.
@@ -692,9 +793,26 @@ reports.
    slower is refused with a sentence while the channel keeps warming in the
    background, so the second attempt succeeds.
 
-While a dwell is running the pointer is pinned against the edge, so it does
-not walk off the source's own desktop before the decision is made. Pinning
-and warping are the platform's half (#125); the decision is here.
+**How edge pressure is even detected**, since it is not obvious: while the
+machine is only watching, the OS clamps its own pointer at the boundary of
+its own desktop, so the position reported never goes past the edge. What the
+engine reads is the position PLUS the motion event's delta, which does go
+past it, and that intended position is what the graph is asked about. So
+nothing has to be pinned while a dwell runs: the OS holds the pointer at the
+boundary for free, and the guards are about a pointer that is already
+resting there. Confinement starts when a session starts, and its job is
+different (keeping the pointer from moving on this machine's desktop while
+it is driving another).
+
+The one case that escapes this is a plane a human dragged into disagreement
+with a machine's own desktop, putting another computer's screen where this
+one's desktop continues. The OS then clamps somewhere else entirely and the
+crossing edge is in the middle of a desktop with nothing holding the pointer
+there. It is detected the same way (position plus delta) and simply crosses
+without a rest, which is the honest outcome: the remedy is one more drag,
+and the interface's plane is where a person can see the disagreement.
+
+Pinning and warping are the platform's half (#125); the decision is here.
 
 The guards are stored per neighbour, keyed by `(our monitor id, their
 node_id, their monitor id, side)`, and set through `input.guards`. A pair
@@ -761,8 +879,8 @@ level of the table and, failing that, reports `UNRESOLVED`.
 Resolving `@` on an AZERTY target gives "AltGr plus the 0 key". Injecting
 that means:
 
-1. release the modifiers the target is holding that the combination does
-   not want;
+1. release the **layout** modifiers the target is holding that the
+   combination does not want;
 2. press the modifiers the combination wants and the target is not holding;
 3. press the key, and release it (unless the frame is a lock, `lk`);
 4. restore the modifiers the target was holding before step 1, and release
@@ -771,6 +889,32 @@ that means:
 Step 4 is what stops a session from leaving a machine in a state nobody
 asked for, and it is also why the held set (below) is authoritative rather
 than derived from the frames.
+
+**Step 1 says "layout modifiers" and it has to**, which implementation
+proved and this paragraph records. The modifiers split in two:
+
+- **layout modifiers**, Shift and AltGr, which choose WHICH SYMBOL a key
+  produces. A resolution that does not want them means it: holding Shift
+  while typing `@` on AZERTY would produce something else.
+- **command modifiers**, Control, Alt and Meta, which change what a stroke
+  MEANS rather than which character it makes. A resolution that does not
+  name them is not saying they are unwanted, it is saying nothing about
+  them, so they are left exactly as they are.
+
+Without that split the two halves of this section contradict each other:
+symbol-first resolution is what makes Control plus the key labelled C be
+copy on any layout, and releasing Control in order to produce a `c` turns
+that copy into a letter, on the most used shortcut there is. Command
+modifiers travel to the target as their own key frames anyway (a Control
+press is usage 0xE0) and the held set carries them across frames.
+
+The known cost, recorded rather than hidden: on macOS the Option key IS a
+layout modifier (Option plus e is a dead key for an acute accent), so a Mac
+target holding Option while a symbol resolves without it produces the wrong
+character. That is the lesser of the two failures, it only arises while a
+human on the SOURCE holds Option, and accents reach a Mac through the
+resolution's own dead-key prefix or through the Unicode fallback in any
+case.
 
 **Dead keys** are the same machinery with two strokes: a symbol reachable
 only through a dead key resolves to the dead key's combination followed by
@@ -785,6 +929,20 @@ keyboards) send a press only; the frame carries `lk` and the target injects
 a press with no release. A lock is never in the held set: releasing it later
 would toggle it, which is the opposite of hygiene.
 
+**The target applies that rule to any key whose resolution names a lock,
+whether the frame carried `lk` or not.** Hygiene is a rule the target owns, so
+it must not depend on the source's manners: a third-party engine holding the
+same role, or our own capture on a backend that reports Caps Lock as a full
+press and release pair, would otherwise get a lock into the held set and have
+the teardown send a Caps Lock release, toggling the machine into caps on the
+way out.
+
+The residual ambiguity, recorded rather than hidden: a **physically remapped
+Caps Lock** (caps to control, which is common on Linux) travels as the Caps
+Lock usage and the target treats it as a lock. The wire has no way to say
+"this position is not a lock here", so a backend should report the usage of
+what a key MEANS on that machine wherever it can tell.
+
 **Per machine modifier remapping** is a table with two canonical sides,
 stored on the machine being driven, per source device
 (`input.remap { device_id, map }`). It is the first thing anyone needs the
@@ -794,6 +952,15 @@ vocabulary. The default is the identity: guessing that a Mac target wants
 Control and Command swapped is an opinion, and an opinion that is wrong for
 half of its users is worse than a switch.
 
+**The map must be injective on the holdable modifiers, and `input.remap`
+refuses one that is not.** It is applied as a simultaneous permutation, so
+mapping Control to Meta and Meta to Control SWAPS them, which is the case
+people actually want. But a map that sends two modifiers to one (Control to
+Meta, with Meta left alone) makes a modifier vanish when both are held, and it
+vanishes silently, on the very path where someone was trying to make a Mac
+behave. The function cannot fix that once it is asked, so the gesture refuses
+it.
+
 ### Modifier hygiene, which is the thing that bites hardest
 
 The target keeps a **held set**: the platform keys it has itself pressed and
@@ -802,13 +969,30 @@ not the OS's keyboard state: what WE pressed, which is the only thing we may
 release. A key the machine's own user is holding is none of our business.
 
 On session end, on link loss, on timeout, on any of the ten channel deaths,
-and on an explicit `rel` frame, the set is released in reverse order and
-cleared. That is one function, called from one place (section 4).
+on an explicit `rel` frame, **and on a layout change**, the set is released in
+reverse order and cleared. That is one function, called from one place
+(section 4).
+
+The layout change belongs on that list for a reason worth stating, because it
+is the one entry that is not about a session ending: the set holds the
+platform's own key identities, and a re-resolve after the keymap changed can
+name the same key differently. A held key that no longer matches is a key
+nothing will ever release. Letting go of everything at that moment costs one
+spurious release, which every platform treats as a no-op.
 
 The set is also the crash guard. An injected key stays down after the
 injector exits, so the modifiers in the set are written to
 `held.json` **before** the press that adds one, and the file is drained with
-a release-all at the next start. Two deliberate limits:
+a release-all at the next start.
+
+**What is written is the set at its WIDEST point during the sequence, not
+the set the sequence ends with**, and the `@` stroke is exactly why: it
+holds AltGr in the middle and holds none of it at the end, so a process
+death between the two would strand AltGr on a machine whose `held.json`
+never mentioned it. Writing the peak costs one unnecessary release at the
+next start in the ordinary case, which every platform treats as a no-op.
+
+Two deliberate limits:
 
 - **Modifiers only.** An ordinary character key is down for milliseconds, so
   the window in which a crash could strand one is negligible and its damage
@@ -827,6 +1011,16 @@ Recognised in the captured stream by the machine that CAPTURES, swallowed
 there, and never forwarded and never negotiated. It works while a session is
 live, which is exactly when the source sees every key, and it works when the
 channel is dead, because nothing about it involves the channel.
+
+A chord is a SET of modifiers plus one key, so `input.hotkey` does not care
+what order it is given and `input.status` always reports one spelling: one
+binding must not have two renderings, or an interface shows two chords for one
+setting. The order it reports is the one all three desktops write chords in,
+Control, then the alternate keys, then Shift, then the platform key (Windows
+writes Ctrl+Alt+Shift+Win, macOS menus render Control, Option, Shift,
+Command). Deliberately NOT the order of the modifier bits, which would put
+Shift first because it is bit 0 and produce "Shift+Ctrl+Home", which nobody
+writes.
 
 The default is **Ctrl + Alt + Escape**, and it is configurable through
 `input.hotkey`. The reasoning, since every candidate is taken somewhere:
@@ -868,11 +1062,40 @@ both ways here, unlike a sync set.
 ## 10. The platform seam
 
 One trait pair, a backend per platform chosen at compile time in `os.rs`
-exactly as `clipboard/src/os.rs` does, an honest `Unsupported` when the
-session cannot provide it (so `main` exits cleanly and the supervisor does
-not register the component), and a **fake backend** that stands in for all
-of it in the tests. Ticket #125 fills in `x11.rs`, `windows.rs` and
+exactly as `clipboard/src/os.rs` does, and a **fake backend** that stands in
+for all of it in the tests. Ticket #125 fills in `x11.rs`, `windows.rs` and
 `macos.rs` behind this seam without touching a caller.
+
+**Unlike the clipboard's, this seam never fails, and the component never
+exits when the OS half is missing.** A first draft of this section said it
+would (an `Unsupported`, a clean exit, and the supervisor simply not
+registering the component); that was wrong twice over, and both halves are
+worth writing down.
+
+It is wrong about the supervisor: registration is a static per-OS list read
+at the Core's start, and the only thing that skips a component there is its
+binary being absent. A component that exits is RESTARTED, with a backoff
+capped at a minute and a reset that an instant exit never reaches, so a
+machine with no OS half would relaunch it every minute for the session's
+whole life. (The clipboard does exactly that today on a headless or
+Wayland-only Linux box; here it would be worse.)
+
+And it is wrong about the product: a machine with no OS half still has real
+work. Its interface has to be able to say "nothing here can type", which it
+can only do if something is answering `input.status`. Its screens still
+belong on the shared plane, so its siblings know where it is. And the
+permissions a person granted still have to be held and honoured, because they
+are the security boundary of the whole feature and they outlive any one
+build.
+
+So `os::create` always succeeds and hands back a backend that reports what it
+CANNOT do, with a `problem` naming why. The engine reads the capabilities and
+behaves accordingly: it opens no channel for driving (it could never drive
+anyone), it refuses an incoming session with `NO_BACKEND`, it calls no
+downcall the capabilities do not offer, and it does everything else exactly
+as it would with a real backend. That is the same path a real backend takes
+when its OS grant has been refused, which is the second reason to have only
+one.
 
 The shape follows the clipboard's, for the reason the clipboard has it: the
 OS event loop is pinned to the main thread (a message pump on Windows, a run
@@ -917,14 +1140,30 @@ as upcalls instead, coalesced, which is all the interface needs.
 ### Upcalls
 
 `Motion { x, y, dx, dy }`, `Button`, `Wheel`, `Key { u, key, sym, m, lk,
-dn }`, `MonitorsChanged`, `LayoutChanged { layout }`, `Refused { code }`,
-`CaptureLost { why }`.
+dn }`, `MonitorsChanged`, `LayoutChanged { layout, group }`,
+`Refused { code }`, `CaptureLost { why }`.
 
 `Key` upcalls carry the same levels the wire carries, because the source's
 job is to read them off the OS and put them in a frame. Reading the symbol
 the local layout produced is part of capture, not a separate lookup.
 
-### Three platform truths this seam is shaped by, and #125 must not have to
+**`LayoutChanged` carries the active GROUP as well as the identity**, and it
+has to. A stroke whose symbol resolves in another keyboard group switches to
+it and switches back afterwards, and "back" means the group the machine was
+in; without a number arriving from the OS the engine would only ever know 0,
+so a user working in group 1 would be left in group 0 by the very code
+written to prevent exactly that. It is free where it matters (the same X11
+`XkbStateNotify` a backend watches to notice the change carries it) and 0 on
+Windows and macOS, which have no equivalent.
+
+Two things the caller owes that event, both proven necessary by review:
+adopt the group, and **release everything held**. The second is not
+housekeeping. The held set is keyed by the platform's own key identity, a
+re-resolve after a layout change can name the same key differently, and a
+held key that no longer matches is a key nothing will ever release: a game's
+W stuck down, or a Control, for the rest of the session.
+
+### Six platform truths this seam is shaped by, and #125 must not have to
 ### rediscover
 
 1. **Under confinement, `dx` and `dy` must come from the OS's own relative
@@ -942,6 +1181,25 @@ the local layout produced is part of capture, not a separate lookup.
    driven is not capturing (section 4, rule 3). Anything that changes that
    rule owes echo suppression a different mechanism, and this is the note
    that says so.
+4. **On X11 the only OS-native relative source under a confining grab is
+   `XI_RawMotion`, whose valuators are UNACCELERATED device deltas.** So the
+   pointer will feel materially different while driving than while local, on
+   the one platform where "mixing a 4K at 100% with a Retina at 200% does not
+   change how the mouse feels" is actually checked. #125 has to choose, and
+   name its choice: apply the device's own acceleration profile, or use
+   `XI_Motion` deltas against the confining window and accept its clamp.
+5. **`CGWarpMouseCursorPosition` suppresses local mouse events for about
+   250 ms** unless it is followed by
+   `CGAssociateMouseAndMouseCursorPosition(true)` (or
+   `CGSetLocalEventsSuppressionInterval` is zeroed). A warp on macOS is
+   therefore two calls, not one. The engine warps on every return and on
+   every teardown, so a quarter of a second of dead mouse would land at the
+   worst possible moment there is.
+6. **`VkKeyScanEx` returns -1 for a character that needs a dead key**, and
+   finding the pair means walking virtual keys by modifier state through
+   `ToUnicodeEx` and its own dead-key state machine. So a Windows `resolve`
+   may legitimately answer `None` for a dead-key symbol, and that is covered:
+   Windows always has `unicode`, so the fallback types the character.
 
 ### Capabilities, and refusals that are detected rather than guessed
 
@@ -951,6 +1209,21 @@ interface can say before anyone tries, and `problem` is the honest hook for
 a permission that is missing (the `session.status.problem` pattern): on
 macOS the Accessibility grant, refused or not yet asked for, makes a backend
 that says exactly what it cannot do rather than one that pretends.
+
+Two of them mean more than their names suggest, and the prose is the contract
+rather than an extra bit, because no real platform can satisfy half of either:
+
+- **`confine` is a two-part promise**: pin the pointer, AND report OS-native
+  relative deltas while it is pinned. A backend that could do the first and
+  not the second would pass `can_drive()` and then produce a frozen pointer,
+  which is the worst of both answers. On macOS `confine` also means "can
+  decouple" rather than "can clip": there is no `ClipCursor` equivalent, the
+  implementation is `CGAssociateMouseAndMouseCursorPosition(false)` plus a
+  warp, and the rectangle is advisory.
+- **`Action::Group` has no macOS meaning at all** (input sources are switched
+  with `TISSelectInputSource`, which is user-visible and slow). Harmless as
+  specified: the engine only ever emits a group `resolve` handed it, and a
+  macOS `resolve` will never set one.
 
 The refusal codes a backend reports upward, each with a sentence in section
 13: `ELEVATED_WINDOW` (`SendInput` returned 0 and the foreground window's
@@ -976,6 +1249,25 @@ atomic discipline (temp, fsync, rename, directory fsync) except where noted:
 - `held.json`: the crash guard of section 8. Written without fsync, on
   purpose, and drained at the next start.
 
+**A corrupt file's policy is PER FILE, and the difference is deliberate.** One
+rule for all four was wrong in both directions, and the two it was wrong about
+are the two most in need of being read:
+
+- `identity.json`: **fatal**, as above. Identity.
+- `settings.json`: **fatal**. Permissions. Starting fresh over an unreadable
+  one would silently re-open a door somebody closed, or close one they opened,
+  and neither is something to guess at.
+- `plane.json`: **lenient**. An unreadable one starts an EMPTY plane with a
+  warning, because a plane authorizes nothing and one round with any peer
+  rebuilds it, so staying down over a file that will be replaced in seconds is
+  strictness with no payoff.
+- `held.json`: **lenient**, and this one is the sharpest of the four. It is the
+  file written WITHOUT fsync, so it is precisely the one a power cut leaves
+  zero-length or torn, and it is the guard against a machine left with Control
+  held down. Treating it as fatal made a corrupt guard the reason the guard
+  could not run, which is the opposite of what the file is for. Unreadable
+  reads as "nothing was held".
+
 The Core stores nothing; `input.status` is answered entirely from this state
 plus the live session.
 
@@ -997,26 +1289,52 @@ RETURNS, with everything else behind `input.updated`.
 | `input.guards { device_id, monitor, side, guards }` | the per neighbour crossing guards: `dwell_ms`, `double_tap_ms`, `dead_corner`, `require_mods`, `wall` |
 | `input.lock { locked }` | pin the pointer to this screen |
 | `input.hotkey { keys }` | the return hotkey, enforced locally by the machine that captures |
-| `input.remap { device_id, map }` | incoming modifier remapping on this machine |
+| `input.remap { device_id, map }` | incoming modifier remapping on this machine. Canonical name to canonical name, holdable modifiers only, and refused unless it is injective: a map that sends two modifiers to one makes a modifier vanish silently |
 
-Errors (the engine's own, relayed verbatim):
+Errors (the engine's own, relayed verbatim).
 
-| Code | When |
-|---|---|
-| `INPUT_DEVICE_UNKNOWN` | not a device of this account, or a mobile (never a source and never a target in v1) |
-| `INPUT_NOT_ALLOWED` | the far side has no grant for this device. Its word, learned by trying |
-| `INPUT_BUSY` | that computer is being driven by another already, or this one is being driven and cannot also drive |
-| `INPUT_NO_BACKEND` | no platform backend here or there, or its permission is refused. The capability report says which |
-| `INPUT_NO_PATH` | the deployment's relays are rendezvous-only above a cap (#88) and no direct path formed |
-| `INPUT_TOO_SLOW` | the measured round trip is above the pointer threshold. `input.take` with `mode: "keys"` is the offer |
-| `INPUT_PLANE_STALE` | the two ends do not hold the same plane. Self-repairing: a layout round is running |
-| `INPUT_UNKNOWN_MONITOR` | a spot or a guard names a monitor no record claims |
-| `INPUT_NOT_READY` | the engine has not resolved the account's directory yet |
-| `INPUT_INTERNAL` | a local failure the caller can only retry |
+**A gesture answers only with what THIS machine already knows.** Everything
+the far side decides arrives afterwards, as that device's `problem` in the
+snapshot and as an `input.refused` notification, and the reason is the grant
+doctrine: the driving side learns by TRYING, so a gesture that answered
+`INPUT_NOT_ALLOWED` would have had to cache the far side's grant, and a
+cached grant is wrong exactly when it matters. Nothing is lost, because the
+answer arrives within a round trip and the interface renders it from the
+snapshot either way. The column below says which of the two each code is.
 
-plus a genuine JSON-RPC `-32602` for shape: a malformed request is not an
-application state, and the engine emits the real code rather than dressing
-one as an app code.
+| Code | Where | When |
+|---|---|---|
+| `INPUT_DEVICE_UNKNOWN` | gesture | not a device of this account, or a mobile (never a source and never a target in v1) |
+| `INPUT_UNKNOWN_MONITOR` | gesture | a guard names a crossing no segment of the plane has |
+| `INPUT_BUSY` | gesture | THIS computer is being driven, or is already driving another one. There is one keyboard, and no preemption |
+| `INPUT_LOCKED` | gesture | THIS computer's pointer is pinned to its own screen (`input.lock`). Distinct from `INPUT_BUSY` on purpose: nobody is holding it, and the remedy is a switch rather than waiting |
+| `INPUT_NO_BACKEND` | gesture | THIS computer's own backend cannot capture, so it has no keyboard to send |
+| `INPUT_TOO_SLOW` | gesture | the round trip THIS computer measured is above the pointer threshold. `input.take` with `mode: "keys"` is the offer |
+| `INPUT_NOT_READY` | gesture | the engine has not resolved the account's directory yet |
+| `INPUT_INTERNAL` | gesture | a local failure the caller can only retry |
+| `-32602` | gesture | the request's shape. Checked BEFORE anything is evaluated: a request missing a required field has no semantics, so an application code would be a category error |
+| `not_allowed` | `problem` | the far side has no grant for this device. Its word, learned by trying |
+| `busy` | `problem` | that computer is being driven by another already, or is driving one |
+| `locked` | `problem` | that computer's pointer is pinned to its own screen, or it is locked and cannot be driven at all |
+| `no_backend` | `problem` | nothing on that computer can type, or its permission is refused |
+| `no_path` | `problem` | the deployment's relays are rendezvous-only above a cap (#88) and no direct path formed |
+| `too_slow` | `problem` | the path to that computer is past the pointer threshold |
+| `plane_stale` | `problem` | the two ends do not hold the same plane. Self-repairing: a layout round is already running |
+
+A malformed request is not an application state, and the engine emits the
+real JSON-RPC code rather than dressing one as an app code. It also checks
+the whole shape BEFORE evaluating any of it, so a call that is both
+malformed and about an unknown device is answered `-32602`: there is nothing
+to evaluate.
+
+**Two fields are called `mode` and they are two different axes**, which is
+worth saying plainly because it is the easiest thing in this vocabulary to
+confuse. `input.take`'s `mode` is what a SESSION carries (`"full"` or
+`"keys"`: pointer and keyboard, or keyboard alone), and it is the same field
+the `start` frame carries. `input.drive`'s `mode` is how a target RESOLVES a
+key (`"typing"` or `"positional"`), stored per peer. The two value sets are
+disjoint on purpose, so passing one where the other belongs is refused rather
+than silently taken for a default.
 
 Notifications (topic `input`, published via `input.emit`):
 
@@ -1028,8 +1346,12 @@ Notifications (topic `input`, published via `input.emit`):
 Shapes:
 
 ```json
-State = { "here": { "monitors": [Monitor], "problem": null | "no_backend"
-                    | "no_permission" | "monitors_unstable" | "wayland" },
+State = { "here": { "device_id", "name",       // this computer, so the plane
+                                              // can say "you are here"
+                    "monitors": [Monitor], "problem": null | "no_backend"
+                    | "no_permission" | "monitors_unstable" | "wayland",
+                    "can_drive": <bool>,      // this machine could take the
+                    "can_be_driven": <bool> },// keyboard away, or accept it
           "plane": { "id": "<32 hex>", "spots": [Spot], "by": "<device_id>" },
           "devices": [ { "device_id", "name",
                          "state": "off" | "warming" | "ready" | "driving"
@@ -1040,20 +1362,34 @@ State = { "here": { "monitors": [Monitor], "problem": null | "no_backend"
                          "allowed": <bool>,   // may drive this computer
                          "drive": <bool>,     // this computer may drive it
                          "mode": "typing" | "positional",
-                         "problem": null | "not_allowed" | "busy"
+                         "problem": null | "not_allowed" | "busy" | "locked"
                                   | "no_backend" | "no_path" | "too_slow"
                                   | "plane_stale" } ],
           "session": null | { "device_id", "direction": "out" | "in",
                               "mode": "full" | "keys", "since": <ts>,
                               "rtt_ms": <n or null> },
+          "guards": [ { "device_id", "monitor", "side",
+                        "dwell_ms", "double_tap_ms", "dead_corner",
+                        "require_mods", "wall" } ],   // only what a human set
           "lock": <bool>,
           "hotkey": ["ctrl", "alt", "Escape"] }
 
 Monitor = { "id", "name", "w", "h", "x", "y", "scale", "primary",
             "present": <bool> }   // false = a ghost, its place kept
 
-Spot = { "monitor": "<node_id>/<monitor id>", "x", "y", "device_id" }
+Spot = { "monitor": "<node_id>/<monitor id>", "device_id", "name",
+         "x", "y", "w", "h",          // the rectangle ON THE PLANE
+         "present": <bool>,           // false = a ghost, its place kept
+         "primary": <bool> }
 ```
+
+`plane.spots` carries the whole rectangle rather than only its corner, and
+that is deliberate: it is the one list an interface needs in order to draw
+the plane, and making it join `spots` against `devices[].monitors` to find a
+width would be an invitation to draw a plane that disagrees with the one the
+engine crosses on. `devices[].monitors` remains each machine's own word about
+its own screens (its own desktop coordinates included, which is what a human
+sees when the interface offers to import an arrangement).
 
 `problem`, both on `here` and per device, is the honest sentence hook: a
 pair that cannot do its job says why, from the snapshot alone, so a window
@@ -1075,7 +1411,7 @@ that carry them.
 | `BUSY` | `no` frame, `INPUT_BUSY` | "Another of your computers is using that keyboard right now." |
 | `PLANE_STALE` | `no` frame | "The two computers do not agree on where the screens are yet. Trying again." |
 | `NO_BACKEND` | `no` / `end`, `INPUT_NO_BACKEND` | "That computer cannot be driven: nothing there can type." On macOS with the grant refused: "1Device needs Accessibility permission on that computer to type on it." |
-| `LOCKED` | `no` / `end` | "This computer cannot be driven while it is locked." |
+| `LOCKED` | `no` / `end`, `INPUT_LOCKED` | "This computer cannot be driven while it is locked." Or, when the pointer was pinned there on purpose: "That computer's pointer is locked to its own screen." |
 | `IDLE` | `end` | "Your keyboard went quiet, so that computer released it." |
 | `TAKEN` | `end` | "Someone is using that computer directly." |
 | `ELEVATED_WINDOW` | `oops` | "Nothing was typed: this window runs as administrator." |
@@ -1086,6 +1422,7 @@ that carry them.
 | `NO_DIRECT_PATH` | `INPUT_NO_PATH` | "This account's relays do not carry a keyboard session. The two computers need a network they share." |
 | `INPUT_TOO_SLOW` | `input.take` | "That computer is <n> ms away, too far for the pointer to feel right. Its keyboard alone would work." |
 | `SLOW` | `stop` | "The connection to that computer slowed down, so your keyboard came back." |
+| `UNKNOWN` | any of the four | "That computer refused, and this version does not know the reason it gave." What every code outside a frame's closed set becomes on arrival, so a later version's vocabulary degrades to a sentence rather than reaching an interface as prose a peer chose |
 
 Plus the two states that are not refusals and still need words: a session
 over a slow path announces its number ("Your keyboard is on **Desk**, 32 ms
@@ -1228,16 +1565,22 @@ D11. **A `placement` from an unverifiable signer is adopted, marked
     grants do), so fail-closed pinning here would break sessions between two
     innocent devices over a third's absence, while the worst a forged
     placement can do is misplace a screen. The loop is closed by re-examining
-    on the pin what was adopted on faith, and by letting an already verified
-    arrangement survive its author's reinstall. A deliberate divergence from
-    the sync engine, with its reason. The draft's extra "relayed by a pinned
-    peer" condition was removed during implementation as vacuous: a peer's key
-    rides its own message, so speaking is what makes a device pinned.
+    the arrangement on EVERY pin, so a forgery adopted on faith goes the moment
+    its author's key arrives, and so does a genuine one whose author has
+    replaced its key. A deliberate divergence from the sync engine, with its
+    reason. Two conditions from the draft were removed during implementation,
+    both recorded in section 6: "relayed by a pinned peer" as vacuous (a peer's
+    key rides its own message, so speaking is what makes a device pinned), and
+    "an already verified arrangement survives a key replacement" as
+    divergent (it made the plane depend on the order two keys arrived in, which
+    is the one thing this document cannot afford).
 
-D12. **The layout replicates as one whole document, not as deltas.** It is
-    bounded at a few kilobytes by construction (16 devices, 16 monitors
-    each, 64 spots), `peers.send` carries 64 KiB, and a merge is idempotent,
-    so a head/need/give round would be complexity with no payoff.
+D12. **The layout replicates as one whole document, not as deltas.** A real
+    desk is a few hundred bytes (3 devices of 2 monitors), the caps are 16
+    devices of 16 monitors and 256 spots, and a merge is idempotent, so a
+    head/need/give round would be complexity with no payoff. The caps alone do
+    not fit `peers.send`'s 64 KiB, so what is OFFERED also has a byte budget:
+    a device's own entry always travels, the rest is relayed while it fits.
 
 D13. **An explicit length-prefixed byte encoding for the signed objects**,
     not canonical JSON. Two small objects entirely under our control, a
@@ -1286,3 +1629,22 @@ D20. **The return hotkey defaults to Ctrl + Alt + Escape** because Ctrl +
     the 2 s stall watchdog that brings the keyboard home when a target stops
     answering: neither is negotiated, because a hung target must not be able
     to keep your keyboard.
+
+D21. **A gesture answers only with what THIS machine knows; everything the
+    far side decides arrives as that device's `problem`.** The first draft
+    let `input.take` answer from the far side's last word while its backoff
+    stood, which reads well and is a cached grant in all but name. It also
+    creates a dead window exactly where the product's main flow is: tick the
+    box on the machine to be driven, walk to the other one, press the button,
+    and be told "not allowed" for the length of a backoff from a word that is
+    now false. So the driving side learns by TRYING, every time, and the
+    answer it gets back within a round trip is what the interface says.
+
+D22. **The component never exits because the OS half is missing, and
+    `os::create` cannot fail.** The supervisor restarts what dies, with a
+    backoff capped at a minute and no notion of "unsupported", so an exit
+    here is a relaunch every minute for ever. And a machine with no OS half
+    still owns its screens on the plane, its grants, and the sentence saying
+    what it cannot do, none of which a dead process can serve. What varies
+    per platform is what the backend SAYS it can do, which is the same path a
+    real backend takes when its OS grant has been refused: one path, not two.
