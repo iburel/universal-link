@@ -1115,7 +1115,10 @@ impl Backend {
         // uses: the fixed point shift keeps one arithmetic for both streams.
         self.pending_dx = self.pending_dx.saturating_add(i64::from(dx) << 32);
         self.pending_dy = self.pending_dy.saturating_add(i64::from(dy) << 32);
-        if self.confine.is_some() {
+        // The pin, and only when the pointer is not already on it: this stream includes the
+        // motion the WARP itself generates, which arrives at the anchor and would otherwise
+        // buy a second warp request for a pointer that is already where it belongs.
+        if self.confine.is_some() && (at.x, at.y) != (self.anchor.x, self.anchor.y) {
             self.warp_to(self.anchor);
         }
     }

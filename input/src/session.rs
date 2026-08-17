@@ -1765,10 +1765,10 @@ impl<B: InputBackend> Engine<B> {
     /// Capture Off for good, whatever the capability says, as long as there is something of
     /// ours to stop.
     ///
-    /// Not `apply_capture`, which would compute Watch again for a peer that is still warm: the
-    /// two callers are the end of the process and nothing comes after them. The rule about the
+    /// Not `apply_capture`, which would compute Watch again for a peer that is still warm: its
+    /// one caller is the end of the process and nothing comes after it. The rule about the
     /// capability is [`Engine::apply_capture`]'s and the reason is the same one, which is why
-    /// this is one function and not two copies of it.
+    /// it is stated in one place rather than copied inline where it used to be.
     fn force_capture_off(&mut self) {
         let was_on = matches!(
             self.capture_sent,
