@@ -110,6 +110,11 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 /// answered `COMPONENT_ABSENT` rather than left to the caller's timeout.
 const ATTACH_GRACE: Duration = Duration::from_secs(5);
 
+/// How long a REFUSED opening is held after its answer, so the answer is not
+/// abandoned in flight on the QUIC side (see [`answer`]). The house responder
+/// norm, as `peers.send` and the clipboard announces use.
+const LINGER: Duration = Duration::from_secs(5);
+
 /// How often a live channel re-checks that its peer is still an attested
 /// device of the account. A poll and not a hook, deliberately: the directory
 /// moves through many paths (a local `devices.revoke`, a tombstone absorbed
@@ -166,6 +171,16 @@ pub(crate) mod reason {
 pub struct PeerChannels {
     live: std::collections::BTreeMap<(String, String), Live>,
     next_id: u64,
+    /// How many times every channel has been cut at once (logout, leaving the
+    /// account, the Core stopping). A channel is authorized when its token is
+    /// minted and only STARTS when its component attaches, so without this the
+    /// two events could straddle a logout and the pipe would outlive the session
+    /// that allowed it: an open captures the era it was authorized in, and a
+    /// pipe from a past era never starts.
+    era: u64,
+    /// Why the last mass cut happened, so a pipe refused for being of a past era
+    /// gives its component the same word its siblings got.
+    era_reason: Option<&'static str>,
 }
 
 struct Live {
@@ -242,12 +257,15 @@ impl PeerChannels {
     }
 }
 
-/// Cuts every live channel with one reason: what a logout, a Core stop and
-/// being struck off the account all need. Each pipe reports the reason to its
-/// own component and unregisters itself; nothing is removed here, so the
-/// bookkeeping stays in one place.
+/// Cuts every live channel with one reason, and closes the era: what a logout, a
+/// Core stop and being struck off the account all need. Each pipe reports the
+/// reason to its own component and unregisters itself; nothing is removed here,
+/// so the bookkeeping stays in one place. Channels AUTHORIZED before this call
+/// and not yet started are refused when they try, with the same reason.
 pub(crate) fn cut_all(state: &AppState, reason: &'static str) {
-    let channels = state.peer_channels.lock().expect("lock peer_channels");
+    let mut channels = state.peer_channels.lock().expect("lock peer_channels");
+    channels.era += 1;
+    channels.era_reason = Some(reason);
     for live in channels.live.values() {
         live.cut.fire(reason);
     }
@@ -267,6 +285,8 @@ pub struct Parked {
     role: String,
     device_id: String,
     node_id: String,
+    /// The era this channel was authorized in (see [`PeerChannels::era`]).
+    era: u64,
 }
 
 /// A channel a PEER opened, waiting for one of the local candidates to attach.
@@ -344,11 +364,11 @@ pub(crate) async fn open(
     // fails leaves the pair with no channel, which is the right outcome for the
     // component that asked to start again and the reason the doctrine is one
     // channel per pair rather than a fresh one per attempt.
-    state
-        .peer_channels
-        .lock()
-        .expect("lock peer_channels")
-        .supersede(role, device_id);
+    let era = {
+        let channels = state.peer_channels.lock().expect("lock peer_channels");
+        channels.supersede(role, device_id);
+        channels.era
+    };
     let stream = tokio::time::timeout(OPEN_TIMEOUT, handshake(state, &peer, role))
         .await
         .map_err(|_| RpcErr::app("DEVICE_OFFLINE"))??;
@@ -361,6 +381,7 @@ pub(crate) async fn open(
         role: role.to_string(),
         device_id: device_id.to_string(),
         node_id: peer.node_id.clone(),
+        era,
     };
     let token = state
         .registry
@@ -443,6 +464,7 @@ pub(crate) async fn serve_opened<R, W>(
             device_id: parked.device_id,
             node_id: parked.node_id,
             conn_id,
+            era: parked.era,
         },
         Box::new(read),
         Box::new(write),
@@ -482,6 +504,9 @@ pub(crate) async fn recv(
     };
     let device_id =
         dataplane::device_id_for(&state, &peer_node_id).unwrap_or_else(|| peer_node_id.clone());
+    // The era this offer belongs to, read before anything is minted: a logout
+    // landing while a candidate is attaching must not leave a pipe behind.
+    let era = state.peer_channels.lock().expect("lock peer_channels").era;
     let (handoff, mut arrivals) = mpsc::channel(1);
     // One token per candidate, each bound to its own component: a token is
     // bound to one process, so the fan-out cannot be one broadcast frame the
@@ -547,6 +572,7 @@ pub(crate) async fn recv(
             device_id,
             node_id: peer_node_id,
             conn_id: attached.conn_id,
+            era,
         },
         attached.read,
         attached.write,
@@ -556,12 +582,21 @@ pub(crate) async fn recv(
 
 /// Writes the `peer_channel_ack`. Best-effort: a caller that has already given
 /// up is no reason to fail here.
+///
+/// A REFUSAL then holds the stream until the initiator closes, exactly as every
+/// responder in this codebase does, and for the reason learned the hard way in
+/// the transfer protocol: dropping the connection right after the write abandons
+/// the bytes in flight on the QUIC side. Without the wait, `COMPONENT_ABSENT`
+/// would reach the caller as an unreadable stream, and it would word a peer that
+/// answered honestly as one that is unreachable. An acceptance needs none of
+/// this: the stream lives on as the pipe.
 async fn answer(stream: &mut Box<dyn IoStream>, accepted: bool) {
     let ack = serde_json::to_vec(&json!({ "type": "peer_channel_ack", "accepted": accepted }))
         .expect("serialize peer_channel_ack");
     let _ = dataplane::write_frame(stream, &ack).await;
     if !accepted {
         let _ = stream.shutdown().await;
+        let _ = tokio::time::timeout(LINGER, dataplane::drain(stream)).await;
     }
 }
 
@@ -578,6 +613,9 @@ struct Endpoints {
     device_id: String,
     node_id: String,
     conn_id: ConnId,
+    /// The era this channel was authorized in: a pipe from a closed era never
+    /// starts (see [`PeerChannels::era`]).
+    era: u64,
 }
 
 /// Relays frames between a local component and a peer until something ends it,
@@ -597,10 +635,41 @@ async fn pipe(
     if !owner_connected(&state, ends.conn_id) {
         return;
     }
-    let (id, cut) = {
+    // The trust may also have ended in that window, in either of two ways.
+    //
+    // A mass cut first (a logout, a leave, the Core stopping), and its check is
+    // ATOMIC with the registration below, under the very lock `cut_all` takes:
+    // otherwise one landing between a check and a registration would cut nothing
+    // (this channel is not in the table yet) and the pipe would outlive the
+    // session that authorized it. First also because it is the more specific
+    // fact: a logout shrinks the directory as a CONSEQUENCE, and the component
+    // deserves the cause rather than the symptom.
+    let registered = {
         let mut channels = state.peer_channels.lock().expect("lock peer_channels");
-        channels.register(&ends.role, &ends.device_id)
+        if channels.era == ends.era {
+            Ok(channels.register(&ends.role, &ends.device_id))
+        } else {
+            Err(channels.era_reason.unwrap_or(reason::CLOSED))
+        }
     };
+    let (id, cut) = match registered {
+        Ok(registered) => registered,
+        Err(reason) => {
+            report(&state, &ends, reason);
+            return;
+        }
+    };
+    // Then the peer itself: the account may have struck it off, or its record
+    // may have stopped verifying, while the token waited for its component.
+    if !still_attested(&state, &ends.device_id, &ends.node_id) {
+        state
+            .peer_channels
+            .lock()
+            .expect("lock peer_channels")
+            .unregister(&ends.role, &ends.device_id, id);
+        report(&state, &ends, reason::DEVICE_REVOKED);
+        return;
+    }
     let (mut net_read, mut net_write) = tokio::io::split(net);
     // Milliseconds since this pipe started, written by both directions and read
     // by the vigil: the idle budget is about the CHANNEL, not about one
@@ -705,6 +774,15 @@ async fn pipe(
     // rather than waiting on a mute pipe.
     let _ = net_write.shutdown().await;
     let _ = local_write.shutdown().await;
+    report(&state, &ends, reason);
+}
+
+/// Tells the component that owns the local end why its channel is over: the one
+/// notification of this primitive's life cycle, emitted exactly once per
+/// channel, on the CONTROL connection (the pipe carries opaque bytes and nothing
+/// else, so a reason could never travel on it). Nothing of the payload is ever
+/// named here, and neither is the token.
+fn report(state: &AppState, ends: &Endpoints, reason: &'static str) {
     state.registry.lock().expect("lock registry").notify_conn(
         ends.conn_id,
         "peer.channel_closed",

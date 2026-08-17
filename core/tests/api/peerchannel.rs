@@ -516,6 +516,43 @@ async fn logging_out_cuts_the_channel() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_channel_authorized_before_a_logout_never_starts() {
+    let server = TestServer::start().await;
+    let (a, mut ca, b, mut cb) = channel_pair(&server).await;
+    let mut gui = manager(&a).await;
+
+    // The open succeeds and the far end takes its half, but this side's
+    // component has not come for its token yet: the window between an
+    // authorization and a pipe.
+    let (opened, _far) = tokio::join!(
+        ca.request("peers.channel", json!({ "device_id": b.device_id() })),
+        async {
+            let offer = cb.wait_notification("peer.channel").await;
+            b.open_peer_pipe(offer["channel_token"].as_str().expect("channel_token"))
+                .await
+        }
+    );
+    let token = opened.expect("peers.channel")["channel_token"]
+        .as_str()
+        .expect("channel_token")
+        .to_string();
+
+    gui.request("session.logout", json!({}))
+        .await
+        .expect("session.logout");
+
+    // The component comes for a channel the session no longer allows: the pipe
+    // never starts, and it is told the cause rather than left to guess from a
+    // connection that simply closed.
+    let mut late = a.open_peer_pipe(&token).await;
+    assert_eq!(
+        closed_reason(&mut ca, CONVERGENCE_TIMEOUT).await,
+        "LOGGED_OUT"
+    );
+    late.expect_closed().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_local_end_closing_ends_the_channel_at_both_ends() {
     let server = TestServer::start().await;
     let (a, mut ca, b, mut cb) = channel_pair(&server).await;
