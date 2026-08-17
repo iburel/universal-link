@@ -263,7 +263,7 @@ Central daemon, launched automatically at session login.
 - Exposes the **local IPC server** to components.
 - Is the **supervisor** of the official background components: it spawns (and
   restarts on crash) the clipboard manager, the contextual menu manager, the
-  sync engine, and the tray/notifier.
+  sync engine, the input engine, and the tray/notifier.
 
 ### Official components
 
@@ -273,6 +273,7 @@ Central daemon, launched automatically at session login.
 | **Clipboard manager** | spawned by the Core | Per-OS backends to read/write the clipboard and be notified of changes (X11 with ICCCM INCR on Linux, the Win32 clipboard and OLE `IDataObject` on Windows, `NSPasteboard` with an `NSFilePresenter` on macOS). Handles the "blocking paste" for the duration of the download, and honors the OS's confidentiality markers in both directions. Protocol specified in [core-api.md](core-api.md) (`clipboard.*`, transactions). |
 | **Contextual menu manager** | spawned by the Core | Per-contextual-menu-surface backends. See the dedicated section. |
 | **Sync engine** | spawned by the Core | The exclusive `sync-backend` behind the routed `sync.*` facade: keeps chosen folders identical across the account's computers, over the generic primitives (published transactions, `peers.send`). Design and protocol in [sync-engine.md](sync-engine.md). |
+| **Input engine** | spawned by the Core | The exclusive `input-backend` behind the routed `input.*` facade: lends this computer's keyboard and mouse to another one of the account, over the generic live channel (`peers.channel`). Design and protocol in [input-sharing.md](input-sharing.md). |
 | **GUI** | launched by the user (or via the tray) | Displays the PCs and their states, drag and drop, list of transfers, settings, approval of third-party components. Never required for nominal operation. |
 
 The Core finds them next to itself, and launches whichever ones the build shipped
@@ -414,9 +415,11 @@ component → Core : hello { name, version, role, requested scopes, token? }
 Core → component : { granted scopes, API version }
 ```
 
-The roles (`gui`, `clipboard-backend`, `menu-backend`, `tray`, `custom`) also
-serve for arbitration: a single active clipboard backend — the exclusive
-`clipboard-backend` role, see [core-api.md](core-api.md), "Roles".
+The roles (`gui`, `clipboard-backend`, `input-backend`, `menu-backend`,
+`sync-backend`, `tray`, `custom`) also serve for arbitration: a single active
+clipboard backend (the exclusive `clipboard-backend` role), and the same
+exclusivity for the sync and input engines, each in a slot of its own. See
+[core-api.md](core-api.md), "Roles".
 
 ## Contextual menu manager
 

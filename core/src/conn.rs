@@ -32,17 +32,21 @@ use crate::{API_VERSION, framing};
 const OUT_QUEUE_DEPTH: usize = 256;
 /// Beyond this, a write that makes no progress counts as a dead connection.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Budget for a `sync.*` facade forward (the proxy norm, like the server
-/// proxies): a backend that does not answer within it reads as absent.
-const SYNC_FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
+/// Budget for a routed facade forward, `sync.*` and `input.*` alike (the proxy
+/// norm, like the server proxies): a backend that does not answer within it
+/// reads as absent. ONE constant for every facade deliberately - the budget is
+/// a doctrine, not a per-namespace tuning, and two copies of the same number
+/// would drift the day one is revisited.
+const FACADE_FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Bounds for fields that are stored and later rebroadcast.
 const NAME_MAX: usize = 128;
 const VERSION_MAX: usize = 64;
 
-const ROLES: [&str; 6] = [
+const ROLES: [&str; 7] = [
     "gui",
     "clipboard-backend",
+    "input-backend",
     "menu-backend",
     "sync-backend",
     "tray",
@@ -51,15 +55,17 @@ const ROLES: [&str; 6] = [
 /// One active holder at a time for these roles (doc/core-api.md, "Roles"):
 /// a second `hello` (or approve) naming one already taken is `ROLE_CONFLICT`.
 /// Replacing an official backend with a third-party one is a configuration
-/// choice, which is exactly what exclusivity protects.
-const EXCLUSIVE_ROLES: [&str; 2] = ["clipboard-backend", "sync-backend"];
+/// choice, which is exactly what exclusivity protects. Each name here is its OWN
+/// slot, one holder each: holding one says nothing about the others, and the
+/// clipboard, input and sync engines coexist by construction.
+const EXCLUSIVE_ROLES: [&str; 3] = ["clipboard-backend", "input-backend", "sync-backend"];
 
 /// Is `role` taken by an active connection, where that matters (exclusivity)?
 fn exclusive_role_taken(reg: &crate::state::Registry, role: &str) -> bool {
     EXCLUSIVE_ROLES.contains(&role) && reg.role_taken(role)
 }
 
-const SCOPES: [&str; 16] = [
+const SCOPES: [&str; 19] = [
     "session.read",
     "session.manage",
     "devices.read",
@@ -74,6 +80,9 @@ const SCOPES: [&str; 16] = [
     "sync.serve",
     "sync.read",
     "sync.manage",
+    "input.serve",
+    "input.read",
+    "input.manage",
     "components.approve",
     "system.shutdown",
 ];
@@ -83,6 +92,13 @@ const SCOPES: [&str; 16] = [
 /// else in the namespace is a gesture, under `sync.manage`. Additive: the
 /// vocabulary freeze (#84) extends this list, never shrinks it.
 const SYNC_READ_METHODS: [&str; 1] = ["sync.status"];
+
+/// The `input.*` facade methods an `input.read` holder may call: the same rule
+/// as its sync twin, one snapshot method. Everything else in the namespace
+/// either moves the pointer, rearranges the screens, or hands a computer the
+/// right to drive this one - a gesture, under `input.manage`. Additive as well:
+/// the vocabulary (doc/input-sharing.md) extends this list, never shrinks it.
+const INPUT_READ_METHODS: [&str; 1] = ["input.status"];
 
 /// Never grantable through the approval prompt — only by the bootstrap trust
 /// roots (otherwise: self-escalation).
@@ -99,6 +115,7 @@ fn topic_scope(topic: &str) -> Option<&'static str> {
         // join. Whoever watches one is whoever may answer it.
         "pairing" => Some("session.manage"),
         "sync" => Some("sync.read"),
+        "input" => Some("input.read"),
         _ => None,
     }
 }
@@ -406,6 +423,12 @@ impl Conn {
             // routed facade, forwarded to the exclusive sync backend.
             "sync.emit" => self.sync_emit(params),
             m if m.starts_with("sync.") => self.sync_forward(m, params).await,
+            // Same shape for the keyboard and mouse engine: its own method
+            // first, then the routed facade. The literal MUST precede the
+            // prefix guard, or `input.emit` would be forwarded to the engine
+            // that is trying to publish.
+            "input.emit" => self.input_emit(params),
+            m if m.starts_with("input.") => self.input_forward(m, params).await,
             _ => {
                 // Phase first: an unenrolled component learns nothing about
                 // the surface, not even which methods exist.
@@ -1667,30 +1690,32 @@ impl Conn {
         Ok(())
     }
 
-    // -- The sync facade ----------------------------------------------------
+    // -- Routed facades: the shared mechanics --------------------------------
 
-    /// Forwards a `sync.*` method to the connected exclusive `sync-backend`
-    /// (the `clipboard.get_data` pattern, in the other direction) and relays
-    /// its reply verbatim - errors included: the vocabulary's semantics live
-    /// in the component, the Core checks scopes and caches nothing. No backend
-    /// connected (or holding `sync.serve`), a backend that dies mid-flight, or
-    /// one that does not answer in time: `COMPONENT_ABSENT`, an honest state
-    /// the interface can phrase.
-    async fn sync_forward(&self, method: &str, params: &Value) -> Result<Value, RpcErr> {
-        // Phase first (through `require_scope`), then the read/manage split:
-        // the snapshot methods under `sync.read`, every gesture under
-        // `sync.manage`.
-        let scope = if SYNC_READ_METHODS.contains(&method) {
-            "sync.read"
-        } else {
-            "sync.manage"
-        };
-        self.require_scope(scope)?;
+    /// Forwards `method` to the active connection holding `role` AND
+    /// `serve_scope`, and relays its reply verbatim - errors included: the
+    /// vocabulary's semantics live in the component, the Core checks scopes and
+    /// caches nothing. No such connection, one that dies mid-flight, or one that
+    /// does not answer in time: `COMPONENT_ABSENT`, an honest state the
+    /// interface can phrase.
+    ///
+    /// Shared by every routed facade (`sync.*`, `input.*`) on purpose: this body
+    /// IS the proxy doctrine - never route to oneself, one budget, reclaim the
+    /// abandoned waiter - and a second copy of it would drift the day one is
+    /// fixed. What stays per facade is what genuinely differs: the role, the
+    /// serving scope, and the caller's read/manage split.
+    async fn facade_forward(
+        &self,
+        role: &str,
+        serve_scope: &str,
+        method: &str,
+        params: &Value,
+    ) -> Result<Value, RpcErr> {
         // Find the backend and enqueue under ONE registry lock; the await
         // happens strictly after its release (the write invariant).
         let issued = {
             let mut reg = self.state.registry.lock().expect("lock registry");
-            reg.conn_for_role_scope("sync-backend", "sync.serve")
+            reg.conn_for_role_scope(role, serve_scope)
                 // Never oneself: a backend calling the facade would enqueue a
                 // request its own blocked dispatch could never answer, and
                 // burn the whole budget for a guaranteed timeout.
@@ -1703,7 +1728,7 @@ impl Conn {
         let Some((target, req_id, reply_rx)) = issued else {
             return Err(RpcErr::app("COMPONENT_ABSENT"));
         };
-        match tokio::time::timeout(SYNC_FORWARD_TIMEOUT, reply_rx).await {
+        match tokio::time::timeout(FACADE_FORWARD_TIMEOUT, reply_rx).await {
             // The backend's reply, result or error, relayed as-is.
             Ok(Ok(outcome)) => outcome,
             // Waiter dropped: the backend's connection tore down mid-flight.
@@ -1721,11 +1746,30 @@ impl Conn {
         }
     }
 
+    // -- The sync facade ----------------------------------------------------
+
+    /// Routes a `sync.*` method to the connected exclusive `sync-backend` (the
+    /// `clipboard.get_data` pattern, in the other direction), through the shared
+    /// proxy above.
+    async fn sync_forward(&self, method: &str, params: &Value) -> Result<Value, RpcErr> {
+        // Phase first (through `require_scope`), then the read/manage split:
+        // the snapshot methods under `sync.read`, every gesture under
+        // `sync.manage`.
+        let scope = if SYNC_READ_METHODS.contains(&method) {
+            "sync.read"
+        } else {
+            "sync.manage"
+        };
+        self.require_scope(scope)?;
+        self.facade_forward("sync-backend", "sync.serve", method, params)
+            .await
+    }
+
     /// The backend publishes a `sync` topic notification through the Core -
-    /// the one component-originated topic, gated exactly like announcing is
-    /// for the clipboard: the exclusive role AND its serving scope. The Core
-    /// checks the shape (a `sync.*` name, an object for params) and relays;
-    /// it interprets nothing.
+    /// a component-originated topic, gated exactly like announcing is for the
+    /// clipboard: the exclusive role AND its serving scope. The Core checks the
+    /// shape (a `sync.*` name, an object for params) and relays; it interprets
+    /// nothing.
     fn sync_emit(&self, params: &Value) -> Result<Value, RpcErr> {
         self.require_sync_backend()?;
         let method = rpc::required_str(params, "method")?;
@@ -1741,6 +1785,56 @@ impl Conn {
             .lock()
             .expect("lock registry")
             .notify_topic("sync", &method, payload);
+        Ok(json!({}))
+    }
+
+    // -- The input facade ---------------------------------------------------
+
+    /// Routes an `input.*` method to the connected exclusive `input-backend`
+    /// (#126), through the same shared proxy as the sync facade.
+    ///
+    /// The Core stays deliberately ignorant here: who may drive this computer,
+    /// where the screens sit and where the pointer currently is are the engine's
+    /// state, and a copy kept here would be a second answer to a question that
+    /// has exactly one. It also means a restarted engine re-reads the truth from
+    /// its own store, not from a Core cache that outlived it.
+    async fn input_forward(&self, method: &str, params: &Value) -> Result<Value, RpcErr> {
+        // Phase first (through `require_scope`), then the read/manage split:
+        // the snapshot method under `input.read`, every gesture under
+        // `input.manage`. Reading the plane and granting a computer the right to
+        // type here are two different rights, so an interface that wants both
+        // holds both.
+        let scope = if INPUT_READ_METHODS.contains(&method) {
+            "input.read"
+        } else {
+            "input.manage"
+        };
+        self.require_scope(scope)?;
+        self.facade_forward("input-backend", "input.serve", method, params)
+            .await
+    }
+
+    /// The engine publishes an `input` topic notification through the Core, the
+    /// sync facade's `sync.emit` for the second component-originated topic: the
+    /// exclusive role AND its serving scope, a shape check (an `input.*` name
+    /// that is not `input.emit` itself, an object for params), then a verbatim
+    /// relay. The Core interprets none of it - a refusal count and a pointer
+    /// crossing mean nothing to it, and it must not learn to read them.
+    fn input_emit(&self, params: &Value) -> Result<Value, RpcErr> {
+        self.require_input_backend()?;
+        let method = rpc::required_str(params, "method")?;
+        if !method.starts_with("input.") || method == "input.emit" {
+            return Err(RpcErr::invalid_params("method"));
+        }
+        let payload = params
+            .get("params")
+            .filter(|v| v.is_object())
+            .ok_or_else(|| RpcErr::invalid_params("params"))?;
+        self.state
+            .registry
+            .lock()
+            .expect("lock registry")
+            .notify_topic("input", &method, payload);
         Ok(json!({}))
     }
 
@@ -1787,6 +1881,21 @@ impl Conn {
             Phase::Fresh => Err(RpcErr::app("NOT_ENROLLED")),
             Phase::Pending(_) => Err(RpcErr::app("PENDING_APPROVAL")),
             Phase::Active(a) if a.role == "sync-backend" && a.has_scope("sync.serve") => Ok(()),
+            Phase::Active(_) => Err(RpcErr::app("SCOPE_DENIED")),
+        }
+    }
+
+    /// Publishing on the `input` topic is bound to the exclusive `input-backend`
+    /// role AND the `input.serve` scope, `require_sync_backend`'s pattern: an
+    /// interface holding every facade scope is still not the engine, and cannot
+    /// fabricate a pointer crossing or a refusal nobody made. Phase before scope
+    /// (an unenrolled connection learns nothing).
+    fn require_input_backend(&self) -> Result<(), RpcErr> {
+        let reg = self.state.registry.lock().expect("lock registry");
+        match &reg.conns.get(&self.conn_id).expect("live connection").phase {
+            Phase::Fresh => Err(RpcErr::app("NOT_ENROLLED")),
+            Phase::Pending(_) => Err(RpcErr::app("PENDING_APPROVAL")),
+            Phase::Active(a) if a.role == "input-backend" && a.has_scope("input.serve") => Ok(()),
             Phase::Active(_) => Err(RpcErr::app("SCOPE_DENIED")),
         }
     }

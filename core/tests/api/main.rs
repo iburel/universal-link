@@ -17,6 +17,7 @@ mod dirsync;
 mod enrollment;
 mod events;
 mod hello;
+mod input;
 mod lanpair;
 mod leave;
 mod login;

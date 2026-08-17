@@ -206,8 +206,8 @@ async fn run_once(
 /// The deployment's official components, looked up next to the Core binary — or,
 /// for the tray, in the helper bundle described by `helper_bundle_program`.
 /// The tray is registered on every platform; the clipboard backend is registered
-/// on Linux (X11), Windows, and macOS, and so are the contextual menu and the
-/// sync engine.
+/// on Linux (X11), Windows, and macOS, and so are the contextual menu, the sync
+/// engine and the keyboard and mouse engine.
 /// A missing executable is ignored (with a word in the log) — a Core without a
 /// tray is still a working Core.
 ///
@@ -293,6 +293,24 @@ pub fn official_components() -> Vec<ChildSpec> {
             "devices.read",
             "session.read",
             "transfers.read",
+        ],
+    ));
+    // The keyboard and mouse engine: the exclusive `input-backend` behind the
+    // routed `input.*` facade (doc/input-sharing.md). Computers only, and for a
+    // blunter reason than the sync engine's: a phone has no pointer to lend and
+    // nothing to capture. It carries the events over `peers.channel` (a standing
+    // pipe, since a mouse move every 8 ms cannot pay for an ack apiece) and
+    // keeps `peers.message` for the occasional word out of band.
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+    official.push((
+        "1device-input",
+        "input-backend",
+        &[
+            "input.serve",
+            "peers.channel",
+            "peers.message",
+            "devices.read",
+            "session.read",
         ],
     ));
 

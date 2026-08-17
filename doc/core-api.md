@@ -63,8 +63,9 @@ only through these two paths, never via the prompt.
 |---|---|
 | `gui` | the only role that receives approval requests (with the `components.approve` scope) |
 | `clipboard-backend` | **exclusive**: only one active at a time; a second `hello` with this role → `ROLE_CONFLICT` (replacing the official backend with a third-party one is a configuration choice) |
+| `input-backend` | **exclusive**, like the clipboard backend: the engine answering the routed `input.*` facade: it captures this computer's keyboard and mouse, and types on it for another one |
 | `menu-backend` | — |
-| `sync-backend` | **exclusive**, exactly like the clipboard backend (one active at a time, `ROLE_CONFLICT`, replaceable by configuration): the engine answering the routed `sync.*` facade. The two exclusive roles are two slots, one holder each |
+| `sync-backend` | **exclusive**, exactly like the clipboard backend (one active at a time, `ROLE_CONFLICT`, replaceable by configuration): the engine answering the routed `sync.*` facade. Every exclusive role is its own slot, one holder each: they coexist, and holding one says nothing about the others |
 | `tray` | — |
 | `custom` | generic third-party components |
 
@@ -86,6 +87,9 @@ only through these two paths, never via the prompt.
 | `sync.serve` | answering the routed `sync.*` facade and publishing the `sync` topic (`sync.emit`) - both additionally require the `sync-backend` role |
 | `sync.read` | the `sync` topic and its snapshot method `sync.status` |
 | `sync.manage` | every other `sync.*` gesture |
+| `input.serve` | answering the routed `input.*` facade and publishing the `input` topic (`input.emit`) - both additionally require the `input-backend` role |
+| `input.read` | the `input` topic and its snapshot method `input.status` |
+| `input.manage` | every other `input.*` gesture - including `input.allow`, which is what lets another computer type on this one |
 | `components.approve` | `components.*` — never grantable via the prompt |
 | `system.shutdown` | `system.shutdown` — stops the whole Core (the tray's Quit) |
 
@@ -96,12 +100,15 @@ too, so without it the menu would offer targets that cannot be reached); tray:
 `session.read + devices.read + transfers.read`; clipboard manager:
 `devices.read + clipboard.read + clipboard.write`; sync engine (#84):
 `sync.serve + transactions.publish + peers.message + devices.read +
-session.read + transfers.read`.
+session.read + transfers.read`; keyboard and mouse engine (#126):
+`input.serve + peers.channel + peers.message + devices.read + session.read`
+(the channel is what carries the events - a pointer move every 8 ms cannot pay
+for an ack apiece; the message is for the occasional word out of band).
 
 ## Subscribing to events
 
 ```
-events.subscribe { topics: ["session", "devices", "transfers", "clipboard", "pairing", "sync"] }
+events.subscribe { topics: ["session", "devices", "transfers", "clipboard", "pairing", "sync", "input"] }
 ```
 
 Topics filtered by scopes. Notifications are named (below, by namespace). After a
@@ -970,12 +977,63 @@ only methods the component does not serve) - without that, a served method
 would be intermittently missing, answered `-32601` by the client itself.
 
 Notifications (topic `sync`, scope `sync.read`, subscription-based): they are
-published BY the backend through `sync.emit { method, params }` - the one
-component-originated topic. The Core checks the shape (`method` a `sync.*`
+published BY the backend through `sync.emit { method, params }` - the first of
+the component-originated topics (`input` is the other). The Core checks the
+shape (`method` a `sync.*`
 name other than `sync.emit`, `params` an object), requires the backend's
 role and `sync.serve` exactly as a clipboard announce requires its own, and
 relays verbatim. The vocabulary of those notifications is the engine
 contract's ([sync-engine.md](sync-engine.md), section 10).
+
+## `input.*`
+
+The second routed facade, the sync one's doctrine applied to the keyboard and
+the mouse: the interface's gestures go through the Core to the engine. Every
+method of the `input.*` namespace except `input.emit` is **forwarded** to the
+connected exclusive `input-backend` component, and its reply - result or
+error - relays verbatim. The vocabulary's semantics live entirely in the
+engine (frozen in [input-sharing.md](input-sharing.md), section 12), the Core
+checks scopes and shapes, caches nothing, interprets nothing.
+
+That last point is not modesty, it is the design: who may drive this computer,
+where the screens sit and where the pointer is now are the engine's state, and
+a copy kept in the Core would be a second answer to a question that has
+exactly one.
+
+| Method | Description |
+|---|---|
+| `input.status {}` | the snapshot of the whole state: the plane, each device's state and its measured round trip, the live session if any, the guards, any problem. The `input` topic's **snapshot method** - the only one under `input.read` |
+| `input.place { spots }` | the arrangement a human dragged: where each computer's screens sit relative to the others |
+| `input.allow { device_id, allowed }` | who may drive THIS computer. The authority, stored here, never replicated: no other device's word grants it |
+| `input.drive { device_id, allowed, mode? }` | who this computer may drive - a local convenience for the interface, the far side still decides |
+| `input.take { device_id, mode? }` | take the keyboard and mouse there now |
+| `input.release {}` | bring them back |
+| `input.guards { device_id, monitor, side, guards }` | the per neighbour crossing guards: what it takes to cross an edge toward that computer |
+| `input.lock { locked }` | pin the pointer to this screen |
+| `input.hotkey { keys }` | the return hotkey, enforced locally by the machine that captures |
+| `input.remap { device_id, map }` | incoming modifier remapping, applied on this machine |
+
+- `input.status` requires `input.read`; every other `input.*` gesture requires
+  `input.manage`. The split is per scope, not cumulative: an interface that
+  wants both holds both.
+- Engine absent, or dead: `COMPONENT_ABSENT` - also the answer for one that
+  tears down mid-request or does not answer within the proxy budget (10 s),
+  the same budget as the sync facade's. An honest state the interface can
+  phrase; nothing is queued for a backend to come.
+- Answering the facade requires the `input-backend` role AND the `input.serve`
+  scope: a connection missing either is not the engine, whatever its name.
+  The subscribe-window rule of the sync facade holds here too - a forward can
+  land before the engine has finished subscribing, and the Rust IPC client
+  holds it until then.
+
+Notifications (topic `input`, scope `input.read`, subscription-based): they are
+published BY the engine through `input.emit { method, params }`, gated exactly
+like `sync.emit` (the `input-backend` role AND `input.serve`, a `method` that
+is an `input.*` name other than `input.emit`, `params` an object), and relayed
+verbatim. Two of them: `input.updated { state }` when anything in the snapshot
+changes, and `input.refused { device_id, code, count }` when this computer
+turns a driver away. Their vocabulary, like the methods', is frozen in
+[input-sharing.md](input-sharing.md), section 12.
 
 ## `components.*`
 
@@ -1069,7 +1127,7 @@ Standard JSON-RPC codes + application codes in `error.data.code`:
 | `PENDING_APPROVAL` | enrollment request still pending |
 | `INVALID_TOKEN` | unknown or revoked token |
 | `SCOPE_DENIED` | scope missing for the method or the topic |
-| `ROLE_CONFLICT` | exclusive role already taken (`clipboard-backend`, `sync-backend`) |
+| `ROLE_CONFLICT` | exclusive role already taken (`clipboard-backend`, `input-backend`, `sync-backend`) |
 | `ALREADY_LOGGED_IN` | `session.login` while a session is open (re-logging in starts with `session.logout`) |
 | `INVALID_CONFIG` | `session.reload` on a `config.json` whose parse reports a problem, a faulty single setting included (the message carries the reason) |
 | `SERVER_UNREACHABLE` | operation requiring the server, offline |
@@ -1083,7 +1141,7 @@ Standard JSON-RPC codes + application codes in `error.data.code`:
 | `PAIRING_UNKNOWN` / `PAIRING_STATE` / `PAIRING_LIMIT` | relayed from the server as-is: unknown/expired/spent session, wrong moment (confirming before anyone scanned, or from the joining side), too many sessions at once. `PAIRING_STATE` is also the local answer for a pairing that is out of step: a code whose window is no longer the one on screen, a device that answers a dial with something other than the protocol's next frame, and confirming a pairing whose stream is gone |
 | `DEVICE_UNKNOWN` / `DEVICE_OFFLINE` | target unknown / unreachable (`pairing.accept` of a `1D2` code: the device that displayed it is not on this network) |
 | `DEVICE_REVOKED` | `pairing.accept` of a `1D2` code shown by a `node_id` the account struck off: a tombstone is permanent, and that device can only come back under a fresh identity |
-| `COMPONENT_ABSENT` | the component the call needs is not connected: no `sync-backend` holding `sync.serve` for a `sync.*` forward (also on a mid-request death or the proxy timeout), or - `peers.send` - the target device's word that nothing there holds the sender's role with `peers.message`, or - `peers.channel` - the same word for `peers.channel`, which also covers a holder there that never came to take the channel |
+| `COMPONENT_ABSENT` | the component the call needs is not connected: no `sync-backend` holding `sync.serve` for a `sync.*` forward, no `input-backend` holding `input.serve` for an `input.*` one (both also on a mid-request death or the proxy timeout), or - `peers.send` - the target device's word that nothing there holds the sender's role with `peers.message`, or - `peers.channel` - the same word for `peers.channel`, which also covers a holder there that never came to take the channel |
 | `PAYLOAD_TOO_LARGE` | `peers.send`: the serialized `payload` exceeds the cap (64 KiB), refused before anything is dialled |
 | `TRANSFER_UNKNOWN` | unknown `transfer_id` |
 | `FORMAT_UNKNOWN` | format not present in the transaction |

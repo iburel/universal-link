@@ -413,6 +413,7 @@ const STAGED_SIDECARS: &[&str] = &[
     "1device-clipboard",
     "1device-menu",
     "1device-sync",
+    "1device-input",
 ];
 
 /// Copies each sidecar next to the durable Core (best-effort). A sidecar absent
@@ -647,7 +648,13 @@ mod tests {
         // is the failure that matters: a sidecar bundled in the AppImage but not
         // staged is never found next to the durable Core, so it silently never runs
         // — logged at INFO as "component absent" and nothing else.
-        for expected in ["1device-tray", "1device-clipboard", "1device-menu"] {
+        for expected in [
+            "1device-tray",
+            "1device-clipboard",
+            "1device-menu",
+            "1device-sync",
+            "1device-input",
+        ] {
             assert!(
                 STAGED_SIDECARS.contains(&expected),
                 "{expected} is launched by the supervisor but never staged"

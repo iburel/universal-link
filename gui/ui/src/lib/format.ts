@@ -31,6 +31,7 @@ const ROLES: Record<string, string> = {
   "clipboard-backend": "clipboard",
   "menu-backend": "context menu",
   "sync-backend": "folder sync",
+  "input-backend": "keyboard and mouse sharing",
   custom: "third-party component",
 };
 
@@ -68,6 +69,14 @@ const SCOPES: Record<string, string> = {
   "sync.serve": "Act as the folder-sync engine",
   "sync.read": "Read the synced folders and their state",
   "sync.manage": "Create synced folders, invite devices, resolve conflicts",
+  // The keyboard and mouse engine's three. `input.serve` is what makes a
+  // component THE engine (it captures this machine's keyboard and mouse, and
+  // types on it for another computer); `input.manage` hands another computer the
+  // right to drive this one, which is the strongest of the three and has to say
+  // so in the prompt.
+  "input.serve": "Act as the keyboard and mouse engine",
+  "input.read": "Read the screen layout and who may drive this computer",
+  "input.manage": "Arrange the screens, and allow or refuse a computer to drive this one",
   "system.shutdown": "Stop 1Device",
   "components.approve": "Approve other components",
 };

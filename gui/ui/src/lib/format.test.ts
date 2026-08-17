@@ -59,6 +59,15 @@ test("the cross-device primitives are spelled out, one message and one flow", ()
   expect(scopeLabel("peers.channel")).toMatch(/live channel/);
 });
 
+// Letting another computer type on this one is the strongest right in the whole
+// list: the prompt must say that in words, not name the identifier.
+test("the input scopes say who gets to drive this computer", () => {
+  expect(roleLabel("input-backend")).toBe("keyboard and mouse sharing");
+  expect(scopeLabel("input.serve")).toMatch(/keyboard and mouse engine/);
+  expect(scopeLabel("input.read")).toMatch(/who may drive this computer/);
+  expect(scopeLabel("input.manage")).toMatch(/drive this one/);
+});
+
 // The phone runs the SAME view as the desktop, so the self label has to follow
 // the platform rather than the build it is displayed on.
 test("a device names itself after what it is", () => {
