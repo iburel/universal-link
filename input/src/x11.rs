@@ -996,20 +996,23 @@ impl Backend {
                     self.on_raw_key(&ev, true);
                 }
             }
-            xcb::Event::Input(xinput::Event::RawKeyRelease(ev)) => {
-                if !self.grabbed {
-                    self.on_raw_key(&ev, false);
-                }
-            }
+            // A RELEASE is not gated, and that is deliberate. The gate exists so a server
+            // that delivered both streams could not count a movement twice; a release counted
+            // twice is a release of a key nothing is holding, which is nothing. What the gate
+            // WOULD cost here is the one loss that strands a key: a stroke in flight when a
+            // session starts (its press forwarded from the raw stream, its release generated
+            // before the server processed the grab and delivered just after) would leave the
+            // target holding a key until the session ended.
+            xcb::Event::Input(xinput::Event::RawKeyRelease(ev)) => self.on_raw_key(&ev, false),
             xcb::Event::Input(xinput::Event::RawButtonPress(ev)) => {
                 if !self.grabbed {
                     self.on_raw_button(&ev, true);
                 }
             }
+            // Ungated for the same reason, and free of the same risk: `on_button` ignores the
+            // release of a wheel button, so no scroll can be counted twice through this arm.
             xcb::Event::Input(xinput::Event::RawButtonRelease(ev)) => {
-                if !self.grabbed {
-                    self.on_raw_button(&ev, false);
-                }
+                self.on_raw_button(&ev, false)
             }
             // The CORE stream, which is what a GRAB delivers and the only thing a
             // swallowing backend can see (truth 8's exception). The mode gate is the
@@ -1020,20 +1023,17 @@ impl Backend {
                     self.on_key(ev.detail(), true);
                 }
             }
-            xcb::Event::X(x::Event::KeyRelease(ev)) => {
-                if self.grabbed {
-                    self.on_key(ev.detail(), false);
-                }
-            }
+            // Ungated in the other direction too, and symmetrically: a release delivered just
+            // after the ungrab (its press having come from the core stream) is the same
+            // stranded key seen from the other end.
+            xcb::Event::X(x::Event::KeyRelease(ev)) => self.on_key(ev.detail(), false),
             xcb::Event::X(x::Event::ButtonPress(ev)) => {
                 if self.grabbed {
                     self.on_button(u32::from(ev.detail()), true);
                 }
             }
             xcb::Event::X(x::Event::ButtonRelease(ev)) => {
-                if self.grabbed {
-                    self.on_button(u32::from(ev.detail()), false);
-                }
+                self.on_button(u32::from(ev.detail()), false)
             }
             xcb::Event::X(x::Event::MotionNotify(ev)) => {
                 if self.grabbed {
