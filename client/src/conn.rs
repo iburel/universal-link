@@ -377,6 +377,10 @@ async fn establish(config: &ClientConfig, next_id: &mut u64) -> Result<Link, Est
         .iter()
         .chain(config.optional_scopes.iter())
         .collect();
+    // A refusal here is `invalid params` from a Core that does not know one of the
+    // names, or `SCOPE_DENIED` from a Core whose grant for this token does not
+    // cover it (the tray's case, with a single-use spawn token): the Core consumes
+    // the token only once every check has passed, so the retry below can use it.
     let result = match hello(&mut link, next_id, config, &token, &wanted).await {
         Ok(result) => result,
         Err(e) if config.optional_scopes.is_empty() => return Err(e),

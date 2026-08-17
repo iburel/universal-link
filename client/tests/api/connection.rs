@@ -395,6 +395,29 @@ async fn an_optional_scope_the_core_knows_is_granted_in_one_hello() {
     expect_connected(&mut events, &["session.read", "devices.read"]).await;
 }
 
+// Against the REAL Core, with a real single-use spawn token, which is the case
+// the tray depends on: a scope outside the supervisor's grant is `SCOPE_DENIED`
+// for the whole hello, and the retry has to work with the SAME token. Two things
+// are being proved here that a scripted Core cannot prove: that the Core does not
+// consume a token on a refused hello, and that it accepts a second hello on the
+// same connection.
+#[tokio::test]
+async fn a_scope_outside_the_grant_is_dropped_and_the_spawn_token_still_works() {
+    let core = TestCore::start().await;
+    let token = core.mint("tray", &["session.read"]);
+    let mut config = client_config(&core, "tray", &["session.read"], &[]);
+    config.token = TokenSource::Spawn(token);
+    // The grant does not cover it: the Core answers SCOPE_DENIED, not -32602.
+    config.optional_scopes = vec!["devices.read".into()];
+
+    let (client, mut events) = onedevice_ipc_client::spawn(config);
+    expect_connected(&mut events, &["session.read"]).await;
+    client
+        .request("session.status", json!({}))
+        .await
+        .expect("the connection is live on the second hello's grant");
+}
+
 // The fallback is for the OPTIONAL half only: a required topic that is refused is
 // still a cycle failure. Nothing is downgraded silently.
 #[tokio::test]
