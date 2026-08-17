@@ -1611,6 +1611,14 @@ crossing graph directly, for arrangements a plane cannot express. Character
 keys are not in the crash guard, only modifiers. No kernel driver, per the
 epic's decision, which is a strategy and not an omission.
 
+One field was not bounded, and #125 found it by writing arithmetic against it. A
+wheel frame's `dx` and `dy` were carried as whatever `i32` a peer put there, and
+a notch count times the Windows wheel unit overflows, as does the X11 backend's
+own pixel accumulator: both PANIC in a debug build, so a peer chose whether the
+component it was driving stayed alive. They are now clamped to `WHEEL_MAX`
+(4096) on arrival and on the way out, which is more than any device produces in
+one event and is the honest reading of a number no device could mean.
+
 And the per-platform gaps #125 found, each of which degrades to a refusal with
 a sentence rather than to something wrong:
 

@@ -654,8 +654,11 @@ struct Backend {
     /// than truncated away.
     pending_dx: i64,
     pending_dy: i64,
-    wheel_x: i32,
-    wheel_y: i32,
+    /// Scroll movement below one notch, in pixels, kept so a trackpad is not rounded to
+    /// nothing event after event. In `i64` so the arithmetic on a peer's number cannot
+    /// overflow (see [`Backend::wheel`]).
+    wheel_x: i64,
+    wheel_y: i64,
 
     monitors_stable: bool,
     shutdown: bool,
@@ -1170,25 +1173,35 @@ impl Backend {
     /// remainder kept: X has no pixel wheel to inject into, and rounding each event to
     /// nothing would make a trackpad scroll nothing at all.
     fn wheel(&mut self, dx: i32, dy: i32, pixels: bool) {
+        // Clamped first, and in `i64` below, because the numbers come off a peer's frame:
+        // the accumulator's `nx * WHEEL_PIXELS_PER_NOTCH` overflows an `i32` for a large
+        // enough delta, which is a PANIC in a debug build. The dialect bounds it too
+        // ([`crate::wire::WHEEL_MAX`]); this is the second bound, because a backend that
+        // trusts its caller for arithmetic is one refactor away from not being bounded.
+        let cap = crate::wire::WHEEL_MAX;
+        let (dx, dy) = (dx.clamp(-cap, cap), dy.clamp(-cap, cap));
         let (dx, dy) = if pixels {
-            self.wheel_x = self.wheel_x.saturating_add(dx);
-            self.wheel_y = self.wheel_y.saturating_add(dy);
-            let nx = self.wheel_x / WHEEL_PIXELS_PER_NOTCH;
-            let ny = self.wheel_y / WHEEL_PIXELS_PER_NOTCH;
-            self.wheel_x -= nx * WHEEL_PIXELS_PER_NOTCH;
-            self.wheel_y -= ny * WHEEL_PIXELS_PER_NOTCH;
-            (nx, ny)
+            self.wheel_x = self.wheel_x.saturating_add(i64::from(dx));
+            self.wheel_y = self.wheel_y.saturating_add(i64::from(dy));
+            let per = i64::from(WHEEL_PIXELS_PER_NOTCH);
+            let nx = self.wheel_x / per;
+            let ny = self.wheel_y / per;
+            self.wheel_x -= nx * per;
+            self.wheel_y -= ny * per;
+            (nx as i32, ny as i32)
         } else {
             (dx, dy)
         };
-        // Bounded: a peer's frame is checked before it gets here, and a loop of ten
-        // thousand button presses would be a denial of service written in one field.
-        for _ in 0..dy.unsigned_abs().min(32) {
+        // And a third bound, on the number of REQUESTS: X11 has no wheel event, only a
+        // button press and release per notch, so a peer sending the dialect's maximum
+        // would otherwise cost eight thousand X requests for one frame. Nothing a device
+        // produces comes near this.
+        for _ in 0..dy.unsigned_abs().min(64) {
             let button = if dy > 0 { 4 } else { 5 };
             self.fake(FAKE_BUTTON_PRESS, button, 0, 0);
             self.fake(FAKE_BUTTON_RELEASE, button, 0, 0);
         }
-        for _ in 0..dx.unsigned_abs().min(32) {
+        for _ in 0..dx.unsigned_abs().min(64) {
             let button = if dx > 0 { 7 } else { 6 };
             self.fake(FAKE_BUTTON_PRESS, button, 0, 0);
             self.fake(FAKE_BUTTON_RELEASE, button, 0, 0);

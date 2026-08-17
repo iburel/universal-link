@@ -1332,15 +1332,29 @@ fn push_input(out: &mut Vec<INPUT>, action: &Action, vs: &RECT) {
             out.push(mouse_input(0, 0, data, flag));
         }
         Action::Wheel { dx, dy, pixels } => {
-            // Windows measures the wheel in `WHEEL_DELTA` units, so a notch is 120
-            // and a pixel precise scroll travels as the fraction of a notch that a
-            // high resolution wheel itself reports.
-            let scale = if *pixels { 1 } else { WHEEL_DELTA_I32 };
+            // Windows measures the wheel in `WHEEL_DELTA` units, so a notch is 120 and a
+            // pixel precise scroll travels as the fraction of a notch that a high
+            // resolution wheel itself reports.
+            //
+            // In `i64` and then clamped, which is not paranoia: the numbers come off a
+            // peer's frame, and an `i32` notch count times 120 overflows, which is a
+            // PANIC in a debug build. The dialect bounds it too
+            // ([`crate::wire::WHEEL_MAX`]); this is the second bound, because a backend
+            // that trusts its caller for arithmetic is one refactor away from not being
+            // bounded at all.
+            let scale = if *pixels {
+                1i64
+            } else {
+                i64::from(WHEEL_DELTA_I32)
+            };
+            let scaled = |d: i32| {
+                (i64::from(d) * scale).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+            };
             if *dy != 0 {
-                out.push(mouse_input(0, 0, (dy * scale) as u32, MOUSEEVENTF_WHEEL));
+                out.push(mouse_input(0, 0, scaled(*dy) as u32, MOUSEEVENTF_WHEEL));
             }
             if *dx != 0 {
-                out.push(mouse_input(0, 0, (dx * scale) as u32, MOUSEEVENTF_HWHEEL));
+                out.push(mouse_input(0, 0, scaled(*dx) as u32, MOUSEEVENTF_HWHEEL));
             }
         }
         Action::Key { code, down } => {

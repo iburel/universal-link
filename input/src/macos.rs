@@ -967,8 +967,12 @@ impl MacBackend {
                 } else {
                     CGScrollEventUnit::Line
                 };
-                if let Some(event) = CGEvent::new_scroll_wheel_event2(source, unit, 2, *dy, *dx, 0)
-                {
+                // Clamped, because the numbers come off a peer's frame and two billion
+                // lines is not a scroll anybody meant. The dialect bounds it too
+                // ([`crate::wire::WHEEL_MAX`]); this is the second bound.
+                let cap = crate::wire::WHEEL_MAX;
+                let (dx, dy) = (dx.clamp(-cap, cap), dy.clamp(-cap, cap));
+                if let Some(event) = CGEvent::new_scroll_wheel_event2(source, unit, 2, dy, dx, 0) {
                     CGEvent::set_flags(Some(&event), flags);
                     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
                 }
