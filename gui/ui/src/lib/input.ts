@@ -25,6 +25,7 @@ import type {
   InputHere,
   InputSpot,
   InputState,
+  PeerProblem,
   PlacedSpot,
 } from "./api";
 import { isCoreError } from "./errors";
@@ -217,8 +218,17 @@ export const REFUSAL_CODES: readonly string[] = Object.keys(REFUSALS);
  * A pair's standing problem, from the snapshot: what the interface says next to
  * a device even when no refusal has just arrived. These are the collapsed set
  * (section 12), which is why `busy` names both directions.
+ *
+ * Keyed by the union rather than by `string`, so **tsc refuses to compile this
+ * file** when the engine gains a code and nobody words it. The lookup below widens
+ * it back, because a code from a newer engine is a real thing to receive and gets
+ * the fallback.
+ *
+ * They are not all failures. `xwayland` is a pair that WORKS and works partly, and
+ * saying so before somebody types into a window that will not receive it is the
+ * whole reason this table exists.
  */
-const PEER_PROBLEMS: Record<string, string> = {
+const PEER_PROBLEMS: Record<PeerProblem, string> = {
   not_allowed:
     "<name> has not been told to accept your keyboard. Allow it there, on <name> itself.",
   busy: "<name> is already being driven, or is driving another computer.",
@@ -231,6 +241,19 @@ const PEER_PROBLEMS: Record<string, string> = {
     "The path to <name> is too slow for the pointer. Its keyboard alone would work.",
   plane_stale:
     "This computer and <name> do not agree on where the screens are yet. They are already sorting it out.",
+  // Deliberately opens with what will happen rather than with what the session is
+  // called: "this is an XWayland session" is a true sentence that tells a person
+  // nothing about the window they are about to type into. The remedy is last because
+  // it is on the other computer, and this pair works meanwhile.
+  //
+  // The screens clause is not decoration, and it is here for the same reason its twin
+  // is in `hereProblemSentence`: this code outranks `monitors_unstable` in the
+  // engine's single problem slot, an XWayland's screens NEVER have a stable identity
+  // (its RandR output carries no EDID), and a peer's `monitors_stable` reaches no part
+  // of this interface at all. Without it the warning would be silently deleted for
+  // every session this code covers, on the side that DRAGS the plane.
+  xwayland:
+    "Your keyboard and mouse will reach only part of <name>: it is a Wayland desktop being driven through its X11 half. Programs that are X11 receive what you type; programs that speak Wayland directly, which on most desktops is nearly all of them, receive nothing at all. An X11 session on <name> is what works completely today. This kind of session also cannot tell its screens apart for certain, so they may swap places on the plane after one is unplugged.",
 };
 
 export function peerProblemSentence(
@@ -239,7 +262,7 @@ export function peerProblemSentence(
 ): string | null {
   if (!problem) return null;
   const who = name && name.length > 0 ? name : "That computer";
-  const known = PEER_PROBLEMS[problem];
+  const known = (PEER_PROBLEMS as Record<string, string>)[problem];
   if (known) return known.replaceAll("<name>", who);
   return `${who} reported a problem this version does not know (${problem}).`;
 }

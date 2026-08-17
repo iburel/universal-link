@@ -38,7 +38,7 @@ use tokio::sync::mpsc;
 
 use crate::backend::{
     Action, BackendEvent, Capabilities, CaptureLoss, CaptureMode, InputBackend, KeyEvent, Monitor,
-    Point, Rect, Refusal,
+    PeerProblem, Point, Rect, Refusal,
 };
 use crate::graph::{self, AtEdge, Graph, Guards, Placed, Segment};
 use crate::keys::{self, Held, Hotkey, ModKeys, Resolver};
@@ -337,8 +337,22 @@ struct Peer {
     attached_at: Option<Instant>,
     /// Nothing is tried towards this peer before this instant.
     backoff_until: Option<Instant>,
-    /// What the interface says about this pair, from the snapshot alone.
-    problem: Option<&'static str>,
+    /// What the interface says about this pair, from the snapshot alone. A code of
+    /// the pair vocabulary rather than a string, so a spelling cannot be invented at
+    /// a call site: [`PeerProblem`] is what the interface has sentences for, and a
+    /// word outside it reaches a person as "this version does not know".
+    ///
+    /// This is the REMEMBERED half only: what the far side said when it refused, or
+    /// what a channel that would not open said. The standing half that a peer's
+    /// handshake implies is derived at snapshot time (`peer_problem`) rather than
+    /// copied in here, and the reason that holds TODAY is the first of these two: a
+    /// `hi` clears this field (a handshake is a fresh start for a pair), so a copy
+    /// would erase a standing fact along with the stale refusal it came with. The
+    /// second is free rather than load-bearing: the dialect accepts a repeated `hi`
+    /// and a derived value would follow one, while nothing in this build sends a
+    /// second one (`CapabilitiesChanged` refreshes our own caps and tells no peer),
+    /// which is its own gap and its own ticket.
+    problem: Option<PeerProblem>,
     /// When the last layout message went out, for the rate limit.
     layout_sent: Option<Instant>,
     /// A layout round was wanted while the rate limit was closed.
@@ -972,10 +986,17 @@ impl<B: InputBackend> Engine<B> {
             let peer = self.peers.entry(node.to_string()).or_default();
             peer.link = Link::Cold;
             peer.out = None;
+            // The handshake goes with the channel, which every OTHER path to Cold
+            // already knew (`tear_down`, and the pump dropping an outbox). This one
+            // kept it, and a review found what that costs now that the snapshot reads
+            // it: a peer with a stale `hi` and no channel rendered "Not connected",
+            // "is not answering right now" and a standing sentence about a session
+            // that cannot start, all three at once.
+            peer.hi = None;
             peer.backoff_until = Some(now + BACKOFF_OPEN);
             peer.problem = match code {
-                "NO_DIRECT_PATH" => Some("no_path"),
-                "COMPONENT_ABSENT" => Some("no_backend"),
+                "NO_DIRECT_PATH" => Some(PeerProblem::NoPath),
+                "COMPONENT_ABSENT" => Some(PeerProblem::NoBackend),
                 _ => None,
             };
         }
@@ -1037,7 +1058,7 @@ impl<B: InputBackend> Engine<B> {
             "NO_DIRECT_PATH" => {
                 let peer = self.peers.entry(node.to_string()).or_default();
                 peer.backoff_until = Some(now + BACKOFF_OPEN);
-                peer.problem = Some("no_path");
+                peer.problem = Some(PeerProblem::NoPath);
             }
             // The two the matrix says to re-warm from: a newer channel took the
             // pair, or our own keepalive did not keep this one alive.
@@ -1078,7 +1099,7 @@ impl<B: InputBackend> Engine<B> {
         {
             peer.problem = match reason {
                 "PEER_GONE" | "IDLE_TIMEOUT" => None,
-                "NO_DIRECT_PATH" => Some("no_path"),
+                "NO_DIRECT_PATH" => Some(PeerProblem::NoPath),
                 _ => peer.problem,
             };
         }
@@ -1745,15 +1766,15 @@ impl<B: InputBackend> Engine<B> {
             _ => BACKOFF_REFUSED,
         };
         let problem = match code {
-            refused::NOT_ALLOWED | ended::REVOKED => Some("not_allowed"),
+            refused::NOT_ALLOWED | ended::REVOKED => Some(PeerProblem::NotAllowed),
             // A target's own user asked for it back, which from here is the same
             // sentence as another computer holding it: that computer is in use.
-            refused::BUSY | ended::TAKEN => Some("busy"),
-            refused::PLANE_STALE => Some("plane_stale"),
-            refused::NO_BACKEND => Some("no_backend"),
+            refused::BUSY | ended::TAKEN => Some(PeerProblem::Busy),
+            refused::PLANE_STALE => Some(PeerProblem::PlaneStale),
+            refused::NO_BACKEND => Some(PeerProblem::NoBackend),
             // Nobody is holding that machine: its pointer is pinned to its own
             // screen, and the remedy is a switch rather than waiting.
-            refused::LOCKED => Some("locked"),
+            refused::LOCKED => Some(PeerProblem::Locked),
             ended::IDLE => None,
             // A code from a newer peer than this build arrives as `UNKNOWN`
             // (`wire::code_in` normalises anything outside a closed set), and
@@ -3396,13 +3417,8 @@ impl<B: InputBackend> Engine<B> {
                     // alone, and the handshake is what lets it say so BEFORE
                     // anyone tries: a peer whose backend cannot type is
                     // `no_backend` here with no refusal ever having happened.
-                    "problem": peer.and_then(|p| {
-                        p.problem.or_else(|| {
-                            p.hi.as_ref()
-                                .filter(|hi| !hi.caps.can_be_driven())
-                                .map(|_| "no_backend")
-                        })
-                    }),
+                    "problem": peer.and_then(Self::peer_problem)
+                        .map(PeerProblem::code),
                 })
             })
             .collect();
@@ -3492,6 +3508,38 @@ impl<B: InputBackend> Engine<B> {
         // that is still warm: this is the end of the process.
         self.force_capture_off();
         self.confine(None);
+    }
+
+    /// What the interface says about one pair: the refusal this engine remembers,
+    /// and failing that whatever the peer's own handshake implies.
+    ///
+    /// **The order is remembered-first and it is not arbitrary.** A refusal is
+    /// something that just happened to the person and names what to do next; the
+    /// standing facts below it are permanent until that machine's session changes, so
+    /// they are still there when the transient one clears (a `hi` and an accepted
+    /// session both clear the remembered half, and this function keeps deriving the
+    /// standing one afterwards).
+    ///
+    /// **A problem derived here is not a refusal**, which is why it lives here and
+    /// not in `Peer::problem`: `device_state` reads that field and would call the pair
+    /// `refused`, and an XWayland peer is `ready`. It really can be driven, it will
+    /// really type into the X11 windows on that screen, and the sentence exists so a
+    /// person knows what they are getting rather than being stopped from having it.
+    fn peer_problem(peer: &Peer) -> Option<PeerProblem> {
+        if let Some(remembered) = peer.problem {
+            return Some(remembered);
+        }
+        let caps = &peer.hi.as_ref()?.caps;
+        // Nothing there can type at all: the flattest thing to say, and it outranks
+        // any partial word below it.
+        if !caps.can_be_driven() {
+            return Some(PeerProblem::NoBackend);
+        }
+        // That machine's own problem, seen from here. It travelled in `caps` from the
+        // first version of the dialect and used to be read by nobody, which is how a
+        // peer able to type into half its windows was offered as a peer with nothing
+        // wrong at all.
+        caps.problem.and_then(crate::backend::Problem::as_peer)
     }
 
     fn device_state(&self, node: &str) -> &'static str {
@@ -3763,6 +3811,17 @@ mod tests {
 
         /// Attaches a channel the way the loop does, and answers its handshake.
         async fn warm(&mut self, peer: &str, pointer: bool) {
+            self.warm_with(
+                peer,
+                json!({ "inject_keys": true, "inject_pointer": pointer }),
+            )
+            .await;
+        }
+
+        /// The same, with the peer's whole `caps` object written out. What a peer
+        /// says about itself is the entire input of a pair's standing problem, so a
+        /// test about that has to be able to say it.
+        async fn warm_with(&mut self, peer: &str, caps: Value) {
             let (tx, rx) = mpsc::channel(256);
             // Attached the way an INCOMING offer is: the harness's default case is
             // a peer that opened a channel to be driven by us.
@@ -3770,7 +3829,7 @@ mod tests {
             self.out.insert(peer.to_string(), rx);
             let hi = Frame::Hi {
                 version: wire::VERSION,
-                caps: json!({ "inject_keys": true, "inject_pointer": pointer }),
+                caps,
                 plane: self.engine.plane_id().to_string(),
             };
             self.feed(peer, vec![hi], self.t0).await;
@@ -5644,6 +5703,124 @@ mod tests {
                 "{code}: no gesture ever answers from a cached refusal"
             );
         }
+    }
+
+    /// A target reached through its XWayland is a pair that HALF works, and the
+    /// snapshot says which half before anybody types into the other one.
+    ///
+    /// This is the sentence #128 left missing: the peer's `caps` already carried its
+    /// `xwayland` code and the snapshot read nothing but `can_be_driven()`, so a
+    /// person crossed to a machine that types into X11 windows only, typed into a
+    /// native Wayland one, and nothing happened with nothing anywhere saying why.
+    #[tokio::test]
+    async fn a_target_reached_through_xwayland_says_which_windows_will_receive() {
+        // Verbatim what the X11 backend reports for a forced XWayland session,
+        // measured in #128: every capability true, and the one thing wrong is the
+        // half of the screen it cannot reach.
+        let xwayland = json!({
+            "capture": true, "swallow": true, "confine": true, "warp": true,
+            "inject_keys": true, "inject_pointer": true, "unicode": true,
+            "monitors_stable": false, "problem": "xwayland",
+        });
+        let mut h = Harness::new();
+        let peer = h.desk().await;
+        h.serve(
+            "input.drive",
+            json!({ "device_id": "d_b", "allowed": true }),
+        )
+        .expect("drive");
+        h.warm_with(&peer, xwayland.clone()).await;
+
+        let status = h.engine.status();
+        assert_eq!(
+            status["devices"][0]["problem"],
+            json!("xwayland"),
+            "the far side's own word about itself reaches the snapshot"
+        );
+        assert_eq!(
+            status["devices"][0]["state"],
+            json!("ready"),
+            "and it is not a refusal: this pair works, for X11 windows"
+        );
+
+        // A refusal that has just happened outranks it while it stands, being the
+        // thing that just happened to the person, and a fresh handshake brings the
+        // standing word back rather than losing it with the transient one.
+        h.engine.on_open_failed(&peer, "NO_DIRECT_PATH", h.t0);
+        assert_eq!(
+            h.engine.status()["devices"][0]["problem"],
+            json!("no_path"),
+            "what just happened comes first"
+        );
+        // A repeated handshake on the live channel, which is what clears the
+        // remembered half, rather than a fresh `attach`: the point being tested is
+        // that the standing word survives the thing that erases the transient one.
+        h.warm_with(&peer, xwayland.clone()).await;
+        h.feed(
+            &peer,
+            vec![Frame::Hi {
+                version: wire::VERSION,
+                caps: xwayland.clone(),
+                plane: h.engine.plane_id().to_string(),
+            }],
+            h.t0,
+        )
+        .await;
+        assert_eq!(
+            h.engine.status()["devices"][0]["problem"],
+            json!("xwayland"),
+            "a standing fact is derived, so clearing a refusal cannot erase it"
+        );
+
+        // The flatter word wins when both are true: a machine that cannot type at
+        // all is not a machine whose Wayland windows are out of reach.
+        h.warm_with(&peer, json!({ "problem": "xwayland" })).await;
+        assert_eq!(
+            h.engine.status()["devices"][0]["problem"],
+            json!("no_backend"),
+            "nothing there can type, which is the whole of it"
+        );
+
+        // And it blocks nothing. A person told what will work may want it.
+        //
+        // The assertion is that a session really goes OUT, not that the gesture
+        // returned `Ok`: by D21 a gesture answers only from what this machine knows,
+        // so `input.take` answers `Ok` for every peer including one that cannot type
+        // at all, and asserting that would have proved the pre-existing contract
+        // rather than anything about this code.
+        h.warm_with(&peer, xwayland).await;
+        assert_eq!(
+            h.serve("input.take", json!({ "device_id": "d_b" })),
+            Ok(json!({}))
+        );
+        assert!(
+            h.frames(&peer)
+                .iter()
+                .any(|f| matches!(f, Frame::Start { .. })),
+            "an honest partial target is offered, never withheld: a start went out"
+        );
+    }
+
+    /// A peer on a build newer than ours says a word we do not have, and the pair
+    /// stays honest: the booleans it sent are still read, and no peer-chosen string
+    /// reaches the interface as if it were a code with a sentence.
+    #[tokio::test]
+    async fn a_problem_code_from_the_future_is_dropped_and_the_pair_still_works() {
+        let mut h = Harness::new();
+        let peer = h.desk().await;
+        h.warm_with(
+            &peer,
+            json!({ "inject_keys": true, "inject_pointer": true,
+                    "problem": "wayland_something_new" }),
+        )
+        .await;
+        let status = h.engine.status();
+        assert_eq!(
+            status["devices"][0]["problem"],
+            Value::Null,
+            "an unknown code is not repeated, and the caps say the pair can work"
+        );
+        assert_eq!(status["devices"][0]["state"], json!("ready"));
     }
 
     /// A layout change is the one moment the old platform keys are still

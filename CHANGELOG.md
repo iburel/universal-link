@@ -20,10 +20,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     as an environment variable a dead compositor left behind, and
     `XDG_SESSION_TYPE` is only a last resort because it is empty on real Wayland
     sessions.
-  - **A session driven through XWayland now says so.** X11 windows can be read
-    and typed into; windows that speak Wayland directly, which on most desktops
-    is nearly all of them, cannot. Before this it said your screens might swap
-    places, which was true and was not the thing you needed to know.
+  - **A session driven through XWayland now says so, on both computers.** X11
+    windows can be read and typed into; windows that speak Wayland directly,
+    which on most desktops is nearly all of them, cannot. Before this it said
+    your screens might swap places, which was true and was not the thing you
+    needed to know. The computer taking the keyboard away says it too, next to
+    that computer's name and before anything is typed: your keyboard reaches only
+    part of that machine. Without that half, crossing to such a computer and
+    typing into one of its Wayland windows did nothing at all, with nothing
+    anywhere saying why. It stops nothing, since typing into the X11 programs
+    there does work.
   - **Six reasons where there was one**, each with its own sentence and its own
     remedy: no D-Bus session bus, this desktop has no input portals, they are
     too old, the permission was refused, and the honest one, everything is

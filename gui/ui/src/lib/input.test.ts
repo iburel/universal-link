@@ -3,7 +3,12 @@
 
 import { expect, test } from "vitest";
 
-import type { InputGuards, InputProblem, InputSpot } from "./api";
+import type {
+  InputGuards,
+  InputProblem,
+  InputSpot,
+  PeerProblem,
+} from "./api";
 import {
   DWELL_CHOICES,
   GHOST_SENTENCE,
@@ -152,24 +157,55 @@ test("without a name, a sentence still reads", () => {
   expect(refusalSentence("BUSY", "")).toContain("That computer");
 });
 
+// A Record keyed by the union, for the reason EVERY_PROBLEM below is one: **tsc
+// refuses to compile this file** when a member joins `PeerProblem` and is not
+// listed here, so a walk over it is real coverage rather than the appearance of it.
+// The engine's own half of the bridge is `PeerProblem::position`, an exhaustive
+// match, plus the test that reads this file's sentences from disk.
+const EVERY_PEER_PROBLEM: Record<PeerProblem, true> = {
+  not_allowed: true,
+  busy: true,
+  locked: true,
+  no_backend: true,
+  no_path: true,
+  too_slow: true,
+  plane_stale: true,
+  xwayland: true,
+};
+
 test("every standing problem of a pair has a sentence", () => {
-  for (const problem of [
-    "not_allowed",
-    "busy",
-    "locked",
-    "no_backend",
-    "no_path",
-    "too_slow",
-    "plane_stale",
-  ]) {
+  for (const problem of Object.keys(EVERY_PEER_PROBLEM) as PeerProblem[]) {
     const said = peerProblemSentence(problem, "Desk");
     expect(said, problem).toBeTruthy();
-    expect(said).toContain("Desk");
+    expect(said, problem).toContain("Desk");
+    // The fallback would carry the code, so a member with no sentence of its own
+    // cannot pass by looking plausible.
+    expect(said, problem).not.toContain("does not know");
+    expect(said, problem).not.toContain(problem);
   }
   expect(peerProblemSentence(null)).toBeNull();
   expect(peerProblemSentence("from_the_future", "Desk")).toContain(
     "from_the_future",
   );
+});
+
+// The one this change exists for: a peer reached through its XWayland is a pair that
+// half works, and the row has to say WHICH half before somebody types into the other
+// one. A sentence that only named the session type would pass a truthiness test and
+// leave the silence in place.
+test("an XWayland target says which windows will receive the keyboard", () => {
+  const said = peerProblemSentence("xwayland", "Desk") ?? "";
+  expect(said).toContain("only part of Desk");
+  expect(said).toContain("X11");
+  expect(said).toContain("Wayland");
+  expect(said).toContain("receive nothing");
+  // It is not a refusal and must not read as one: nothing here says the pair
+  // cannot be driven.
+  expect(said).not.toContain("cannot be driven");
+  // And the screens warning this code swallows in the engine's single slot, said
+  // here, to the side that drags the plane. Its twin is asserted for
+  // `hereProblemSentence` for the same reason.
+  expect(said).toContain("swap places");
 });
 
 // The grant is the far side's, and the sentence has to send the person THERE.
