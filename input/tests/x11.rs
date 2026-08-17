@@ -794,8 +794,32 @@ async fn a_confined_pointer_reports_a_delta_and_comes_back_to_its_anchor() {
         peer.pointer()
     );
 
-    // Released, and the pointer is free again.
+    // Back to WATCHING, which is where a machine goes when a session ends, and the
+    // observation has to come back with it: the two modes read two different streams, so a
+    // backend that swallowed once and then watched with nothing arriving would let a person
+    // start one session per process and no more. Drained first, so the motion asserted here
+    // is one the raw stream delivered after the grab was gone.
     handle.confine(None);
+    handle.capture(CaptureMode::Watch);
+    thread::sleep(Duration::from_millis(400));
+    while events.try_recv().is_ok() {}
+    let mut again = None;
+    let start = std::time::Instant::now();
+    while start.elapsed() < DEADLINE && again.is_none() {
+        peer.fake_move(9, 0);
+        again = wait_within(
+            &mut events,
+            Duration::from_millis(200),
+            &mut |e| matches!(e, BackendEvent::Motion(m) if m.dx != 0),
+        )
+        .await;
+    }
+    assert!(
+        again.is_some(),
+        "after the session, watching must observe movement again"
+    );
+
+    // Released, and the pointer is free again.
     handle.capture(CaptureMode::Off);
     assert!(
         wait_until(DEADLINE, || {
