@@ -97,6 +97,14 @@
   let selected = $state<string | null>(null);
   let drag = $state<{ keys: string[]; dx: number; dy: number } | null>(null);
   let refused = $state<string | null>(null);
+  /**
+   * How to take a live drag's two window listeners back. Leaving the section
+   * mid-drag has to take them with it: without this, the mouse being released
+   * afterwards would send a placement from a component nobody is looking at, and
+   * every visit would leave another pair of listeners on the window.
+   */
+  let stopDrag: (() => void) | null = null;
+  $effect(() => () => stopDrag?.());
 
   function keysFor(key: string): string[] {
     return detach ? [key] : blockKeys(spots, key);
@@ -118,6 +126,10 @@
    */
   function startDrag(event: MouseEvent, spot: InputSpot) {
     if (disabled) return;
+    // A second drag cannot start while one is live (a mouse has one button down
+    // at a time, but a lost mouseup would otherwise strand the first one's
+    // listeners).
+    stopDrag?.();
     selected = spot.monitor;
     const keys = keysFor(spot.monitor);
     const element = event.currentTarget as HTMLElement | null;
@@ -126,23 +138,30 @@
     const from = { x: event.clientX, y: event.clientY };
     drag = { keys, dx: 0, dy: 0 };
 
-    const move = (e: MouseEvent) => {
-      drag = {
-        keys,
-        dx: ((e.clientX - from.x) * factor) / scale,
-        dy: ((e.clientY - from.y) * factor) / scale,
-      };
+    const handlers = {
+      move: (e: MouseEvent) => {
+        drag = {
+          keys,
+          dx: ((e.clientX - from.x) * factor) / scale,
+          dy: ((e.clientY - from.y) * factor) / scale,
+        };
+      },
+      up: () => {
+        const moved = drag;
+        finish();
+        if (!moved || (moved.dx === 0 && moved.dy === 0)) return;
+        void commit(moved.keys, moved.dx, moved.dy);
+      },
     };
-    const up = () => {
-      window.removeEventListener("mousemove", move);
-      window.removeEventListener("mouseup", up);
-      const moved = drag;
+    const finish = () => {
+      window.removeEventListener("mousemove", handlers.move);
+      window.removeEventListener("mouseup", handlers.up);
+      stopDrag = null;
       drag = null;
-      if (!moved || (moved.dx === 0 && moved.dy === 0)) return;
-      void commit(moved.keys, moved.dx, moved.dy);
     };
-    window.addEventListener("mousemove", move);
-    window.addEventListener("mouseup", up);
+    stopDrag = finish;
+    window.addEventListener("mousemove", handlers.move);
+    window.addEventListener("mouseup", handlers.up);
   }
 
   /** Arrow keys, for whoever is not holding a mouse: one screen, or a nudge. */

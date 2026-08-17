@@ -319,6 +319,27 @@ test("a drag that would put two screens in the same place is refused, and nothin
   expect(textOf(view)).toContain("Two screens cannot be in the same place");
 });
 
+// Leaving the section with the mouse still down: the two window listeners a drag
+// holds must go with it, or a mouseup afterwards writes a placement from a
+// component nobody is looking at.
+test("leaving the tab in the middle of a drag takes the drag with it", async () => {
+  const place = vi.spyOn(store, "placeScreens").mockResolvedValue();
+  const view = render(Input, { store });
+
+  const screen = byLabel(view, "Desk Main");
+  screen.dispatchEvent(
+    new MouseEvent("mousedown", { bubbles: true, clientX: 0, clientY: 0 }),
+  );
+  window.dispatchEvent(
+    new MouseEvent("mousemove", { bubbles: true, clientX: 40, clientY: 0 }),
+  );
+  cleanup();
+  window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+  await Promise.resolve();
+
+  expect(place).not.toHaveBeenCalled();
+});
+
 test("a click that moves nothing sends nothing", async () => {
   const place = vi.spyOn(store, "placeScreens").mockResolvedValue();
   const view = render(Input, { store });
