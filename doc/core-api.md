@@ -669,7 +669,9 @@ on two devices, carrying OPAQUE bytes the Core interprets in no way.
   `DEVICE_REVOKED` (the peer is no longer an attested device of the account
   here: struck off, record gone, or an attestation that stopped verifying,
   the three collapsed fail-closed as they are behind `DEVICE_UNKNOWN`),
-  `LOGGED_OUT`, `ACCOUNT_LEFT`, `SHUTDOWN`, `FRAME_TOO_LARGE`,
+  `LOGGED_OUT`, `ACCOUNT_LEFT`, `SHUTDOWN` (best-effort: the Core is closing
+  that component's control connection in the same breath, so the usual way it
+  learns is its own connection ending), `FRAME_TOO_LARGE`,
   `RATE_EXCEEDED`, `IDLE_TIMEOUT`, `NO_DIRECT_PATH` (the direct path died
   mid-stream under a rendezvous-only relay policy). The end of a channel is
   worded by the Core that saw the CAUSE: the side that replaced, revoked or

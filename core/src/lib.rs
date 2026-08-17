@@ -259,8 +259,15 @@ impl Drop for CoreHandle {
             .clear_all();
         self.state.clipboard_reset.notify_waiters();
         // Same reasoning for the live peer channels (#124), whose pipes are not
-        // in `conns` either: a channel does not outlive the Core that carries
-        // it, and its component hears why rather than watching a pipe go mute.
+        // in `conns` either. What this call is really for is a Core dropped
+        // inside a LIVING process (the phone embeds one, and every in-process
+        // test does): a pipe task is detached and polls a vigil of its own, so
+        // without this it would outlive the Core that owns its state. It also
+        // shuts each peer stream, so the far ends see an end rather than a
+        // timeout. The reason it carries is best-effort: the sweep above already
+        // queued a close on those very components' connections, so most of the
+        // time a component learns by its own connection ending, which says the
+        // same thing.
         crate::peerchannel::cut_all(&self.state, crate::peerchannel::reason::SHUTDOWN);
         // The session and login tasks are held by the state (logout and flow
         // replacement go through it): stopped via their handles.

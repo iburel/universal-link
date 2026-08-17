@@ -143,7 +143,9 @@ pub(crate) mod reason {
     pub(crate) const LOGGED_OUT: &str = "LOGGED_OUT";
     /// This device was struck off the account it was speaking for.
     pub(crate) const ACCOUNT_LEFT: &str = "ACCOUNT_LEFT";
-    /// The Core is stopping.
+    /// The Core is stopping. Best-effort, and honestly so: the same teardown
+    /// closes the component's control connection, so this word usually loses
+    /// the race with the close that says the same thing.
     pub(crate) const SHUTDOWN: &str = "SHUTDOWN";
     /// A frame above the 1 KiB cap, in either direction.
     pub(crate) const FRAME_TOO_LARGE: &str = "FRAME_TOO_LARGE";
