@@ -1694,6 +1694,10 @@ a sentence rather than to something wrong:
   AppKit, which this component does not link. A display's `name` is its
   position in the active list ("Display 1" is the main one) and not the name a
   person gave it, which is `NSScreen.localizedName` and therefore AppKit too.
+  Whether an injected Caps Lock toggles a Mac's own lock is unknown and on the
+  live list: the lock is handled below the event system there, so posting the
+  keycode may do nothing, and the capture side (which reports a Mac's own Caps
+  Lock on its transition) is the half that is certainly right.
   And macOS has no `dwExtraInfo`: nothing marks an injected event as this
   component's own, so a tap cannot tell its own injection from a hand. Rule 3
   is what makes that safe in v1 (a machine being driven does not capture), and
