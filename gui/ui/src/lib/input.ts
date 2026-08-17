@@ -383,7 +383,18 @@ export function modifierWords(bits: number): string | null {
  * What a crossing's guards do, as sentences. The order is the chain's order
  * (section 7), because that is the order a refusal is reported in.
  */
-export function guardWords(guards: Partial<GuardValues>): string[] {
+export function guardWords(
+  guards: Partial<GuardValues>,
+  ghost = false,
+): string[] {
+  // A crossing into a screen that is away is a wall whatever the guards say, so
+  // saying "after a short pause at the edge" would be describing something that
+  // cannot happen. The place is kept and the pointer stops there.
+  if (ghost) {
+    return [
+      "The pointer stops at that edge: the screen across it is not connected right now.",
+    ];
+  }
   const g = { ...GUARD_DEFAULTS, ...guards };
   if (g.wall) return ["The pointer never crosses here."];
   const words: string[] = [];

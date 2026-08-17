@@ -16,6 +16,7 @@ import { mockIPC } from "@tauri-apps/api/mocks";
 import type {
   Component,
   Device,
+  InputState,
   PendingRequest,
   SessionState,
 } from "../lib/api";
@@ -63,6 +64,145 @@ const DEVICES: Device[] = [
   },
 ];
 
+const NODE_SELF = "1a".repeat(32);
+const NODE_MAC = "2b".repeat(32);
+const NODE_WIN = "3c".repeat(32);
+
+/**
+ * A desk worth looking at: this computer with two screens side by side, the
+ * Living Room PC to their right (so there is a real crossing to set guards on),
+ * and the MacBook's screen kept as a ghost, which is the case a plane exists for.
+ * Its own arrangement is what the engine would have derived.
+ */
+const INPUT: InputState = {
+  here: {
+    device_id: "d_self",
+    name: "Office PC",
+    monitors: [
+      {
+        id: "DP-1",
+        name: "Dell U2720Q",
+        w: 2560,
+        h: 1440,
+        x: 0,
+        y: 0,
+        scale: 1000,
+        primary: true,
+        present: true,
+      },
+      {
+        id: "HDMI-1",
+        name: "Second screen",
+        w: 1920,
+        h: 1080,
+        x: 2560,
+        y: 0,
+        scale: 1000,
+        primary: false,
+        present: true,
+      },
+    ],
+    problem: null,
+    can_drive: true,
+    can_be_driven: true,
+  },
+  plane: {
+    id: "7f3a91cc20b45de6a1740b9e3f28cd51",
+    by: "d_self",
+    spots: [
+      {
+        monitor: `${NODE_SELF}/DP-1`,
+        device_id: "d_self",
+        name: "Dell U2720Q",
+        x: 0,
+        y: 0,
+        w: 2560,
+        h: 1440,
+        present: true,
+        primary: true,
+      },
+      {
+        monitor: `${NODE_SELF}/HDMI-1`,
+        device_id: "d_self",
+        name: "Second screen",
+        x: 2560,
+        y: 0,
+        w: 1920,
+        h: 1080,
+        present: true,
+        primary: false,
+      },
+      {
+        monitor: `${NODE_WIN}/win:dev:0`,
+        device_id: "d_win",
+        name: "Living room TV",
+        x: 4480,
+        y: 0,
+        w: 1920,
+        h: 1080,
+        present: true,
+        primary: true,
+      },
+      // A ghost, exactly as the engine renders one: no name, not primary, and a
+      // nominal size, because the only thing anybody still knows about it is
+      // where it was.
+      {
+        monitor: `${NODE_MAC}/mac:1`,
+        device_id: "d_mac",
+        name: "",
+        x: -1920,
+        y: 200,
+        w: 1920,
+        h: 1080,
+        present: false,
+        primary: false,
+      },
+    ],
+  },
+  devices: [
+    {
+      device_id: "d_mac",
+      name: "MacBook",
+      state: "off",
+      monitors: [],
+      rtt_ms: null,
+      lan: false,
+      allowed: false,
+      drive: false,
+      mode: "typing",
+      problem: null,
+    },
+    {
+      device_id: "d_win",
+      name: "Living Room PC",
+      state: "ready",
+      monitors: [
+        {
+          id: "win:dev:0",
+          name: "Living room TV",
+          w: 1920,
+          h: 1080,
+          x: 0,
+          y: 0,
+          scale: 1000,
+          primary: true,
+          present: true,
+        },
+      ],
+      rtt_ms: 6,
+      lan: true,
+      allowed: true,
+      drive: true,
+      mode: "typing",
+      problem: null,
+    },
+  ],
+  session: null,
+  guards: [],
+  lock: false,
+  hotkey: ["ctrl", "alt", "Escape"],
+};
+
 const REQUEST: PendingRequest = {
   request_id: "r_clipnet",
   name: "clipnet",
@@ -104,12 +244,25 @@ export function installFakeCore(): void {
     oidc_client_secret: null as string | null,
   };
 
+  let input: InputState = INPUT;
+
   const changed = () => void emit("core:notification", {
     method: "session.changed",
     params: session,
   });
   const notify = (method: string, params: unknown) =>
     void emit("core:notification", { method, params });
+  /** The engine publishes its whole state after every change, so this does too. */
+  const inputChanged = () => notify("input.updated", { state: input });
+  const withPeer = (
+    device_id: string,
+    change: (peer: InputState["devices"][number]) => InputState["devices"][number],
+  ): InputState => ({
+    ...input,
+    devices: input.devices.map((peer) =>
+      peer.device_id === device_id ? change(peer) : peer,
+    ),
+  });
 
   /** What both `pairing.accept` and `pairing.claimed` carry. */
   const claimed = (pairing_id: string, role: string) => ({
@@ -277,6 +430,121 @@ export function installFakeCore(): void {
       components = components.filter((c) => c.component_id !== component_id);
       return {};
     },
+    // Keyboard and mouse. Enough of the engine to walk the Input tab in a
+    // browser: the gestures mutate this fake state and publish the whole
+    // snapshot, which is exactly the contract the real engine has.
+    "input.status": () => input,
+    "input.place": ({ spots }) => {
+      const placed = spots as unknown as { monitor: string; x: number; y: number }[];
+      input = {
+        ...input,
+        plane: {
+          ...input.plane,
+          by: "d_self",
+          spots: input.plane.spots.map((spot) => {
+            const at = placed.find((p) => p.monitor === spot.monitor);
+            return at ? { ...spot, x: at.x, y: at.y } : spot;
+          }),
+        },
+      };
+      inputChanged();
+      return {};
+    },
+    "input.allow": ({ device_id, allowed }) => {
+      input = withPeer(device_id, (peer) => ({
+        ...peer,
+        allowed: allowed as unknown as boolean,
+      }));
+      inputChanged();
+      return {};
+    },
+    "input.drive": ({ device_id, allowed }) => {
+      input = withPeer(device_id, (peer) => ({
+        ...peer,
+        drive: allowed as unknown as boolean,
+      }));
+      inputChanged();
+      return {};
+    },
+    "input.take": ({ device_id, mode }) => {
+      const peer = input.devices.find((d) => d.device_id === device_id);
+      if (!peer) throw rpc("INPUT_DEVICE_UNKNOWN");
+      if (!peer.drive) {
+        // The far side's word, learned by trying: a refusal, then the standing
+        // problem in the snapshot. The engine does exactly this.
+        setTimeout(() => {
+          notify("input.refused", {
+            device_id,
+            code: "NOT_ALLOWED",
+            count: 1,
+          });
+          input = withPeer(device_id, (p) => ({
+            ...p,
+            state: "refused",
+            problem: "not_allowed",
+          }));
+          inputChanged();
+        }, 300);
+        return {};
+      }
+      input = {
+        ...input,
+        session: {
+          device_id,
+          direction: "out",
+          mode: (mode as unknown as "full" | "keys") ?? "full",
+          since: Date.now(),
+          rtt_ms: peer.rtt_ms,
+        },
+      };
+      input = withPeer(device_id, (p) => ({ ...p, state: "driving" }));
+      inputChanged();
+      return {};
+    },
+    "input.release": () => {
+      const device_id = input.session?.device_id;
+      input = { ...input, session: null };
+      if (device_id) {
+        input = withPeer(device_id, (p) => ({ ...p, state: "ready" }));
+      }
+      inputChanged();
+      return {};
+    },
+    "input.guards": ({ device_id, monitor, side, guards }) => {
+      const set = guards as unknown as Record<string, number | boolean>;
+      const rest = input.guards.filter(
+        (g) => !(g.monitor === monitor && g.side === side),
+      );
+      input = {
+        ...input,
+        guards: [
+          ...rest,
+          {
+            device_id,
+            monitor,
+            side: side as unknown as "left" | "right" | "top" | "bottom",
+            dwell_ms: 250,
+            double_tap_ms: 0,
+            dead_corner: 16,
+            require_mods: 0,
+            wall: false,
+            ...set,
+          },
+        ],
+      };
+      inputChanged();
+      return {};
+    },
+    "input.lock": ({ locked }) => {
+      input = { ...input, lock: locked as unknown as boolean };
+      inputChanged();
+      return {};
+    },
+    "input.hotkey": ({ keys }) => {
+      input = { ...input, hotkey: keys as unknown as string[] };
+      inputChanged();
+      return {};
+    },
   };
 
   mockIPC(
@@ -334,6 +602,11 @@ export function installFakeCore(): void {
           "files.send",
           "transfers.read",
           "components.approve",
+          // Asked for optionally by the real shell, and granted by a Core of
+          // this version: without them the Input section does not exist, which
+          // is also worth being able to preview (drop them here).
+          "input.read",
+          "input.manage",
         ],
         api_version: 1,
       }),

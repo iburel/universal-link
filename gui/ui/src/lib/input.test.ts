@@ -391,6 +391,15 @@ test("the guards are words, and the wall says the whole truth on its own", () =>
   expect(strict.join(" ")).not.toContain("corners");
 });
 
+// A crossing into a screen that is away is a wall whatever the guards say, so
+// describing a dwell there would describe something that cannot happen.
+test("a crossing into a screen that is away is reported as the wall it is", () => {
+  const said = guardWords({ dwell_ms: 250 }, true);
+  expect(said).toHaveLength(1);
+  expect(said[0]).toContain("stops at that edge");
+  expect(said[0]).toContain("not connected right now");
+});
+
 test("a dwell nobody offered is shown as the number it is", () => {
   expect(guardWords({ dwell_ms: 1234 }).join(" ")).toContain("1234 ms");
   expect(dwellChoice(0)).toBe(0);

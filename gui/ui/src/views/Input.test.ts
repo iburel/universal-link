@@ -258,6 +258,18 @@ test("a screen that is away keeps its place and says so", () => {
   expect(ghost.style.left).not.toBe("0px");
 });
 
+// A box of empty space below the screens reads as a plane with somewhere to drag
+// to, and there is not: it is as tall as the arrangement.
+test("the plane is as tall as the arrangement, not as tall as its budget", () => {
+  const view = render(Input, { store });
+
+  const plane = view.querySelector(".plane") as HTMLElement;
+  // Two 1920x1080 screens side by side: 3840 wide, 1080 tall, so the height is
+  // the width's ratio away from 620 and nowhere near the 300 budget.
+  expect(plane.style.height).toBe("174px");
+  expect(plane.style.width).toBe("620px");
+});
+
 test("the plane invites the drag, and says how to detach one screen", () => {
   const view = render(Input, { store });
 
@@ -618,6 +630,34 @@ test("a stored wall is shown as set, and its words replace the rest", () => {
 
   expect(textOf(view)).toContain("The pointer never crosses here.");
   expect(byLabel(view, "Never cross to Desk")).toHaveProperty("checked", true);
+});
+
+// A crossing into a screen that is away is a wall, so the guards are not offered
+// as settings there: they are reported as the wall.
+test("a neighbour whose only screen is away is a wall, not a set of guards", () => {
+  ready({
+    plane: {
+      id: "f".repeat(32),
+      by: null,
+      spots: [
+        spot({ monitor: `${NODE_A}/A1` }),
+        spot({
+          monitor: `${NODE_B}/B1`,
+          device_id: "d_desk",
+          name: "",
+          x: 1920,
+          y: 0,
+          present: false,
+        }),
+      ],
+    },
+  });
+
+  const view = render(Input, { store });
+
+  expect(textOf(view)).toContain("The pointer stops at that edge");
+  expect(() => byLabel(view, "Never cross to Desk")).toThrow();
+  expect(() => byLabel(view, "Ask for a double tap toward Desk")).toThrow();
 });
 
 // A pair whose screens do not touch cannot be crossed to, and saying nothing

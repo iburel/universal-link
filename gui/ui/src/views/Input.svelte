@@ -59,6 +59,13 @@
       : 1,
   );
 
+  // Drawn as tall as the arrangement really is (never taller than the budget,
+  // never so short that a single screen has no room): a box of empty space below
+  // the screens reads as a plane with somewhere to drag to, and there is not.
+  const planeHeight = $derived(
+    Math.min(PLANE_H, Math.max(80, Math.round(bounds.h * scale))),
+  );
+
   const peers = $derived<InputPeer[]>(state?.devices ?? []);
   const hereId = $derived(state?.here.device_id ?? null);
   const ourKeys = $derived(
@@ -213,9 +220,18 @@
     return ourCrossings.filter((c) => c.device_id === device_id);
   }
 
+  /**
+   * The ones a pointer could really use. A crossing into a screen that is away is
+   * a wall whatever any guard says, so it is not offered as a setting: it is
+   * reported as the wall it is.
+   */
+  function crossable(device_id: string): Crossing[] {
+    return toward(device_id).filter((c) => !c.ghost);
+  }
+
   /** One guard change, applied to every crossing toward that machine. */
   async function guard(peer: InputPeer, change: Record<string, number | boolean>) {
-    for (const crossing of toward(peer.device_id)) {
+    for (const crossing of crossable(peer.device_id)) {
       const stored = guardsFor(state?.guards ?? [], crossing);
       await store.setGuards(peer.device_id, crossing.to, crossing.side, {
         dwell_ms: stored?.dwell_ms ?? 250,
@@ -230,13 +246,16 @@
 
   /** What the guards toward one machine do, said once for the whole pair. */
   function guardSummary(peer: InputPeer): string[] {
-    const crossing = toward(peer.device_id)[0];
+    const crossing = crossable(peer.device_id)[0] ?? toward(peer.device_id)[0];
     if (!crossing) return [];
-    return guardWords(guardsFor(state?.guards ?? [], crossing) ?? {});
+    return guardWords(
+      guardsFor(state?.guards ?? [], crossing) ?? {},
+      crossing.ghost,
+    );
   }
 
   function firstGuards(peer: InputPeer) {
-    const crossing = toward(peer.device_id)[0];
+    const crossing = crossable(peer.device_id)[0];
     return crossing ? guardsFor(state?.guards ?? [], crossing) : undefined;
   }
 
@@ -294,7 +313,7 @@
     <h2>Where your screens are</h2>
     <div
       class="plane"
-      style="width:{PLANE_W}px;height:{PLANE_H}px"
+      style="width:{PLANE_W}px;height:{planeHeight}px"
       aria-label="The screens of your computers"
     >
       {#each spots as spot (spot.monitor)}
@@ -420,46 +439,50 @@
             {#if path}<p class="meta">{path}</p>{/if}
             {#if problem}<p class="problem">{problem}</p>{/if}
 
-            {#if peer.state === "driving"}
-              <button {disabled} onclick={() => store.releaseInput()}>
-                Bring my keyboard back
-              </button>
-            {:else if confirming === peer.device_id}
+            {#if confirming === peer.device_id}
               <p class="confirm">
                 {slowPathWarning(peer.name, peer.rtt_ms ?? 0)}
               </p>
-              <button
-                {disabled}
-                aria-label="Send the keyboard alone to {peer.name}"
-                onclick={() => {
-                  confirming = null;
-                  void store.takeInput(peer.device_id, "keys");
-                }}>Keyboard only</button
-              >
-              {#if pointerVerdict(peer.rtt_ms) !== "refuse"}
+            {/if}
+            <div class="row">
+              {#if peer.state === "driving"}
+                <button {disabled} onclick={() => store.releaseInput()}>
+                  Bring my keyboard back
+                </button>
+              {:else if confirming === peer.device_id}
                 <button
                   {disabled}
-                  aria-label="Take the pointer to {peer.name} anyway"
+                  aria-label="Send the keyboard alone to {peer.name}"
                   onclick={() => {
                     confirming = null;
-                    void store.takeInput(peer.device_id, "full");
-                  }}>Take it anyway</button
+                    void store.takeInput(peer.device_id, "keys");
+                  }}>Keyboard only</button
+                >
+                {#if pointerVerdict(peer.rtt_ms) !== "refuse"}
+                  <button
+                    {disabled}
+                    aria-label="Take the pointer to {peer.name} anyway"
+                    onclick={() => {
+                      confirming = null;
+                      void store.takeInput(peer.device_id, "full");
+                    }}>Take it anyway</button
+                  >
+                {/if}
+                <button onclick={() => (confirming = null)}>Cancel</button>
+              {:else}
+                <button
+                  {disabled}
+                  aria-label="Take control of {peer.name}"
+                  onclick={() => askOrTake(peer)}>Take control</button
+                >
+                <button
+                  {disabled}
+                  aria-label="Send the keyboard alone to {peer.name}"
+                  onclick={() => store.takeInput(peer.device_id, "keys")}
+                  >Keyboard only</button
                 >
               {/if}
-              <button onclick={() => (confirming = null)}>Cancel</button>
-            {:else}
-              <button
-                {disabled}
-                aria-label="Take control of {peer.name}"
-                onclick={() => askOrTake(peer)}>Take control</button
-              >
-              <button
-                {disabled}
-                aria-label="Send the keyboard alone to {peer.name}"
-                onclick={() => store.takeInput(peer.device_id, "keys")}
-                >Keyboard only</button
-              >
-            {/if}
+            </div>
 
             {#if toward(peer.device_id).length > 0}
               {@const stored = firstGuards(peer)}
@@ -470,6 +493,7 @@
                     <li>{said}</li>
                   {/each}
                 </ul>
+                {#if crossable(peer.device_id).length > 0}
                 <label>
                   <input
                     type="checkbox"
@@ -515,6 +539,7 @@
                   />
                   Leave the corners alone, for menus and hot corners
                 </label>
+                {/if}
               </div>
             {:else}
               <p class="meta">
