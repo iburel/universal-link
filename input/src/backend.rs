@@ -367,14 +367,13 @@ pub enum Problem {
     /// (XWayland's RandR outputs carry no EDID) and nothing at all about XWayland,
     /// which is a true sentence in place of the one that mattered.
     ///
-    /// **What it still does not do**, named because a review named it: the
-    /// capability bits are unchanged under XWayland, so a peer being driven through
-    /// one is offered with no problem of its own. The local sentence is right and
-    /// the far side's is missing. Closing it means a new member in the frozen peer
-    /// vocabulary of doc/input-sharing.md section 12, which is a decision above this
-    /// ticket's pay grade; it is on the deferred list, and until then
-    /// `FORCE_X11_ENV` is an opt-in whose limits are documented where it is
-    /// defined.
+    /// **It also travels**, which took a second change to arrange. The capability
+    /// bits are unchanged under XWayland (this machine really can type, into X11
+    /// windows), so for a while a peer being driven through one was offered to the
+    /// driving side with no problem of its own: a person crossed to it, typed into a
+    /// native Wayland window and nothing happened, with nothing anywhere saying why.
+    /// [`Problem::as_peer`] is the mapping that closed it, and
+    /// [`PeerProblem::XWayland`] is the far side's half of this sentence.
     XWayland,
     /// A Wayland session with no D-Bus session bus, so the portals cannot even
     /// be asked. A compositor started from a tty without `dbus-run-session` is
@@ -485,6 +484,153 @@ impl Problem {
     /// cannot name is one we do not repeat to the interface as peer-chosen prose.
     pub fn parse(code: &str) -> Option<Problem> {
         Problem::ALL.iter().copied().find(|p| p.code() == code)
+    }
+
+    /// What THIS problem means for the machine on the other end of it, when that
+    /// machine is a target we could drive.
+    ///
+    /// The two vocabularies are separate on purpose (section 12: one is about this
+    /// computer, the other about a pair), and this is the one bridge between them.
+    /// It exists because a peer's `caps` already carries its `problem` code and the
+    /// snapshot used to drop it on the floor: it read `can_be_driven()` and nothing
+    /// else, so a peer that could type into HALF its windows was offered as a peer
+    /// with nothing wrong.
+    ///
+    /// **The match is exhaustive so that a new [`Problem`] cannot be added without
+    /// somebody deciding whether it has a far side.** Most of them do not, and the
+    /// reason is the same for all: they leave the peer unable to type at all, so
+    /// `can_be_driven()` is false and the snapshot already says `no_backend`, which is
+    /// both truer and more useful than repeating a local remedy that only the person
+    /// sitting at that other machine can carry out.
+    pub fn as_peer(self) -> Option<PeerProblem> {
+        match self {
+            // The one that is neither "all of it works" nor "none of it does".
+            Problem::XWayland => Some(PeerProblem::XWayland),
+            // Nothing there can type. The peer's own `caps` say so through
+            // `can_be_driven()`, and `no_backend` is where those arrive.
+            Problem::NoBackend
+            | Problem::NoPermission
+            | Problem::Wayland
+            | Problem::WaylandNoBus
+            | Problem::WaylandNoPortal
+            | Problem::WaylandPortalOld
+            | Problem::WaylandPortalRefused
+            | Problem::WaylandUntested => None,
+            // A pair whose target cannot tell its own screens apart is a real
+            // thing to know, and it is not a thing the driving side needs a
+            // REFUSAL slot for: the plane already keeps an absent screen's place
+            // and says so on the screen itself (section 6), and the one `problem`
+            // slot per device is worth more to a reason a person can act on. Giving
+            // it a peer code is a product decision about the plane's own wording,
+            // not this mapping's to take.
+            Problem::MonitorsUnstable => None,
+        }
+    }
+}
+
+/// What a PAIR cannot do: the far side's word, learned from its handshake or by
+/// trying (doc/input-sharing.md, section 12).
+///
+/// A separate vocabulary from [`Problem`], and separate on purpose: that one is
+/// about the computer a person is sitting at and names remedies they can carry out
+/// where they are, this one is about another computer and has to send them there, or
+/// tell them what will and will not work if they stay. Two of the codes are spelled
+/// the same in both ([`Problem::NoBackend`] and this one's `no_backend`, and now
+/// XWayland), because they are the same platform fact seen from the two ends, and
+/// the interface holds two different sentences for each.
+///
+/// Every member has a sentence in `gui/ui/src/lib/input.ts` and a name in
+/// `api.ts`'s `PeerProblem` union, and the test in this module reads both files to
+/// make sure of it. [`PeerProblem::position`] is what makes [`PeerProblem::ALL`]
+/// complete by construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerProblem {
+    /// The far side has no grant for this device. Its word, learned by trying:
+    /// grants are never replicated (section 9).
+    NotAllowed,
+    /// That computer is being driven by another already, or is driving one. One
+    /// keyboard, no preemption.
+    Busy,
+    /// Its pointer is pinned to its own screen, or it is locked and cannot be
+    /// driven at all.
+    Locked,
+    /// Nothing on that computer can type, or its permission is refused. Said from
+    /// the handshake alone, before anyone tries, which is what `caps` is on the wire
+    /// for.
+    NoBackend,
+    /// The deployment's relays are rendezvous-only above a cap (#88) and no direct
+    /// path formed.
+    NoPath,
+    /// The path to that computer is past the pointer threshold. **Reserved**:
+    /// nothing sets it in v1, because the threshold is enforced where a pointer is
+    /// actually asked for (`input.take` answers `INPUT_TOO_SLOW`) and the number an
+    /// interface would word it from is already in `rtt_ms`. It keeps its sentence
+    /// for the day something does.
+    TooSlow,
+    /// The two ends do not hold the same plane. Self-repairing: a layout round is
+    /// already running.
+    PlaneStale,
+    /// That computer is a Wayland desktop reached through its XWayland, so it can be
+    /// typed into and it cannot be typed into everywhere: X11 programs receive the
+    /// keyboard and the pointer, native Wayland ones receive nothing at all.
+    ///
+    /// **This is a partial success and it is the reason this member exists.** Every
+    /// other code here means a session did not happen; this one means a session
+    /// happens and then silently does nothing for most of the windows on that
+    /// screen, which is the "best effort that lies" the whole component is built to
+    /// forbid. It is read from the peer's own `caps.problem` (which already
+    /// travelled), never guessed, and it never blocks anything: a person told what
+    /// will work may perfectly well want it.
+    XWayland,
+}
+
+impl PeerProblem {
+    /// Every problem a pair can have, so a test can walk them. Complete by
+    /// construction through [`PeerProblem::position`], for the reason
+    /// [`Problem::ALL`] documents at length: a hand-written array silently falls
+    /// short, and every test that walks it then passes while a person is told this
+    /// version does not know why.
+    pub const ALL: &'static [PeerProblem] = &[
+        PeerProblem::NotAllowed,
+        PeerProblem::Busy,
+        PeerProblem::Locked,
+        PeerProblem::NoBackend,
+        PeerProblem::NoPath,
+        PeerProblem::TooSlow,
+        PeerProblem::PlaneStale,
+        PeerProblem::XWayland,
+    ];
+
+    /// Where this problem sits in [`PeerProblem::ALL`]. Exists only to make that
+    /// array exhaustive by construction: a new variant is a compile error here until
+    /// somebody gives it a position, and the test then checks the array holds it
+    /// there.
+    #[cfg(test)]
+    const fn position(self) -> usize {
+        match self {
+            PeerProblem::NotAllowed => 0,
+            PeerProblem::Busy => 1,
+            PeerProblem::Locked => 2,
+            PeerProblem::NoBackend => 3,
+            PeerProblem::NoPath => 4,
+            PeerProblem::TooSlow => 5,
+            PeerProblem::PlaneStale => 6,
+            PeerProblem::XWayland => 7,
+        }
+    }
+
+    /// The snapshot spelling (`input.status`'s per device `problem`).
+    pub fn code(self) -> &'static str {
+        match self {
+            PeerProblem::NotAllowed => "not_allowed",
+            PeerProblem::Busy => "busy",
+            PeerProblem::Locked => "locked",
+            PeerProblem::NoBackend => "no_backend",
+            PeerProblem::NoPath => "no_path",
+            PeerProblem::TooSlow => "too_slow",
+            PeerProblem::PlaneStale => "plane_stale",
+            PeerProblem::XWayland => "xwayland",
+        }
     }
 }
 
@@ -1067,6 +1213,121 @@ mod tests {
                 "{problem:?} is missing from the interface's InputProblem union"
             );
         }
+    }
+
+    /// The pair vocabulary gets the same two guarantees as the local one: no two
+    /// members share a code, and the array holds every member at the position the
+    /// enum's exhaustive match gives it.
+    #[test]
+    fn every_problem_a_pair_can_have_is_in_the_list_exactly_once() {
+        let mut codes: Vec<&str> = PeerProblem::ALL.iter().map(|p| p.code()).collect();
+        let before = codes.len();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(before, codes.len(), "two peer problems share a code");
+        for (index, problem) in PeerProblem::ALL.iter().enumerate() {
+            assert_eq!(
+                problem.position(),
+                index,
+                "{problem:?} sits at {index} in PeerProblem::ALL and says it belongs at {}",
+                problem.position()
+            );
+        }
+        assert_eq!(
+            PeerProblem::ALL.len(),
+            PeerProblem::XWayland.position() + 1,
+            "the array is shorter than the positions the enum defines"
+        );
+    }
+
+    /// **Every problem a pair can have has a sentence in the interface**, the same
+    /// check across the same language boundary as the one above it, for the other
+    /// vocabulary. A code with no sentence reaches a person as "reported a problem
+    /// this version does not know", which is the whole defect.
+    ///
+    /// The interface's own half of this bridge is stronger than a string scan and
+    /// worth naming here: `PEER_PROBLEMS` is typed `Record<PeerProblem, string>`, so
+    /// `tsc` refuses to compile a member with no sentence, and `input.test.ts` walks a
+    /// `Record<PeerProblem, true>` so a member added to the union cannot go
+    /// unexercised. This side is what catches the case those cannot see: a code minted
+    /// in Rust that never reached the union at all.
+    #[test]
+    fn every_problem_a_pair_can_have_has_a_sentence_in_the_interface() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let path = dir
+            .join("../gui/ui/src/lib/input.ts")
+            .canonicalize()
+            .expect("the interface's input module is where this crate's sibling GUI keeps it");
+        let source = std::fs::read_to_string(&path).expect("read the interface's input module");
+        // The table itself rather than the whole file: these codes are keys of one
+        // object, and a mention in a comment somewhere else in the module is not a
+        // sentence. `not_allowed` also appears in this file as an `input.allow`
+        // gesture's own wording, which a file-wide scan would have accepted.
+        let table = source
+            .split_once("const PEER_PROBLEMS")
+            .expect("the interface's table of pair sentences")
+            .1
+            .split_once("\n};")
+            .expect("the table ends")
+            .0;
+        for &problem in PeerProblem::ALL {
+            assert!(
+                table.contains(&format!("{}:", problem.code())),
+                "{problem:?} is reported by this build and PEER_PROBLEMS in {} has no sentence \
+                 for it, so a person hitting it is told this version does not know why",
+                path.display()
+            );
+        }
+
+        let types = dir
+            .join("../gui/ui/src/lib/api.ts")
+            .canonicalize()
+            .expect("the interface's api module");
+        let types = std::fs::read_to_string(&types).expect("read the interface's api module");
+        let union = types
+            .split_once("export type PeerProblem =")
+            .expect("the PeerProblem union")
+            .1
+            .split_once(';')
+            .expect("the union ends")
+            .0;
+        for &problem in PeerProblem::ALL {
+            assert!(
+                union.contains(&format!("\"{}\"", problem.code())),
+                "{problem:?} is missing from the interface's PeerProblem union"
+            );
+        }
+    }
+
+    /// The bridge between the two vocabularies, in the only direction it goes.
+    ///
+    /// The far side of an XWayland session is the one local problem with a pair
+    /// meaning, and it is a partial success rather than a failure: the peer can still
+    /// be driven, so nothing about it may be read as a refusal.
+    #[test]
+    fn a_local_problem_with_a_far_side_has_exactly_one() {
+        assert_eq!(Problem::XWayland.as_peer(), Some(PeerProblem::XWayland));
+        for &problem in Problem::ALL {
+            if let Some(peer) = problem.as_peer() {
+                assert_eq!(
+                    problem,
+                    Problem::XWayland,
+                    "{problem:?} gained a far side ({peer:?}): give it a row in section 12 \
+                     and a sentence, then say so here"
+                );
+                assert!(
+                    PeerProblem::ALL.contains(&peer),
+                    "{peer:?} is not in the pair vocabulary"
+                );
+            }
+        }
+        // Deliberately no assertion about the other nine here. The reason they map to
+        // nothing is that a machine reporting one cannot type at all, so its own
+        // capability bits already carry it to the driving side as `no_backend`, and
+        // that is a property of the three platform backends rather than of this enum:
+        // asserting it from a `Capabilities::none` would be a tautology dressed as
+        // coverage. What guards it is the exhaustive match itself, which stops a tenth
+        // problem from being added without somebody answering the question.
     }
 
     /// The `oops` codes have ONE spelling, the dialect's. Four of the five are

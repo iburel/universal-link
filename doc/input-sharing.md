@@ -1462,6 +1462,16 @@ of the one that mattered. The single `problem` slot therefore has a precedence,
 argued rather than accidental: nothing works, then most windows are out of reach,
 then the screens may swap places.
 
+**And it travels**, which is the half that matters to somebody else. That code goes
+out in the handshake's `caps` like any other, and the driving side turns it into the
+pair's own `xwayland` problem (section 12) with a sentence of its own. Without that
+last step the local sentence was right and the far side's was missing: a person
+crossed to such a machine, typed into a native Wayland window, and nothing happened
+with nothing anywhere saying why, which is the "best effort that lies" this whole
+component exists to forbid. It refuses nothing: the pair stays `ready`, because it
+really does type into the X11 windows on that screen and a person who knows that may
+well want it.
+
 ### Capture: the `InputCapture` portal, and libei is not optional
 
 The portal manages **when** input is captured and nothing else. Its own words:
@@ -1806,6 +1816,29 @@ snapshot either way. The column below says which of the two each code is.
 | `no_path` | `problem` | the deployment's relays are rendezvous-only above a cap (#88) and no direct path formed |
 | `too_slow` | `problem` | the path to that computer is past the pointer threshold. **Reserved**: nothing sets it in v1, because the threshold is enforced where a pointer is actually asked for (`input.take` answers `INPUT_TOO_SLOW`) and the number an interface would word it from is already in `rtt_ms`. An interface still needs its sentence, for the day something does |
 | `plane_stale` | `problem` | the two ends do not hold the same plane. Self-repairing: a layout round is already running |
+| `xwayland` | `problem` | that computer is a Wayland desktop reached through its XWayland: it types into X11 windows and native Wayland ones receive nothing. **The one code here that is not a failure**, so it never blocks a session and the state stays `ready` |
+
+**Two of these are the same word as a member of `here.problem`** (`no_backend`
+and `xwayland`), because they are one platform fact seen from the two ends, and
+the interface holds a different sentence for each end: one names a remedy where
+the person is standing, the other says what will and will not work on a machine
+they are about to type on.
+
+**Where a pair's problem comes from.** Two sources, and the precedence between
+them is remembered-first: a refusal the far side has just sent (or a channel that
+would not open) outranks the standing facts, because it is what just happened to
+the person and it names what to do next. Under it, the peer's own handshake:
+`caps` that cannot type at all is `no_backend`, and the peer's own `problem` code
+mapped through the one bridge between the two vocabularies (`Problem::as_peer`,
+an exhaustive match, so a new local code cannot be added without somebody
+deciding whether it has a far side). The standing half is DERIVED at snapshot
+time rather than stored, so a `hi` or an accepted session clearing the remembered
+half cannot erase it, and a peer that re-sends its handshake with different
+capabilities is followed rather than remembered wrongly. Nine of the ten local
+codes map to nothing, and for one reason: they leave a machine unable to type at
+all, so the capability bits already carry them as `no_backend`, which is both
+truer and more use than repeating a remedy only the person at that other machine
+can carry out.
 
 A malformed request is not an application state, and the engine emits the
 real JSON-RPC code rather than dressing one as an app code. It also checks
@@ -1859,7 +1892,7 @@ State = { "here": { "device_id", "name",       // this computer, so the plane
                          "mode": "typing" | "positional",
                          "problem": null | "not_allowed" | "busy" | "locked"
                                   | "no_backend" | "no_path" | "too_slow"
-                                  | "plane_stale" } ],
+                                  | "plane_stale" | "xwayland" } ],
           "session": null | { "device_id", "direction": "out" | "in",
                               "mode": "full" | "keys", "since": <ts>,
                               "rtt_ms": <n or null> },
@@ -1916,6 +1949,7 @@ that carry them.
 | `NO_PERMISSION` | `oops` | "Nothing was typed: 1Device is not allowed to type on that computer." |
 | `UNRESOLVED` | `oops` | "That key does not exist on the other computer's keyboard." |
 | `NO_DIRECT_PATH` | `problem: "no_path"` | "This account's relays do not carry a keyboard session. The two computers need a network they share." |
+| `xwayland` (a peer's) | `problem: "xwayland"` | "Your keyboard and mouse will reach only part of that computer: it is a Wayland desktop being driven through its X11 half. Programs that are X11 receive what you type; programs that speak Wayland directly, which on most desktops is nearly all of them, receive nothing at all." The one sentence here about a session that WORKS, said before somebody types into the half that will not answer, and it opens with what will happen rather than with what the session is called: "this is an XWayland session" is true and tells nobody anything about the window in front of them |
 | `INPUT_TOO_SLOW` | `input.take` | "That computer is <n> ms away, too far for the pointer to feel right. Its keyboard alone would work." |
 | `SLOW` | `stop` | "The connection to that computer slowed down, so your keyboard came back." |
 | `GONE` | `stop` | "Your keyboard came back: the session with that computer ended on its own." One code for three causes (this machine's capture died, its grant went away, the channel did), so the sentence says the one thing all three share, and `here.problem` carries the local half when there is one |

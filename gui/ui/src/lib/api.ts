@@ -199,7 +199,15 @@ export type InputProblem =
   | "wayland_portal_refused"
   | "wayland_untested";
 
-/** What a PAIR cannot do. The far side's word, learned by trying. */
+/**
+ * What a PAIR cannot do. The far side's word, learned from its handshake or by
+ * trying.
+ *
+ * `no_backend` and `xwayland` are spelled the same as their members of
+ * `InputProblem`, and mean the same platform fact seen from the other end: the
+ * sentences differ, because one is said to the person sitting at that computer and
+ * the other to the person about to type on it from somewhere else.
+ */
 export type PeerProblem =
   | "not_allowed"
   | "busy"
@@ -207,7 +215,8 @@ export type PeerProblem =
   | "no_backend"
   | "no_path"
   | "too_slow"
-  | "plane_stale";
+  | "plane_stale"
+  | "xwayland";
 
 /** Where a pair has got to. `refused` is a state, not an error. */
 export type PeerInputState =
