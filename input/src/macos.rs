@@ -1036,11 +1036,20 @@ impl MacBackend {
         // round trip and this is the 125 Hz path; a `CFRetained<CGEventSource>` is not `Send`,
         // so it cannot live in the handle the engine clones across threads, and a thread local
         // is the shape that fits. Truth 4's non-deprecated cure is applied to it at creation.
-        SOURCE.with(|source| {
+        // `try_with` and not `with`: the latter PANICS when the thread local is already
+        // destroyed, which is a thread on its way out, and a panic on the injection path is
+        // worse than an injection with no source (which every arm of `post` accepts, because
+        // the API does).
+        let with_source = SOURCE.try_with(|source| {
             for action in &actions {
                 self.post(source.as_deref(), action);
             }
         });
+        if with_source.is_err() {
+            for action in &actions {
+                self.post(None, action);
+            }
+        }
     }
 
     /// [`screen_is_locked`], asked at most once every [`LOCK_POLL`].
