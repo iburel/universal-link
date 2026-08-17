@@ -143,8 +143,28 @@ const FAKE_DEVICE: u8 = 0;
 /// One wheel notch, as X11 counts them: a button press and release.
 const WHEEL_PIXELS_PER_NOTCH: i32 = 120;
 
+/// One line to the standard error, and never a panic.
+///
+/// `eprintln!` PANICS when the write fails, and a supervised component's stderr can be closed
+/// or full. Every caller here is on the loop's own thread, so a panic would unwind into
+/// `Drop for Backend` and be survivable, but a warning is not worth a stop either way.
 fn warn(message: &str) {
-    eprintln!("[1device-input] {message}");
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "[1device-input] {message}");
+}
+
+/// Which of the four control upcalls this is, so at most one of each kind is deferred.
+///
+/// A number rather than `std::mem::discriminant`, because `LayoutChanged` carries fields and
+/// two of them with different fields are still the same FACT: the newest one is the truth.
+fn control_kind(event: &BackendEvent) -> u8 {
+    match event {
+        BackendEvent::LayoutChanged { .. } => 0,
+        BackendEvent::CapabilitiesChanged => 1,
+        BackendEvent::MonitorsChanged => 2,
+        BackendEvent::CaptureLost(_) => 3,
+        _ => 4,
+    }
 }
 
 // ------------------------------------------------------------- the key table
@@ -775,10 +795,21 @@ impl Backend {
             Err(TrySendError::Closed(_)) => self.engine_gone = true,
             Err(TrySendError::Full(event)) => {
                 if control {
-                    // Bounded: the four control events are few and idempotent enough that
-                    // a queue of them cannot grow without the engine having stopped
-                    // draining entirely, which the closed arm above catches.
-                    if self.deferred.len() < 32 {
+                    // At most one per KIND, which is what makes this need no cap at all.
+                    // All four are idempotent FACTS rather than moments, so the newest of a
+                    // kind says everything an older one did. It used to be a flat cap of 32
+                    // events, which silently dropped everything past it: a mode set emits a
+                    // `MonitorsChanged` per CRTC, so 32 of those could fill the buffer while
+                    // the engine was stalled and the `LayoutChanged` behind them, whose loss
+                    // strands a held key for ever, would be the one thrown away.
+                    let kind = control_kind(&event);
+                    if let Some(slot) = self
+                        .deferred
+                        .iter_mut()
+                        .find(|held| control_kind(held) == kind)
+                    {
+                        *slot = event;
+                    } else {
                         self.deferred.push(event);
                     }
                     return;
@@ -792,6 +823,8 @@ impl Backend {
     }
 
     /// Tries the control upcalls a full queue turned away.
+    ///
+    /// One per kind is held (see `emit`), so this is at most four sends.
     fn retry_deferred(&mut self) {
         if self.deferred.is_empty() {
             return;
@@ -825,6 +858,14 @@ impl Backend {
             // buffered during that read), so it would not fire again.
             self.retry_deferred();
             self.process_cmds();
+            // Asked here as well as learned in `emit`, because `emit` only learns it when
+            // there is something to send. The state in which this machine has keys physically
+            // DOWN is `driven`, which is capture Off: no grab, no raw events selected, nothing
+            // that can ever emit. So the one case that matters most is the one traffic alone
+            // would never notice.
+            if self.events_tx.is_closed() {
+                self.engine_gone = true;
+            }
             if self.engine_gone {
                 if self.gone_seen || self.exit_code.is_some() {
                     if self.exit_code.is_none() {
@@ -854,6 +895,13 @@ impl Backend {
             guard.drain(..).collect()
         };
         for cmd in drained {
+            // Nothing queued behind an `Exit` runs. The teardown that follows would undo it
+            // anyway on this platform, so this is tidiness here; the same `break` is not
+            // tidiness on macOS, where a `Capture` behind an `Exit` can put a permission
+            // dialog on the screen of a component that is shutting down.
+            if self.shutdown {
+                break;
+            }
             match cmd {
                 Cmd::Capture(mode) => self.set_capture(mode),
                 Cmd::Confine(rect) => self.set_confine(rect),
@@ -1399,14 +1447,23 @@ impl Backend {
             self.fake(FAKE_KEY_RELEASE, spare, 0, 0);
             self.sync();
         }
-        self.unbind_spare();
+        self.unbind_spare(false);
     }
 
     /// Puts the spare keycode back to nothing.
     ///
     /// Called at the end of a `Text` and again from every teardown, because a keymap
     /// change outlives the client that made it (see [`Backend::spare_bound`]).
-    fn unbind_spare(&mut self) {
+    ///
+    /// `teardown` is what tells the ordinary call from the last one. A `sync` here is a
+    /// `wait_for_reply` with no timeout, and there is no timeout to give it: a server that is
+    /// alive but WEDGED (a client holding `GrabServer` and then hanging, which a screen locker
+    /// or a window manager mid-operation can be) would hang the teardown for ever, and then
+    /// `main` never exits, so the supervisor's `wait` never returns and nothing ever restarts
+    /// this component. At teardown the request only has to be SENT: a flush writes it to the
+    /// socket, and the server applies what it has already read whether this process is still
+    /// there or not.
+    fn unbind_spare(&mut self, teardown: bool) {
         if !self.spare_bound {
             return;
         }
@@ -1424,7 +1481,11 @@ impl Backend {
             keysyms: &empty,
         });
         self.spare_bound = false;
-        self.sync();
+        if teardown {
+            let _ = self.conn.flush();
+        } else {
+            self.sync();
+        }
     }
 
     /// One round trip, for the ordering the Unicode path needs.
@@ -1989,16 +2050,19 @@ impl Backend {
         self.wheel_x = 0;
         self.wheel_y = 0;
         // The one thing the server will not undo for us.
-        self.unbind_spare();
+        self.unbind_spare(true);
         // And the commands nobody will ever answer: an answering downcall's reply
         // travels INSIDE its queued command, so a `monitors` or a `resolve` pushed after
         // the last turn would leave its sender in the queue and its caller awaiting a
         // future that can never resolve. Dropping them here resolves each one to the
         // neutral answer its own documentation promises.
-        if let Ok(mut queue) = self.cmds.lock() {
-            queue.clear();
-        } else if let Err(p) = self.cmds.lock() {
-            p.into_inner().clear();
+        // One `lock`, not two. The `if let Ok(..) else if let Err(..)` this replaces took the
+        // lock a second time in the `else`, which is a self deadlock on any edition that keeps
+        // the scrutinee's temporary alive across the arm: it happened to be safe under this
+        // crate's edition and was not something to leave resting on that.
+        match self.cmds.lock() {
+            Ok(mut queue) => queue.clear(),
+            Err(p) => p.into_inner().clear(),
         }
         let _ = self.conn.flush();
     }
@@ -2095,12 +2159,29 @@ fn spend_pixels(accumulator: &mut i64) -> i32 {
 /// that made them, and the X server undoes every one of them when that client's
 /// connection closes. So a component that dies holding this machine's keyboard cannot
 /// leave it swallowed: the socket closing is the release. That is a property of the
-/// protocol rather than of this code, it is the reason this function has no "clear
-/// what a predecessor left" step where the Windows one does, and the live suite proves
-/// it by killing a process mid-grab rather than by asserting it.
+/// protocol rather than of this code, and the live suite proves it by killing a process
+/// mid-grab rather than by asserting it.
 ///
-/// What is NOT covered, and is the engine's business rather than this backend's: the
-/// keys a dead run left pressed through XTEST. Those are in `held.json` and are
+/// # The one thing this function CANNOT clear, and the honest size of it
+///
+/// The keymap is the exception, and it is the exception because it is the one piece of
+/// state the server keeps for the whole session no matter who made it (see
+/// [`Backend::spare_bound`]). A run that dies while the Unicode path has the spare
+/// keycode bound leaves that keysym on that keycode for every client until the X
+/// session ends, and the next start cannot find it: `refresh_spare` chooses a keycode
+/// whose entry is entirely `NO_SYMBOL`, so a keycode a predecessor left BOUND is by
+/// construction never the one picked and never the one cleared.
+///
+/// Nothing here fixes that, deliberately, and this is what it costs: the window is the
+/// few milliseconds of one `Text` injection, every ordinary teardown (including an
+/// unwinding panic, through `Drop`) does unbind it, and what is left behind is one
+/// keysym on a keycode no physical key produces, so nothing types it and nothing else
+/// breaks. Clearing it properly means writing the chosen keycode down where the next
+/// start can read it, which means the state directory reaching this backend, which the
+/// seam does not carry today. It is on the deferred list rather than guessed at here.
+///
+/// What is NOT covered either, and is the engine's business rather than this backend's:
+/// the keys a dead run left pressed through XTEST. Those are in `held.json` and are
 /// released at the next start.
 pub fn create() -> Result<crate::os::Created, Unsupported> {
     let (conn, screen_num) = xcb::Connection::connect_with_extensions(

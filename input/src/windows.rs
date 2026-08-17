@@ -951,80 +951,82 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
     if code != HC_ACTION {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     }
-    let swallow = HOOK_SHARED
-        .try_with(|cell| {
-            let Some(shared) = cell.get() else {
-                return false;
-            };
-            let mode = shared.mode();
-            if mode == MODE_OFF {
-                return false;
-            }
-            // SAFETY: the OS's own structure, valid for this call.
-            let info = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
-            if info.dwExtraInfo == MARKER {
-                // Our own injection coming back round. It never happens in v1 (a
-                // machine being driven does not capture) and dropping it costs nothing
-                // if that ever changes.
-                return false;
-            }
-            let down = info.flags & LLKHF_UP == 0;
-            let extended = info.flags & LLKHF_EXTENDED != 0;
-            let vk = info.vkCode as u16;
-            let scancode = if extended {
-                0xE000 | (info.scanCode as u16 & 0xFF)
-            } else {
-                info.scanCode as u16 & 0xFF
-            };
-
-            // The modifier state, kept here because a swallowed modifier never reaches the
-            // OS's own keyboard state. Per KEY and not per canonical bit, so letting go of
-            // one of two held Shifts does not clear a modifier the other is still holding:
-            // that phantom un-Shift made every symbol read off the layout come out lower
-            // case while a Shift was visibly down.
-            let mut mods = shared.track_mod_key(vk, down);
-            // The virtual key first for the two keys whose scancode is shared, then the
-            // scancode, which is what a layout cannot move and what a game reads.
-            let usage = AMBIGUOUS_VK
-                .iter()
-                .find(|(v, _)| *v == vk)
-                .map(|(_, usage)| *usage)
-                .or_else(|| usage_of_scancode(scancode))
-                .unwrap_or(0);
-            let is_lock = usage != 0 && keys::is_lock(usage);
-            if is_lock && down {
-                // A lock toggles on the press. Tracked rather than read back, for the
-                // same reason as the modifiers.
-                let bit = match usage & 0xFFFF {
-                    0x39 => keys::mods::CAPS,
-                    0x53 => keys::mods::NUM,
-                    _ => keys::mods::SCROLL,
+    let swallow = catching(|| {
+        HOOK_SHARED
+            .try_with(|cell| {
+                let Some(shared) = cell.get() else {
+                    return false;
                 };
-                mods = shared.toggle_lock(bit, mods);
-            }
+                let mode = shared.mode();
+                if mode == MODE_OFF {
+                    return false;
+                }
+                // SAFETY: the OS's own structure, valid for this call.
+                let info = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
+                if info.dwExtraInfo == MARKER {
+                    // Our own injection coming back round. It never happens in v1 (a
+                    // machine being driven does not capture) and dropping it costs nothing
+                    // if that ever changes.
+                    return false;
+                }
+                let down = info.flags & LLKHF_UP == 0;
+                let extended = info.flags & LLKHF_EXTENDED != 0;
+                let vk = info.vkCode as u16;
+                let scancode = if extended {
+                    0xE000 | (info.scanCode as u16 & 0xFF)
+                } else {
+                    info.scanCode as u16 & 0xFF
+                };
 
-            // A half duplex lock reports only its press: a target that waited for the
-            // release would hold the lock down for ever, and one that replayed the
-            // release would toggle it back.
-            if is_lock && !down {
-                return mode == MODE_SWALLOW;
-            }
+                // The modifier state, kept here because a swallowed modifier never reaches the
+                // OS's own keyboard state. Per KEY and not per canonical bit, so letting go of
+                // one of two held Shifts does not clear a modifier the other is still holding:
+                // that phantom un-Shift made every symbol read off the layout come out lower
+                // case while a Shift was visibly down.
+                let mut mods = shared.track_mod_key(vk, down);
+                // The virtual key first for the two keys whose scancode is shared, then the
+                // scancode, which is what a layout cannot move and what a game reads.
+                let usage = AMBIGUOUS_VK
+                    .iter()
+                    .find(|(v, _)| *v == vk)
+                    .map(|(_, usage)| *usage)
+                    .or_else(|| usage_of_scancode(scancode))
+                    .unwrap_or(0);
+                let is_lock = usage != 0 && keys::is_lock(usage);
+                if is_lock && down {
+                    // A lock toggles on the press. Tracked rather than read back, for the
+                    // same reason as the modifiers.
+                    let bit = match usage & 0xFFFF {
+                        0x39 => keys::mods::CAPS,
+                        0x53 => keys::mods::NUM,
+                        _ => keys::mods::SCROLL,
+                    };
+                    mods = shared.toggle_lock(bit, mods);
+                }
 
-            let sym = symbol_for(vk, scancode, mods);
-            shared.emit(BackendEvent::Key(crate::backend::KeyEvent {
-                usage,
-                key: (usage != 0)
-                    .then(|| keys::name_of(usage))
-                    .flatten()
-                    .map(str::to_string),
-                sym,
-                mods,
-                down,
-                lock: is_lock,
-            }));
-            mode == MODE_SWALLOW
-        })
-        .unwrap_or(false);
+                // A half duplex lock reports only its press: a target that waited for the
+                // release would hold the lock down for ever, and one that replayed the
+                // release would toggle it back.
+                if is_lock && !down {
+                    return mode == MODE_SWALLOW;
+                }
+
+                let sym = symbol_for(vk, scancode, mods);
+                shared.emit(BackendEvent::Key(crate::backend::KeyEvent {
+                    usage,
+                    key: (usage != 0)
+                        .then(|| keys::name_of(usage))
+                        .flatten()
+                        .map(str::to_string),
+                    sym,
+                    mods,
+                    down,
+                    lock: is_lock,
+                }));
+                mode == MODE_SWALLOW
+            })
+            .unwrap_or(false)
+    });
     if swallow {
         return 1;
     }
@@ -1119,124 +1121,139 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
     if code != HC_ACTION {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     }
-    let swallow = HOOK_SHARED
-        .try_with(|cell| {
-            let Some(shared) = cell.get() else {
-                return false;
-            };
-            let mode = shared.mode();
-            if mode == MODE_OFF {
-                return false;
-            }
-            // SAFETY: the OS's own structure, valid for this call.
-            let info = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
-            if info.dwExtraInfo == MARKER {
-                return false;
-            }
-            let swallow = mode == MODE_SWALLOW;
-            match wparam as u32 {
-                WM_MOUSEMOVE => {
-                    // Our own warp, recognised by where it was going. PASSED THROUGH rather
-                    // than swallowed (a swallowed warp is a pointer that never comes home)
-                    // and not reported (a reported one is a phantom delta the engine reads
-                    // as a hand). See `Shared::warp`.
-                    let armed = shared.warp.load(Ordering::Acquire);
-                    let at = Point {
-                        x: info.pt.x,
-                        y: info.pt.y,
-                    };
-                    if armed != NO_WARP && pack(at) == armed {
-                        shared.warp.store(NO_WARP, Ordering::Release);
-                        return false;
-                    }
-                    // Truth 1: the cursor has NOT moved yet, so this subtraction is the
-                    // accelerated delta of this one event. `at` is where the pointer
-                    // actually is, which keeps it inside this machine's desktop even
-                    // when the intended point is not, and the engine adds the delta back
-                    // on to ask whether an edge was crossed.
-                    let mut cur = POINT { x: 0, y: 0 };
-                    // SAFETY: an out parameter we own.
-                    if unsafe { GetCursorPos(&mut cur) } == 0 {
-                        return swallow;
-                    }
-                    let (dx, dy) = (info.pt.x - cur.x, info.pt.y - cur.y);
-                    if dx != 0 || dy != 0 {
-                        shared.emit(BackendEvent::Motion(crate::backend::Motion {
-                            at: Point { x: cur.x, y: cur.y },
-                            dx,
-                            dy,
-                        }));
-                    }
-                    // The pointer only drifts off the anchor if something else moved it
-                    // (an injection by another tool, or a hook Windows dropped), because
-                    // a swallowed move never reaches the cursor. So this is a no-op in
-                    // the ordinary case and the repair in the case that matters.
-                    if shared.confined.load(Ordering::Acquire) {
-                        let anchor = shared.anchor();
-                        let far = (cur.x - anchor.x).saturating_abs() > DRIFT_SLACK
-                            || (cur.y - anchor.y).saturating_abs() > DRIFT_SLACK;
-                        if far {
-                            shared.warp.store(pack(anchor), Ordering::Release);
-                            // SAFETY: a coordinate pair.
-                            unsafe { SetCursorPos(anchor.x, anchor.y) };
+    let swallow = catching(|| {
+        HOOK_SHARED
+            .try_with(|cell| {
+                let Some(shared) = cell.get() else {
+                    return false;
+                };
+                let mode = shared.mode();
+                if mode == MODE_OFF {
+                    return false;
+                }
+                // SAFETY: the OS's own structure, valid for this call.
+                let info = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
+                if info.dwExtraInfo == MARKER {
+                    return false;
+                }
+                let swallow = mode == MODE_SWALLOW;
+                match wparam as u32 {
+                    WM_MOUSEMOVE => {
+                        // Our own warp, recognised by where it was going. PASSED THROUGH rather
+                        // than swallowed (a swallowed warp is a pointer that never comes home)
+                        // and not reported (a reported one is a phantom delta the engine reads
+                        // as a hand). See `Shared::warp`.
+                        let armed = shared.warp.load(Ordering::Acquire);
+                        let at = Point {
+                            x: info.pt.x,
+                            y: info.pt.y,
+                        };
+                        if armed != NO_WARP && pack(at) == armed {
+                            shared.warp.store(NO_WARP, Ordering::Release);
+                            return false;
+                        }
+                        // Truth 1: the cursor has NOT moved yet, so this subtraction is the
+                        // accelerated delta of this one event. `at` is where the pointer
+                        // actually is, which keeps it inside this machine's desktop even
+                        // when the intended point is not, and the engine adds the delta back
+                        // on to ask whether an edge was crossed.
+                        let mut cur = POINT { x: 0, y: 0 };
+                        // SAFETY: an out parameter we own.
+                        if unsafe { GetCursorPos(&mut cur) } == 0 {
+                            return swallow;
+                        }
+                        let (dx, dy) = (info.pt.x - cur.x, info.pt.y - cur.y);
+                        if dx != 0 || dy != 0 {
+                            shared.emit(BackendEvent::Motion(crate::backend::Motion {
+                                at: Point { x: cur.x, y: cur.y },
+                                dx,
+                                dy,
+                            }));
+                        }
+                        // The pointer only drifts off the anchor if something else moved it
+                        // (an injection by another tool, or a hook Windows dropped), because
+                        // a swallowed move never reaches the cursor. So this is a no-op in
+                        // the ordinary case and the repair in the case that matters.
+                        if shared.confined.load(Ordering::Acquire) {
+                            let anchor = shared.anchor();
+                            let far = (cur.x - anchor.x).saturating_abs() > DRIFT_SLACK
+                                || (cur.y - anchor.y).saturating_abs() > DRIFT_SLACK;
+                            if far {
+                                shared.warp.store(pack(anchor), Ordering::Release);
+                                // SAFETY: a coordinate pair.
+                                unsafe { SetCursorPos(anchor.x, anchor.y) };
+                            }
                         }
                     }
-                }
-                WM_LBUTTONDOWN => shared.emit(button(1, true)),
-                WM_LBUTTONUP => shared.emit(button(1, false)),
-                WM_MBUTTONDOWN => shared.emit(button(2, true)),
-                WM_MBUTTONUP => shared.emit(button(2, false)),
-                WM_RBUTTONDOWN => shared.emit(button(3, true)),
-                WM_RBUTTONUP => shared.emit(button(3, false)),
-                WM_XBUTTONDOWN | WM_XBUTTONUP => {
-                    // Exactly the two the dialect has a number for. A gaming mouse's third
-                    // or fourth side button reports 0x0004 or 0x0008 here, and calling one
-                    // of those "forward" would have the target navigate forward when nobody
-                    // asked it to.
-                    let which = (info.mouseData >> 16) as u16;
-                    let n = match which {
-                        w if w == XBUTTON1 => 4,
-                        w if w == XBUTTON2_ID => 5,
-                        _ => return swallow,
-                    };
-                    shared.emit(button(n, wparam as u32 == WM_XBUTTONDOWN));
-                }
-                WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
-                    let raw = i32::from((info.mouseData >> 16) as i16);
-                    let horizontal = wparam as u32 == WM_MOUSEHWHEEL;
-                    let acc = if horizontal {
-                        &shared.wheel_x
-                    } else {
-                        &shared.wheel_y
-                    };
-                    // Whole notches out, the remainder kept: a high resolution wheel
-                    // sends a fraction of a notch per event, and rounding each one to
-                    // zero would make it scroll nothing at all.
-                    let total = acc.fetch_add(raw, Ordering::Relaxed) + raw;
-                    let notches = total / WHEEL_DELTA_I32;
-                    if notches != 0 {
-                        acc.fetch_sub(notches * WHEEL_DELTA_I32, Ordering::Relaxed);
-                        let (dx, dy) = if horizontal {
-                            (notches, 0)
-                        } else {
-                            (0, notches)
+                    WM_LBUTTONDOWN => shared.emit(button(1, true)),
+                    WM_LBUTTONUP => shared.emit(button(1, false)),
+                    WM_MBUTTONDOWN => shared.emit(button(2, true)),
+                    WM_MBUTTONUP => shared.emit(button(2, false)),
+                    WM_RBUTTONDOWN => shared.emit(button(3, true)),
+                    WM_RBUTTONUP => shared.emit(button(3, false)),
+                    WM_XBUTTONDOWN | WM_XBUTTONUP => {
+                        // Exactly the two the dialect has a number for. A gaming mouse's third
+                        // or fourth side button reports 0x0004 or 0x0008 here, and calling one
+                        // of those "forward" would have the target navigate forward when nobody
+                        // asked it to.
+                        let which = (info.mouseData >> 16) as u16;
+                        let n = match which {
+                            w if w == XBUTTON1 => 4,
+                            w if w == XBUTTON2_ID => 5,
+                            _ => return swallow,
                         };
-                        shared.emit(BackendEvent::Wheel {
-                            dx,
-                            dy,
-                            pixels: false,
-                        });
+                        shared.emit(button(n, wparam as u32 == WM_XBUTTONDOWN));
                     }
+                    WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+                        let raw = i32::from((info.mouseData >> 16) as i16);
+                        let horizontal = wparam as u32 == WM_MOUSEHWHEEL;
+                        let acc = if horizontal {
+                            &shared.wheel_x
+                        } else {
+                            &shared.wheel_y
+                        };
+                        // Whole notches out, the remainder kept: a high resolution wheel
+                        // sends a fraction of a notch per event, and rounding each one to
+                        // zero would make it scroll nothing at all.
+                        let total = acc.fetch_add(raw, Ordering::Relaxed) + raw;
+                        let notches = total / WHEEL_DELTA_I32;
+                        if notches != 0 {
+                            acc.fetch_sub(notches * WHEEL_DELTA_I32, Ordering::Relaxed);
+                            let (dx, dy) = if horizontal {
+                                (notches, 0)
+                            } else {
+                                (0, notches)
+                            };
+                            shared.emit(BackendEvent::Wheel {
+                                dx,
+                                dy,
+                                pixels: false,
+                            });
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }
-            swallow
-        })
-        .unwrap_or(false);
+                swallow
+            })
+            .unwrap_or(false)
+    });
     if swallow {
         return 1;
     }
     unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+}
+
+/// Runs a hook callback's body, and treats a panic as "let the event through".
+///
+/// A panic across an `extern "system"` boundary ABORTS the process (Rust makes it an abort
+/// rather than undefined behaviour, which is the safe half), and an abort while this backend
+/// holds a cursor clip leaves that clip for the next start to clear. Neither half is
+/// acceptable for a bug in a callback that runs on every keystroke, and the answer costs
+/// nothing: the panic is caught, the event is PASSED THROUGH rather than swallowed, and the
+/// session degrades to one that observes nothing instead of a machine whose keyboard is
+/// gone. The panic message still reaches the log through the ordinary hook.
+fn catching(body: impl FnOnce() -> bool) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or(false)
 }
 
 fn button(button: u8, down: bool) -> BackendEvent {
@@ -2063,6 +2080,11 @@ impl Backend {
             guard.drain(..).collect()
         };
         for cmd in drained {
+            // Nothing queued behind an `Exit` runs: the teardown that follows would undo it
+            // anyway, and a hook installed on the way out is a hook that has to come off again.
+            if self.shutdown {
+                break;
+            }
             match cmd {
                 Cmd::Capture(mode) => self.set_capture(mode),
                 Cmd::Exit(code) => {
@@ -2169,6 +2191,13 @@ impl Backend {
     ///
     /// SAFETY: called from `run` with no other borrow of `self` live.
     unsafe fn periodic(&mut self) {
+        // Asked here as well as learned in `emit`, because `emit` only learns it when there is
+        // something to send. The state in which this machine has keys physically DOWN is
+        // `driven`, which is capture Off: no hooks installed, nothing that can ever emit. So
+        // the one case that matters most is the one traffic alone would never notice.
+        if self.shared.events_tx.is_closed() {
+            self.shared.engine_gone.store(true, Ordering::Relaxed);
+        }
         if self.shared.engine_gone.load(Ordering::Relaxed) {
             // ONE more turn before acting on it, and only then. `main` drops the receiver
             // when the engine returns and only then calls `request_exit`, so at a clean

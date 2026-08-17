@@ -46,7 +46,26 @@ fn main() {
             .enable_all()
             .build()
             .expect("tokio runtime");
-        let code = runtime.block_on(onedevice_input::supervised(brain_backend, backend_events));
+        // CAUGHT, and this is the whole reason the two lines below it are reachable at all. A
+        // panic anywhere in the engine unwinds through `block_on` and drops the runtime on the
+        // way out, and `Runtime::drop` waits for every blocking task: the engine leaves one
+        // behind for ever (the read on standard input that is its stop signal), so the unwind
+        // parks in the destructor and this thread never reaches `request_exit`. The main thread
+        // then pumps for ever, the process never exits, and the supervisor's `wait` never
+        // returns, so the restart that would have released the keys a session left down never
+        // happens. A panicking engine has to be able to take the process down with it.
+        let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(onedevice_input::supervised(brain_backend, backend_events))
+        }))
+        .unwrap_or_else(|_| {
+            // 1, which is the supervisor's signal to restart. That is exactly what should
+            // happen: a fresh process re-reads `held.json` and releases what this one left.
+            let _ = std::io::Write::write_all(
+                &mut std::io::stderr(),
+                b"[1device-input] the engine's loop panicked; stopping so it can be restarted\n",
+            );
+            1
+        });
         // NOT a plain drop of the runtime: it waits for every blocking task, and
         // the engine leaves one behind for ever, the read on standard input that
         // is its stop signal, which only ends when the supervisor closes it.
