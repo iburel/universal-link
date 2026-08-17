@@ -675,6 +675,9 @@ on two devices, carrying OPAQUE bytes the Core interprets in no way.
   worded by the Core that saw the CAUSE: the side that replaced, revoked or
   logged out names it, and the far side hears `PEER_GONE`, because a closed
   stream carries no reason and no control frame lives inside an opaque pipe.
+  A channel authorized but not yet started when the trust ends (the token
+  minted, the second connection not yet made) never starts, and its component
+  is told with the same reason its siblings got.
 - **What it deliberately is not**: no store and forward, no reconnection
   logic (the component retries on its own schedule, and the `devices` topic
   already says when a peer is reachable again), no interpretation, and no

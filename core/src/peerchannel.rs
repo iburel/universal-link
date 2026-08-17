@@ -674,6 +674,14 @@ async fn pipe(
     // Milliseconds since this pipe started, written by both directions and read
     // by the vigil: the idle budget is about the CHANNEL, not about one
     // direction, so a peer typing while the local end stays silent is not idle.
+    //
+    // It is also what bounds a stuck WRITE, and deliberately the only thing that
+    // does. Neither direction wraps its I/O in a no-progress budget of its own
+    // (the rest of the data plane does): here a write that does not complete is
+    // BACKPRESSURE, the very property this pipe exists for, and cutting a
+    // channel because a component is a few frames behind would be a bug rather
+    // than a guardrail. A stuck write stops advancing this mark, so a genuinely
+    // wedged end is swept by the idle budget while a merely slow one is not.
     let born = Instant::now();
     let last = AtomicU64::new(0);
     let touch = || last.store(born.elapsed().as_millis() as u64, Ordering::Relaxed);
