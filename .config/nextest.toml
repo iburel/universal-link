@@ -67,12 +67,17 @@ serial-os-clipboard = { max-threads = 1 }
 # flake rate to ~0 so retries almost never fire.
 [[profile.ci.overrides]]
 platform = 'cfg(any(target_os = "macos", target_os = "windows"))'
-filter = 'package(onedevice-core) & kind(test) & test(/clipboard|dataplane|transactions|peers|peerchannel|sync::/)'
+filter = 'package(onedevice-core) & kind(test) & test(/clipboard|dataplane|transactions|peers|peerchannel|sync::|input::/)'
 test-group = 'serial-ipc'
 
 [[profile.ci.overrides]]
 platform = 'cfg(any(target_os = "macos", target_os = "windows"))'
-filter = 'package(onedevice-ipc-client) & kind(test) & test(/channel::/)'
+# Both channel suites, named explicitly. `channel::` alone already matched
+# `peerchannel::` (the regex is unanchored), which was the outcome wanted and by
+# accident: renaming either module, or anchoring this the way the
+# serial-os-clipboard arms below were deliberately anchored, would silently drop
+# the serialization on macOS and Windows and bring the flake back as a mystery.
+filter = 'package(onedevice-ipc-client) & kind(test) & test(/^channel::|^peerchannel::/)'
 test-group = 'serial-ipc'
 
 [[profile.ci.overrides]]
@@ -88,6 +93,14 @@ test-group = 'serial-ipc'
 [[profile.ci.overrides]]
 platform = 'cfg(any(target_os = "macos", target_os = "windows"))'
 filter = 'package(onedevice-sync) & kind(test)'
+test-group = 'serial-ipc'
+
+# The keyboard and mouse engine's suite, for the same reason as its sync sibling
+# above: it co-locates a real Core per test and drives routed `input.*` forwards
+# through it. Scoped to macOS + Windows like every other arm here.
+[[profile.ci.overrides]]
+platform = 'cfg(any(target_os = "macos", target_os = "windows"))'
+filter = 'package(onedevice-input) & kind(test)'
 test-group = 'serial-ipc'
 
 # --- serial-os-clipboard: shared per-session OS resources -------------------

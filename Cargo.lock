@@ -4490,6 +4490,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "onedevice-input"
+version = "0.6.0"
+dependencies = [
+ "blake3",
+ "ed25519-dalek 3.0.0",
+ "hex",
+ "onedevice-core",
+ "onedevice-ipc-client",
+ "onedevice-paths",
+ "onedevice-server",
+ "onedevice-test-support",
+ "rand 0.10.2",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "onedevice-ipc-client"
 version = "0.6.0"
 dependencies = [

@@ -129,7 +129,8 @@ async fn the_sync_backend_role_is_exclusive_and_coexists_with_the_clipboard_one(
         .unwrap_err();
     assert_eq!(err.app_code(), "ROLE_CONFLICT");
 
-    // The two exclusive roles are two SLOTS, not one.
+    // Each exclusive role is its OWN slot, never a shared one (the input engine
+    // joined them in #126: `input.rs` proves the same from its side).
     let _clip = spawn_component(
         &core,
         "clipboard",

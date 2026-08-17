@@ -7,5 +7,6 @@ mod channel;
 mod connection;
 mod events;
 mod full_stack;
+mod peerchannel;
 mod protocol;
 mod requests;

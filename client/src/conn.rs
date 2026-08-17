@@ -77,11 +77,31 @@ impl Client {
     /// Sends a JSON-RPC request and awaits its response. Offline:
     /// immediate `NotConnected`. The result is the Core's raw `result`.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, RequestError> {
+        self.request_within(method, params, self.request_timeout)
+            .await
+    }
+
+    /// [`Client::request`] with a budget of its own, for the one call whose
+    /// honest worst case is far longer than a component's ordinary one.
+    ///
+    /// `peers.channel` is that call: the Core does not answer it until the far
+    /// end has attached, which can take its whole handshake budget
+    /// ([`crate::PEER_CHANNEL_REQUEST_TIMEOUT`]). Without this, a component that
+    /// gave that call the budget it is owed would have to give it to
+    /// `devices.list` and `session.status` too, so a wedged Core would take half
+    /// a minute to be noticed on every call and the client's fail-closed promise
+    /// would get five times slower everywhere to make one call honest.
+    pub async fn request_within(
+        &self,
+        method: &str,
+        params: Value,
+        budget: Duration,
+    ) -> Result<Value, RequestError> {
         let (tx, rx) = oneshot::channel();
         // The timeout ALSO covers enqueuing: a suspended manager (for
         // example under backpressure from an event consumer that has stopped
         // reading) must never block a caller without bound.
-        match timeout(self.request_timeout, async {
+        match timeout(budget, async {
             self.cmd
                 .send(Cmd::Request {
                     method: method.to_string(),

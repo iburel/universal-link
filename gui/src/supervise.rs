@@ -407,12 +407,18 @@ fn stage_core_copy(src: &Path, data_home: &Path) -> std::io::Result<PathBuf> {
 /// supervisor won't find them once we run from the copy. This list grows as
 /// components are added; nothing cross-checks it against `official_components`, and
 /// a sidecar missing from it is simply never launched on a real Linux install.
+///
+/// The guard test below catches a name being DELETED from this list and nothing
+/// else: `gui` does not depend on `onedevice-daemon`, even for tests, so there is
+/// no mechanical way to notice a component added to `official_components` and
+/// forgotten here. That one stays a human duty.
 #[cfg(target_os = "linux")]
 const STAGED_SIDECARS: &[&str] = &[
     "1device-tray",
     "1device-clipboard",
     "1device-menu",
     "1device-sync",
+    "1device-input",
 ];
 
 /// Copies each sidecar next to the durable Core (best-effort). A sidecar absent
@@ -647,7 +653,13 @@ mod tests {
         // is the failure that matters: a sidecar bundled in the AppImage but not
         // staged is never found next to the durable Core, so it silently never runs
         // — logged at INFO as "component absent" and nothing else.
-        for expected in ["1device-tray", "1device-clipboard", "1device-menu"] {
+        for expected in [
+            "1device-tray",
+            "1device-clipboard",
+            "1device-menu",
+            "1device-sync",
+            "1device-input",
+        ] {
             assert!(
                 STAGED_SIDECARS.contains(&expected),
                 "{expected} is launched by the supervisor but never staged"

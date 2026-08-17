@@ -8,6 +8,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The engine that will share one keyboard and mouse across your
+  computers.** A new official component, `1device-input`, and the frozen
+  `input.*` vocabulary the interfaces will speak: one plane holding every
+  monitor of every computer, dragged into the arrangement that matches the
+  room; who may drive this computer, decided here and nowhere else; who this
+  computer is willing to drive, which decides nothing on the far side; the
+  guards that keep a pointer from crossing an edge by accident; the return
+  hotkey; and one authoritative snapshot carrying the plane, the state of
+  every computer with the round trip measured to it, the live session and any
+  problem, so a window opening late renders everything from that snapshot
+  alone. Permission to drive is stored on the machine that will be driven and
+  is never copied anywhere: the other computer learns by asking and gets a
+  clean refusal with a sentence, and the permission dies the instant the
+  device leaves the account. The arrangement is a small signed document the
+  computers pass between themselves, converging on the same plane in any
+  order with no coordination, and a screen that is unplugged keeps its place
+  and says so instead of letting the pointer fall through where it used to
+  be. What is NOT here yet is the half that touches the real keyboard: this
+  release ships the whole computer-independent engine, proven against a test
+  double and against two real Cores talking to each other. Until the
+  per-platform capture and injection land, every computer says plainly that
+  nothing on it can type yet, and it says it while doing everything else: you
+  can already arrange your screens, and decide who may drive this computer,
+  and both will still be true the day it can. Design and protocol:
+  [doc/input-sharing.md](doc/input-sharing.md).
+
 - **The Core grew a live channel between two of your computers**, the
   primitive the coming keyboard and mouse sharing rides on. `peers.send`
   already carried a message between the components of one role across the

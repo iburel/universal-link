@@ -426,9 +426,9 @@
 //!   least one matching component", nothing more.
 //!
 //! The routed `sync.*` facade (#83, `sync.rs`):
-//! - Role `sync-backend` joins `clipboard-backend` as an EXCLUSIVE role: two
-//!   slots, one holder each, `ROLE_CONFLICT` at activation as before (the
-//!   refused token not consumed, the pending request surviving an occupied
+//! - Role `sync-backend` joins `clipboard-backend` as an EXCLUSIVE role: each
+//!   its own slot, one holder each, `ROLE_CONFLICT` at activation as before
+//!   (the refused token not consumed, the pending request surviving an occupied
 //!   approve).
 //! - Every `sync.*` method except `sync.emit` is FORWARDED to the active
 //!   `sync-backend` connection holding `sync.serve`, and the reply (result or
@@ -444,6 +444,19 @@
 //!   AND `sync.serve` (the announce pattern): `method` must be a `sync.*`
 //!   name other than `sync.emit`, `params` must be an object; the Core
 //!   relays verbatim and interprets nothing.
+//!
+//! The routed `input.*` facade (#126, `input.rs`):
+//! - The same contract, one namespace over: role `input-backend` (a third
+//!   EXCLUSIVE role, its own slot), scopes `input.serve` / `input.read` /
+//!   `input.manage`, topic `input`, `input.status` as the only read method,
+//!   `input.emit` as the engine's publication. The forward mechanics are
+//!   SHARED with the sync facade in the Core (one proxy body, one budget), so
+//!   what this suite proves is the wiring of the new namespace onto it - not a
+//!   second copy of the same mechanics.
+//! - The Core holds no input state of its own on purpose: who may drive this
+//!   computer, where the screens sit and where the pointer is now are the
+//!   engine's, and a Core-side copy would be a second answer to a question
+//!   with exactly one.
 
 #![allow(dead_code)]
 
@@ -1899,8 +1912,21 @@ impl PeerPipe {
     }
 
     /// Asserts the channel ends (rather than a frame arriving).
+    ///
+    /// Its own budget, wider than [`RESPONSE_TIMEOUT`], and the difference is the
+    /// point rather than a fudge: everywhere else that constant bounds a reply the
+    /// Core OWES, so a slow one is a defect worth failing on. Here nothing is
+    /// owed. What is being waited for is a teardown becoming observable through
+    /// two schedulers (the Core's connection task noticing, and this process being
+    /// woken on the socket), which on a loaded runner is not a promise anybody
+    /// made about latency. Five seconds made this a flake at a few percent under
+    /// a full-workspace run, and the failure it produced was "still open", which
+    /// reads like a real leak and is not one.
     pub async fn expect_closed(&mut self) {
-        assert_eq!(self.recv().await, None, "the peer channel is still open");
+        let ended = timeout(DATA_CHANNEL_TIMEOUT, self.read_frame())
+            .await
+            .expect("the peer channel never ended");
+        assert_eq!(ended, None, "the peer channel is still open");
     }
 
     async fn read_frame(&mut self) -> Option<Vec<u8>> {

@@ -59,6 +59,21 @@ test("the cross-device primitives are spelled out, one message and one flow", ()
   expect(scopeLabel("peers.channel")).toMatch(/live channel/);
 });
 
+// Reading every keystroke on this machine is the strongest right in the whole
+// list, and letting another computer type here is the second: the prompt must say
+// both in words, not name the identifier. "Act as the keyboard and mouse engine"
+// would be a keylogger worded as a job title, so what is asserted here is the
+// verb, not the label.
+test("the input scopes say what they really allow", () => {
+  expect(roleLabel("input-backend")).toBe("keyboard and mouse sharing");
+  expect(scopeLabel("input.serve")).toMatch(/Read this computer's keyboard/);
+  expect(scopeLabel("input.serve")).toMatch(/type on it/);
+  expect(scopeLabel("input.read")).toMatch(/who may drive this computer/);
+  expect(scopeLabel("input.manage")).toMatch(/drive this one/);
+  // The other half of `input.manage`, which the first wording left out.
+  expect(scopeLabel("input.manage")).toMatch(/take control of another/);
+});
+
 // The phone runs the SAME view as the desktop, so the self label has to follow
 // the platform rather than the build it is displayed on.
 test("a device names itself after what it is", () => {

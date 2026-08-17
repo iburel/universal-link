@@ -253,10 +253,12 @@ them when they fall (capped exponential backoff, reset once the child has stood 
 and takes them with it when it stops. A missing component is ignored: a Core without
 a tray is still a Core that works.
 
-Four of them ship (`daemon/src/supervisor.rs`, `official_components`), each with
+Five of them ship (`daemon/src/supervisor.rs`, `official_components`), each with
 its own scopes: `1device-tray`, `1device-clipboard` (a per-OS
-backend, on all three desktops), `1device-menu` (the contextual menu) and
-`1device-sync` (the sync engine, [sync-engine.md](sync-engine.md)).
+backend, on all three desktops), `1device-menu` (the contextual menu),
+`1device-sync` (the sync engine, [sync-engine.md](sync-engine.md)) and
+`1device-input` (the keyboard and mouse engine,
+[input-sharing.md](input-sharing.md)).
 The GUI is not in that list — the user launches it.
 
 One exception to "next to its binary": on macOS the tray lives in a nested

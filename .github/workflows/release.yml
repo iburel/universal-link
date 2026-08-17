@@ -50,7 +50,7 @@ jobs:
             bundles: dmg
             bundle_glob: target/release/bundle/dmg/*.dmg
             tauri_config: >-
-              {"bundle":{"externalBin":["binaries/1device-core","binaries/1device-clipboard","binaries/1device-menu","binaries/1device-sync"],
+              {"bundle":{"externalBin":["binaries/1device-core","binaries/1device-clipboard","binaries/1device-menu","binaries/1device-sync","binaries/1device-input"],
               "macOS":{"files":{
               "Frameworks/1DeviceTray.app/Contents/Info.plist":"helpers/1DeviceTray.app/Contents/Info.plist",
               "Frameworks/1DeviceTray.app/Contents/MacOS/1device-tray":"helpers/1DeviceTray.app/Contents/MacOS/1device-tray"}}}}
@@ -61,7 +61,7 @@ jobs:
             bundles: nsis
             bundle_glob: target/release/bundle/nsis/*-setup.exe
             tauri_config: >-
-              {"bundle":{"externalBin":["binaries/1device-core","binaries/1device-tray","binaries/1device-clipboard","binaries/1device-menu","binaries/1device-sync"]}}
+              {"bundle":{"externalBin":["binaries/1device-core","binaries/1device-tray","binaries/1device-clipboard","binaries/1device-menu","binaries/1device-sync","binaries/1device-input"]}}
           # Linux x64. Built on 22.04 (NOT ubuntu-latest/24.04): an AppImage
           # links against the build host's glibc, so building on the newer
           # image would refuse to start on Debian 12 / Ubuntu 22.04. 22.04 =
@@ -73,7 +73,7 @@ jobs:
             bundles: appimage
             bundle_glob: target/release/bundle/appimage/*.AppImage
             tauri_config: >-
-              {"bundle":{"externalBin":["binaries/1device-core","binaries/1device-tray","binaries/1device-clipboard","binaries/1device-menu","binaries/1device-sync"]}}
+              {"bundle":{"externalBin":["binaries/1device-core","binaries/1device-tray","binaries/1device-clipboard","binaries/1device-menu","binaries/1device-sync","binaries/1device-input"]}}
     steps:
       # Actions pinned to a SHA (the only immutable reference), as in ci.yml.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -172,8 +172,18 @@ jobs:
       - name: Build the sync engine (sidecar)
         run: cargo build -p onedevice-sync --bin 1device-sync --release --locked
 
+      # The keyboard and mouse engine, a sixth sidecar: the exclusive
+      # `input-backend` behind the Core's routed `input.*` facade
+      # (doc/input-sharing.md). Pure Rust with no build-time system library
+      # either - the per-OS capture and injection backends are a later ticket,
+      # and every one of them answers `Unsupported` for now, so nothing here
+      # links against X11, Win32 or AppKit yet. When they land, this step is
+      # where their build dependencies will have to be declared.
+      - name: Build the input engine (sidecar)
+        run: cargo build -p onedevice-input --bin 1device-input --release --locked
+
       # Tauri expects each sidecar named with the target triple, next to the GUI.
-      # All five on every platform, uniformly: on macOS the tray copy staged here
+      # All six on every platform, uniformly: on macOS the tray copy staged here
       # goes unused (it is not in that leg's `externalBin`) and the helper bundle
       # below takes the binary straight from `target/release` instead.
       - name: Stage the sidecars
@@ -190,6 +200,8 @@ jobs:
              "gui/binaries/1device-menu-${{ matrix.triple }}${{ matrix.bin_ext }}"
           cp "target/release/1device-sync${{ matrix.bin_ext }}" \
              "gui/binaries/1device-sync-${{ matrix.triple }}${{ matrix.bin_ext }}"
+          cp "target/release/1device-input${{ matrix.bin_ext }}" \
+             "gui/binaries/1device-input-${{ matrix.triple }}${{ matrix.bin_ext }}"
 
       # macOS only: the tray does not ride along in `Contents/MacOS` like the other
       # sidecars — it gets a nested application bundle of its own.
