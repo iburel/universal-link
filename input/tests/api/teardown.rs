@@ -297,7 +297,9 @@ async fn a_session_that_ends_on_its_own_is_said_out_loud() {
         json!(fleet.b.device_id()),
         "the sentence is about the computer the keyboard was on: {said:#}"
     );
-    assert_eq!(said["count"], json!(1));
+    // At least once: `announce` coalesces per code per second, so an earlier
+    // teardown inside the window arrives as a count of two.
+    assert!(said["count"].as_u64().is_some_and(|n| n >= 1), "{said:#}");
 }
 
 /// A grant withdrawn while the session runs ends it, and the source is TOLD which

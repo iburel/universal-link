@@ -427,6 +427,11 @@ async fn establish(config: &ClientConfig, next_id: &mut u64) -> Result<Link, Est
         // found per topic. With only one there is nothing to find: the call
         // above already named it, and asking again would be a round trip whose
         // answer we hold.
+        //
+        // During a probe the connection IS subscribed to a smaller set than it
+        // will end on, so an event on another optional topic in that window is
+        // dropped by the Core. Two round trips on a local socket, only on the
+        // degraded path, and a consumer resynchronizes on `Connected` anyway.
         let mut accepted: Vec<&str> = Vec::new();
         if optional.len() > 1 {
             for topic in &optional {
@@ -444,7 +449,12 @@ async fn establish(config: &ClientConfig, next_id: &mut u64) -> Result<Link, Est
         // So this call is not redundant with the probes above even when it asks
         // for exactly what the last accepted probe asked for.
         let keep: Vec<&str> = required.iter().copied().chain(accepted).collect();
-        subscribe(&mut link, next_id, &keep, &config.served_methods).await?;
+        // Nothing left to ask for: a component with no required topic whose every
+        // optional one was refused has nothing to subscribe to, and the Core would
+        // read an empty list as "subscribed to nothing", which it already is.
+        if !keep.is_empty() {
+            subscribe(&mut link, next_id, &keep, &config.served_methods).await?;
+        }
     }
 
     Ok(link)

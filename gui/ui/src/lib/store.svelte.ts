@@ -639,8 +639,14 @@ export class CoreStore {
     // phone), `-32601` (a Core older than the facade). The section stays if it
     // has ever been served, and says what is missing.
     this.input = input.status === "fulfilled" ? input.value : null;
-    if (this.input) this.inputSeen = true;
-    if (!this.inputGranted) this.inputSeen = false;
+    // The SCOPE is what decides whether the section exists, not whether the
+    // engine happened to answer this time. It very often does not on a cold
+    // start: this interface spawns the Core and connects to it immediately, while
+    // the engine is still a process being launched, and nothing would resnapshot
+    // afterwards on an account with no server to send a `session.changed`. The
+    // section can say the engine is not running; it cannot say it about a section
+    // that is not there.
+    this.inputSeen = this.inputGranted || this.input !== null;
     this.primed = true;
     // A fresh snapshot expires any earlier message: without this, the error
     // from a missed resnapshot survives the recovery and lies to the user. A
@@ -1358,39 +1364,54 @@ export class CoreStore {
   // with what THIS machine knows (D21), the rest arrives as that device's
   // `problem` and as `input.refused`.
 
-  /** An `input.*` gesture, with the engine's own vocabulary in the banner. */
-  #inputAct(action: () => Promise<unknown>): Promise<void> {
-    return this.#act(async () => {
+  /**
+   * An `input.*` gesture, with the engine's own vocabulary in the banner.
+   * Answers whether it went through, which is what lets a control that the
+   * browser has already moved (a checkbox) be put back when the engine says no:
+   * a tick left standing on the list that decides who may type here would be this
+   * interface asserting a grant nobody holds.
+   */
+  async #inputAct(action: () => Promise<unknown>): Promise<boolean> {
+    let done = false;
+    await this.#act(async () => {
       try {
         await action();
+        done = true;
       } catch (e) {
         this.notice = { kind: "error", text: gestureFailure(e) ?? humanize(e) };
       }
     });
+    return done;
   }
 
-  /** The arrangement a human dragged. The whole set of spots, always. */
-  placeScreens(spots: PlacedSpot[]): Promise<void> {
+  /**
+   * The arrangement a human dragged. The whole set of spots, always, and never an
+   * empty one: `input.place` REPLACES the placement, so an empty set would erase
+   * the arrangement of every computer on the account (and every kept place of a
+   * screen that is away) from one gesture. No interface ever means that.
+   */
+  placeScreens(spots: PlacedSpot[]): Promise<boolean> {
+    if (spots.length === 0) return Promise.resolve(false);
     return this.#inputAct(() => api.inputPlace(spots));
   }
 
   /** Who may drive THIS computer: the authority, and it stays here. */
-  allowInput(device_id: string, allowed: boolean): Promise<void> {
+  allowInput(device_id: string, allowed: boolean): Promise<boolean> {
     return this.#inputAct(() => api.inputAllow(device_id, allowed));
   }
 
   /** Who this computer may drive: a convenience list, and the far side decides. */
-  driveInput(device_id: string, allowed: boolean): Promise<void> {
+  driveInput(device_id: string, allowed: boolean): Promise<boolean> {
     return this.#inputAct(() => api.inputDrive(device_id, allowed));
   }
 
   /** Take the keyboard and mouse there now, or the keyboard alone. */
-  takeInput(device_id: string, mode?: "full" | "keys"): Promise<void> {
+  takeInput(device_id: string, mode?: "full" | "keys"): Promise<boolean> {
     return this.#inputAct(() => api.inputTake(device_id, mode));
   }
 
   /** Bring them back. The method twin of the return hotkey. */
-  releaseInput(): Promise<void> {
+  releaseInput(): Promise<boolean> {
     return this.#inputAct(() => api.inputRelease());
   }
 
@@ -1404,19 +1425,19 @@ export class CoreStore {
     monitor: string,
     side: string,
     guards: Record<string, number | boolean>,
-  ): Promise<void> {
+  ): Promise<boolean> {
     return this.#inputAct(() =>
       api.inputGuards(device_id, monitor, side, guards),
     );
   }
 
   /** Pin the pointer to this screen, both ways. */
-  lockPointer(locked: boolean): Promise<void> {
+  lockPointer(locked: boolean): Promise<boolean> {
     return this.#inputAct(() => api.inputLock(locked));
   }
 
   /** The return hotkey. Refused by the engine unless it can enforce it. */
-  setHotkey(keys: string[]): Promise<void> {
+  setHotkey(keys: string[]): Promise<boolean> {
     return this.#inputAct(() => api.inputHotkey(keys));
   }
 

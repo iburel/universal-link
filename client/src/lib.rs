@@ -70,6 +70,13 @@ pub struct ClientConfig {
     /// `Event::Connected`'s `granted_scopes`, which is what it must gate the
     /// feature on. Same promotion rule as [`ClientConfig::optional_topics`]:
     /// moved into `scopes` once no such Core is in the field.
+    ///
+    /// Unlike the topics, this list is all or nothing: one name the Core does not
+    /// know costs every scope in it, because the hello has no per-scope answer to
+    /// probe with. So it may only ever hold scopes that shipped in one release
+    /// together, which is what `input.read` and `input.manage` are. A second,
+    /// later scope wanting the same protection needs the per-item probe the topics
+    /// have.
     pub optional_scopes: Vec<String>,
     /// `events.subscribe` topics, subscribed on every (re)connection before
     /// `Event::Connected`. Empty: no subscription. A topic the Core does not

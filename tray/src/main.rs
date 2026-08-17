@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use onedevice_ipc_client::{ClientConfig, TokenSource};
-use onedevice_tray::{InputSession, Outcome, TrayStatus, TrayView, UiCommand, run};
+use onedevice_tray::{Outcome, TrayView, UiCommand, run};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -25,12 +25,6 @@ const IPC_PATH_ENV: &str = "ONEDEVICE_IPC_PATH";
 /// rather than let the client retry.
 const RECONNECT_BASE_DELAY: Duration = Duration::from_millis(500);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// What is shown before the brain has said anything.
-const START: TrayView = TrayView {
-    status: TrayStatus::Connecting,
-    input: InputSession::None,
-};
 
 /// Delivered to the tao loop from the other threads.
 enum UserEvent {
@@ -72,7 +66,7 @@ fn main() {
     // else. Its handle is kept (cloned into the loop): a `muda` item is not
     // Send, so it can only be written from the main thread, which is where the
     // loop runs.
-    let status_item = MenuItem::new(START.menu_line(), false, None);
+    let status_item = MenuItem::new(TrayView::connecting().menu_line(), false, None);
     let open_item = MenuItem::new("Open 1Device", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
     let open_id = open_item.id().clone();
@@ -120,7 +114,7 @@ fn main() {
                         TrayIconBuilder::new()
                             .with_menu(Box::new(menu))
                             .with_icon(icon)
-                            .with_tooltip(START.tooltip())
+                            .with_tooltip(TrayView::connecting().tooltip())
                             .build()
                             .expect("build tray icon"),
                     );
@@ -187,11 +181,10 @@ async fn brain(cmd_rx: mpsc::Receiver<UiCommand>, proxy: EventLoopProxy<UserEven
         // The keyboard and mouse session, which the tray must show for as long
         // as it lasts. OPTIONAL, and not because of an old Core (the supervisor
         // that spawns us is the Core, so we are always its own version), but
-        // because a spawn token bounds the scopes by the supervisor's GRANT: if
-        // the two ever disagree, the hello is refused, the client retries with a
-        // token the Core has already consumed, and the tray sits on "connecting"
-        // for ever. Asked for this way, the worst case is a tray that says
-        // nothing about input, which is what it did before.
+        // because a spawn token bounds the scopes by the supervisor's GRANT: a
+        // hello asking for one outside it is refused whole, and the tray would
+        // then sit on "connecting" for ever rather than lose one line. (The token
+        // itself survives a refused hello, which is why the retry can use it.)
         optional_scopes: vec!["input.read".into()],
         optional_topics: vec!["input".into()],
         served_methods: vec![],

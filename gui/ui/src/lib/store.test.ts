@@ -2809,9 +2809,11 @@ test("without the scopes, the engine is never asked and the section stays away",
   expect(fake.calls.map((c) => c.method)).not.toContain("input.status");
 });
 
-// A phone: the engine is not spawned on Android at all, so the facade answers
-// COMPONENT_ABSENT for ever and the section never appears.
-test("an engine that never answers leaves no section behind", async () => {
+// An engine that has not answered YET is the ordinary cold start: this interface
+// spawns the Core and connects at once, while the engine is still a process being
+// launched. The section exists (the scope is what decides), and it holds no state
+// to show until the engine speaks.
+test("an engine that has not answered yet leaves the section with nothing in it", async () => {
   const fake = mockCore({
     status: INPUT_CONNECTED,
     methods: {
@@ -2824,7 +2826,7 @@ test("an engine that never answers leaves no section behind", async () => {
   await vi.waitFor(() => expect(store.primed).toBe(true));
 
   expect(store.input).toBeNull();
-  expect(store.inputSeen).toBe(false);
+  expect(store.inputSeen).toBe(true);
   expect(fake.calls.map((c) => c.method)).toContain("input.status");
 });
 
@@ -2902,8 +2904,11 @@ test("an update this version cannot recognize is not applied over a good one", a
 
 // An update arriving before any snapshot is what makes the section appear on a
 // window opened after a crossing had already started.
-test("an update alone is enough to bring the section up", async () => {
-  // An engine that was not there when the snapshot was read, and speaks after.
+test("an update alone is enough to fill the section in", async () => {
+  // An engine that was not there when the snapshot was read, and speaks after:
+  // its first published snapshot is what a window opened too early renders from,
+  // with no resnapshot in between (a serverless account sends no
+  // `session.changed` to provoke one).
   mockCore({
     status: INPUT_CONNECTED,
     methods: {
@@ -2914,7 +2919,7 @@ test("an update alone is enough to bring the section up", async () => {
   });
   await store.start();
   await vi.waitFor(() => expect(store.primed).toBe(true));
-  expect(store.inputSeen).toBe(false);
+  expect(store.input).toBeNull();
 
   await emit("core:notification", {
     method: "input.updated",
@@ -2947,11 +2952,26 @@ test("a refusal that happened more than once says how many", async () => {
 
   await emit("core:notification", {
     method: "input.refused",
-    params: { device_id: "d_win", code: "UNRESOLVED", count: 7 },
+    params: { device_id: "d_win", code: "IDLE", count: 7 },
   });
 
   expect(store.notice?.text).toContain("Living Room PC");
   expect(store.notice?.text).toContain("(7 times)");
+});
+
+// The engine emits an injection's refusal on BOTH ends of a session, and the
+// notification carries a device_id with no direction: a sentence that named the
+// device would name the wrong machine on one of the two sides every time.
+test("an injection's refusal names no machine at all", async () => {
+  await withInput();
+
+  await emit("core:notification", {
+    method: "input.refused",
+    params: { device_id: "d_win", code: "UNRESOLVED", count: 1 },
+  });
+
+  expect(store.notice?.text).toContain("the computer being driven");
+  expect(store.notice?.text).not.toContain("Living Room PC");
 });
 
 test("a refusal about a device nobody names still says something", async () => {

@@ -9,6 +9,7 @@ import {
   GHOST_SENTENCE,
   MODS,
   POINTER_MAX_MS,
+  POINTER_WARN_MS,
   REFUSAL_CODES,
   SNAP,
   blockKeys,
@@ -32,6 +33,7 @@ import {
   reimportBlock,
   sessionSentence,
   slowPathWarning,
+  tooShortToCross,
 } from "./input";
 
 const A = "a".repeat(64);
@@ -62,18 +64,16 @@ test("the epic's three sentences are said exactly", () => {
   expect(refusalSentence("SECURE_INPUT")).toBe(
     "Nothing was typed: password fields block synthetic keystrokes on macOS.",
   );
-  // The third one names the machine instead of saying "this computer", because
-  // it is read on the machine that is DRIVING, and it carries the second cause
-  // the one code covers (a pointer pinned there on purpose).
-  expect(refusalSentence("LOCKED", "Desk")).toContain(
-    "cannot be driven while it is locked",
-  );
+  // The third one belongs to the code a locked screen really produces, which is
+  // the `oops` one (`refused::LOCKED` is the pointer PIN, and nothing else). It
+  // names no machine, deliberately: the same code is emitted on both ends of a
+  // session and a name would be the wrong machine on one of them.
+  const locked = refusalSentence("SCREEN_LOCKED", "Desk");
+  expect(locked).toContain("cannot be driven while it is locked");
+  expect(locked).not.toContain("Desk");
+  // And the pin, which is a switch on the other machine rather than a lock.
   expect(refusalSentence("LOCKED", "Desk")).toContain("pinned to its own screen");
-  // And the same fact about an injection that did not happen, from the `oops`
-  // half of the vocabulary.
-  expect(refusalSentence("SCREEN_LOCKED", "Desk")).toBe(
-    "Nothing was typed: Desk is locked.",
-  );
+  expect(refusalSentence("LOCKED", "Desk")).toContain("switch is on Desk");
 });
 
 test("the deployment whose relays will not carry a session says so, and how to fix it", () => {
@@ -112,6 +112,13 @@ test("every code the engine emits has a sentence, and none of them softens it", 
     "COMPONENT_ABSENT",
     "OPEN_REFUSED",
     "OPEN_FAILED",
+    // The Core's own words for a channel that could not be opened, relayed
+    // verbatim by the engine. `DEVICE_OFFLINE` is the everyday one: a computer
+    // whose record still carries a route while it is asleep.
+    "DEVICE_OFFLINE",
+    "DEVICE_UNKNOWN",
+    // And what a code from a newer engine becomes on the way in.
+    "UNKNOWN",
   ];
   for (const code of emitted) {
     expect(REFUSAL_CODES, `${code} has a sentence`).toContain(code);
@@ -280,9 +287,14 @@ test("the pointer thresholds are the decided ones", () => {
   expect(pointerVerdict(undefined)).toBe("unknown");
   expect(pointerVerdict(4)).toBe("silent");
   expect(pointerVerdict(10)).toBe("silent");
+  // 10 to 60 "passes but announces the number"; the question is only worth
+  // asking past the point where a pointer stops feeling like one (the epic's
+  // "roughly 40 ms"), which #123's measured 32 ms relay is still inside.
   expect(pointerVerdict(11)).toBe("announce");
   expect(pointerVerdict(32)).toBe("announce");
-  expect(pointerVerdict(POINTER_MAX_MS)).toBe("announce");
+  expect(pointerVerdict(POINTER_WARN_MS)).toBe("announce");
+  expect(pointerVerdict(POINTER_WARN_MS + 1)).toBe("warn");
+  expect(pointerVerdict(POINTER_MAX_MS)).toBe("warn");
   expect(pointerVerdict(POINTER_MAX_MS + 1)).toBe("refuse");
 });
 
@@ -292,11 +304,23 @@ test("the path and its number are said, and a slow one warns first", () => {
   const relayed = pathLine({ rtt_ms: 32, lan: false });
   expect(relayed).toContain("32 ms away, over the internet");
   expect(relayed).toContain("lag a little");
+  // The same wording in the line and in the warning, for the same number.
+  const slow = pathLine({ rtt_ms: 50, lan: false });
+  expect(slow).toContain("lag noticeably");
+  expect(slowPathWarning("Desk", 50)).toContain("lag noticeably");
+  expect(slow).toContain("keyboard alone");
   const far = pathLine({ rtt_ms: 120, lan: false });
   expect(far).toContain("keyboard alone");
-  expect(pathLine({ rtt_ms: null, lan: false })).toContain("Not measured yet");
-  expect(slowPathWarning("Desk", 32)).toContain("32 ms");
-  expect(slowPathWarning("Desk", 32)).toContain("keyboard alone");
+  expect(slowPathWarning("Desk", 50)).toContain("50 ms");
+});
+
+// Nothing measured is not a route: a computer that has never answered gets no
+// claim about how a session to it would travel.
+test("an unmeasured path claims no route", () => {
+  expect(pathLine({ rtt_ms: null, lan: false })).toBe("Nothing measured yet.");
+  expect(pathLine({ rtt_ms: null, lan: true })).toBe(
+    "On this network. Nothing measured yet.",
+  );
 });
 
 // --- The live state ---------------------------------------------------------
@@ -385,14 +409,32 @@ test("the guards are words, and the wall says the whole truth on its own", () =>
     dwell_ms: 0,
     dead_corner: 0,
   });
+  // The chain's own order (section 7): corners, modifier, double tap, dwell.
   expect(strict[0]).toBe("Only while Ctrl is held.");
   expect(strict[1]).toContain("comes straight back");
   expect(strict[2]).toContain("As soon as");
   expect(strict.join(" ")).not.toContain("corners");
+  const all = guardWords({ require_mods: MODS.alt, double_tap_ms: 200 });
+  expect(all[0]).toContain("corners");
+  expect(all[1]).toContain("Alt");
+  expect(all[2]).toContain("comes straight back");
+  expect(all[3]).toContain("short pause");
 });
 
 // A crossing into a screen that is away is a wall whatever the guards say, so
 // describing a dwell there would describe something that cannot happen.
+// A shared stretch no longer than the corners left alone at both ends of it
+// admits nothing, and the remedy is one of the toggles beside it.
+test("a crossing too short for its own corners says so", () => {
+  expect(tooShortToCross(20, {})).toContain("cannot cross there");
+  expect(tooShortToCross(20, {})).toContain("Untick the corners");
+  expect(tooShortToCross(20, { dead_corner: 0 })).toBeNull();
+  expect(tooShortToCross(400, {})).toBeNull();
+  // Exactly twice the corner is still nothing left in the middle.
+  expect(tooShortToCross(32, {})).not.toBeNull();
+  expect(tooShortToCross(33, {})).toBeNull();
+});
+
 test("a crossing into a screen that is away is reported as the wall it is", () => {
   const said = guardWords({ dwell_ms: 250 }, true);
   expect(said).toHaveLength(1);
@@ -577,6 +619,16 @@ test("a drop within the tolerance snaps onto the edge it was aiming at", () => {
     return { ...s, x: at?.x ?? s.x, y: at?.y ?? s.y };
   });
   expect(crossings(moved, [`${A}/A1`])).toHaveLength(1);
+});
+
+// Two blocks stacked one under the other: the facing edges are on the y axis, so
+// the x snap has nothing to face and lines the near edges up instead.
+test("a block dropped under another lines its edge up", () => {
+  const spots = [spot(`${A}/A1`, 0, 0), spot(`${B}/B1`, 4000, 4000)];
+  const out = dropSpots(spots, [`${B}/B1`], -4000 + 9, -4000 + 1080 + 4);
+  expect(out.ok).toBe(true);
+  if (!out.ok) return;
+  expect(out.spots[1]).toEqual({ monitor: `${B}/B1`, x: 0, y: 1080 });
 });
 
 // An overlap silently removes the crossing the person was trying to make: the

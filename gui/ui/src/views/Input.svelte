@@ -15,7 +15,10 @@
 <script lang="ts">
   import type { InputPeer, InputSpot } from "../lib/api";
   import {
+    DWELL_CHOICES,
     GHOST_SENTENCE,
+    GUARD_DEFAULTS,
+    MODS,
     SNAP,
     blockKeys,
     crossings,
@@ -33,18 +36,21 @@
     reimportBlock,
     sessionSentence,
     slowPathWarning,
+    tooShortToCross,
     type Crossing,
   } from "../lib/input";
   import type { CoreStore } from "../lib/store.svelte";
 
   let { store }: { store: CoreStore } = $props();
 
-  // The nominal size of the plane, in CSS pixels. The plane is in logical
-  // pixels of a real desk, so it is drawn scaled to fit this box; a drag is
-  // converted back through the same factor. A fixed nominal size (rather than a
-  // measured one) keeps the arithmetic honest with no layout to read, and the
-  // one measurement taken is the box's real width, to survive the CSS shrinking
-  // it on a narrow window.
+  // The size of the plane's box, in CSS pixels. The plane is in logical pixels of
+  // a real desk, so it is drawn scaled to fit this box, and a drag is converted
+  // back through the same scale.
+  //
+  // The box keeps this width whatever the window does (a scroller around it is
+  // what gives way on a narrow one), and that is what makes the arithmetic
+  // honest: a box CSS had shrunk would draw the screens over 620 pixels of a
+  // 400 pixel pane and move the dragged one faster than the cursor.
   const PLANE_W = 620;
   const PLANE_H = 300;
 
@@ -119,10 +125,11 @@
   }
 
   /**
-   * A drag, in CSS pixels of the mouse, converted to the plane's own pixels. The
-   * box's real width is read once per drag: CSS may have shrunk the nominal size
-   * on a narrow window, and a factor of 1 (a box with no layout, as in a test)
-   * is the honest fallback.
+   * A drag, in CSS pixels of the mouse, converted to the plane's own pixels
+   * through the scale the plane HAD when the mouse went down. Reading the live
+   * scale here would have committed a distance the box never showed: a peer
+   * coming online mid-drag widens the plane, the scale halves, and the same
+   * cursor offset would suddenly mean twice as far.
    */
   function startDrag(event: MouseEvent, spot: InputSpot) {
     if (disabled) return;
@@ -132,9 +139,7 @@
     stopDrag?.();
     selected = spot.monitor;
     const keys = keysFor(spot.monitor);
-    const element = event.currentTarget as HTMLElement | null;
-    const plane = element?.parentElement?.getBoundingClientRect();
-    const factor = plane && plane.width > 0 ? PLANE_W / plane.width : 1;
+    const at = scale;
     const from = { x: event.clientX, y: event.clientY };
     drag = { keys, dx: 0, dy: 0 };
 
@@ -142,8 +147,8 @@
       move: (e: MouseEvent) => {
         drag = {
           keys,
-          dx: ((e.clientX - from.x) * factor) / scale,
-          dy: ((e.clientY - from.y) * factor) / scale,
+          dx: (e.clientX - from.x) / at,
+          dy: (e.clientY - from.y) / at,
         };
       },
       up: () => {
@@ -189,6 +194,11 @@
    * making) or off the plane.
    */
   async function commit(keys: string[], dx: number, dy: number) {
+    // The plane may have gone while the mouse was down (the engine restarting
+    // takes the snapshot away, and the drag's listeners live on the window rather
+    // than in this section's markup). An arrangement of nothing REPLACES the
+    // placement of every computer on the account, so it is not a thing to send.
+    if (state === null || spots.length === 0 || keys.length === 0) return;
     const outcome = dropSpots(spots, keys, dx, dy);
     if (!outcome.ok) {
       refused = dropRefusal(outcome.reason);
@@ -208,6 +218,24 @@
     refused = null;
     await store.placeScreens(outcome.spots);
   }
+
+  /**
+   * Who dragged the arrangement this plane is showing. Worth saying because the
+   * plane is adopted from a signature this computer may not be able to verify
+   * (D11): the worst a forged one can do is misplace a screen, and a human
+   * noticing is the whole repair, so they are told whose it is.
+   */
+  const arrangedBy = $derived(
+    state?.plane.by ? store.inputName(state.plane.by) : null,
+  );
+
+  // A drop refused is about the plane it was refused against: once the plane has
+  // moved on (a drag that took, or another computer's), the sentence is a stale
+  // account of something nobody can act on any more.
+  $effect(() => {
+    void state?.plane.id;
+    refused = null;
+  });
 
   /** The machines that have a spot on the plane, in the order they are drawn. */
   const blocks = $derived.by(() => {
@@ -247,14 +275,35 @@
     return `${named} (${siblings.findIndex((s) => s.monitor === spot.monitor) + 1})`;
   }
 
-  const STATES: Record<string, string> = {
-    off: "Not connected",
-    warming: "Getting ready",
-    ready: "Ready",
-    driving: "Your keyboard and mouse are there",
-    driven: "It is using your keyboard and mouse",
-    refused: "Refused",
-  };
+  /**
+   * Where a pair has got to, in words. The two live ones name what really
+   * crossed: a keyboard-only session (the offer this tab makes on every slow
+   * path) never moved the mouse, and saying it did would be the interface
+   * inventing half a session.
+   */
+  function stateWords(peer: InputPeer): string {
+    const keys = state?.session?.mode === "keys";
+    switch (peer.state) {
+      case "off":
+        return "Not connected";
+      case "warming":
+        return "Getting ready";
+      case "ready":
+        return "Ready";
+      case "driving":
+        return keys
+          ? "Your keyboard is there"
+          : "Your keyboard and mouse are there";
+      case "driven":
+        return keys
+          ? "It is using your keyboard"
+          : "It is using your keyboard and mouse";
+      case "refused":
+        return "Refused";
+      default:
+        return peer.state;
+    }
+  }
 
   /** The crossings toward one machine: the guards are per crossing. */
   function toward(device_id: string): Crossing[] {
@@ -270,19 +319,37 @@
     return toward(device_id).filter((c) => !c.ghost);
   }
 
-  /** One guard change, applied to every crossing toward that machine. */
-  async function guard(peer: InputPeer, change: Record<string, number | boolean>) {
+  /**
+   * One guard change, applied to every crossing toward that machine, and every
+   * field sent every time: the engine fills a field a write leaves out with its
+   * DEFAULT rather than with what was stored, so a partial write would quietly
+   * reset the other four.
+   *
+   * One write per distinct (their screen, side): that is the key the engine
+   * stores under, and it already fans a write out to every segment matching it,
+   * so writing once per segment would be several identical persists and several
+   * snapshots for nothing. It stops at the first refusal, because each gesture
+   * clears the banner as it starts and carrying on would wipe the sentence
+   * explaining the failure.
+   */
+  async function guard(
+    peer: InputPeer,
+    change: Record<string, number | boolean>,
+  ): Promise<boolean> {
+    const seen = new Set<string>();
     for (const crossing of crossable(peer.device_id)) {
+      const key = `${crossing.to}|${crossing.side}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
       const stored = guardsFor(state?.guards ?? [], crossing);
-      await store.setGuards(peer.device_id, crossing.to, crossing.side, {
-        dwell_ms: stored?.dwell_ms ?? 250,
-        double_tap_ms: stored?.double_tap_ms ?? 0,
-        dead_corner: stored?.dead_corner ?? 16,
-        require_mods: stored?.require_mods ?? 0,
-        wall: stored?.wall ?? false,
+      const ok = await store.setGuards(peer.device_id, crossing.to, crossing.side, {
+        ...GUARD_DEFAULTS,
+        ...(stored ?? {}),
         ...change,
       });
+      if (!ok) return false;
     }
+    return true;
   }
 
   /** What the guards toward one machine do, said once for the whole pair. */
@@ -306,15 +373,46 @@
    * the pointer outright (`INPUT_TOO_SLOW`), so the warning is the honest step
    * before a refusal the person would otherwise walk into.
    */
-  let confirming = $state<string | null>(null);
+  let confirming = $state<{ device_id: string; rtt: number } | null>(null);
 
   function askOrTake(peer: InputPeer) {
     const verdict = pointerVerdict(peer.rtt_ms);
-    if (verdict === "announce" || verdict === "refuse") {
-      confirming = peer.device_id;
+    if ((verdict === "warn" || verdict === "refuse") && peer.rtt_ms !== null) {
+      // The number is captured, not re-read: the engine republishes up to ten
+      // times a second, and a warning that read a live `rtt_ms` could end up
+      // saying "0 ms away" about a path that had just gone quiet.
+      confirming = { device_id: peer.device_id, rtt: peer.rtt_ms };
       return;
     }
     void store.takeInput(peer.device_id);
+  }
+
+  /**
+   * Whether taking the keyboard there could work at all, and what to say when it
+   * could not. Both facts are this machine's own: the engine only warms a channel
+   * to a computer this one has been told it may drive AND that its directory calls
+   * reachable, so a take without both is accepted, parked, and never spoken of
+   * again. Offering a button that answers nothing is the exact failure this
+   * feature exists to correct.
+   */
+  function cannotTake(peer: InputPeer): string | null {
+    if (!peer.drive) {
+      return `Tick ${peer.name} under "Who this computer may drive" first: this computer keeps a live channel only to the computers on that list.`;
+    }
+    if (peer.state === "off") {
+      return `${peer.name} is not answering right now, so there is nothing to hand a keyboard to.`;
+    }
+    return null;
+  }
+
+  /** A checkbox the browser has already moved, put back if the engine said no. */
+  async function toggle(
+    event: Event,
+    act: (wanted: boolean) => Promise<boolean>,
+  ) {
+    const box = event.currentTarget as HTMLInputElement;
+    const wanted = box.checked;
+    if (!(await act(wanted))) box.checked = !wanted;
   }
 
   const HOTKEYS: readonly { keys: string[]; label: string }[] = [
@@ -352,6 +450,9 @@
     {/if}
 
     <h2>Where your screens are</h2>
+    <!-- The scroller is what gives way on a narrow window, so the box below keeps
+         the width the drag's arithmetic assumes. -->
+    <div class="scroller">
     <div
       class="plane"
       style="width:{PLANE_W}px;height:{planeHeight}px"
@@ -379,12 +480,24 @@
         </button>
       {/each}
     </div>
+    </div>
 
-    <p class="hint">
-      Drag a screen to say where it really is. A computer's screens move together;
-      tick the box below to move one on its own. Arrow keys move the selection by
-      one screen, and hold Shift for a nudge.
-    </p>
+    {#if blocks.length < 2}
+      <p class="hint">
+        There is only this computer's screens here. Another computer of your
+        account shows up on this plane as soon as it says where its own screens
+        are, and then dragging says which is next to which.
+      </p>
+    {:else}
+      <p class="hint">
+        Drag a screen to say where it really is. A computer's screens move
+        together; tick the box below to move one on its own. Arrow keys move the
+        selection by one screen, and hold Shift for a nudge.
+      </p>
+    {/if}
+    {#if arrangedBy}
+      <p class="muted">Arranged by {arrangedBy}.</p>
+    {/if}
     <label class="row">
       <input
         type="checkbox"
@@ -425,10 +538,7 @@
               {disabled}
               aria-label="Let {peer.name} drive this computer"
               onchange={(e) =>
-                store.allowInput(
-                  peer.device_id,
-                  (e.currentTarget as HTMLInputElement).checked,
-                )}
+                toggle(e, (wanted) => store.allowInput(peer.device_id, wanted))}
             />
             {peer.name}
           </label>
@@ -441,9 +551,10 @@
 
     <h2>Who this computer may drive</h2>
     <p class="muted">
-      A shortlist for this computer's own use: it says which computers it will
-      offer to drive. It grants nothing over there. Each of those computers keeps
-      its own list, and this one finds out by trying.
+      A shortlist for this computer's own use: which computers its pointer may
+      cross to, and which ones it keeps a live channel ready for. It grants
+      nothing over there. Each of those computers keeps its own list, and this one
+      finds out by trying.
     </p>
     <ul class="switches">
       {#each peers as peer (peer.device_id)}
@@ -455,10 +566,7 @@
               {disabled}
               aria-label="Let this computer drive {peer.name}"
               onchange={(e) =>
-                store.driveInput(
-                  peer.device_id,
-                  (e.currentTarget as HTMLInputElement).checked,
-                )}
+                toggle(e, (wanted) => store.driveInput(peer.device_id, wanted))}
             />
             {peer.name}
           </label>
@@ -472,17 +580,18 @@
         {#each peers as peer (peer.device_id)}
           {@const problem = peerProblemSentence(peer.problem, peer.name)}
           {@const path = pathLine(peer)}
+          {@const blocked = cannotTake(peer)}
           <li>
             <div class="row">
               <span class="name">{peer.name}</span>
-              <span class="meta">{STATES[peer.state] ?? peer.state}</span>
+              <span class="meta">{stateWords(peer)}</span>
             </div>
             {#if path}<p class="meta">{path}</p>{/if}
             {#if problem}<p class="problem">{problem}</p>{/if}
 
-            {#if confirming === peer.device_id}
+            {#if confirming?.device_id === peer.device_id}
               <p class="confirm">
-                {slowPathWarning(peer.name, peer.rtt_ms ?? 0)}
+                {slowPathWarning(peer.name, confirming.rtt)}
               </p>
             {/if}
             <div class="row">
@@ -490,7 +599,17 @@
                 <button {disabled} onclick={() => store.releaseInput()}>
                   Bring my keyboard back
                 </button>
-              {:else if confirming === peer.device_id}
+              {:else if peer.state === "driven"}
+                <!-- It is using OUR keyboard: the only gesture that can succeed
+                     here is ending that, and the two takes would both be refused
+                     `INPUT_BUSY` every time. -->
+                <button
+                  {disabled}
+                  aria-label="Take my keyboard back from {peer.name}"
+                  onclick={() => store.releaseInput()}
+                  >Take my keyboard back</button
+                >
+              {:else if confirming?.device_id === peer.device_id}
                 <button
                   {disabled}
                   aria-label="Send the keyboard alone to {peer.name}"
@@ -510,7 +629,7 @@
                   >
                 {/if}
                 <button onclick={() => (confirming = null)}>Cancel</button>
-              {:else}
+              {:else if blocked === null}
                 <button
                   {disabled}
                   aria-label="Take control of {peer.name}"
@@ -524,6 +643,12 @@
                 >
               {/if}
             </div>
+            {#if blocked && peer.state !== "driving" && peer.state !== "driven"}
+              <!-- No button at all, and the reason: a take this machine cannot
+                   even attempt is accepted by the engine, parked, and never spoken
+                   of again, which is the one thing this feature must not do. -->
+              <p class="meta">{blocked}</p>
+            {/if}
 
             {#if toward(peer.device_id).length > 0}
               {@const stored = firstGuards(peer)}
@@ -535,6 +660,55 @@
                   {/each}
                 </ul>
                 {#if crossable(peer.device_id).length > 0}
+                {@const edge = crossable(peer.device_id)[0]}
+                {#if tooShortToCross(edge.length, stored ?? {})}
+                  <p class="problem">{tooShortToCross(edge.length, stored ?? {})}</p>
+                {/if}
+                <label>
+                  Cross
+                  <select
+                    {disabled}
+                    aria-label="When the pointer crosses to {peer.name}"
+                    value={String(stored?.dwell_ms ?? GUARD_DEFAULTS.dwell_ms)}
+                    onchange={(e) =>
+                      guard(peer, {
+                        dwell_ms: Number(
+                          (e.currentTarget as HTMLSelectElement).value,
+                        ),
+                      })}
+                  >
+                    {#if !DWELL_CHOICES.some((c) => c.ms === (stored?.dwell_ms ?? GUARD_DEFAULTS.dwell_ms))}
+                      <option value={String(stored?.dwell_ms)}>
+                        after {stored?.dwell_ms} ms at the edge
+                      </option>
+                    {/if}
+                    {#each DWELL_CHOICES as choice (choice.ms)}
+                      <option value={String(choice.ms)}>
+                        {choice.label.toLowerCase()}
+                      </option>
+                    {/each}
+                  </select>
+                </label>
+                <label>
+                  Only while holding
+                  <select
+                    {disabled}
+                    aria-label="The key to hold to cross to {peer.name}"
+                    value={String(stored?.require_mods ?? 0)}
+                    onchange={(e) =>
+                      guard(peer, {
+                        require_mods: Number(
+                          (e.currentTarget as HTMLSelectElement).value,
+                        ),
+                      })}
+                  >
+                    <option value="0">nothing</option>
+                    <option value={String(MODS.ctrl)}>Ctrl</option>
+                    <option value={String(MODS.alt)}>Alt</option>
+                    <option value={String(MODS.shift)}>Shift</option>
+                    <option value={String(MODS.meta)}>Meta</option>
+                  </select>
+                </label>
                 <label>
                   <input
                     type="checkbox"
@@ -542,9 +716,7 @@
                     {disabled}
                     aria-label="Never cross to {peer.name}"
                     onchange={(e) =>
-                      guard(peer, {
-                        wall: (e.currentTarget as HTMLInputElement).checked,
-                      })}
+                      toggle(e, (wanted) => guard(peer, { wall: wanted }))}
                   />
                   Never cross to this computer
                 </label>
@@ -555,12 +727,9 @@
                     {disabled}
                     aria-label="Ask for a double tap toward {peer.name}"
                     onchange={(e) =>
-                      guard(peer, {
-                        double_tap_ms: (e.currentTarget as HTMLInputElement)
-                          .checked
-                          ? 300
-                          : 0,
-                      })}
+                      toggle(e, (wanted) =>
+                        guard(peer, { double_tap_ms: wanted ? 300 : 0 }),
+                      )}
                   />
                   Only after the pointer leaves the edge and comes straight back
                 </label>
@@ -571,12 +740,11 @@
                     {disabled}
                     aria-label="Keep the corners free toward {peer.name}"
                     onchange={(e) =>
-                      guard(peer, {
-                        dead_corner: (e.currentTarget as HTMLInputElement)
-                          .checked
-                          ? 16
-                          : 0,
-                      })}
+                      toggle(e, (wanted) =>
+                        guard(peer, {
+                          dead_corner: wanted ? GUARD_DEFAULTS.dead_corner : 0,
+                        }),
+                      )}
                   />
                   Leave the corners alone, for menus and hot corners
                 </label>
@@ -601,8 +769,7 @@
         checked={state.lock}
         {disabled}
         aria-label="Keep the pointer on this screen"
-        onchange={(e) =>
-          store.lockPointer((e.currentTarget as HTMLInputElement).checked)}
+        onchange={(e) => toggle(e, (wanted) => store.lockPointer(wanted))}
       />
       Keep the pointer on this computer's screens, whatever the layout says
     </label>
@@ -693,9 +860,14 @@
   /* The plane: one box, the screens placed inside it in its own pixels. A fixed
      nominal size, shrunk by CSS on a narrow window (the drag reads the real
      width once, so the arithmetic follows). */
+  /* The box keeps its width; this is what gives way on a narrow window. */
+  .scroller {
+    max-width: 100%;
+    overflow-x: auto;
+  }
+
   .plane {
     position: relative;
-    max-width: 100%;
     background: var(--nav);
     border: 1px solid var(--line);
     border-radius: var(--radius);

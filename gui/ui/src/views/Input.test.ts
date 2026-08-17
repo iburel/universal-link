@@ -11,6 +11,7 @@ import {
   cleanup,
   click,
   render,
+  settle,
   textOf,
 } from "../lib/harness";
 import { CoreStore } from "../lib/store.svelte";
@@ -119,6 +120,11 @@ function state(over: Partial<InputState> = {}): InputState {
   };
 }
 
+/** The fixture's peer, ticked in "who this computer may drive" and ready. */
+function drivable(over: Partial<InputState["devices"][number]> = {}) {
+  return { devices: [{ ...state().devices[0], drive: true, ...over }] };
+}
+
 let store: CoreStore;
 
 function ready(over: Partial<InputState> = {}) {
@@ -149,7 +155,7 @@ test("with the keyboard here, the tab says so and offers no way back", () => {
 });
 
 test("while the pointer is away, the source says where it is and how to get it back", () => {
-  const release = vi.spyOn(store, "releaseInput").mockResolvedValue();
+  const release = vi.spyOn(store, "releaseInput").mockResolvedValue(true);
   ready({
     session: {
       device_id: "d_desk",
@@ -313,7 +319,7 @@ function dragBy(screen: Element, dx: number, dy: number) {
 }
 
 test("dragging a screen sends the whole arrangement, every spot included", async () => {
-  const place = vi.spyOn(store, "placeScreens").mockResolvedValue();
+  const place = vi.spyOn(store, "placeScreens").mockResolvedValue(true);
   const view = render(Input, { store });
 
   dragBy(byLabel(view, "Desk Main"), 40, 0);
@@ -331,7 +337,7 @@ test("dragging a screen sends the whole arrangement, every spot included", async
 });
 
 test("a drag that would put two screens in the same place is refused, and nothing is sent", async () => {
-  const place = vi.spyOn(store, "placeScreens").mockResolvedValue();
+  const place = vi.spyOn(store, "placeScreens").mockResolvedValue(true);
   const view = render(Input, { store });
 
   // Far to the left: right on top of this computer's own screen.
@@ -346,7 +352,7 @@ test("a drag that would put two screens in the same place is refused, and nothin
 // holds must go with it, or a mouseup afterwards writes a placement from a
 // component nobody is looking at.
 test("leaving the tab in the middle of a drag takes the drag with it", async () => {
-  const place = vi.spyOn(store, "placeScreens").mockResolvedValue();
+  const place = vi.spyOn(store, "placeScreens").mockResolvedValue(true);
   const view = render(Input, { store });
 
   const screen = byLabel(view, "Desk Main");
@@ -364,7 +370,7 @@ test("leaving the tab in the middle of a drag takes the drag with it", async () 
 });
 
 test("a click that moves nothing sends nothing", async () => {
-  const place = vi.spyOn(store, "placeScreens").mockResolvedValue();
+  const place = vi.spyOn(store, "placeScreens").mockResolvedValue(true);
   const view = render(Input, { store });
 
   dragBy(byLabel(view, "Desk Main"), 0, 0);
@@ -376,7 +382,7 @@ test("a click that moves nothing sends nothing", async () => {
 // A machine's screens move together, unless the person says otherwise: a laptop's
 // external screen may genuinely sit next to another computer.
 test("a whole machine's screens move together, and one can be detached", async () => {
-  const place = vi.spyOn(store, "placeScreens").mockResolvedValue();
+  const place = vi.spyOn(store, "placeScreens").mockResolvedValue(true);
   ready({
     plane: {
       id: "f".repeat(32),
@@ -412,7 +418,7 @@ test("a whole machine's screens move together, and one can be detached", async (
 });
 
 test("arrow keys move a screen for whoever is not holding a mouse", async () => {
-  const place = vi.spyOn(store, "placeScreens").mockResolvedValue();
+  const place = vi.spyOn(store, "placeScreens").mockResolvedValue(true);
   const view = render(Input, { store });
 
   byLabel(view, "Desk Main").dispatchEvent(
@@ -426,7 +432,7 @@ test("arrow keys move a screen for whoever is not holding a mouse", async () => 
 
 // The arrangement is imported rather than re-invented, so there is a way back.
 test("a machine's own arrangement can be put back", async () => {
-  const place = vi.spyOn(store, "placeScreens").mockResolvedValue();
+  const place = vi.spyOn(store, "placeScreens").mockResolvedValue(true);
   const desk = state().devices[0];
   ready({
     devices: [
@@ -477,13 +483,14 @@ test("the two lists are told apart: one decides, the other only offers", () => {
   expect(said).toContain("only if it is");
   expect(said).toContain("ticked here, on this computer");
   expect(said).toContain("Who this computer may drive");
-  expect(said).toContain("It grants nothing over there");
+  expect(said).toContain("It grants");
+  expect(said).toContain("nothing over there");
   expect(said).toContain("finds out by trying");
 });
 
 test("the authority's switch is the one stored here", () => {
-  const allow = vi.spyOn(store, "allowInput").mockResolvedValue();
-  const drive = vi.spyOn(store, "driveInput").mockResolvedValue();
+  const allow = vi.spyOn(store, "allowInput").mockResolvedValue(true);
+  const drive = vi.spyOn(store, "driveInput").mockResolvedValue(true);
   const view = render(Input, { store });
 
   click(byLabel(view, "Let Desk drive this computer"));
@@ -494,7 +501,7 @@ test("the authority's switch is the one stored here", () => {
 });
 
 test("a switch already on turns off", () => {
-  const allow = vi.spyOn(store, "allowInput").mockResolvedValue();
+  const allow = vi.spyOn(store, "allowInput").mockResolvedValue(true);
   ready({ devices: [{ ...state().devices[0], allowed: true }] });
 
   const view = render(Input, { store });
@@ -537,7 +544,8 @@ test("a deployment whose relays will not carry a session says so", () => {
 });
 
 test("taking control on a fast path just takes it", () => {
-  const take = vi.spyOn(store, "takeInput").mockResolvedValue();
+  const take = vi.spyOn(store, "takeInput").mockResolvedValue(true);
+  ready(drivable());
   const view = render(Input, { store });
 
   click(byLabel(view, "Take control of Desk"));
@@ -545,16 +553,37 @@ test("taking control on a fast path just takes it", () => {
   expect(take).toHaveBeenCalledWith("d_desk");
 });
 
+// The engine only warms a channel to a computer this one may drive and that its
+// directory calls reachable, and a take without both is accepted, parked and
+// never spoken of again. So the button is not offered, and the reason is.
+test("a computer this one may not drive is not offered a take, and says why", () => {
+  const take = vi.spyOn(store, "takeInput").mockResolvedValue(true);
+  const view = render(Input, { store });
+
+  expect(() => byLabel(view, "Take control of Desk")).toThrow();
+  expect(() => byLabel(view, "Send the keyboard alone to Desk")).toThrow();
+  expect(textOf(view)).toContain('Tick Desk under "Who this computer may drive"');
+  expect(take).not.toHaveBeenCalled();
+});
+
+test("a computer that is not answering is not offered a take either", () => {
+  ready(drivable({ state: "off" }));
+  const view = render(Input, { store });
+
+  expect(() => byLabel(view, "Take control of Desk")).toThrow();
+  expect(textOf(view)).toContain("is not answering right now");
+});
+
 // The relay is allowed, never silently: a slow path warns BEFORE the pointer
 // goes, and the offer alongside the warning is the keyboard alone.
 test("a slow path warns before the pointer goes, and offers the keyboard alone", () => {
-  const take = vi.spyOn(store, "takeInput").mockResolvedValue();
-  ready({ devices: [{ ...state().devices[0], rtt_ms: 32, lan: false }] });
+  const take = vi.spyOn(store, "takeInput").mockResolvedValue(true);
+  ready(drivable({ rtt_ms: 50, lan: false }));
   const view = render(Input, { store });
 
   click(byLabel(view, "Take control of Desk"));
   expect(take).not.toHaveBeenCalled();
-  expect(textOf(view)).toContain("32 ms away");
+  expect(textOf(view)).toContain("50 ms away");
   expect(textOf(view)).toContain("lag noticeably");
 
   click(byLabel(view, "Send the keyboard alone to Desk"));
@@ -562,8 +591,8 @@ test("a slow path warns before the pointer goes, and offers the keyboard alone",
 });
 
 test("a slow path can still be taken deliberately", () => {
-  const take = vi.spyOn(store, "takeInput").mockResolvedValue();
-  ready({ devices: [{ ...state().devices[0], rtt_ms: 32, lan: false }] });
+  const take = vi.spyOn(store, "takeInput").mockResolvedValue(true);
+  ready(drivable({ rtt_ms: 50, lan: false }));
   const view = render(Input, { store });
 
   click(byLabel(view, "Take control of Desk"));
@@ -574,8 +603,21 @@ test("a slow path can still be taken deliberately", () => {
 
 // Above the threshold the engine refuses the pointer outright, so the interface
 // does not offer a button that cannot succeed.
+// A measured number inside the band that "passes but announces it" is not worth
+// a question: #123 measured 32 ms over a relay, and the epic's own line is that a
+// pointer stops feeling like one at roughly 40.
+test("an ordinary relay is announced rather than questioned", () => {
+  const take = vi.spyOn(store, "takeInput").mockResolvedValue(true);
+  ready(drivable({ rtt_ms: 32, lan: false }));
+  const view = render(Input, { store });
+
+  expect(textOf(view)).toContain("32 ms away, over the internet");
+  click(byLabel(view, "Take control of Desk"));
+  expect(take).toHaveBeenCalledWith("d_desk");
+});
+
 test("past the threshold the pointer is not offered at all", () => {
-  ready({ devices: [{ ...state().devices[0], rtt_ms: 120, lan: false }] });
+  ready(drivable({ rtt_ms: 120, lan: false }));
   const view = render(Input, { store });
 
   click(byLabel(view, "Take control of Desk"));
@@ -586,9 +628,9 @@ test("past the threshold the pointer is not offered at all", () => {
 });
 
 test("the computer being driven offers the way back rather than a second take", () => {
-  const release = vi.spyOn(store, "releaseInput").mockResolvedValue();
+  const release = vi.spyOn(store, "releaseInput").mockResolvedValue(true);
   ready({
-    devices: [{ ...state().devices[0], state: "driving" }],
+    devices: [{ ...state().devices[0], drive: true, state: "driving" }],
     session: {
       device_id: "d_desk",
       direction: "out",
@@ -617,7 +659,7 @@ test("the guards of a crossing are shown in words, not in milliseconds", () => {
 });
 
 test("a wall is set per crossing, and says the whole truth on its own", async () => {
-  const guards = vi.spyOn(store, "setGuards").mockResolvedValue();
+  const guards = vi.spyOn(store, "setGuards").mockResolvedValue(true);
   const view = render(Input, { store });
 
   click(byLabel(view, "Never cross to Desk"));
@@ -632,7 +674,7 @@ test("a wall is set per crossing, and says the whole truth on its own", async ()
 });
 
 test("the double tap and the dead corners are toggles", async () => {
-  const guards = vi.spyOn(store, "setGuards").mockResolvedValue();
+  const guards = vi.spyOn(store, "setGuards").mockResolvedValue(true);
   const view = render(Input, { store });
 
   click(byLabel(view, "Ask for a double tap toward Desk"));
@@ -733,7 +775,7 @@ test("a pair with no shared edge says why the pointer cannot cross", () => {
 // --- This computer ----------------------------------------------------------
 
 test("the pointer can be pinned to this computer, and the reason is given", () => {
-  const lock = vi.spyOn(store, "lockPointer").mockResolvedValue();
+  const lock = vi.spyOn(store, "lockPointer").mockResolvedValue(true);
   const view = render(Input, { store });
 
   expect(textOf(view)).toContain("game or a virtual machine");
@@ -743,7 +785,7 @@ test("the pointer can be pinned to this computer, and the reason is given", () =
 });
 
 test("the return hotkey is shown, changeable, and said to be local", () => {
-  const hotkey = vi.spyOn(store, "setHotkey").mockResolvedValue();
+  const hotkey = vi.spyOn(store, "setHotkey").mockResolvedValue(true);
   const view = render(Input, { store });
 
   const select = byLabel(view, "The key that brings your keyboard back") as HTMLSelectElement;
@@ -776,6 +818,7 @@ test("an engine that is not running says so, and offers nothing", () => {
 });
 
 test("without the Core, nothing can be changed", () => {
+  ready(drivable());
   store.connection = { status: "connecting" };
   const view = render(Input, { store });
 
@@ -787,11 +830,207 @@ test("without the Core, nothing can be changed", () => {
 });
 
 test("a drag is inert while the Core is away", async () => {
-  const place = vi.spyOn(store, "placeScreens").mockResolvedValue();
+  const place = vi.spyOn(store, "placeScreens").mockResolvedValue(true);
   store.connection = { status: "connecting" };
   const view = render(Input, { store });
 
   dragBy(byLabel(view, "Desk Main"), 40, 0);
+  await Promise.resolve();
+
+  expect(place).not.toHaveBeenCalled();
+});
+
+// --- What the engine says, and only that ------------------------------------
+
+// A tick the engine refused must not be left standing: on the list that decides
+// who may type here, that would be the interface asserting a grant nobody holds.
+test("a refused switch goes back to what the engine says", async () => {
+  vi.spyOn(store, "allowInput").mockResolvedValue(false);
+  const view = render(Input, { store });
+
+  const box = byLabel(view, "Let Desk drive this computer") as HTMLInputElement;
+  expect(box.checked).toBe(false);
+  box.click();
+  expect(box.checked).toBe(true);
+  await Promise.resolve();
+  await Promise.resolve();
+
+  expect(box.checked).toBe(false);
+});
+
+test("a switch the engine took goes on waiting for the engine's word", async () => {
+  vi.spyOn(store, "allowInput").mockResolvedValue(true);
+  const view = render(Input, { store });
+
+  const box = byLabel(view, "Let Desk drive this computer") as HTMLInputElement;
+  box.click();
+  await Promise.resolve();
+  await Promise.resolve();
+
+  // Not put back: the engine accepted, and its notification is what will confirm
+  // it. Putting it back here would make the happy path flicker.
+  expect(box.checked).toBe(true);
+});
+
+// A keyboard-only session never moved the mouse, and the row must not say it did.
+test("a keyboard-only session is not described as a pointer one", () => {
+  ready({
+    devices: [{ ...state().devices[0], drive: true, state: "driving" }],
+    session: {
+      device_id: "d_desk",
+      direction: "out",
+      mode: "keys",
+      since: 1,
+      rtt_ms: 4,
+    },
+  });
+
+  const view = render(Input, { store });
+
+  expect(textOf(view)).toContain("Your keyboard is there");
+  expect(textOf(view)).not.toContain("Your keyboard and mouse are there");
+});
+
+// The machine being driven: the two takes would both be refused INPUT_BUSY every
+// time, and the gesture that works was offered nowhere.
+test("the machine being driven is offered the one gesture that works", () => {
+  const release = vi.spyOn(store, "releaseInput").mockResolvedValue(true);
+  ready({
+    devices: [{ ...state().devices[0], state: "driven" }],
+    session: {
+      device_id: "d_desk",
+      direction: "in",
+      mode: "full",
+      since: 1,
+      rtt_ms: 4,
+    },
+  });
+
+  const view = render(Input, { store });
+
+  expect(() => byLabel(view, "Take control of Desk")).toThrow();
+  click(byLabel(view, "Take my keyboard back from Desk"));
+  expect(release).toHaveBeenCalledOnce();
+});
+
+// The dwell is the primary guard of the chain, and a millisecond count is not
+// what anybody is choosing: three intentions, and the engine's own numbers.
+test("the dwell is chosen in words", async () => {
+  const guards = vi.spyOn(store, "setGuards").mockResolvedValue(true);
+  const view = render(Input, { store });
+
+  const select = byLabel(
+    view,
+    "When the pointer crosses to Desk",
+  ) as HTMLSelectElement;
+  expect(select.value).toBe("250");
+  select.value = "600";
+  select.dispatchEvent(new Event("change", { bubbles: true }));
+  await Promise.resolve();
+
+  expect(guards).toHaveBeenCalledWith(
+    "d_desk",
+    `${NODE_B}/B1`,
+    "right",
+    expect.objectContaining({ dwell_ms: 600 }),
+  );
+});
+
+test("a held modifier is chosen by name", async () => {
+  const guards = vi.spyOn(store, "setGuards").mockResolvedValue(true);
+  const view = render(Input, { store });
+
+  const select = byLabel(
+    view,
+    "The key to hold to cross to Desk",
+  ) as HTMLSelectElement;
+  expect(select.value).toBe("0");
+  select.value = "2";
+  select.dispatchEvent(new Event("change", { bubbles: true }));
+  await Promise.resolve();
+
+  expect(guards).toHaveBeenCalledWith(
+    "d_desk",
+    `${NODE_B}/B1`,
+    "right",
+    expect.objectContaining({ require_mods: 2 }),
+  );
+});
+
+// A crossing whose shared stretch is used up by the corners left alone at both
+// ends admits nothing, and the remedy is the toggle right beside it.
+test("a crossing too short for its corners says so", () => {
+  ready({
+    plane: {
+      id: "f".repeat(32),
+      by: null,
+      spots: [
+        spot({ monitor: `${NODE_A}/A1` }),
+        // Twenty pixels of shared edge, which the 16 pixel corners eat.
+        spot({
+          monitor: `${NODE_B}/B1`,
+          device_id: "d_desk",
+          name: "Main",
+          x: 1920,
+          y: 1060,
+        }),
+      ],
+    },
+  });
+
+  const view = render(Input, { store });
+
+  expect(textOf(view)).toContain("pixels of that edge are shared");
+  expect(textOf(view)).toContain("Untick the corners");
+});
+
+// Who arranged the plane, because a placement is adopted from a signature this
+// computer may not be able to verify, and a human noticing is the whole repair.
+test("the plane says who arranged it", () => {
+  ready({
+    plane: { ...state().plane, by: "d_desk" },
+  });
+
+  const view = render(Input, { store });
+
+  expect(textOf(view)).toContain("Arranged by Desk.");
+});
+
+// One computer on the plane: dragging its own screens says nothing to anybody,
+// and inviting a drag would be inviting a gesture with no meaning.
+test("with only this computer on the plane, the invitation is a different one", () => {
+  ready({
+    plane: {
+      id: "f".repeat(32),
+      by: null,
+      spots: [spot({ monitor: `${NODE_A}/A1` })],
+    },
+    devices: [],
+  });
+
+  const view = render(Input, { store });
+
+  expect(textOf(view)).toContain("only this computer's screens here");
+  expect(textOf(view)).not.toContain("Drag a screen to say where it really is");
+});
+
+// The plane can go while the mouse is down (the engine restarting takes the
+// snapshot away), and an arrangement of NOTHING replaces the placement of every
+// computer on the account.
+test("a drag that outlives the plane sends nothing at all", async () => {
+  const place = vi.spyOn(store, "placeScreens").mockResolvedValue(true);
+  const view = render(Input, { store });
+
+  const screen = byLabel(view, "Desk Main");
+  screen.dispatchEvent(
+    new MouseEvent("mousedown", { bubbles: true, clientX: 0, clientY: 0 }),
+  );
+  window.dispatchEvent(
+    new MouseEvent("mousemove", { bubbles: true, clientX: 40, clientY: 0 }),
+  );
+  store.input = null;
+  settle();
+  window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
   await Promise.resolve();
 
   expect(place).not.toHaveBeenCalled();

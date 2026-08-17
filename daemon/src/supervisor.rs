@@ -211,8 +211,9 @@ async fn run_once(
 /// A missing executable is ignored (with a word in the log) — a Core without a
 /// tray is still a working Core.
 ///
-/// The tray is granted `system.shutdown` (its Quit stops the whole Core) on top
-/// of `session.read` (its status icon); it requests only what each of its
+/// The tray is granted `system.shutdown` (its Quit stops the whole Core) and
+/// `input.read` (the keyboard and mouse session it shows for as long as it lasts)
+/// on top of `session.read` (its status icon); it requests only what each of its
 /// building blocks actually uses.
 pub fn official_components() -> Vec<ChildSpec> {
     // (name, role, scopes). The tray is cross-platform; the clipboard backend

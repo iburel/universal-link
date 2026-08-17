@@ -1210,11 +1210,27 @@ impl<B: InputBackend> Engine<B> {
             }
             Frame::Accepted { session } => self.on_accepted(node, *session, now),
             Frame::Refused { session, code, .. } => self.on_refused(node, *session, code, now),
+            // The NODE as well as the session number, in every arm below. A
+            // session number is per peer and starts at 1 on every attach, so "the
+            // session I am in" and "the session this frame names" agree by
+            // accident all the time: without the node, one stale `Ended` from a
+            // peer whose `Stop` was dropped ends the session this machine is
+            // holding with a DIFFERENT computer, and names the wrong one in the
+            // sentence it emits on the way out. `on_refused` above always checked
+            // both; these did not.
             Frame::Stop { session, .. } | Frame::Ended { session, .. } => {
-                if self.driven.as_ref().is_some_and(|d| d.session == *session) {
+                if self
+                    .driven
+                    .as_ref()
+                    .is_some_and(|d| d.node == node && d.session == *session)
+                {
                     // The source ended it: release everything, say nothing back.
                     self.end_driven(None, now);
-                } else if self.driving.as_ref().is_some_and(|d| d.session == *session) {
+                } else if self
+                    .driving
+                    .as_ref()
+                    .is_some_and(|d| d.node == node && d.session == *session)
+                {
                     // The target ended it unilaterally.
                     if let Frame::Ended { code, .. } = frame {
                         self.remember_refusal(node, code, now);
@@ -1230,7 +1246,11 @@ impl<B: InputBackend> Engine<B> {
                 }
             }
             Frame::ReleaseAll { session } => {
-                if self.driven.as_ref().is_some_and(|d| d.session == *session) {
+                if self
+                    .driven
+                    .as_ref()
+                    .is_some_and(|d| d.node == node && d.session == *session)
+                {
                     self.release_held();
                 }
             }
@@ -1239,7 +1259,11 @@ impl<B: InputBackend> Engine<B> {
                 code,
                 count,
             } => {
-                if self.driving.as_ref().is_some_and(|d| d.session == *session) {
+                if self
+                    .driving
+                    .as_ref()
+                    .is_some_and(|d| d.node == node && d.session == *session)
+                {
                     self.emit_refused(node, code, *count);
                 }
             }
@@ -1297,7 +1321,16 @@ impl<B: InputBackend> Engine<B> {
                 // Both ends run a round; ours starts here.
                 self.want_layout(node, now);
             }
-            self.announce(node, code, false, now);
+            // Deliberately NOT announced here. `input.refused` names a device and
+            // nothing else, so a sentence built from one names the machine that
+            // ASKED while describing the state of the machine that refused: on
+            // this side that is exactly the wrong way round, in all five codes
+            // ("that computer has not been told to accept your keyboard" about
+            // the computer that just asked to use ours). The side that needs the
+            // sentence is the one whose person pressed something, and it gets it
+            // from the `no` frame above (`on_refused`). What this machine shows
+            // is its own standing state, which the snapshot already carries: the
+            // switch that is off, the pin, the session it is already in.
             return;
         }
         // The same source starting again: its previous session is over as far as
@@ -1722,7 +1755,14 @@ impl<B: InputBackend> Engine<B> {
             // screen, and the remedy is a switch rather than waiting.
             refused::LOCKED => Some("locked"),
             ended::IDLE => None,
-            _ => Some("busy"),
+            // A code from a newer peer than this build arrives as `UNKNOWN`
+            // (`wire::code_in` normalises anything outside a closed set), and
+            // there is nothing to say about it beyond that. It used to become
+            // "busy", which put a fabricated sentence on the row ("that computer
+            // is already being driven") next to a transient one that honestly said
+            // the reason was not known. The backoff below still applies: what is
+            // dropped is the invented standing state, not the caution.
+            _ => None,
         };
         let peer = self.peers.entry(node.to_string()).or_default();
         peer.backoff_until = Some(now + backoff);
@@ -5215,6 +5255,69 @@ mod tests {
             "and a backend that can do nothing is never asked to: {:?}",
             h.calls()
         );
+    }
+
+    /// A session number is per peer and starts at 1 on every attach, so "the
+    /// session I am in" and "the session this frame names" agree by accident all
+    /// the time. A frame from the WRONG computer must therefore change nothing:
+    /// otherwise one stale `Ended` from a peer whose `Stop` was dropped ends the
+    /// session this machine is holding with a DIFFERENT computer, and puts that
+    /// other computer's name on the sentence it emits on the way out.
+    #[tokio::test]
+    async fn a_frame_from_another_computer_cannot_end_this_session() {
+        let mut h = Harness::new();
+        let peer = h.desk().await;
+        let stranger = node(0xc);
+        h.engine.set_directory(
+            directory(&[("d_b", &peer, true), ("d_c", &stranger, true)]),
+            h.t0,
+        );
+        h.driving(&peer).await;
+        assert_ne!(h.engine.status()["session"], Value::Null);
+
+        // The stranger attaches and speaks about "session 1", which is exactly
+        // the number the live session with B has.
+        h.warm(&stranger, true).await;
+        let _ = h.engine.take_effects();
+        h.feed(
+            &stranger,
+            vec![Frame::Ended {
+                session: 1,
+                code: ended::IDLE.to_string(),
+            }],
+            h.t0,
+        )
+        .await;
+
+        assert_ne!(
+            h.engine.status()["session"],
+            Value::Null,
+            "the session with B survives a frame from C"
+        );
+        let effects = h.engine.take_effects();
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::Emit { method, .. } if method == "input.refused")),
+            "and nothing is said about C, which said nothing: {effects:?}"
+        );
+        // Nor about B, whose row is untouched.
+        assert_eq!(h.engine.status()["devices"][0]["problem"], Value::Null);
+        assert_eq!(h.engine.status()["devices"][1]["problem"], Value::Null);
+
+        // And the same frame from B really does end it, so the guard is a guard
+        // and not a mute.
+        let session = 1;
+        h.feed(
+            &peer,
+            vec![Frame::Ended {
+                session,
+                code: ended::IDLE.to_string(),
+            }],
+            h.t0,
+        )
+        .await;
+        assert_eq!(h.engine.status()["session"], Value::Null);
     }
 
     /// The OS grant that arrives LATE, which is the macOS Accessibility case and

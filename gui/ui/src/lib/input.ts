@@ -33,10 +33,25 @@ import { isCoreError } from "./errors";
 
 /** Under this round trip, the pointer goes over without a word. */
 export const POINTER_SILENT_MS = 10;
+/**
+ * Past this, the pointer is worth a question before it is handed over. The
+ * decided bands are silent under 10 and refused above 60, and the epic's own
+ * reading of the middle is that "typing over a relay is genuinely usable (it
+ * feels like SSH), a pointer past roughly 40 ms is not": so 10 to 40 announces
+ * the number and goes, and 40 to 60 asks first. Announcing a measured 12 ms and
+ * then stopping to ask about it would be a warning nobody needs, on the ordinary
+ * wide area path (#123 measured 4 ms direct, 32 relayed).
+ */
+export const POINTER_WARN_MS = 40;
 /** Above this, the pointer is refused and the keyboard alone is offered. */
 export const POINTER_MAX_MS = 60;
 
-export type PointerVerdict = "unknown" | "silent" | "announce" | "refuse";
+export type PointerVerdict =
+  | "unknown"
+  | "silent"
+  | "announce"
+  | "warn"
+  | "refuse";
 
 /**
  * What the measured round trip means for the pointer. The number comes from the
@@ -46,7 +61,8 @@ export type PointerVerdict = "unknown" | "silent" | "announce" | "refuse";
 export function pointerVerdict(rtt: number | null | undefined): PointerVerdict {
   if (typeof rtt !== "number" || !Number.isFinite(rtt)) return "unknown";
   if (rtt <= POINTER_SILENT_MS) return "silent";
-  if (rtt <= POINTER_MAX_MS) return "announce";
+  if (rtt <= POINTER_WARN_MS) return "announce";
+  if (rtt <= POINTER_MAX_MS) return "warn";
   return "refuse";
 }
 
@@ -54,27 +70,41 @@ export function pointerVerdict(rtt: number | null | undefined): PointerVerdict {
  * The path and its latency, for a pair. Said whenever there is a number: the
  * relay is allowed here but never silently, and "on this network" is the one
  * thing the Core itself says about the route (`lan`).
+ *
+ * With nothing measured it says only that, and does NOT name a route: `lan` is
+ * first-hand (this machine hears that one on the local network) but its absence
+ * says nothing about how a session would travel, and "over the internet" about a
+ * computer that has never answered would be an invention.
  */
 export function pathLine(peer: {
   rtt_ms: number | null;
   lan: boolean;
 }): string | null {
-  const where = peer.lan ? "on this network" : "over the internet";
-  if (typeof peer.rtt_ms !== "number") return `Not measured yet, ${where}.`;
-  const verdict = pointerVerdict(peer.rtt_ms);
-  const number = `${peer.rtt_ms} ms away, ${where}`;
-  if (verdict === "refuse") {
-    return `${number}. Too far for the pointer to feel right; its keyboard alone would work.`;
+  if (typeof peer.rtt_ms !== "number") {
+    return peer.lan
+      ? "On this network. Nothing measured yet."
+      : "Nothing measured yet.";
   }
-  if (verdict === "announce") {
-    return `${number}. The pointer will lag a little.`;
+  const number = `${peer.rtt_ms} ms away, ${peer.lan ? "on this network" : "over the internet"}`;
+  switch (pointerVerdict(peer.rtt_ms)) {
+    case "refuse":
+      return `${number}. Too far for the pointer to feel right; its keyboard alone would work.`;
+    case "warn":
+      return `${number}. ${SLOW_POINTER}`;
+    case "announce":
+      return `${number}. The pointer will lag a little.`;
+    default:
+      return `${number}.`;
   }
-  return `${number}.`;
 }
+
+/** One wording for the same fact, wherever it is said. */
+const SLOW_POINTER =
+  "The pointer will lag noticeably at that distance; its keyboard alone would feel normal.";
 
 /** The warning shown BEFORE the pointer is handed across a slow path. */
 export function slowPathWarning(name: string, rtt: number): string {
-  return `${name} is ${rtt} ms away. The pointer will lag noticeably at that distance. Its keyboard alone would feel normal.`;
+  return `${name} is ${rtt} ms away. ${SLOW_POINTER}`;
 }
 
 // --- The refusals (doc/input-sharing.md, section 13) ------------------------
@@ -98,10 +128,12 @@ const REFUSALS: Record<string, string> = {
   PLANE_STALE:
     "The two computers do not agree on where the screens are yet. Trying again.",
   NO_BACKEND: "<name> cannot be driven: nothing there can type.",
-  // Two causes, one code, so the sentence names both rather than guessing: a
-  // locked screen is unlocked there, and a pinned pointer is a switch there.
+  // One cause, and not the one it looks like: `refused::LOCKED` and
+  // `ended::LOCKED` are both sent from `input.lock` alone (verified in
+  // input/src/session.rs), never by a locked screen, which reports itself as
+  // `SCREEN_LOCKED`. So the sentence names the pin and the switch that undoes it.
   LOCKED:
-    "<name> cannot be driven while it is locked, or while its pointer is pinned to its own screen.",
+    "<name>'s pointer is pinned to its own screen, so it cannot be driven. That switch is on <name>.",
   // The channel could not be opened. `NO_DIRECT_PATH` is the deployment whose
   // relays introduce devices without carrying a session (#88), and it is a
   // property of the PAIR rather than of either device.
@@ -109,22 +141,51 @@ const REFUSALS: Record<string, string> = {
     "This account's relays do not carry a keyboard session. <name> and this computer need a network they share, or a VPN between them.",
   COMPONENT_ABSENT:
     "<name> is not running the keyboard and mouse engine right now.",
+  // The everyday one, and it was the one with no sentence: a computer whose
+  // record still carries a route (a relay, or a signed address) reads as
+  // reachable while it is asleep, and the channel to it times out.
+  DEVICE_OFFLINE:
+    "<name> is not answering right now. It may be asleep, off, or on another network.",
+  DEVICE_UNKNOWN: "<name> is no longer one of your account's computers.",
+  // What every code outside a frame's closed set becomes on arrival, so a later
+  // engine's vocabulary reaches a person as a sentence rather than as prose a
+  // peer chose.
+  UNKNOWN: "<name> refused, and this version does not know the reason it gave.",
   OPEN_REFUSED: "<name> did not accept a live channel.",
   OPEN_FAILED: "The live channel to <name> could not be opened.",
   // What the target says about an injection that did not happen. Each of these
   // is DETECTED, which is why it can be said at all.
+  //
+  // These five name NO machine, and that is not laziness: the engine emits them
+  // on BOTH ends of a session (the target says them about itself, and forwards
+  // them to the source in an `oops` frame), while the notification carries a
+  // device_id and no direction. A sentence naming the device would name the wrong
+  // machine on one of the two sides every time. "The computer being driven" is
+  // true wherever it is read, and the epic's own wording is machine-free for the
+  // same reason.
   ELEVATED_WINDOW: "Nothing was typed: this window runs as administrator.",
   SECURE_INPUT:
     "Nothing was typed: password fields block synthetic keystrokes on macOS.",
-  SCREEN_LOCKED: "Nothing was typed: <name> is locked.",
-  NO_PERMISSION: "Nothing was typed: 1Device is not allowed to type on <name>.",
-  UNRESOLVED: "That key does not exist on <name>'s keyboard.",
+  // Windows reports its secure desktop the same way it reports a locked screen
+  // (`refusal_for` in input/src/windows.rs), and a UAC prompt is the common one of
+  // the two, so the sentence names both rather than sending somebody to unlock a
+  // machine that is not locked.
+  SCREEN_LOCKED:
+    "Nothing was typed: a computer cannot be driven while it is locked, and Windows reports a security prompt the same way.",
+  NO_PERMISSION:
+    "Nothing was typed: 1Device is not allowed to type on the computer being driven.",
+  UNRESOLVED:
+    "That key does not exist on the keyboard of the computer being driven.",
   // How a session ended, when nobody asked it to.
   IDLE: "Your keyboard went quiet, so <name> released it.",
   TAKEN: "Someone is using <name> directly.",
   REVOKED: "<name> took its permission back, so your keyboard came back.",
   SLOW: "The connection to <name> slowed down, so your keyboard came back.",
-  GONE: "Your keyboard came back: the session with <name> ended on its own.",
+  // Three causes under one code, two of them local (this computer's capture died,
+  // or its own permission to capture went away) and one remote (the channel
+  // ended). So it blames nobody: the local half, when there is one, is said by
+  // this computer's own problem line right above.
+  GONE: "Your keyboard came back: the session with <name> could not go on.",
   // Not a refusal: the channel is not warm yet. Said because a crossing that
   // did not happen needs a reason, and "wait a moment" is the true one.
   NOT_WARM: "<name> is not ready yet. Try again in a moment.",
@@ -162,7 +223,7 @@ const PEER_PROBLEMS: Record<string, string> = {
     "<name> has not been told to accept your keyboard. Allow it there, on <name> itself.",
   busy: "<name> is already being driven, or is driving another computer.",
   locked:
-    "<name> cannot be driven right now: it is locked, or its pointer is pinned to its own screen.",
+    "<name>'s pointer is pinned to its own screen, so it cannot be driven. That switch is on <name>.",
   no_backend: "Nothing on <name> can type, so it cannot be driven.",
   no_path:
     "This account's relays do not carry a keyboard session, and no direct path to <name> was found. The same network, or a VPN between them, would give it one.",
@@ -259,7 +320,10 @@ const GESTURES: Record<string, string> = {
     "That computer is too far away for the pointer to feel right. Its keyboard alone would work.",
   INPUT_UNKNOWN_MONITOR:
     "The screens have moved since this was on screen: there is no crossing there any more.",
-  INPUT_INTERNAL: "1Device could not carry that out. Trying again is worth it.",
+  // Both reachable causes are permanent (a counter at its ceiling, a stored table
+  // that is full), so "try again" would be advice that cannot work.
+  INPUT_INTERNAL:
+    "1Device could not record that. Its own limit for this was reached, and repeating the gesture will not change it.",
   COMPONENT_ABSENT:
     "The keyboard and mouse engine is not running on this computer right now.",
 };
@@ -380,8 +444,9 @@ export function modifierWords(bits: number): string | null {
 }
 
 /**
- * What a crossing's guards do, as sentences. The order is the chain's order
- * (section 7), because that is the order a refusal is reported in.
+ * What a crossing's guards do, as sentences, in the order the engine asks them
+ * (section 7: wall, dead corner, required modifier, double tap, dwell), because
+ * that is the order a refusal is reported in.
  */
 export function guardWords(
   guards: Partial<GuardValues>,
@@ -398,6 +463,9 @@ export function guardWords(
   const g = { ...GUARD_DEFAULTS, ...guards };
   if (g.wall) return ["The pointer never crosses here."];
   const words: string[] = [];
+  if (g.dead_corner > 0) {
+    words.push("The corners of the edge are left alone, for menus and hot corners.");
+  }
   const mods = modifierWords(g.require_mods);
   if (mods) words.push(`Only while ${mods} is held.`);
   if (g.double_tap_ms > 0) {
@@ -407,9 +475,6 @@ export function guardWords(
   // A dwell set elsewhere (a third-party interface, a hand-edited file) is shown
   // as the number it is rather than rounded into one of the three intentions.
   words.push(offered ? `${offered.label}.` : `After ${g.dwell_ms} ms at the edge.`);
-  if (g.dead_corner > 0) {
-    words.push("The corners of the edge are left alone, for menus and hot corners.");
-  }
   return words;
 }
 
@@ -442,9 +507,10 @@ export function nodeOfSpot(key: string): string {
 }
 
 /**
- * The monitor's own id, the other half of a spot key. A monitor id may itself
- * contain a slash on some platforms, so the split is at the FIRST one and the
- * rest is the id, exactly as the engine splits it.
+ * The monitor's own id, the other half of a spot key. Split at the FIRST slash,
+ * exactly as the engine splits it (`split_spot_key`), which also REFUSES an id
+ * containing one: the tail is the whole id, and a key with two slashes is a key
+ * the engine would never have minted and would refuse on the way back.
  */
 export function monitorOfSpot(key: string): string {
   const cut = key.indexOf("/");
@@ -542,6 +608,12 @@ function overlaps(a: Bounds, b: Bounds): boolean {
  * crossing the engine does not have would be offering a setting that can never
  * apply. When the two disagree the engine refuses the write
  * (`INPUT_UNKNOWN_MONITOR`), which is said out loud rather than swallowed.
+ *
+ * One deliberate difference: the engine's SEGMENT set has nothing into a ghost at
+ * all, while this returns it marked `ghost`. That is the same fact from the other
+ * side (the engine calls it a wall whose reason is that the screen is away), and
+ * an interface needs the entry in order to say so. What it must not do is offer
+ * guards on one, which the engine would refuse.
  */
 export function crossings(
   spots: readonly InputSpot[],
@@ -600,9 +672,12 @@ export type DropOutcome =
  *   person was trying to make, and nothing on screen would say why;
  * - a spot **off the plane**, which the engine answers with `-32602`.
  *
- * Returns the whole set, every spot included: `input.place` replaces the
- * placement, so a spot left out would lose its place, and a ghost's place is
- * exactly what must not be lost.
+ * Returns every spot the SNAPSHOT carries, which is what `input.place` needs
+ * (it replaces the placement, so a spot left out loses its place, and a ghost's
+ * place is exactly what must not be lost). One caveat that is not this file's to
+ * fix: the snapshot itself omits the spots of a device whose own signed word
+ * about its screens this computer cannot verify yet, so a placement written from
+ * here cannot carry those. See the note in the PR for #127.
  */
 export function dropSpots(
   spots: readonly InputSpot[],
@@ -628,26 +703,42 @@ export function dropSpots(
   // One snap for the whole block, the smallest on each axis: a block is rigid,
   // so an offset found on one of its screens moves all of them.
   const snap = (axis: "x" | "y", size: "w" | "h", cross: "y" | "x", crossSize: "h" | "w") => {
-    let best = 0;
+    let best: number | null = null;
     for (const a of shifted) {
       for (const b of still) {
-        // Only edges that face each other, and only where the OTHER axis
-        // overlaps: aligning with a screen nowhere near it is not a snap.
+        // Two arrangements, and they want different candidates. Side by side
+        // (the other axis overlaps): the two FACING edges, which is what makes a
+        // crossing, plus lining the near edges up. Stacked (the other axis abuts
+        // within the tolerance): lining the near edges up is the only thing left,
+        // and it is what tidies a block dropped under another one. A screen
+        // nowhere near it on either axis is not a snap at all.
         const overlapping =
           a[cross] < b[cross] + b[crossSize] && b[cross] < a[cross] + a[crossSize];
-        if (!overlapping) continue;
-        for (const delta of [
-          b[axis] + b[size] - a[axis],
-          b[axis] - (a[axis] + a[size]),
-          b[axis] - a[axis],
-        ]) {
-          if (Math.abs(delta) <= SNAP && (best === 0 || Math.abs(delta) < Math.abs(best))) {
+        const abutting =
+          Math.abs(b[cross] - (a[cross] + a[crossSize])) <= SNAP ||
+          Math.abs(a[cross] - (b[cross] + b[crossSize])) <= SNAP;
+        if (!overlapping && !abutting) continue;
+        const candidates = overlapping
+          ? [
+              b[axis] + b[size] - a[axis],
+              b[axis] - (a[axis] + a[size]),
+              b[axis] - a[axis],
+            ]
+          : [b[axis] - a[axis]];
+        for (const delta of candidates) {
+          // `null` and not `0` as the sentinel: a drop that landed exactly right
+          // has a delta of zero, and a sentinel of zero let a 10 pixel candidate
+          // overrule it and open a gap where the human had aimed true.
+          if (
+            Math.abs(delta) <= SNAP &&
+            (best === null || Math.abs(delta) < Math.abs(best))
+          ) {
             best = delta;
           }
         }
       }
     }
-    return best;
+    return best ?? 0;
   };
   const ax = snap("x", "w", "y", "h");
   const ay = snap("y", "h", "x", "w");
@@ -691,10 +782,11 @@ function settle(
     if (
       !Number.isFinite(a.x) ||
       !Number.isFinite(a.y) ||
+      // The corner, and only the corner: that is what the engine bounds
+      // (`MAX_EXTENT` in input/src/plane.rs), and refusing a plane it would
+      // accept is not this file's job.
       Math.abs(a.x) > PLANE_EXTENT ||
-      Math.abs(a.y) > PLANE_EXTENT ||
-      Math.abs(a.x + a.w) > PLANE_EXTENT ||
-      Math.abs(a.y + a.h) > PLANE_EXTENT
+      Math.abs(a.y) > PLANE_EXTENT
     ) {
       return { ok: false, reason: "off_plane" };
     }
@@ -713,6 +805,21 @@ function settle(
     ok: true,
     spots: placed.map((s) => ({ monitor: s.monitor, x: s.x, y: s.y })),
   };
+}
+
+/**
+ * A crossing whose shared stretch is not longer than the dead corners at both
+ * ends of it admits nothing at all: the engine shrinks the segment by
+ * `dead_corner` on each side and a pointer never lands inside what is left. Said
+ * out loud, because the remedy is one of the toggles right beside it.
+ */
+export function tooShortToCross(
+  length: number,
+  guards: Partial<GuardValues>,
+): string | null {
+  const corner = { ...GUARD_DEFAULTS, ...guards }.dead_corner;
+  if (corner <= 0 || length > 2 * corner) return null;
+  return `Only about ${length} pixels of that edge are shared, which the corners left alone use up: the pointer cannot cross there. Untick the corners, or line the two screens up more.`;
 }
 
 /** Why a drop was refused, as a sentence. */
