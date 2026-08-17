@@ -10,8 +10,11 @@
 //!   pump, `SendInput` for injection, `ClipCursor` for the pin.
 //! - macOS ([`crate::macos`]): an active `CGEventTap` on a run loop source under
 //!   the Input Monitoring grant, `CGEventPost` under the Accessibility grant.
-//! - Wayland: a ticket of its own (#128). It says what it cannot do rather than
-//!   staying silent, which is the standing decision for Linux.
+//! - Wayland ([`crate::wayland`]): the `InputCapture` portal for capture, the
+//!   `RemoteDesktop` portal for injection. Its transport has never been run
+//!   against a real compositor, so it is off unless [`WAYLAND_ENV`] switches it
+//!   on, and a Wayland session otherwise says precisely which piece is missing
+//!   rather than staying silent.
 //!
 //! # Why this does not fail, unlike the clipboard's equivalent
 //!
@@ -90,7 +93,27 @@ pub fn describe(problem: Problem) -> &'static str {
         Problem::NoBackend => "no keyboard and mouse backend for this platform yet",
         Problem::NoPermission => "the OS has not granted permission to read the input devices",
         Problem::MonitorsUnstable => "the monitors of this session cannot be identified",
-        Problem::Wayland => "this is a Wayland session, whose input portals are a later ticket",
+        Problem::Wayland => "this is a Wayland session with no native path in this build",
+        Problem::XWayland => {
+            "serving this Wayland session through its XWayland: X11 windows only, \
+             native Wayland windows are out of reach"
+        }
+        Problem::WaylandNoBus => {
+            "this is a Wayland session with no D-Bus session bus, so the input portals \
+             cannot be asked for"
+        }
+        Problem::WaylandNoPortal => {
+            "this desktop's portal does not offer the input portals \
+             (org.freedesktop.portal.InputCapture, org.freedesktop.portal.RemoteDesktop)"
+        }
+        Problem::WaylandPortalOld => {
+            "this desktop's input portals are older than this build can speak to"
+        }
+        Problem::WaylandPortalRefused => "the input portal refused this session",
+        Problem::WaylandUntested => {
+            "this desktop has everything the Wayland path needs, and that path has never \
+             been run against a real compositor, so it stays off"
+        }
     }
 }
 
@@ -112,6 +135,8 @@ pub struct Created {
 pub enum Backend {
     #[cfg(target_os = "linux")]
     X11(crate::x11::X11Backend),
+    #[cfg(target_os = "linux")]
+    Wayland(crate::wayland::WaylandBackend),
     #[cfg(windows)]
     Windows(crate::windows::WindowsBackend),
     #[cfg(target_os = "macos")]
@@ -130,6 +155,8 @@ pub enum Backend {
 pub enum EventLoop {
     #[cfg(target_os = "linux")]
     X11(Box<crate::x11::X11Loop>),
+    #[cfg(target_os = "linux")]
+    Wayland(Box<crate::wayland::WaylandLoop>),
     #[cfg(windows)]
     Windows(Box<crate::windows::WindowsLoop>),
     #[cfg(target_os = "macos")]
@@ -142,6 +169,8 @@ impl EventLoop {
         match self {
             #[cfg(target_os = "linux")]
             EventLoop::X11(l) => (*l).run(),
+            #[cfg(target_os = "linux")]
+            EventLoop::Wayland(l) => (*l).run(),
             #[cfg(windows)]
             EventLoop::Windows(l) => (*l).run(),
             #[cfg(target_os = "macos")]
@@ -177,12 +206,44 @@ fn absent(problem: Problem) -> Created {
 }
 
 /// Tries to build the real thing for this target.
+///
+/// # The Linux decision, in one place
+///
+/// Three sessions and one escape hatch, and the order below is the whole policy:
+///
+/// - a real X server, so [`crate::x11`] gets it;
+/// - a Wayland session (with or without an XWayland alongside), so
+///   [`crate::wayland`] gets it, and answers with either the portal backend or the
+///   precise reason it cannot be built;
+/// - nothing graphical, so [`crate::x11`] is asked anyway and fails for its own
+///   reasons: the probe is advice and the backend is the authority;
+/// - and [`FORCE_X11_ENV`], which hands a Wayland session to [`crate::x11`]
+///   deliberately. That backend then reports [`Problem::XWayland`] for as long as
+///   it serves one, so a forced session is honest about what it cannot reach
+///   rather than silently claiming everything.
 #[cfg(target_os = "linux")]
 fn build() -> Result<Created, Unsupported> {
-    if let Some(problem) = linux_problem() {
-        return Err(Unsupported(problem));
+    // FIRST, before anything is probed. The escape hatch is what a person reaches for
+    // when the detection is wrong about their machine, so it must not be hostage to
+    // the detection: an earlier version asked `session_kind()` first, and since that
+    // opens an X connection, a forced session with a black-holed `DISPLAY` hung in the
+    // probe whose answer it was about to throw away.
+    if forced_x11() {
+        eprintln!("[1device-input] forced to X11");
+        return crate::x11::create();
     }
-    crate::x11::create()
+    let kind = session_kind();
+    eprintln!("[1device-input] session: {kind:?}");
+    match kind {
+        SessionKind::X11 => crate::x11::create(),
+        SessionKind::XWayland | SessionKind::Wayland => crate::wayland::create(kind),
+        // No compositor and no X server. Asked anyway rather than refused here,
+        // because a probe that could not reach a server is not proof that a
+        // connection cannot be made (a `DISPLAY` that came up a moment later, an
+        // authority file that arrived): the backend decides, and its failure is
+        // the honest `NoBackend`.
+        SessionKind::None => crate::x11::create(),
+    }
 }
 
 #[cfg(windows)]
@@ -201,86 +262,255 @@ fn build() -> Result<Created, Unsupported> {
 }
 
 /// The environment variable that lets the X11 backend serve a session this
-/// function would otherwise refuse.
+/// module would otherwise hand to [`crate::wayland`].
 ///
 /// It exists for two named readers and no others: the live X suite, which runs
 /// against an Xvfb or an XWayland on a machine whose own session is Wayland, and a
 /// person who knows their session is really X-only and whose environment says
 /// otherwise. It is not a fix for a Wayland desktop, and a session forced this way
-/// half works by construction (see [`problem_for`]), which is exactly why it is not
-/// the default.
+/// half works by construction, which is exactly why it is not the default and why
+/// the backend it builds reports [`Problem::XWayland`] for as long as it serves one.
 #[cfg(target_os = "linux")]
 pub const FORCE_X11_ENV: &str = "ONEDEVICE_INPUT_FORCE_X11";
 
-/// Why this Linux session cannot have an X11 backend, or `None` when it can try.
+/// The environment variable that switches the Wayland portal path ON.
+///
+/// **Off by default because nothing on that path has ever been executed against a
+/// real compositor.** The D-Bus calls, the barrier round trip and the EI stream are
+/// written, compiled and unit tested against a scripted portal; no machine
+/// available while they were written implemented either portal
+/// (`xdg-desktop-portal` 1.18.4 with only the GTK backend exports neither), so the
+/// first real run is the live validation ticket's, not a user's.
+///
+/// A desktop that has everything therefore reports [`Problem::WaylandUntested`] and
+/// says so on screen, which is the honest state: a backend claiming `capture` and
+/// `inject_keys` on the strength of unexecuted code would be the exact lie this
+/// component exists not to tell. Delete this gate in the commit that records a real
+/// run, and not before.
 #[cfg(target_os = "linux")]
-fn linux_problem() -> Option<Problem> {
-    if std::env::var_os(FORCE_X11_ENV).is_some_and(|v| !v.is_empty() && v != "0") {
-        return None;
+pub const WAYLAND_ENV: &str = "ONEDEVICE_INPUT_WAYLAND";
+
+/// Is a boolean-ish environment variable switched on? Absent, empty and `0` are
+/// off, so `FOO=` in a service file does not turn something on by accident.
+#[cfg(target_os = "linux")]
+pub(crate) fn env_switch(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+#[cfg(target_os = "linux")]
+fn forced_x11() -> bool {
+    env_switch(FORCE_X11_ENV)
+}
+
+/// Which Linux graphical session this process is in.
+///
+/// Four states rather than the two the first version had, because the two it had
+/// could not express the case this repository is developed on: a Wayland session
+/// with an XWayland beside it, where an X11 backend works for some windows and not
+/// for most.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionKind {
+    /// Nothing graphical: no compositor, and no X server answering.
+    None,
+    /// A real X server that is nobody's XWayland.
+    X11,
+    /// A Wayland session, and the X server reachable on `DISPLAY` is its XWayland.
+    /// The ordinary shape of GNOME, KDE and WSLg.
+    XWayland,
+    /// A Wayland session with no X server reachable at all.
+    Wayland,
+}
+
+/// What the X server on `DISPLAY` turned out to be, asked of the server itself.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XServer {
+    /// No `DISPLAY`, or nothing answered on it.
+    Unreachable,
+    /// An X server that does not announce the `XWAYLAND` extension.
+    Plain,
+    /// An X server that does. Only an XWayland does
+    /// ([`crate::x11::XWAYLAND_EXTENSION`]).
+    XWayland,
+}
+
+/// What kind of session this is, from what is really there.
+#[cfg(target_os = "linux")]
+pub fn session_kind() -> SessionKind {
+    session_kind_for(
+        wayland_socket_present(),
+        std::env::var_os("XDG_SESSION_TYPE").as_deref(),
+        local_x_server(),
+    )
+}
+
+/// The X server on `DISPLAY`, asked about itself, but **only when `DISPLAY` names a
+/// local one**.
+///
+/// # Why the remote case is refused rather than probed
+///
+/// Two reasons, and either alone would be enough.
+///
+/// It is correct: a display on another host is not the desk this person is sitting at.
+/// A `DISPLAY` left behind by an `ssh -X`, or handed to a container, names somebody
+/// else's screen, and capturing a keyboard there or typing into it is not what anybody
+/// asked for.
+///
+/// And it is the only way to bound this call. `xcb::Connection::connect` blocks through
+/// the whole handshake with no timeout of its own, so a host that is up and then
+/// black-holed costs the kernel's full TCP connect budget, about two minutes, at
+/// component start-up: `os::create` would not return, nothing would answer
+/// `input.status`, and the supervisor would restart into the same wait for ever. The
+/// version of this function that probed unconditionally introduced that on Wayland
+/// desktops, which had never connected to an X server at all before.
+///
+/// The residual exposure is a LOCAL server that accepts and then goes quiet (a
+/// suspended virtual machine, a half-dead `Xvfb`). That one is not new: the X11 backend
+/// has always connected the same way on every X11 session, and bounding it means a
+/// timeout inside `crate::x11`. It is on the deferred list under its own name.
+#[cfg(target_os = "linux")]
+fn local_x_server() -> XServer {
+    let Some(display) = std::env::var_os("DISPLAY") else {
+        return XServer::Unreachable;
+    };
+    // Lossy on purpose: a display name that is not UTF-8 is not one of the three local
+    // shapes either way, and the comparison is about the first character.
+    let display = display.to_string_lossy();
+    let local =
+        display.starts_with(':') || display.starts_with("unix:") || display.starts_with('/');
+    if !local {
+        eprintln!("[1device-input] DISPLAY={display} is not local, so it is not this session's");
+        return XServer::Unreachable;
     }
-    // Read as `OsStr`: a display name is not required to be UTF-8, and a session
+    crate::x11::server_kind()
+}
+
+/// Is there a Wayland socket we could actually connect to?
+///
+/// **The socket, not the variable**, and that distinction is the point of the
+/// function. `WAYLAND_DISPLAY` is inherited like any other variable, so a shell
+/// started inside a compositor and then used after that compositor died carries a
+/// name pointing at nothing; a user service that imported an old environment does
+/// the same. Believing the name there would send a live X11 session down the portal
+/// path and leave it with no backend at all.
+///
+/// An absolute name is used as given (the protocol allows one); a relative name is
+/// resolved under `XDG_RUNTIME_DIR`, which is where a compositor puts it. No
+/// connection is opened: the file being there is enough to decide which family of
+/// session this is, and the Wayland half opens its own connection when it needs
+/// one.
+#[cfg(target_os = "linux")]
+pub fn wayland_socket_present() -> bool {
+    // `OsStr` throughout: a socket name is not required to be UTF-8, and a session
     // whose variable happened not to be would otherwise read as no session at all.
-    let wayland = std::env::var_os("WAYLAND_DISPLAY");
-    let session_type = std::env::var_os("XDG_SESSION_TYPE");
-    let display = std::env::var_os("DISPLAY");
-    match problem_for(
-        wayland.as_deref(),
-        session_type.as_deref(),
-        display.as_deref(),
-    ) {
-        // The one answer that is not a refusal: no evidence of Wayland, so the
-        // backend gets to try and to fail for its own reasons.
-        Problem::NoBackend => None,
-        problem => Some(problem),
+    socket_present(
+        std::env::var_os("WAYLAND_DISPLAY").as_deref(),
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+    )
+}
+
+/// [`wayland_socket_present`] with the environment handed in, so the resolution rule
+/// is testable against a directory a test owns rather than against the session the
+/// test happens to run under.
+#[cfg(target_os = "linux")]
+fn socket_present(name: Option<&std::ffi::OsStr>, runtime_dir: Option<&std::ffi::OsStr>) -> bool {
+    let Some(name) = name.filter(|n| !n.is_empty()) else {
+        return false;
+    };
+    let path = std::path::Path::new(name);
+    if path.is_absolute() {
+        return path.exists();
+    }
+    match runtime_dir.filter(|d| !d.is_empty()) {
+        Some(dir) => std::path::Path::new(dir).join(path).exists(),
+        // No runtime directory to resolve a relative name against. The name is
+        // still evidence of a compositor (it was set by one), and nothing here can
+        // check it, so it is believed: the cost of believing it is the portal path
+        // saying precisely what it cannot do, and the cost of disbelieving it is an
+        // X11 backend under a Wayland desktop pretending to work.
+        None => true,
     }
 }
 
-/// The Linux decision, as a pure function of the three variables, so it can be
-/// tested without an environment.
+/// The Linux decision, as a pure function of the evidence, so it can be tested
+/// without an environment and without a display.
 ///
-/// # Why `DISPLAY` is not allowed to veto, which is what this function is for
+/// # Why the X server's own word leads
 ///
-/// The first version of this was
-/// `WAYLAND_DISPLAY.is_some() && DISPLAY.is_none()`, and that condition is FALSE on
-/// every Wayland desktop there is. GNOME and KDE both start XWayland and set
-/// `DISPLAY=:0`; so does WSLg, which is what this repository is developed on. So
-/// the one sentence a Wayland user needs ("this is a Wayland session, whose input
-/// portals are a later ticket") was never said to anyone, and they were left
-/// waiting for a ticket that had shipped, reading `no_backend` instead.
+/// Because it is the only piece of evidence here that cannot be inherited, stale or
+/// missing. The first version of this function read `WAYLAND_DISPLAY` and
+/// `XDG_SESSION_TYPE` and nothing else, and both of those failed on the machine it
+/// was written on: `XDG_SESSION_TYPE` is EMPTY there, under a genuine Wayland
+/// session, so a detector leaning on it is wrong about the one Wayland session
+/// available to test against. An X server that announces the `XWAYLAND` extension
+/// is announcing a fact about itself, and there is no environment in which that is
+/// a leftover.
 ///
-/// It matters for the X11 backend too, and that is the reason to be firm about it
-/// rather than lenient: an X11 backend running under XWayland can neither OBSERVE
-/// nor INJECT to native Wayland clients, which on a modern desktop is most of the
-/// windows on screen. A session that half works is worse than one that says what it
-/// cannot do, and [`Problem::Wayland`] is the accurate word for it.
+/// So: the server's word first, then the socket, then the server's word again for a
+/// plain one, and logind only when no server answers at all. That last ordering was got
+/// wrong first time round and a review caught it: a stale `XDG_SESSION_TYPE=wayland`
+/// vetoed a live, plain, fully drivable X server, which is the one case where the
+/// server's evidence is strongest.
 ///
-/// # Why both variables, and in this order
+/// # Why `DISPLAY` is never allowed to veto a Wayland session
 ///
-/// `WAYLAND_DISPLAY` leads because it is set by the COMPOSITOR for its own clients,
-/// which is the thing we actually care about, and because it is present in cases
-/// where the session type is not (a compositor started by hand from a tty leaves
-/// `XDG_SESSION_TYPE=tty`). `XDG_SESSION_TYPE` is kept as a second chance because
-/// it comes from logind and survives an environment that lost the socket name (a
-/// user service that did not import the compositor's environment). Either one alone
-/// would miss a real case, so it is the OR of the two: this is the only
-/// `WAYLAND_DISPLAY` in the whole repository, so the choice sets the precedent, and
-/// the precedent is "believe the strongest evidence of a Wayland session, and never
-/// let the presence of an X display argue it away".
+/// The version before that one was `WAYLAND_DISPLAY.is_some() && DISPLAY.is_none()`,
+/// which is FALSE on every Wayland desktop there is: GNOME, KDE and WSLg all start
+/// an XWayland and set `DISPLAY=:0`. The one sentence a Wayland user needed was
+/// therefore never said to anybody. It matters for the X11 backend as much as for
+/// the sentence, which is the reason to be firm rather than lenient: an X11 backend
+/// under XWayland can neither observe nor inject to native Wayland clients, which on
+/// a modern desktop is most of the windows on screen.
+///
+/// # The one case that looks like a contradiction and is not
+///
+/// A Wayland socket present AND a plain (non-XWayland) X server on `DISPLAY`. That
+/// is a nested server: an `Xvfb :99` or an `Xephyr` started inside a Wayland
+/// session, which is exactly how this repository's own live X suite is sometimes
+/// run. The nested server is real and fully drivable, and it is not the desk the
+/// person is sitting at: driving it would move a pointer inside a window. So the
+/// compositor wins and the answer is [`SessionKind::Wayland`], with
+/// [`FORCE_X11_ENV`] as the deliberate way to say "no, I mean that X server".
 #[cfg(target_os = "linux")]
-fn problem_for(
-    wayland: Option<&std::ffi::OsStr>,
+pub fn session_kind_for(
+    wayland_socket: bool,
     session_type: Option<&std::ffi::OsStr>,
-    // Deliberately unused, and kept in the signature to say so: DISPLAY is
-    // XWayland's, not evidence of an X11 session.
-    _display: Option<&std::ffi::OsStr>,
-) -> Problem {
+    x: XServer,
+) -> SessionKind {
+    // The server's own word about itself, which nothing can argue with. It is also
+    // the answer when the environment has lost every trace of the compositor: an
+    // XWayland exists only underneath one.
+    if x == XServer::XWayland {
+        return SessionKind::XWayland;
+    }
+    if wayland_socket {
+        return SessionKind::Wayland;
+    }
+    // A plain X server that is really there outranks logind, exactly as an XWayland
+    // does above, and for the same reason: `XDG_SESSION_TYPE` is inherited by every
+    // child of the login session, so it survives its own session. Somebody logged into
+    // Wayland who drops to a tty and runs `startx`, or whose compositor died and who
+    // started an Xorg, carries `XDG_SESSION_TYPE=wayland` into a session where X11
+    // capture and XTEST both work; believing it there left them with no backend at all.
+    // The rule is one sentence: the display server's own word beats what the login
+    // manager remembers, and the login manager only speaks when no server answers.
+    if x == XServer::Plain {
+        return SessionKind::X11;
+    }
     let named_wayland = session_type
         .and_then(std::ffi::OsStr::to_str)
         .is_some_and(|kind| kind.eq_ignore_ascii_case("wayland"));
-    if wayland.is_some() || named_wayland {
-        return Problem::Wayland;
+    if named_wayland {
+        return SessionKind::Wayland;
     }
-    Problem::NoBackend
+    match x {
+        XServer::Unreachable => SessionKind::None,
+        // Both handled above, and matched rather than left to a catch-all so that
+        // adding a fifth kind of server is a compile error here.
+        XServer::Plain => SessionKind::X11,
+        XServer::XWayland => SessionKind::XWayland,
+    }
 }
 
 /// The backend of a machine whose OS half could not be built: it reports what it
@@ -355,6 +585,8 @@ impl InputBackend for Backend {
         match self {
             #[cfg(target_os = "linux")]
             Backend::X11(b) => b.capabilities(),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(b) => b.capabilities(),
             #[cfg(windows)]
             Backend::Windows(b) => b.capabilities(),
             #[cfg(target_os = "macos")]
@@ -367,6 +599,8 @@ impl InputBackend for Backend {
         match self {
             #[cfg(target_os = "linux")]
             Backend::X11(b) => b.monitors().await,
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(b) => b.monitors().await,
             #[cfg(windows)]
             Backend::Windows(b) => b.monitors().await,
             #[cfg(target_os = "macos")]
@@ -379,6 +613,8 @@ impl InputBackend for Backend {
         match self {
             #[cfg(target_os = "linux")]
             Backend::X11(b) => b.pointer().await,
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(b) => b.pointer().await,
             #[cfg(windows)]
             Backend::Windows(b) => b.pointer().await,
             #[cfg(target_os = "macos")]
@@ -391,6 +627,8 @@ impl InputBackend for Backend {
         match self {
             #[cfg(target_os = "linux")]
             Backend::X11(b) => b.resolve(want).await,
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(b) => b.resolve(want).await,
             #[cfg(windows)]
             Backend::Windows(b) => b.resolve(want).await,
             #[cfg(target_os = "macos")]
@@ -403,6 +641,8 @@ impl InputBackend for Backend {
         match self {
             #[cfg(target_os = "linux")]
             Backend::X11(b) => b.capture(mode),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(b) => b.capture(mode),
             #[cfg(windows)]
             Backend::Windows(b) => b.capture(mode),
             #[cfg(target_os = "macos")]
@@ -415,6 +655,8 @@ impl InputBackend for Backend {
         match self {
             #[cfg(target_os = "linux")]
             Backend::X11(b) => b.confine(rect),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(b) => b.confine(rect),
             #[cfg(windows)]
             Backend::Windows(b) => b.confine(rect),
             #[cfg(target_os = "macos")]
@@ -427,6 +669,8 @@ impl InputBackend for Backend {
         match self {
             #[cfg(target_os = "linux")]
             Backend::X11(b) => b.warp(to),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(b) => b.warp(to),
             #[cfg(windows)]
             Backend::Windows(b) => b.warp(to),
             #[cfg(target_os = "macos")]
@@ -439,6 +683,8 @@ impl InputBackend for Backend {
         match self {
             #[cfg(target_os = "linux")]
             Backend::X11(b) => b.inject(actions),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(b) => b.inject(actions),
             #[cfg(windows)]
             Backend::Windows(b) => b.inject(actions),
             #[cfg(target_os = "macos")]
@@ -451,6 +697,8 @@ impl InputBackend for Backend {
         match self {
             #[cfg(target_os = "linux")]
             Backend::X11(b) => b.release_all(keys),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(b) => b.release_all(keys),
             #[cfg(windows)]
             Backend::Windows(b) => b.release_all(keys),
             #[cfg(target_os = "macos")]
@@ -463,6 +711,8 @@ impl InputBackend for Backend {
         match self {
             #[cfg(target_os = "linux")]
             Backend::X11(b) => b.request_exit(code),
+            #[cfg(target_os = "linux")]
+            Backend::Wayland(b) => b.request_exit(code),
             #[cfg(windows)]
             Backend::Windows(b) => b.request_exit(code),
             #[cfg(target_os = "macos")]
@@ -526,60 +776,207 @@ mod tests {
         );
     }
 
-    /// A Wayland session is recognised WITH an X display present, because every
-    /// Wayland desktop has one: GNOME, KDE and WSLg all start XWayland and set
-    /// `DISPLAY=:0`. The condition this replaces (`WAYLAND_DISPLAY` set and
-    /// `DISPLAY` unset) was false on all of them, so the one sentence a Wayland
-    /// user needs was never said and they waited for a ticket that had shipped.
+    /// The four sessions, from the evidence, and the two traps the earlier versions
+    /// of this fell into.
     ///
-    /// It protects the X11 backend as much as the sentence: an X11 backend under
-    /// XWayland can neither observe nor inject to native Wayland clients, so
-    /// `wayland` is the accurate word rather than a pessimistic one.
+    /// Trap one: a Wayland session is recognised WITH an X display present, because
+    /// every Wayland desktop has one (GNOME, KDE and WSLg all start an XWayland and
+    /// set `DISPLAY=:0`), so a condition of the form "Wayland set and DISPLAY unset"
+    /// is false on all of them and nobody was ever told anything.
+    ///
+    /// Trap two: `XDG_SESSION_TYPE` is EMPTY on this repository's own Wayland
+    /// session, so it cannot be the thing the answer turns on. The X server's own
+    /// word leads, the socket is next, and logind is only a last chance.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_wayland_session_is_named_even_though_xwayland_sets_a_display() {
+    fn the_four_linux_sessions_are_told_apart_from_what_is_really_there() {
         use std::ffi::OsStr;
         let os = OsStr::new;
 
+        // The ordinary Wayland desktop, and the case of this development machine:
+        // the socket is there, the session type says NOTHING, and the X server on
+        // DISPLAY is an XWayland. Every one of the three is what a real GNOME, KDE
+        // or WSLg session looks like.
         assert_eq!(
-            problem_for(Some(os("wayland-0")), None, Some(os(":0"))),
-            Problem::Wayland,
-            "GNOME, KDE and WSLg all look exactly like this"
+            session_kind_for(true, None, XServer::XWayland),
+            SessionKind::XWayland,
+            "socket, no session type, XWayland: this repository's own machine"
         );
         assert_eq!(
-            problem_for(Some(os("wayland-0")), Some(os("wayland")), Some(os(":0"))),
-            Problem::Wayland
+            session_kind_for(true, Some(os("wayland")), XServer::XWayland),
+            SessionKind::XWayland
+        );
+        // The server's word stands even when the environment has lost every trace of
+        // the compositor, and even when logind is wrong: an XWayland exists only
+        // underneath a compositor.
+        assert_eq!(
+            session_kind_for(false, None, XServer::XWayland),
+            SessionKind::XWayland,
+            "a service that did not import the compositor's environment"
         );
         assert_eq!(
-            problem_for(Some(os("wayland-1")), Some(os("tty")), None),
-            Problem::Wayland,
-            "a compositor started from a tty leaves the session type saying tty"
-        );
-        assert_eq!(
-            problem_for(None, Some(os("wayland")), Some(os(":0"))),
-            Problem::Wayland,
-            "logind's word is the second chance, for an environment that lost the socket name"
-        );
-        assert_eq!(
-            problem_for(None, Some(os("Wayland")), None),
-            Problem::Wayland,
-            "and the comparison does not turn on somebody's capitalisation"
+            session_kind_for(false, Some(os("x11")), XServer::XWayland),
+            SessionKind::XWayland,
+            "the server knows better than logind"
         );
 
-        // A real X11 session, and a headless machine: both are the X11 backend's
-        // business rather than the portals ticket's, and it fails for its own
-        // reasons when there is no server to reach.
+        // A Wayland session with no X server at all: a compositor built without
+        // XWayland, or one where it has not started yet.
         assert_eq!(
-            problem_for(None, Some(os("x11")), Some(os(":0"))),
-            Problem::NoBackend
+            session_kind_for(true, None, XServer::Unreachable),
+            SessionKind::Wayland
         );
-        assert_eq!(problem_for(None, None, Some(os(":0"))), Problem::NoBackend);
-        assert_eq!(problem_for(None, None, None), Problem::NoBackend);
         assert_eq!(
-            problem_for(None, Some(os("tty")), None),
-            Problem::NoBackend,
-            "a console login is not a Wayland session"
+            session_kind_for(false, Some(os("wayland")), XServer::Unreachable),
+            SessionKind::Wayland,
+            "logind's word is the last chance, and only when no server answers"
         );
+        // The one a review caught: logind remembers a Wayland login, the compositor is
+        // gone, and a plain X server is right there and fully drivable. Believing
+        // logind left that session with no backend at all.
+        assert_eq!(
+            session_kind_for(false, Some(os("wayland")), XServer::Plain),
+            SessionKind::X11,
+            "a plain server that is really there outranks what logind remembers"
+        );
+        assert_eq!(
+            session_kind_for(false, Some(os("Wayland")), XServer::Unreachable),
+            SessionKind::Wayland,
+            "and the comparison does not turn on somebody's capitalisation"
+        );
+        // The nested server: an Xvfb or an Xephyr started inside a Wayland session.
+        // Real, drivable, and not the desk anybody is sitting at, so the compositor
+        // wins and FORCE_X11_ENV is the deliberate way to say otherwise.
+        assert_eq!(
+            session_kind_for(true, None, XServer::Plain),
+            SessionKind::Wayland,
+            "a nested X server inside a Wayland session is not that session's desktop"
+        );
+
+        // A real X11 session.
+        assert_eq!(
+            session_kind_for(false, Some(os("x11")), XServer::Plain),
+            SessionKind::X11
+        );
+        assert_eq!(
+            session_kind_for(false, None, XServer::Plain),
+            SessionKind::X11,
+            "an X server and no evidence of a compositor is an X11 session, \
+             whatever logind failed to say"
+        );
+
+        // Nothing graphical. A console login is not a Wayland session.
+        assert_eq!(
+            session_kind_for(false, None, XServer::Unreachable),
+            SessionKind::None
+        );
+        assert_eq!(
+            session_kind_for(false, Some(os("tty")), XServer::Unreachable),
+            SessionKind::None
+        );
+    }
+
+    /// `WAYLAND_DISPLAY` is a name, and a name is not a socket.
+    ///
+    /// The variable is inherited like any other, so a shell that outlived its
+    /// compositor carries one pointing at nothing. Believing it there sends a live
+    /// X11 session down the portal path and leaves it with no backend at all, which
+    /// is why the check is for the file.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_wayland_name_pointing_at_nothing_is_not_a_wayland_session() {
+        use std::ffi::OsStr;
+        let os = OsStr::new;
+
+        // The environment is handed in rather than set: this binary's other tests
+        // read the real one, and a test that mutated the process environment would
+        // race them.
+        let dir = tempfile::tempdir().expect("a runtime directory");
+        let runtime = dir.path().as_os_str();
+        std::fs::write(dir.path().join("wayland-0"), b"").expect("stand in for the socket");
+
+        assert!(
+            socket_present(Some(os("wayland-0")), Some(runtime)),
+            "a relative name resolves under the runtime directory"
+        );
+        assert!(
+            !socket_present(Some(os("wayland-1")), Some(runtime)),
+            "a name the compositor never created is not a session"
+        );
+        let absolute = dir.path().join("wayland-0");
+        assert!(
+            socket_present(Some(absolute.as_os_str()), None),
+            "an absolute name is used as given, which the protocol allows"
+        );
+        assert!(!socket_present(Some(os("/nonexistent/wayland-0")), None));
+
+        // No variable, and the empty variable a service file leaves behind.
+        assert!(!socket_present(None, Some(runtime)));
+        assert!(!socket_present(Some(os("")), Some(runtime)));
+        // No runtime directory to resolve against: the name is believed, because the
+        // cost of disbelieving it is an X11 backend under a Wayland desktop.
+        assert!(socket_present(Some(os("wayland-0")), None));
+        assert!(socket_present(Some(os("wayland-0")), Some(os(""))));
+    }
+
+    /// **The session this test runs in is told apart correctly, live.**
+    ///
+    /// The one assertion that could not be made without a real display server, and
+    /// the one that would have caught the earlier detectors: `XDG_SESSION_TYPE` is
+    /// empty on the machine this was written on, so a detector leaning on it reports
+    /// the wrong thing about the only Wayland session available to test against.
+    ///
+    /// It passes in both places it runs, and says something different in each. On a
+    /// bare `Xvfb` (what CI has) there is no compositor and no `XWAYLAND`
+    /// extension, so the answer is [`SessionKind::X11`]. On an XWayland (what this
+    /// repository's development machine has) the server announces the extension and
+    /// the answer is [`SessionKind::XWayland`]. The invariant asserted is the link
+    /// between the two halves: **the server's word and the socket's presence must
+    /// agree**, because an XWayland exists only underneath a compositor.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn this_machines_own_session_is_told_apart_correctly() {
+        let x = crate::x11::server_kind();
+        let socket = wayland_socket_present();
+        let kind = session_kind();
+
+        match (x, socket) {
+            (XServer::XWayland, _) => assert_eq!(
+                kind,
+                SessionKind::XWayland,
+                "an X server announcing XWAYLAND is an XWayland whatever else is true"
+            ),
+            (XServer::Plain, false) => assert_eq!(
+                kind,
+                SessionKind::X11,
+                "a plain server that is really there outranks what logind remembers"
+            ),
+            (XServer::Plain, true) => assert_eq!(
+                kind,
+                SessionKind::Wayland,
+                "a nested X server does not make a Wayland session an X11 one"
+            ),
+            (XServer::Unreachable, true) => assert_eq!(kind, SessionKind::Wayland),
+            (XServer::Unreachable, false) => assert!(
+                kind == SessionKind::None || kind == SessionKind::Wayland,
+                "with no server and no socket, only logind can still name a session"
+            ),
+        }
+
+        // The link that makes the XWAYLAND probe worth trusting: an XWayland exists
+        // only underneath a compositor. Asserted only when there is a socket to
+        // corroborate it, because the interesting third case is real and healthy: an
+        // `ssh -X` into a machine whose desktop is Wayland forwards the XWayland's own
+        // extension list, and the ssh session has neither the variable nor the socket.
+        // That session's `DISPLAY` is not local, so `local_x_server` refuses to probe
+        // it and `x` is `Unreachable` here, which is why this arm reads as it does
+        // rather than demanding a compositor from every XWayland.
+        if x == XServer::XWayland {
+            assert!(
+                local_x_server() == XServer::XWayland,
+                "the probe must be stable across two calls a moment apart"
+            );
+        }
     }
 
     /// Every downcall is a no-op rather than a panic: the engine consults the

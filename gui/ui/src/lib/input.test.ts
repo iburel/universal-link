@@ -3,7 +3,7 @@
 
 import { expect, test } from "vitest";
 
-import type { InputGuards, InputSpot } from "./api";
+import type { InputGuards, InputProblem, InputSpot } from "./api";
 import {
   DWELL_CHOICES,
   GHOST_SENTENCE,
@@ -226,7 +226,32 @@ test("a Wayland session is told what does not work, and what still does", () => 
   expect(said).toContain("keeps working");
 });
 
-test("this computer's other problems have sentences, and none is invented", () => {
+// Every problem the engine can report, so a new reason code cannot arrive without
+// a sentence. The engine has the mirror of this test: it walks its own `Problem`
+// enum and reads this file, which closes the loop from the other side. Neither the
+// Rust compiler nor tsc can see across the boundary, so this pair is the bridge.
+// A Record keyed by the union, so **tsc refuses to compile this file** when a member
+// is added to `InputProblem` and not listed here. A review caught the first version,
+// which was a plain array: a member added to the union and to `input.ts` but not to
+// the array was never exercised, so the test looked like coverage and was not. The
+// engine's own half of the bridge is `Problem::position`, an exhaustive match that
+// makes the same guarantee on the Rust side.
+const EVERY_PROBLEM: Record<InputProblem, true> = {
+  no_backend: true,
+  no_permission: true,
+  monitors_unstable: true,
+  wayland: true,
+  xwayland: true,
+  wayland_no_bus: true,
+  wayland_no_portal: true,
+  wayland_portal_old: true,
+  wayland_portal_refused: true,
+  wayland_untested: true,
+};
+
+const PROBLEMS = Object.keys(EVERY_PROBLEM) as InputProblem[];
+
+test("every problem the engine can report has a real sentence, on every platform", () => {
   expect(
     hereProblemSentence({
       problem: null,
@@ -234,11 +259,73 @@ test("this computer's other problems have sentences, and none is invented", () =
       can_be_driven: true,
     }),
   ).toBeNull();
-  for (const problem of ["no_backend", "monitors_unstable"] as const) {
-    expect(
-      hereProblemSentence({ problem, can_drive: false, can_be_driven: false }),
-    ).toBeTruthy();
+  // Both platform wordings and all four capability combinations, because two of
+  // these sentences branch on them and a branch with no test is a branch that says
+  // the wrong thing to somebody.
+  for (const problem of PROBLEMS) {
+    for (const platform of ["linux", "macos", "windows", undefined]) {
+      for (const can_drive of [true, false]) {
+        for (const can_be_driven of [true, false]) {
+          const said = hereProblemSentence(
+            { problem, can_drive, can_be_driven },
+            platform,
+          );
+          expect(said, `${problem} on ${platform}`).toBeTruthy();
+          expect(said, `${problem} on ${platform}`).not.toContain(
+            "does not know",
+          );
+          // The code itself never reaches a person: a sentence that leaked its
+          // own reason code would mean the `default` arm had been taken.
+          expect(said, `${problem} on ${platform}`).not.toContain(problem);
+        }
+      }
+    }
   }
+});
+
+test("a code the engine invents later still says something a person can repeat", () => {
+  const said = hereProblemSentence({
+    problem: "wayland_something_new" as InputProblem,
+    can_drive: false,
+    can_be_driven: false,
+  });
+  expect(said).toContain("does not know");
+  expect(said).toContain("wayland_something_new");
+});
+
+// The one this ticket exists for: a Wayland desktop is told which piece is missing
+// and what would fix it, never just "this is Wayland".
+test("each Wayland reason names its own remedy", () => {
+  const say = (problem: InputProblem, can_drive = false, can_be_driven = false) =>
+    hereProblemSentence({ problem, can_drive, can_be_driven }, "linux") ?? "";
+
+  expect(say("xwayland")).toContain("X11");
+  expect(say("xwayland")).toContain("Wayland directly");
+  expect(say("wayland_no_bus")).toContain("D-Bus");
+  expect(say("wayland_portal_old")).toContain("xdg-desktop-portal");
+  expect(say("wayland_portal_refused")).toContain("again");
+  expect(say("wayland_untested")).toContain("ONEDEVICE_INPUT_WAYLAND");
+  expect(say("wayland_untested")).toContain("never been run");
+
+  // A missing portal says that a desktop may have one half without the other, and
+  // deliberately does not claim WHICH: the capability bits it would have to read are
+  // all false while the Wayland path is switched off, so every combination said the
+  // same wrong thing. It must therefore read identically whatever they are.
+  const said = new Set([
+    say("wayland_no_portal", false, false),
+    say("wayland_no_portal", false, true),
+    say("wayland_no_portal", true, false),
+    say("wayland_no_portal", true, true),
+  ]);
+  expect(said.size).toBe(1);
+  expect(say("wayland_no_portal")).toContain("GNOME 45");
+  expect(say("wayland_no_portal")).toContain("or the other way round");
+  expect(say("wayland_no_portal")).not.toContain("neither half");
+
+  // And the screens clause the `xwayland` code has to carry, because it outranks
+  // `monitors_unstable` in the engine's one problem slot and nothing else in this
+  // interface reads `monitors_stable`.
+  expect(say("xwayland")).toContain("swap places");
 });
 
 test("a gesture's own refusals are sentences, and a malformed call is not", () => {

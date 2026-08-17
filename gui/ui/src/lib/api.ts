@@ -178,12 +178,26 @@ export interface DiscoveredDeployment {
 // Nothing in this interface computes a piece of it. The engine hand-writes its
 // JSON, so every field is always present and optionality is a `null`.
 
-/** What this computer cannot do, in the engine's words. */
+/**
+ * What this computer cannot do, in the engine's words.
+ *
+ * Seven of the ten are about Linux, and that is not an accident of history: it is
+ * the one platform where the answer depends on which desktop the person runs, so
+ * the engine has to be able to say WHICH parts this desktop supports. Every member
+ * has a sentence in `hereProblemSentence`, and the engine's own
+ * `Problem::ALL` test reads this file to make sure of it.
+ */
 export type InputProblem =
   | "no_backend"
   | "no_permission"
   | "monitors_unstable"
-  | "wayland";
+  | "wayland"
+  | "xwayland"
+  | "wayland_no_bus"
+  | "wayland_no_portal"
+  | "wayland_portal_old"
+  | "wayland_portal_refused"
+  | "wayland_untested";
 
 /** What a PAIR cannot do. The far side's word, learned by trying. */
 export type PeerProblem =
