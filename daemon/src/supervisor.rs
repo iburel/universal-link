@@ -222,8 +222,16 @@ pub fn official_components() -> Vec<ChildSpec> {
         not(any(target_os = "linux", target_os = "windows", target_os = "macos")),
         allow(unused_mut)
     )]
-    let mut official: Vec<(&str, &str, &[&str])> =
-        vec![("1device-tray", "tray", &["session.read", "system.shutdown"])];
+    // `input.read` is what lets the tray show a keyboard that is away, on both
+    // sides, for as long as the session lasts (the epic's rule). Read only: the
+    // tray never grants anything and never takes a keyboard. It is asked for
+    // OPTIONALLY on the tray's side, so a tray and a Core that ever disagree
+    // about this list lose the input line rather than the whole tray.
+    let mut official: Vec<(&str, &str, &[&str])> = vec![(
+        "1device-tray",
+        "tray",
+        &["session.read", "system.shutdown", "input.read"],
+    )];
     #[cfg(target_os = "linux")]
     official.push((
         "1device-clipboard",

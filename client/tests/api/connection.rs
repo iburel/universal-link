@@ -311,7 +311,10 @@ async fn an_unknown_optional_topic_does_not_take_a_known_one_down_with_it() {
 
     // Everything at once, refused whole: the Core subscribes all or nothing.
     let all = conn.recv().await;
-    assert_eq!(all["params"]["topics"], json!(["session", "pairing", "input"]));
+    assert_eq!(
+        all["params"]["topics"],
+        json!(["session", "pairing", "input"])
+    );
     refuse(&mut conn, &all["id"]).await;
 
     // Then one optional topic at a time, to find out which one it will not have.
