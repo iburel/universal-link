@@ -228,6 +228,29 @@ test("every screen of every computer is drawn, and this one is marked", () => {
 });
 
 // A screen that is away keeps its place and says so, in the epic's words.
+// Two identical monitors report the same name, which is the model's: both boxes
+// would read the same and nobody could tell which one they were dragging.
+test("two screens of one machine with the same name are numbered", () => {
+  ready({
+    plane: {
+      id: "f".repeat(32),
+      by: null,
+      spots: [
+        spot({ monitor: `${NODE_A}/A1`, name: "U2720Q" }),
+        spot({ monitor: `${NODE_A}/A2`, name: "U2720Q", x: 1920, primary: false }),
+        spot({ monitor: `${NODE_B}/B1`, device_id: "d_desk", name: "U2720Q", x: 3840 }),
+      ],
+    },
+  });
+
+  const view = render(Input, { store });
+
+  expect(byLabel(view, "Laptop U2720Q (1)")).toBeTruthy();
+  expect(byLabel(view, "Laptop U2720Q (2)")).toBeTruthy();
+  // The other machine's screen shares the name but not the machine: no number.
+  expect(byLabel(view, "Desk U2720Q")).toBeTruthy();
+});
+
 test("a screen that is away keeps its place and says so", () => {
   ready({
     plane: {

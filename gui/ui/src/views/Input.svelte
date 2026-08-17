@@ -225,6 +225,23 @@
     return blocks.find((b) => b.node === nodeOfSpot(spot.monitor))?.name ?? "";
   }
 
+  /**
+   * What a screen is called on the plane. Two identical monitors on one desk
+   * really do report the same name (it is the model's, from the EDID), so they are
+   * numbered: without that, both boxes read "Dell U2720Q" and nobody can tell
+   * which of the two they are about to drag. The order is the snapshot's own.
+   */
+  function screenLabel(spot: InputSpot): string {
+    const named = spot.name || "screen";
+    const siblings = spots.filter(
+      (s) =>
+        nodeOfSpot(s.monitor) === nodeOfSpot(spot.monitor) &&
+        (s.name || "screen") === named,
+    );
+    if (siblings.length < 2) return named;
+    return `${named} (${siblings.findIndex((s) => s.monitor === spot.monitor) + 1})`;
+  }
+
   const STATES: Record<string, string> = {
     off: "Not connected",
     warming: "Getting ready",
@@ -342,13 +359,13 @@
           class:mine={spot.device_id === hereId}
           class:selected={selected === spot.monitor}
           style={box(spot)}
-          aria-label="{nameOfSpot(spot)} {spot.name || 'screen'}"
+          aria-label="{nameOfSpot(spot)} {screenLabel(spot)}"
           onmousedown={(e) => startDrag(e, spot)}
           onkeydown={(e) => nudge(e, spot)}
         >
           <span class="who">{nameOfSpot(spot)}</span>
           <span class="what">
-            {spot.name || "screen"}{spot.primary ? " (main)" : ""}
+            {screenLabel(spot)}{spot.primary ? " (main)" : ""}
           </span>
           {#if spot.device_id === hereId && spot.primary}
             <span class="here">you are here</span>
