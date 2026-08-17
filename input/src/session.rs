@@ -478,6 +478,21 @@ pub struct Engine<B> {
     driven: Option<Driven>,
     /// What WE pressed on this machine and have not released.
     held: Held,
+    /// Keys that may still be DOWN and that this engine could not release, which is not the
+    /// same thing as keys it is holding, and the difference is the whole reason this is its
+    /// own field.
+    ///
+    /// It fills from two places: a `held.json` found at startup on a machine that cannot type,
+    /// and a `release_held` whose release could not have reached the OS. `held` would have been
+    /// the obvious place to keep them, and it is the wrong one: `held` is an INPUT to the
+    /// injection planner, so a set kept there made the planner believe a modifier was already
+    /// down. Proved end to end in review: an `A` came out as `a` because the Shift press was
+    /// skipped, and the next keystroke pressed that phantom Shift FOR REAL, on a machine
+    /// nobody had touched.
+    ///
+    /// Nothing reads this except the drain, and the drain is [`Engine::refresh_caps`], so
+    /// every path that re-reads the capabilities is a chance to try again.
+    stranded: Held,
     held_on_disk: Value,
     resolver: Resolver,
     mod_keys: ModKeys,
@@ -537,7 +552,7 @@ impl<B: InputBackend> Engine<B> {
         let caps = backend.capabilities();
         let stored = store.load_held();
         let found = Held::from_value(&stored);
-        let mut held = Held::new();
+        let mut stranded = Held::new();
         let mut held_on_disk = stored;
         if !found.is_empty() {
             if caps.inject_keys {
@@ -552,16 +567,16 @@ impl<B: InputBackend> Engine<B> {
                     Err(e) => eprintln!("[1device-input] cannot write the held set: {e}"),
                 }
             } else {
-                // KEPT, both on disk and in the engine's own idea of what is down. Keeping it
-                // in `held` is what makes every ordinary release path retry it, and the
-                // `CapabilitiesChanged` arm is the event that says the grant arrived.
+                // KEPT, on disk and in `stranded`, which is deliberately NOT `held`: see the
+                // field's own documentation for what putting it there did. Every path that
+                // re-reads the capabilities retries the release (`refresh_caps`).
                 eprintln!(
                     "[1device-input] {} key(s) a previous run left down cannot be released \
                      yet: this computer cannot type at the moment. The record is kept and the \
                      release is retried as soon as it can",
                     found.len()
                 );
-                held = found;
+                stranded = found;
             }
         }
         Ok(Engine {
@@ -584,7 +599,8 @@ impl<B: InputBackend> Engine<B> {
             peers: BTreeMap::new(),
             driving: None,
             driven: None,
-            held,
+            held: Held::new(),
+            stranded,
             held_on_disk,
             resolver: Resolver::new(),
             mod_keys: ModKeys::new(),
@@ -609,7 +625,7 @@ impl<B: InputBackend> Engine<B> {
         // its own permission state after it is built (the macOS Accessibility
         // grant is the case), and every sentence the interface says about this
         // machine comes from here.
-        self.caps = self.backend.capabilities();
+        self.refresh_caps();
         self.monitors = self.backend.monitors().await;
         self.last_pointer = self.backend.pointer().await;
         self.relearn().await;
@@ -1484,13 +1500,16 @@ impl<B: InputBackend> Engine<B> {
         // AltGr in the middle and none of it at the end, so a process death
         // between the two would strand AltGr on a machine whose file never
         // mentioned it.
-        self.write_held(&plan.peak);
+        //
+        // Plus whatever is STRANDED, in both writes. The file is the union of the two sets
+        // for the reason `write_stranded` gives, and a peak written without the stranded half
+        // would quietly drop keys that are still down from the record the next run reads.
+        let mut peak = plan.peak.clone();
+        peak.absorb(&self.stranded);
+        self.write_held(&peak);
         self.backend.inject(plan.actions);
         self.held = plan.held;
-        let after = self.held.to_value();
-        if after != self.held_on_disk {
-            self.write_value(after);
-        }
+        self.write_stranded();
     }
 
     /// Forgets every cached resolution and asks the backend for the modifier keys
@@ -1511,6 +1530,48 @@ impl<B: InputBackend> Engine<B> {
         self.mod_keys.learn(&self.backend, &mut self.resolver).await;
     }
 
+    /// Re-reads what this machine can do, and retries anything the last answer made
+    /// impossible.
+    ///
+    /// EVERY assignment to `self.caps` goes through here, and that is the point rather than
+    /// tidiness. The crash guard's retry hangs off the moment `inject_keys` becomes true, and
+    /// when only one of the four capability re-reads looked for that moment, whichever of the
+    /// other three ran first consumed it: the record then sat in memory for the life of the
+    /// process with nothing left that would ever drain it. Found in review, driven end to end.
+    fn refresh_caps(&mut self) {
+        self.caps = self.backend.capabilities();
+        self.drain_stranded();
+    }
+
+    /// Tries again to release the keys a previous release could not have delivered.
+    ///
+    /// Fire and forget, like every release: what the engine can know is whether the release
+    /// COULD have landed, and `inject_keys` is that. The record leaves memory and the file
+    /// only when it could.
+    fn drain_stranded(&mut self) {
+        if self.stranded.is_empty() || !self.caps.inject_keys {
+            return;
+        }
+        eprintln!(
+            "[1device-input] releasing {} key(s) that could not be released earlier",
+            self.stranded.len()
+        );
+        self.backend.release_all(self.stranded.release_plan());
+        self.stranded.clear();
+        self.write_stranded();
+    }
+
+    /// Writes the crash guard's file from the two sets that belong in it.
+    ///
+    /// `held` is what this engine is holding and `stranded` is what it could not release, and
+    /// the file has to name both: it exists so that the NEXT run releases what this one left
+    /// down, and that is the union.
+    fn write_stranded(&mut self) {
+        let mut record = self.held.clone();
+        record.absorb(&self.stranded);
+        self.write_held(&record);
+    }
+
     /// Releases every key WE pressed, in reverse press order, and clears the
     /// file. The only way a held set empties.
     ///
@@ -1526,10 +1587,17 @@ impl<B: InputBackend> Engine<B> {
         }
         self.backend.release_all(self.held.release_plan());
         if !self.caps.inject_keys {
+            // The release cannot have landed, so what it named MOVES to the stranded record
+            // rather than being forgotten. Out of `held` either way: leaving it there would
+            // have the injection planner treat a key nobody is holding as held (see
+            // `Engine::stranded`), and the next session would inherit the phantom.
+            let missed = std::mem::replace(&mut self.held, Held::new());
+            self.stranded.absorb(&missed);
+            self.write_stranded();
             return;
         }
         self.held.clear();
-        self.write_value(Held::new().to_value());
+        self.write_stranded();
     }
 
     /// Ends the session this machine is being driven in. The ONE function, and
@@ -1850,7 +1918,7 @@ impl<B: InputBackend> Engine<B> {
             BackendEvent::Key(event) => self.on_key(event, now),
             BackendEvent::MonitorsChanged => {
                 self.monitors = self.backend.monitors().await;
-                self.caps = self.backend.capabilities();
+                self.refresh_caps();
                 self.republish(now);
                 self.apply_capture();
                 self.dirty = true;
@@ -1886,6 +1954,9 @@ impl<B: InputBackend> Engine<B> {
                 // remembered as unable to type for the life of the process.
                 let fresh = self.backend.capabilities();
                 let before = std::mem::replace(&mut self.caps, fresh);
+                // BEFORE the teardowns and before the relearn, because it is the cheapest
+                // thing here and the most urgent: a key somewhere may be physically down.
+                self.drain_stranded();
                 // The teardowns BEFORE the relearn, which is the opposite of the order this
                 // arm had. A session that is about to end has no use for a resolver rebuilt
                 // for capabilities it will never produce anything with, and the relearn is
@@ -1914,21 +1985,13 @@ impl<B: InputBackend> Engine<B> {
                 {
                     self.relearn().await;
                 }
-                // The crash guard's second half. `open` keeps the record when this machine
-                // could not have typed the release, and this is the moment that changes: the
-                // grant arrived. Only while nothing is being driven, so a live session's
-                // legitimately held keys are never yanked out from under the person holding
-                // them.
-                if !before.inject_keys && self.caps.inject_keys && self.driven.is_none() {
-                    self.release_held();
-                }
                 self.republish(now);
                 self.apply_capture();
                 self.dirty = true;
             }
             BackendEvent::Refused(refusal) => self.on_backend_refusal(refusal, now),
             BackendEvent::CaptureLost(why) => {
-                self.caps = self.backend.capabilities();
+                self.refresh_caps();
                 if self.driving.is_some() {
                     // The local backend died under us.
                     self.bring_home(stopped::GONE, now);
@@ -4832,6 +4895,68 @@ mod tests {
             on_disk(),
             Some(json!({ "keys": [] })),
             "and only then is the record emptied"
+        );
+    }
+
+    /// The kept record is not the same thing as a key this engine is HOLDING, and the
+    /// difference is not academic: it was driven end to end in review.
+    ///
+    /// Keeping it in `held` made the injection planner believe a modifier was already down, so
+    /// an `A` came out as `a` (the Shift press was skipped as redundant) and the NEXT keystroke
+    /// pressed that phantom Shift for real, on a machine nobody had touched. It lives in its
+    /// own field now, which nothing but the drain reads.
+    ///
+    /// The second half of the test is the drain's own trap: it used to hang off the
+    /// `CapabilitiesChanged` arm alone, so whichever OTHER capability re-read ran first
+    /// consumed the moment the grant arrived and the record was stranded for the life of the
+    /// process. `start()` is one of those re-reads, and here it is the only thing that runs.
+    #[tokio::test]
+    async fn a_kept_record_is_never_mistaken_for_a_key_this_engine_is_holding() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("input");
+        let store = Store::open(root.clone()).expect("open");
+        let record = json!({ "keys": [
+            { "code": 16, "detail": 0, "mod": keys::mods::SHIFT },
+        ] });
+        store.save_held(&record).expect("save");
+        drop(store);
+
+        let store = Store::open(root.clone()).expect("reopen");
+        let (fake, _events) = FakeBackend::new();
+        fake.refused();
+        let mut engine = Engine::open(fake.clone(), store, Instant::now()).expect("open");
+        assert!(
+            engine.held.is_empty(),
+            "what a previous run left down is not something THIS engine holds"
+        );
+        assert_eq!(
+            engine.stranded.len(),
+            1,
+            "it is stranded, and named as that"
+        );
+
+        // The grant lands, and the ONLY thing that runs is `start`, which is not the arm the
+        // drain used to live in.
+        let (full, _rx) = FakeBackend::new();
+        fake.set_capabilities(full.capabilities());
+        fake.forget();
+        engine.start(Instant::now()).await;
+
+        assert_eq!(
+            fake.calls().releases,
+            vec![vec![PlatformKey {
+                code: 16,
+                detail: 0
+            }]],
+            "the release is retried by whichever capability re-read comes first"
+        );
+        assert!(engine.stranded.is_empty(), "and the record is done with");
+        assert_eq!(
+            std::fs::read_to_string(root.join(HELD_FILE))
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok()),
+            Some(json!({ "keys": [] })),
+            "on disk too, and only once it could have landed"
         );
     }
 

@@ -394,6 +394,17 @@ impl Held {
         });
     }
 
+    /// Takes on everything ANOTHER set holds, this set's own press order first.
+    ///
+    /// For the crash guard, and for one case in it: a release that could not have reached
+    /// the OS moves the set it failed to release into the record of keys that may still be
+    /// down, and a second failure has to ADD to that record rather than replace it.
+    pub fn absorb(&mut self, other: &Held) {
+        for entry in &other.keys {
+            self.press(entry.code, entry.bit);
+        }
+    }
+
     /// Forgets a key. Releasing one that is not held is a no-op rather than an
     /// error: every teardown path calls this on its way out, and a path that
     /// cannot be called twice is a path that will be.
