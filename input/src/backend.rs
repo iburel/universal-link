@@ -546,6 +546,19 @@ pub enum BackendEvent {
     /// start already re-learns; this makes the moment the grant lands re-learn too,
     /// so an interface that says "1Device can type on this computer now" is telling
     /// the truth rather than predicting it.
+    ///
+    /// # What it does NOT mean, and what to send instead
+    ///
+    /// It means the CAPABILITIES moved. The engine throws the resolution cache away only
+    /// when one of the three that decide what this machine can produce has changed
+    /// (`inject_keys`, `unicode`, `inject_pointer`), because throwing it away is five
+    /// round trips plus a fresh resolve on the next press of every distinct symbol, and
+    /// this seam puts no rate limit on the upcall: a backend that emits it for its own
+    /// housekeeping (a rebuilt event tap, a monitor coming back) would otherwise pay that
+    /// on every occurrence. So a backend whose KEYMAP connection was rebuilt, and which
+    /// therefore wants the cache emptied, sends [`BackendEvent::LayoutChanged`], which is
+    /// the upcall that means exactly that. Emitting this one with unchanged capabilities is
+    /// harmless and is meant to be.
     CapabilitiesChanged,
     /// An injection was refused. Coalesced by the engine into one `oops` frame
     /// per code per second, with a count.
