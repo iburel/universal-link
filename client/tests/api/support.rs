@@ -59,14 +59,19 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use onedevice_core::CoreHandle;
-use onedevice_ipc_client::{Client, ClientConfig, Event, TokenSource};
+use onedevice_ipc_client::{Client, ClientConfig, Event, RequestError, TokenSource};
+use onedevice_test_support::memory_transport::MemorySwitchboard;
 pub use onedevice_test_support::{
-    Device, FakeOidc, TEST_CLIENT_ID, TEST_EMAIL, TEST_SUB, authenticate, browse, enroll_device_at,
+    Device, DeviceKey, FakeOidc, TEST_CLIENT_ID, TEST_EMAIL, TEST_SUB, TestConn, authenticate,
+    browse, enroll_device_at, enroll_key,
 };
 
 pub const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Observation window to assert that no event arrives.
 pub const SILENCE_WINDOW: Duration = Duration::from_millis(300);
+/// Budget for a state the Core converges on asynchronously (a directory
+/// snapshot, a server connection): polled, not awaited.
+pub const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The Core's device name in the directory (same value as the Core's suite).
 pub const CORE_DEVICE_NAME: &str = "PC-Core";
@@ -102,6 +107,14 @@ pub struct TestCore {
     dir: tempfile::TempDir,
     ipc_path: PathBuf,
     server_cfg: Option<onedevice_core::ServerConfig>,
+    /// The id the account knows this device by, for the Cores the harness
+    /// enrolled by hand ([`TestCore::start_pair`]). `None`: nobody ever logged
+    /// in here.
+    device_id: Option<String>,
+    /// The data-plane endpoint, kept ACROSS restarts: it is the same endpoint
+    /// coming back, as the real daemon rewires iroh with the same `device.key`.
+    /// `None`: a fresh isolated switchboard, with nobody on the other side.
+    transport: Option<Arc<dyn onedevice_core::PeerTransport>>,
 }
 
 impl TestCore {
@@ -116,15 +129,86 @@ impl TestCore {
 
     async fn spawn_in(server_cfg: Option<onedevice_core::ServerConfig>) -> TestCore {
         let dir = tempfile::tempdir().expect("tempdir");
+        Self::spawn_full(dir, server_cfg, None, None).await
+    }
+
+    async fn spawn_full(
+        dir: tempfile::TempDir,
+        server_cfg: Option<onedevice_core::ServerConfig>,
+        device_id: Option<String>,
+        transport: Option<Arc<dyn onedevice_core::PeerTransport>>,
+    ) -> TestCore {
         let ipc_path = ipc_path_for(dir.path());
         let mut core = TestCore {
             handle: None,
             dir,
             ipc_path,
             server_cfg,
+            device_id,
+            transport,
         };
         core.restart().await;
         core
+    }
+
+    /// Two Cores enrolled on the SAME account, sharing one memory switchboard:
+    /// they open data-plane streams to each other like two iroh endpoints, each
+    /// registered under its real `node_id` (its `device.key`) with a synthetic
+    /// relay to be dialable by. Same account means the SAME account key (C7): a
+    /// single recovery code, shared, which each Core attests its own `node_id`
+    /// under, and without which they refuse each other fail-closed.
+    ///
+    /// The only place in the workspace where a component crate can express an
+    /// enrolled PAIR: this is the one crate whose dev-dependencies carry the
+    /// server. The shape is lifted from `core/tests/api/support.rs`
+    /// (`start_pair`), where it was proven.
+    pub async fn start_pair(server: &TestServer) -> (TestCore, TestCore) {
+        let switchboard = MemorySwitchboard::new();
+        let code = onedevice_core::account_key::generate_recovery_code();
+        let a = Self::start_enrolled_on(server, &switchboard, &code).await;
+        let b = Self::start_enrolled_on(server, &switchboard, &code).await;
+        (a, b)
+    }
+
+    /// A Core seeded with everything a real login leaves on disk (the identity,
+    /// the session, the account's trust root), plugged into `switchboard`, and
+    /// left to connect to the server on its own.
+    async fn start_enrolled_on(
+        server: &TestServer,
+        switchboard: &MemorySwitchboard,
+        code: &str,
+    ) -> TestCore {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = DeviceKey::generate();
+        let device_id = server.enroll(&key).await;
+        let node_id = key.node_id();
+        std::fs::write(dir.path().join("device.key"), key.seed_hex()).expect("seed device.key");
+        let session = json!({
+            "server_url": server.url(),
+            "device_id": device_id,
+            "account": { "email": TEST_EMAIL },
+        });
+        std::fs::write(dir.path().join("session.json"), session.to_string())
+            .expect("seed session.json");
+        seed_account_from_code(dir.path(), &node_id, code);
+        // A relay to be reached by: the memory transport refuses to connect to a
+        // device that published none, exactly as iroh would.
+        let transport: Arc<dyn onedevice_core::PeerTransport> =
+            switchboard.endpoint(node_id.clone(), Some(format!("iroh+memory://{node_id}")));
+        Self::spawn_full(
+            dir,
+            Some(server.core_cfg()),
+            Some(device_id),
+            Some(transport),
+        )
+        .await
+    }
+
+    /// The id the account knows this Core by ([`TestCore::start_pair`]).
+    pub fn device_id(&self) -> &str {
+        self.device_id
+            .as_deref()
+            .expect("a Core the harness enrolled")
     }
 
     /// Stops the Core (socket closed, orphan token on disk).
@@ -149,9 +233,12 @@ impl TestCore {
             secret_store: Arc::new(onedevice_core::FileSecretStore::new(self.dir.path())),
             // The lib speaks only in cleartext: it is the daemon that wires up TLS.
             connector: Arc::new(onedevice_core::PlainConnector),
-            // These tests do not exercise the data plane: isolated in-memory transport.
-            transport: onedevice_test_support::memory_transport::MemorySwitchboard::new()
-                .endpoint("client-test", None),
+            // Without one of its own, an isolated in-memory transport: the tests
+            // that do not exercise the data plane have nobody on the other side.
+            transport: match &self.transport {
+                Some(shared) => shared.clone(),
+                None => MemorySwitchboard::new().endpoint("client-test", None),
+            },
             receive_dir: self.dir.path().join("received"),
             reconnect_base_delay: Duration::from_millis(50),
         };
@@ -206,8 +293,30 @@ impl TestCore {
 // Config and helpers for the client crate.
 // ---------------------------------------------------------------------------
 
+/// Seeds the account trust root (C7) into `dir`: derives the account key from
+/// the `code` recovery code, attests `node_id`, writes `account-key.json` -
+/// exactly what `account.join` would do. Without it the data plane is
+/// fail-closed: no peer is authorized or reachable.
+fn seed_account_from_code(dir: &Path, node_id: &str, code: &str) {
+    let ak = onedevice_core::account_key::account_key_from_code(code).expect("valid test code");
+    let root = onedevice_core::account_key::root_for(&ak, node_id);
+    onedevice_core::account_key::save(dir, &root).expect("seed account-key.json");
+}
+
 pub fn client_config(
     core: &TestCore,
+    role: &str,
+    scopes: &[&str],
+    topics: &[&str],
+) -> ClientConfig {
+    component_config(core, "client-test", role, scopes, topics)
+}
+
+/// [`client_config`] for a component that has to be told apart from another on
+/// the same Core (two holders of one role, a GUI beside an engine).
+pub fn component_config(
+    core: &TestCore,
+    name: &str,
     role: &str,
     scopes: &[&str],
     topics: &[&str],
@@ -215,7 +324,7 @@ pub fn client_config(
     ClientConfig {
         ipc_path: core.ipc_path(),
         token: TokenSource::File(core.token_path()),
-        name: "client-test".into(),
+        name: name.into(),
         version: "0.0-test".into(),
         role: role.into(),
         scopes: scopes.iter().map(|s| s.to_string()).collect(),
@@ -293,6 +402,179 @@ pub async fn assert_no_event(events: &mut mpsc::Receiver<Event>) {
         Ok(Some(e)) => panic!("unexpected event: {e:?}"),
         Ok(None) => panic!("event channel closed during the silence window"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// A buffering view over one client's events, for the tests that watch SEVERAL
+// events on the same component.
+// ---------------------------------------------------------------------------
+
+/// The client's event stream plus what has been read and not yet asked for.
+///
+/// [`wait_notification`] above DISCARDS everything it skips, and that is a trap
+/// the moment a test waits for one notification and later asserts on another
+/// that arrived in between: the second wait times out on an event already thrown
+/// away, and the failure reads as a product bug. This keeps them, exactly as
+/// [`RawComponent::expect_notification`] does. Connection events are kept too: a
+/// lost `Disconnected` would hide a reconnection cycle nobody asked for.
+pub struct Events {
+    rx: mpsc::Receiver<Event>,
+    seen: VecDeque<Event>,
+}
+
+impl Events {
+    pub fn new(rx: mpsc::Receiver<Event>) -> Events {
+        Events {
+            rx,
+            seen: VecDeque::new(),
+        }
+    }
+
+    /// Waits for a `method` notification within `RESPONSE_TIMEOUT`.
+    pub async fn wait_notification(&mut self, method: &str) -> Value {
+        self.wait_notification_within(method, RESPONSE_TIMEOUT)
+            .await
+    }
+
+    /// Waits for a `method` notification within `budget` - for the events whose
+    /// arrival is a Core-side budget elapsing, where the harness's own default
+    /// would be the thing that fired.
+    pub async fn wait_notification_within(&mut self, method: &str, budget: Duration) -> Value {
+        if let Some(pos) = self.seen.iter().position(|e| is_notification(e, method)) {
+            match self.seen.remove(pos) {
+                Some(Event::Notification { params, .. }) => return params,
+                other => panic!("the buffered event moved under us: {other:?}"),
+            }
+        }
+        timeout(budget, async {
+            loop {
+                match self.next().await {
+                    Event::Notification { method: m, params } if m == method => return params,
+                    other => self.seen.push_back(other),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timeout waiting for the {method} notification"))
+    }
+
+    /// Checks that no `method` notification has arrived, or arrives during
+    /// `SILENCE_WINDOW`. Whatever else turns up is kept.
+    pub async fn assert_no_notification(&mut self, method: &str) {
+        assert!(
+            !self.seen.iter().any(|e| is_notification(e, method)),
+            "a {method} notification had already arrived"
+        );
+        let arrived = timeout(SILENCE_WINDOW, async {
+            loop {
+                let event = self.next().await;
+                let hit = is_notification(&event, method);
+                self.seen.push_back(event);
+                if hit {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(arrived.is_err(), "unexpected {method} notification");
+    }
+
+    async fn next(&mut self) -> Event {
+        self.rx
+            .recv()
+            .await
+            .expect("the client's event channel closed")
+    }
+}
+
+fn is_notification(event: &Event, method: &str) -> bool {
+    matches!(event, Event::Notification { method: m, .. } if m == method)
+}
+
+/// A connected component, its events buffered. The client and the events are
+/// two separate bindings on purpose: a test racing a request against another
+/// component's notification in one `tokio::join!` needs the one borrowed
+/// immutably and the other mutably.
+pub async fn component(
+    core: &TestCore,
+    name: &str,
+    role: &str,
+    scopes: &[&str],
+    request_timeout: Duration,
+) -> (Client, Events) {
+    let mut cfg = component_config(core, name, role, scopes, &[]);
+    cfg.request_timeout = request_timeout;
+    let (client, mut events) = onedevice_ipc_client::spawn(cfg);
+    expect_connected(&mut events, scopes).await;
+    (client, Events::new(events))
+}
+
+/// The application code of a request error. Panics naming what came instead,
+/// because a [`RequestError::Timeout`] and an honest refusal must never be read
+/// for one another.
+pub fn app_code(err: &RequestError) -> &str {
+    match err {
+        RequestError::Rpc(e) => e
+            .data_code
+            .as_deref()
+            .unwrap_or_else(|| panic!("a JSON-RPC error with no application code: {e:?}")),
+        other => panic!("expected an application error, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Convergence: the states the Core reaches on its own schedule (a server
+// connection, a directory snapshot), polled rather than awaited. Same shape as
+// the Core's own harness.
+// ---------------------------------------------------------------------------
+
+/// Retries `attempt` (50 ms step) until `true`, within `CONVERGENCE_TIMEOUT`.
+pub async fn eventually(mut attempt: impl AsyncFnMut() -> bool, what: &str) {
+    let deadline = tokio::time::Instant::now() + CONVERGENCE_TIMEOUT;
+    loop {
+        if attempt().await {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "condition never reached: {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Waits for `session.status` (as seen by a `session.read` holder) to converge
+/// on the desired server connection state.
+pub async fn wait_server_connected(client: &Client, want: bool) {
+    eventually(
+        async || {
+            let Ok(r) = client.request("session.status", json!({})).await else {
+                return false;
+            };
+            r["server_connected"] == json!(want)
+        },
+        "convergence of server_connected",
+    )
+    .await;
+}
+
+/// Waits for the directory as seen by `client` to carry both the attestation AND
+/// the relay of `device_id`, i.e. for the peer to be dialable at all.
+pub async fn wait_reachable(client: &Client, device_id: &str) {
+    eventually(
+        async || {
+            let Ok(list) = client.request("devices.list", json!({})).await else {
+                return false;
+            };
+            list.as_array().into_iter().flatten().any(|d| {
+                d.get("device_id").and_then(Value::as_str) == Some(device_id)
+                    && d.get("attestation").and_then(Value::as_str).is_some()
+                    && d.get("relay_url").and_then(Value::as_str).is_some()
+            })
+        },
+        "a reachable peer (attestation + relay) in the directory",
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -682,6 +964,27 @@ impl TestServer {
             _server: server,
             url,
         }
+    }
+
+    /// The WebSocket URL a Core is pointed at (what a session on disk carries).
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Enrolls `key` on the test account, as a real login's `auth.enroll` does,
+    /// and returns the id the account will know that device by. The connection
+    /// is dropped: the Core being seeded will open its own.
+    pub async fn enroll(&self, key: &DeviceKey) -> String {
+        let mut conn = TestConn::connect(&self.url).await;
+        enroll_key(
+            &mut conn,
+            &self.oidc,
+            key,
+            TEST_SUB,
+            CORE_DEVICE_NAME,
+            std::env::consts::OS,
+        )
+        .await
     }
 
     /// The config a Core pointed at this environment receives.

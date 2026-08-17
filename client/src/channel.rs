@@ -17,8 +17,18 @@
 //!
 //! Framing (after the attach frame): `[u32 BE length L][1 tag byte][L-1 payload]`
 //! with `L = 1 + payload.len()`; a `DATA` payload is `[u64 BE offset][bytes]`.
+//!
+//! A third type rides the very same second connection with another grammar:
+//! [`PeerChannel`] (`peers.channel`, #124), a live duplex pipe between the
+//! components holding the same role on two devices. Its frames carry no tag and
+//! no offset, only a length and opaque bytes, because the Core interprets none
+//! of them. It is grouped here rather than in a module of its own for one
+//! reason: everything a second connection has in common (the dial, the single
+//! LSP-framed attach frame `attach` writes, the reader task that makes reads
+//! cancel-safe) is then written once, for all three types.
 
 use std::path::Path;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -432,6 +442,284 @@ async fn read_msg<R: tokio::io::AsyncRead + Unpin>(
     let tag = frame[0];
     frame.remove(0);
     Ok(Some((tag, frame)))
+}
+
+// ---------------------------------------------------------------------------
+// Peer channel (#124): an opaque duplex pipe between the same role on two
+// devices. The grammar lives HERE and nowhere else in this crate: the input
+// component (#122) consumes this type, and a private copy of the codec in a
+// component is how the two ends of a frozen framing drift apart.
+// ---------------------------------------------------------------------------
+
+/// Ceiling on ONE peer-channel frame, in either direction: the Core's
+/// `MAX_FRAME` (`core/src/peerchannel.rs`, 1 KiB, the size #123 measured the
+/// input flow needs).
+///
+/// The two values MUST agree, and if the Core's ever moves this constant moves
+/// with it in the same commit. [`PeerChannel::send`] refuses anything above it
+/// LOCALLY, before a byte reaches the socket, because a frame over the cap makes
+/// the Core cut the whole channel with `FRAME_TOO_LARGE`: a client that shoots
+/// its own pipe dead because a caller asked it to send one oversized message is
+/// a bug factory. Refused here, the caller gets a distinct error and the channel
+/// stays usable.
+pub const MAX_PEER_FRAME: usize = 1024;
+
+/// The narrowest `ClientConfig::request_timeout` a component that calls
+/// `peers.channel` may configure, and the value its own tests use.
+///
+/// The Core does not answer that call until the far end has ATTACHED, which is
+/// what makes the token it returns a pipe that is already alive at both ends,
+/// and its budgets for getting there are up to 15 s of dialling (a cold relay
+/// connect plus the hole-punching grace the rendezvous-only refusal needs in
+/// order to be able to speak at all) plus 10 s for the two frames and the far
+/// end's attach. A tighter budget on the caller's side turns the one refusal
+/// this primitive owes the user (`NO_DIRECT_PATH`, whose remedy is the pair's
+/// network) into a bare [`crate::RequestError::Timeout`], which is a lie about
+/// whose fault it is. `doc/core-api.md` ("`peers.channel`: a live pipe, for a
+/// flow") states the duty; this constant is that duty in code.
+pub const PEER_CHANNEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Frames buffered between a peer channel's reader task and
+/// [`PeerChannel::recv`].
+///
+/// 64, chosen against the flow this primitive exists for: 125 Hz to 1000 Hz of
+/// tiny frames (#123). Too small (1, say) and every frame costs a full round of
+/// task wakeups, because the reader task blocks on the handoff until the
+/// consumer takes it, up to a thousand times a second. Too large and a consumer
+/// that has stopped draining becomes INVISIBLE: the frames pile up here, the
+/// socket keeps being read, and when the consumer comes back it works through
+/// positions from the past instead of the present, which for input is worse than
+/// not working through them at all. 64 is 64 ms of a 1000 Hz flow (an eternity
+/// for a consumer merely between polls, nothing at all against the Core's 10 s
+/// idle sweep) and it bounds this buffer at 64 KiB in the worst case of frames
+/// at the cap, where a real input flow sits nearer 1 KiB.
+const PEER_FRAME_CAPACITY: usize = 64;
+
+/// What sending on a peer channel can fail with.
+#[derive(Debug)]
+pub enum PeerSendError {
+    /// The frame is above [`MAX_PEER_FRAME`], and was refused HERE: nothing was
+    /// written, the channel is untouched and stays usable. Always a caller bug
+    /// (a dialect that outgrew the cap), never a peer's and never a network's.
+    TooLarge {
+        /// Length of the refused frame, for the caller's log.
+        len: usize,
+    },
+    /// The pipe is gone: the Core closed it, or the connection broke. WHY it
+    /// ended is not in here and cannot be: it arrives as `peer.channel_closed`
+    /// on the control connection (see [`PeerChannel`]).
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for PeerSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PeerSendError::TooLarge { len } => write!(
+                f,
+                "peer-channel frame of {len} bytes above the {MAX_PEER_FRAME}-byte cap"
+            ),
+            PeerSendError::Io(e) => write!(f, "peer channel I/O: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for PeerSendError {}
+
+/// A live duplex pipe to the components holding the SAME role on another device
+/// of the account (`peers.channel`, #124). The Core relays opaque bytes and
+/// interprets none of them: the dialect is the two components', and what this
+/// type owns is the frame, the cap, and the moment the pipe ends.
+///
+/// ONE type for both ends, on purpose. A channel this device opened (the token
+/// comes back in the `peers.channel` reply) and one a peer opened (the token
+/// arrives as a `peer.channel` notification) differ in nothing once attached:
+/// the pipe is duplex and neither end is the driver, so two types would be two
+/// names for one thing.
+///
+/// # The reason a channel ended NEVER travels on the pipe
+///
+/// The most important thing a caller can get wrong. A `PeerChannel` that just
+/// ended says only THAT it ended: [`PeerChannel::recv`] returns `None` and a
+/// [`PeerChannel::send`] fails with [`PeerSendError::Io`]. The reason arrives as
+/// a `peer.channel_closed { device_id, reason }` notification on the CONTROL
+/// connection that owned the local end, with one of `CLOSED`, `REPLACED`,
+/// `PEER_GONE`, `DEVICE_REVOKED`, `LOGGED_OUT`, `ACCOUNT_LEFT`, `SHUTDOWN`,
+/// `FRAME_TOO_LARGE`, `RATE_EXCEEDED`, `IDLE_TIMEOUT`, `NO_DIRECT_PATH`. It
+/// cannot ride the pipe: a closed stream carries no reason, and no control frame
+/// lives inside a grammar the Core refuses to look inside. A component that
+/// watches only its pipe can report "it stopped" and never why, so watch both.
+///
+/// # Liveness is the caller's duty
+///
+/// The Core sweeps a channel with no frame in EITHER direction for 10 s
+/// (`IDLE_TIMEOUT`). Any frame resets it, a zero-length one included, so a
+/// keepalive costs 4 bytes at whatever cadence the component picks. This type
+/// sends none by itself: the cadence is the component's policy, and a client
+/// that silently kept a dead peer's channel alive would hide exactly what the
+/// sweep exists to reveal.
+///
+/// # Shape
+///
+/// The read half is owned by an internal task funnelling parsed frames through a
+/// bounded channel, like [`ConsumerChannel`] and for the same two reasons:
+/// [`PeerChannel::recv`] must be cancel-safe so it can be raced in a `select!`
+/// against the control plane's events (the frame codec's `read_exact` is not
+/// cancel-safe, an `mpsc::recv` is), and the bounded channel is the backpressure
+/// seam (`PEER_FRAME_CAPACITY`, whose size is argued where it is defined).
+///
+/// No convenience wraps "wait for a frame, and learn if the channel died"
+/// deliberately: [`PeerChannel::recv`] IS that one call, and a sibling that
+/// resolved only on the end would invite a caller to await both at once and lose
+/// a frame to whichever won.
+pub struct PeerChannel {
+    writer: Box<dyn AsyncWrite + Send + Unpin>,
+    frames: mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for PeerChannel {
+    fn drop(&mut self) {
+        // Abort the reader task so its read half drops; with the write half
+        // (dropped along with the struct) the stream closes, and the Core ends
+        // the channel at once: `CLOSED` here, `PEER_GONE` at the far end, rather
+        // than a live channel nobody reads waiting out a Core-side budget.
+        self.reader.abort();
+    }
+}
+
+impl PeerChannel {
+    /// Opens the pipe and attaches `channel_token`. Serves both ends
+    /// identically: a token from a `peers.channel` reply, or one from a
+    /// `peer.channel` notification.
+    ///
+    /// Fails only on connect / attach I/O. A token the Core does not honor (spent,
+    /// unknown, or belonging to a channel whose trust ended in the meantime) is
+    /// NOT an error here: the connection is accepted and then closed, which shows
+    /// up as [`PeerChannel::recv`] returning `None` right away, with the reason on
+    /// the control plane like any other end.
+    ///
+    /// A caller minting the token with `peers.channel` must give that request at
+    /// least [`PEER_CHANNEL_REQUEST_TIMEOUT`].
+    pub async fn open(ipc_path: &Path, channel_token: &str) -> std::io::Result<PeerChannel> {
+        let stream = transport::connect(ipc_path).await?;
+        let (read, mut writer) = tokio::io::split(stream);
+        attach(&mut writer, channel_token).await?;
+        let (tx, frames) = mpsc::channel(PEER_FRAME_CAPACITY);
+        let reader = tokio::spawn(peer_read_loop(BufReader::new(read), tx));
+        Ok(PeerChannel {
+            writer: Box::new(writer),
+            frames,
+            reader,
+        })
+    }
+
+    /// Sends one frame. `bytes` empty is legal and is the keepalive: to a Core
+    /// that does not know what a keepalive is, that is all one can look like.
+    ///
+    /// Above [`MAX_PEER_FRAME`] the frame is refused without being written
+    /// ([`PeerSendError::TooLarge`]) and the channel stays usable.
+    pub async fn send(&mut self, bytes: &[u8]) -> Result<(), PeerSendError> {
+        if bytes.len() > MAX_PEER_FRAME {
+            return Err(PeerSendError::TooLarge { len: bytes.len() });
+        }
+        write_peer_frame(&mut self.writer, bytes)
+            .await
+            .map_err(PeerSendError::Io)
+    }
+
+    /// The next frame. `None` = the pipe ENDED (cleanly or not: the reason is on
+    /// the control plane, see the type's documentation); `Some(Err(..))` = an I/O
+    /// or framing failure that is this side's business, i.e. a frame announced
+    /// above the cap, which is a Core or a peer not speaking this primitive.
+    ///
+    /// Cancel-safe: a `recv` dropped in a lost `select!` race loses no frame.
+    pub async fn recv(&mut self) -> Option<Result<Vec<u8>, std::io::Error>> {
+        self.frames.recv().await
+    }
+}
+
+/// Reads frames until the pipe ends or breaks, forwarding each to `tx`. The
+/// bounded channel is the backpressure seam: a consumer that stops draining
+/// suspends this task, which stops reading the socket, which the Core throttles
+/// (and, past its idle and rate budgets, cuts).
+async fn peer_read_loop<R: tokio::io::AsyncBufRead + Unpin>(
+    mut reader: R,
+    tx: mpsc::Sender<std::io::Result<Vec<u8>>>,
+) {
+    loop {
+        match read_peer_frame(&mut reader).await {
+            Ok(None) => return, // the pipe ended
+            Ok(Some(frame)) => {
+                if tx.send(Ok(frame)).await.is_err() {
+                    return; // the PeerChannel was dropped
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                return;
+            }
+        }
+    }
+}
+
+/// `[u32 BE length][exactly that many bytes]`, one buffer and one `write_all`.
+/// The Core writes the two halves separately (measured as free in #123), but on
+/// this side a single write is what keeps a cancellation from tearing a frame in
+/// two: the length and the body always go out together or not at all.
+async fn write_peer_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let len = u32::try_from(bytes.len()).map_err(|_| invalid("peer-channel frame too large"))?;
+    let mut frame = Vec::with_capacity(4 + bytes.len());
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(bytes);
+    writer.write_all(&frame).await?;
+    writer.flush().await
+}
+
+/// `Ok(None)` = the pipe ended. Bounds the announced length against the cap
+/// BEFORE allocating: the Core is semi-trusted, and the far end is a peer.
+async fn read_peer_frame<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut len_buf = [0u8; 4];
+    match reader.read_exact(&mut len_buf).await {
+        Ok(_) => {}
+        Err(e) if is_end_of_pipe(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let len = u32::from_be_bytes(len_buf) as usize;
+    // A zero length is a legal frame (the keepalive); above the cap is not a
+    // frame at all, and we say so instead of allocating what was announced.
+    if len > MAX_PEER_FRAME {
+        return Err(invalid("peer-channel frame above the cap"));
+    }
+    let mut frame = vec![0u8; len];
+    match reader.read_exact(&mut frame).await {
+        Ok(_) => Ok(Some(frame)),
+        // An end of stream in the MIDDLE of a frame is a close, not a violation:
+        // the length and the body are two writes on the Core's side, so a
+        // channel cut between them legitimately looks exactly like this.
+        Err(e) if is_end_of_pipe(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Does this read error mean "the pipe ended" rather than "something failed"? A
+/// closed Unix socket reads as `UnexpectedEof` (or `ConnectionReset` when it was
+/// reset), a closed Windows named pipe as `BrokenPipe`. The three collapse
+/// because on this type they carry the same amount of information: none. What
+/// ended the channel is a `peer.channel_closed` reason on the control plane, and
+/// a caller that reads it there is told the same thing whichever of these the
+/// socket happened to produce.
+fn is_end_of_pipe(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+    )
 }
 
 fn invalid(what: &str) -> std::io::Error {

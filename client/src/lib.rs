@@ -26,7 +26,10 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-pub use channel::{ChannelError, ConsumerChannel, ErrorCode, ProviderChannel};
+pub use channel::{
+    ChannelError, ConsumerChannel, ErrorCode, MAX_PEER_FRAME, PEER_CHANNEL_REQUEST_TIMEOUT,
+    PeerChannel, PeerSendError, ProviderChannel,
+};
 pub use conn::Client;
 
 /// Major version of the IPC API this crate implements. A Core announcing
