@@ -45,7 +45,7 @@ iroh = "1"
 # LAN discovery: announces this endpoint and resolves peers over mDNS
 # (swarm-discovery), so two devices on the same network reach each other
 # without the relay. Published by n0 (the iroh team) and versioned with iroh.
-iroh-mdns-address-lookup = "0.4"
+iroh-mdns-address-lookup = "0.5"
 # `StreamExt::next` for the mDNS subscription loop — already in the tree (an
 # iroh dependency), and the stream type the lookup crate hands out.
 n0-future = "0.3"
